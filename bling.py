@@ -149,7 +149,7 @@ class BlingAuth:
         self.redirect_uri = os.getenv("BLING_REDIRECT_URI", "https://bling-automacao.onrender.com/callback")
         self.token_url = 'https://www.bling.com.br/Api/v3/oauth/token'
         self.access_token = None
-        self.refresh_token = None
+        self.refresh_token = os.getenv('BLING_REFRESH_TOKEN') # Carrega do ENV para produção
         self.expires_at = None
 
     def get_authorization_url(self) -> str:
@@ -201,13 +201,15 @@ class BlingAuth:
             }, f, indent=2)
 
     def load_tokens(self) -> bool:
+        """Tenta carregar tokens do arquivo local (uso primário em desenvolvimento)"""
         try:
             if not Path(self.TOKEN_FILE).exists():
                 return False
             with open(self.TOKEN_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             self.access_token = data.get('access_token')
-            self.refresh_token = data.get('refresh_token')
+            # Prioriza o refresh_token do arquivo se existir, senão mantém o do ENV
+            self.refresh_token = data.get('refresh_token', self.refresh_token)
             self.expires_at = data.get('expires_at')
             return True
         except Exception:
@@ -241,7 +243,12 @@ class BlingAuth:
     def ensure_valid_token(self) -> bool:
         if not self.access_token:
             if not self.load_tokens():
-                raise BlingAuthError("Execute: python bling.py --serve")
+                # Se não carregou do arquivo, tenta carregar do ENV (para produção)
+                if not self.refresh_token:
+                    raise BlingAuthError("Token não encontrado. Execute: python bling.py --serve para autenticar ou defina BLING_REFRESH_TOKEN no ambiente.")
+                # Se o refresh_token existe no ENV, tenta renovar imediatamente
+                if not self.refresh_access_token():
+                    raise BlingAuthError("Falha ao renovar token com BLING_REFRESH_TOKEN. Reautentique.")
         if self.expires_at:
             expires = datetime.fromisoformat(self.expires_at)
             if datetime.now() >= expires - timedelta(minutes=5):
@@ -1145,6 +1152,10 @@ def main():
 
     args = parser.parse_args()
 
+    # Se nenhuma flag for passada, assume-se que é o ambiente de produção (Render)
+    if not args.serve and not args.run:
+        args.serve = True
+
     if args.serve:
         config = Config()
         auth = BlingAuth(config)
@@ -1167,8 +1178,10 @@ def main():
 
         # Inicia o servidor Flask corretamente
         try:
+            # Render usa a variável de ambiente PORT
+            port = int(os.environ.get("PORT", 8000))
             server = WebServer(auth, orchestrator)
-            server.run(host="0.0.0.0", port=8000)
+            server.run(host="0.0.0.0", port=port)
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado")
         return
