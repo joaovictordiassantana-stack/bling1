@@ -1,0 +1,7 @@
+2025-11-12 13:52:48,369 - errors - ERROR - Erro ao buscar kits e componentes do Bling: Execute: python bling_enhanced.py --serve
+2025-11-12 14:17:04,994 - errors - ERROR - Erro ao buscar kits e componentes do Bling: Execute: python bling.py --serve
+2025-11-12 14:20:56,019 - errors - ERROR - Erro ao buscar kits e componentes do Bling: Execute: python bling.py --serve
+2025-11-12 14:21:36,568 - __main__ - INFO - Verificando estoques mínimos no Bling...
+2025-11-12 14:21:38,882 - errors - ERROR - Erro ao buscar kits e componentes do Bling: Execute: python bling.py --serve
+2025-11-12 14:58:40,106 - errors - ERROR - Erro ao buscar kits e componentes do Bling: Execute: python bling.py --serve
+2025-11-12 15:02:27,975 - errors - ERROR - Erro ao buscar kits e componentes do Bling: Execute: python bling.py --serve
