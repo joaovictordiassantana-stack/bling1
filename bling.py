@@ -193,12 +193,19 @@ class BlingAuth:
         self.refresh_token = data.get('refresh_token')
         expires_in = data.get('expires_in', 3600)
         self.expires_at = (datetime.now() + timedelta(seconds=expires_in)).isoformat()
-        with open(self.TOKEN_FILE, 'w', encoding='utf-8') as f:
-            json.dump({
-                'access_token': self.access_token,
-                'refresh_token': self.refresh_token,
-                'expires_at': self.expires_at
-            }, f, indent=2)
+        try:
+            # Garante que o arquivo seja criado no diretório de trabalho atual
+            token_path = Path(self.TOKEN_FILE)
+            with open(token_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'access_token': self.access_token,
+                    'refresh_token': self.refresh_token,
+                    'expires_at': self.expires_at
+                }, f, indent=2)
+            logger.info(f"✓ Tokens salvos em {token_path.absolute()}")
+        except Exception as e:
+            error_logger.error(f"Falha ao salvar tokens: {e}")
+            raise
 
     def load_tokens(self) -> bool:
         """Tenta carregar tokens do arquivo local (uso primário em desenvolvimento)"""
@@ -874,13 +881,24 @@ document.addEventListener('DOMContentLoaded', function() {
       .then(response => response.json())
       .then(data => {
         const statusElement = document.getElementById('status-token');
+        const statusIndicator = document.querySelector('.status-indicator');
+        
         if (data.token_valid) {
-          statusElement.innerHTML = '<span class="badge bg-success">Token Válido</span>';
+          statusElement.className = 'status-badge bg-success';
+          statusElement.innerHTML = '<i class="fas fa-check-circle"></i> Conectado ao Bling';
+          statusIndicator.className = 'status-indicator active';
         } else {
-          statusElement.innerHTML = '<span class="badge bg-danger">Token Inválido/Expirado</span>';
+          statusElement.className = 'status-badge bg-danger';
+          statusElement.innerHTML = '<i class="fas fa-times-circle"></i> Desconectado do Bling';
+          statusIndicator.className = 'status-indicator inactive';
         }
       })
-      .catch(error => console.error('Erro ao carregar status:', error));
+      .catch(error => {
+        console.error('Erro ao carregar status:', error);
+        const statusElement = document.getElementById('status-token');
+        statusElement.className = 'status-badge bg-warning';
+        statusElement.innerHTML = '<i class="fas fa-exclamation-triangle"></i> Erro de Conexao';
+      });
   }
 
   function loadStats() {
@@ -951,9 +969,18 @@ document.addEventListener('DOMContentLoaded', function() {
       .then(response => response.json())
       .then(data => {
         const logsElement = document.getElementById('logs-content');
-        logsElement.innerHTML = data.logs.join('\n');
-        // Scroll to bottom
+        const fullLogsElement = document.getElementById('full-logs-content');
+        const logCount = document.getElementById('log-count');
+        
+        const formattedLogs = (data.logs || []).map(formatLog).join('');
+        const recentLogs = (data.logs || []).slice(-15).map(formatLog).join('');
+        
+        logsElement.innerHTML = recentLogs || '<div class="text-muted">Nenhum log disponivel</div>';
+        fullLogsElement.innerHTML = formattedLogs || '<div class="text-muted">Nenhum log disponivel</div>';
+        logCount.textContent = `${(data.logs || []).length} entradas`;
+        
         logsElement.scrollTop = logsElement.scrollHeight;
+        fullLogsElement.scrollTop = fullLogsElement.scrollHeight;
       })
       .catch(error => console.error('Erro ao carregar logs:', error));
   }
