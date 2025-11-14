@@ -34,7 +34,7 @@ except ImportError:
     WEBSOCKET_AVAILABLE = False
     Sock = None
 
-load_dotenv(dotenv_path='bling_config.env')
+load_dotenv(dotenv_path='.env')
 
 # Colorama
 try:
@@ -203,25 +203,32 @@ class BlingAuth:
         self._initialize_tokens()
 
     def _initialize_tokens(self):
-        """Inicializa tokens de forma inteligente"""
+        """Inicializa tokens de forma inteligente sem travar a inicialização."""
         # 1. Tenta carregar do arquivo local
-        if self.load_tokens():
-            logger.info("✓ Tokens carregados do arquivo local")
-            return
-        
-        # 2. Tenta carregar do ambiente (produção)
+        try:
+            if self.load_tokens():
+                logger.info("✓ Tokens carregados do arquivo local")
+                return
+        except Exception as e:
+            logger.warning(f"Não foi possível carregar tokens locais: {e}")
+
+        # 2. Tenta carregar refresh token do ambiente (por exemplo no Render)
         env_refresh = os.getenv('BLING_REFRESH_TOKEN')
         if env_refresh:
             logger.info("✓ Refresh token encontrado no ambiente")
             self.refresh_token = env_refresh
             try:
-                if self.refresh_access_token():
+                ok = self.refresh_access_token()
+                if ok:
                     logger.info("✓ Token renovado automaticamente com sucesso")
                     return
+                else:
+                    logger.warning("✗ Renovação com refresh token do ambiente falhou")
             except Exception as e:
-                logger.error(f"✗ Falha ao renovar token do ambiente: {e}")
-        
-        logger.warning("⚠ Nenhum token válido encontrado. Autenticação necessária.")
+                logger.warning(f"✗ Falha ao renovar token do ambiente (não crítico): {e}")
+
+        # Não lançar erro — deixa o servidor subir e pede autorização manual depois
+        logger.warning("⚠ Nenhum token válido encontrado. Autenticação necessária (visite a URL de autorização).")
 
     def get_authorization_url(self) -> str:
         params = {
@@ -274,12 +281,15 @@ class BlingAuth:
         
         try:
             token_path = Path(self.TOKEN_FILE)
+            # Garante que o diretório exista antes de salvar
+            token_path.parent.mkdir(parents=True, exist_ok=True)
             with open(token_path, 'w', encoding='utf-8') as f:
                 json.dump(token_data, f, indent=2)
             logger.info(f"✓ Tokens salvos em {token_path.absolute()}")
         except Exception as e:
             error_logger.error(f"Falha ao salvar tokens: {e}")
-            raise
+            # Não lança a exceção para não interromper o fluxo de autenticação
+            pass
 
     def load_tokens(self) -> bool:
         """Carrega tokens do arquivo local"""
@@ -948,7 +958,8 @@ class WebServer:
         print_info(f"Interface: http://{host}:{port}/dashboard")
         print_info(f"OAuth: {self.auth.get_authorization_url()}")
         print_info(f"Webhook: http://{host}:{port}/webhook/bling\n")
-        self.app.run(host=host, port=port, debug=False)
+        # O Render/servidor de produção exige que o host seja 0.0.0.0
+        self.app.run(host='0.0.0.0', port=port, debug=False)
 
 # ============================================================================
 # TEMPLATES HTML
