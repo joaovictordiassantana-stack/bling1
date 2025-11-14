@@ -34,7 +34,7 @@ except ImportError:
     WEBSOCKET_AVAILABLE = False
     Sock = None
 
-load_dotenv()
+load_dotenv(dotenv_path='bling_config.env')
 
 # Colorama
 try:
