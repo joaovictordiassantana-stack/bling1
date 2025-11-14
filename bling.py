@@ -24,8 +24,15 @@ from threading import Lock
 
 import requests
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
-from flask_sock import Sock
 from dotenv import load_dotenv
+
+# Tenta importar flask_sock, mas funciona sem ele
+try:
+    from flask_sock import Sock
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    Sock = None
 
 load_dotenv()
 
@@ -742,7 +749,15 @@ class AutomationOrchestrator:
 class WebServer:
     def __init__(self, auth: BlingAuth, orchestrator: AutomationOrchestrator):
         self.app = Flask(__name__)
-        self.sock = Sock(self.app)
+        
+        # Só inicializa Sock se disponível
+        if WEBSOCKET_AVAILABLE:
+            self.sock = Sock(self.app)
+            logger.info("✓ WebSocket disponível")
+        else:
+            self.sock = None
+            logger.warning("⚠ WebSocket não disponível, usando polling")
+        
         self.auth = auth
         self.orchestrator = orchestrator
         self._setup_routes()
@@ -906,26 +921,27 @@ class WebServer:
                 error_logger.error(f"Erro no webhook: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        # WebSocket para logs em tempo real
-        @self.sock.route('/ws/logs')
-        def ws_logs(ws):
-            logger.info("🔌 Cliente conectado ao WebSocket de logs")
-            last_log_count = 0
-            
-            try:
-                while True:
-                    logs = memory_handler.get_logs()
-                    current_count = len(logs)
-                    
-                    # Envia apenas novos logs
-                    if current_count > last_log_count:
-                        new_logs = logs[last_log_count:]
-                        ws.send(json.dumps({"logs": new_logs}))
-                        last_log_count = current_count
-                    
-                    time.sleep(1)  # Verifica a cada segundo
-            except Exception as e:
-                logger.info(f"🔌 Cliente desconectado do WebSocket: {e}")
+        # WebSocket para logs em tempo real (apenas se disponível)
+        if WEBSOCKET_AVAILABLE and self.sock:
+            @self.sock.route('/ws/logs')
+            def ws_logs(ws):
+                logger.info("🔌 Cliente conectado ao WebSocket de logs")
+                last_log_count = 0
+                
+                try:
+                    while True:
+                        logs = memory_handler.get_logs()
+                        current_count = len(logs)
+                        
+                        # Envia apenas novos logs
+                        if current_count > last_log_count:
+                            new_logs = logs[last_log_count:]
+                            ws.send(json.dumps({"logs": new_logs}))
+                            last_log_count = current_count
+                        
+                        time.sleep(1)  # Verifica a cada segundo
+                except Exception as e:
+                    logger.info(f"🔌 Cliente desconectado do WebSocket: {e}")
 
     def run(self, host='0.0.0.0', port=8000):
         print_header("SERVIDOR WEB BLING")
@@ -1140,39 +1156,72 @@ document.addEventListener('DOMContentLoaded', function() {
   let processingChart;
   let wsConnection;
 
-  // ========== WebSocket para logs em tempo real ==========
+  // ========== Sistema de Logs (Polling ou WebSocket) ==========
+  let lastLogIndex = 0;
+  let logsPollingInterval;
+  
   function connectWebSocket() {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}/ws/logs`;
     
     try {
-      wsConnection = new WebSocket(wsUrl);
+      const ws = new WebSocket(wsUrl);
       
-      wsConnection.onopen = function() {
+      ws.onopen = function() {
         console.log('✓ WebSocket conectado');
+        // Para polling se WebSocket conectar
+        if (logsPollingInterval) {
+          clearInterval(logsPollingInterval);
+        }
       };
       
-      wsConnection.onmessage = function(event) {
+      ws.onmessage = function(event) {
         const data = JSON.parse(event.data);
         if (data.logs) {
           appendLogs(data.logs);
         }
       };
       
-      wsConnection.onerror = function(error) {
-        console.error('Erro no WebSocket:', error);
-        // Fallback para polling se WebSocket falhar
-        setTimeout(() => loadLogs(), 5000);
+      ws.onerror = function(error) {
+        console.log('WebSocket indisponível, usando polling');
+        startLogsPolling();
       };
       
-      wsConnection.onclose = function() {
-        console.log('WebSocket desconectado, tentando reconectar...');
-        setTimeout(connectWebSocket, 5000);
+      ws.onclose = function() {
+        console.log('WebSocket desconectado, usando polling');
+        startLogsPolling();
       };
     } catch (e) {
-      console.error('Erro ao conectar WebSocket:', e);
-      loadLogs(); // Fallback
+      console.log('WebSocket não suportado, usando polling');
+      startLogsPolling();
     }
+  }
+  
+  function startLogsPolling() {
+    if (logsPollingInterval) return; // Já está rodando
+    
+    console.log('✓ Iniciando polling de logs (a cada 3s)');
+    
+    // Primeira carga
+    loadLogsIncremental();
+    
+    // Polling a cada 3 segundos
+    logsPollingInterval = setInterval(() => {
+      loadLogsIncremental();
+    }, 3000);
+  }
+  
+  function loadLogsIncremental() {
+    fetch(`${API_BASE}/logs`)
+      .then(response => response.json())
+      .then(data => {
+        if (data.logs && data.logs.length > lastLogIndex) {
+          const newLogs = data.logs.slice(lastLogIndex);
+          appendLogs(newLogs);
+          lastLogIndex = data.logs.length;
+        }
+      })
+      .catch(error => console.error('Erro ao carregar logs:', error));
   }
 
   function appendLogs(logs) {
@@ -1684,4 +1733,3 @@ if __name__ == '__main__':
         print_error(f"ERRO FATAL: {e}")
         error_logger.exception("Erro fatal:")
         sys.exit(1)
-  
