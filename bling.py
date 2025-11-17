@@ -34,7 +34,7 @@ except ImportError:
     WEBSOCKET_AVAILABLE = False
     Sock = None
 
-load_dotenv(dotenv_path='.env')
+load_dotenv()
 
 # Colorama
 try:
@@ -203,32 +203,25 @@ class BlingAuth:
         self._initialize_tokens()
 
     def _initialize_tokens(self):
-        """Inicializa tokens de forma inteligente sem travar a inicialização."""
+        """Inicializa tokens de forma inteligente"""
         # 1. Tenta carregar do arquivo local
-        try:
-            if self.load_tokens():
-                logger.info("✓ Tokens carregados do arquivo local")
-                return
-        except Exception as e:
-            logger.warning(f"Não foi possível carregar tokens locais: {e}")
-
-        # 2. Tenta carregar refresh token do ambiente (por exemplo no Render)
+        if self.load_tokens():
+            logger.info("✓ Tokens carregados do arquivo local")
+            return
+        
+        # 2. Tenta carregar do ambiente (produção)
         env_refresh = os.getenv('BLING_REFRESH_TOKEN')
         if env_refresh:
             logger.info("✓ Refresh token encontrado no ambiente")
             self.refresh_token = env_refresh
             try:
-                ok = self.refresh_access_token()
-                if ok:
+                if self.refresh_access_token():
                     logger.info("✓ Token renovado automaticamente com sucesso")
                     return
-                else:
-                    logger.warning("✗ Renovação com refresh token do ambiente falhou")
             except Exception as e:
-                logger.warning(f"✗ Falha ao renovar token do ambiente (não crítico): {e}")
-
-        # Não lançar erro — deixa o servidor subir e pede autorização manual depois
-        logger.warning("⚠ Nenhum token válido encontrado. Autenticação necessária (visite a URL de autorização).")
+                logger.error(f"✗ Falha ao renovar token do ambiente: {e}")
+        
+        logger.warning("⚠ Nenhum token válido encontrado. Autenticação necessária.")
 
     def get_authorization_url(self) -> str:
         params = {
@@ -281,15 +274,12 @@ class BlingAuth:
         
         try:
             token_path = Path(self.TOKEN_FILE)
-            # Garante que o diretório exista antes de salvar
-            token_path.parent.mkdir(parents=True, exist_ok=True)
             with open(token_path, 'w', encoding='utf-8') as f:
                 json.dump(token_data, f, indent=2)
             logger.info(f"✓ Tokens salvos em {token_path.absolute()}")
         except Exception as e:
             error_logger.error(f"Falha ao salvar tokens: {e}")
-            # Não lança a exceção para não interromper o fluxo de autenticação
-            pass
+            raise
 
     def load_tokens(self) -> bool:
         """Carrega tokens do arquivo local"""
@@ -776,6 +766,15 @@ class WebServer:
         @self.app.route("/")
         def index():
             return redirect(url_for("dashboard"))
+        
+        @self.app.route("/health")
+        def health():
+            """Health check endpoint para Render e outros serviços"""
+            return jsonify({
+                "status": "ok",
+                "service": "Bling Automação ERP",
+                "timestamp": datetime.now().isoformat()
+            }), 200
 
         @self.app.route("/dashboard")
         def dashboard():
@@ -958,8 +957,7 @@ class WebServer:
         print_info(f"Interface: http://{host}:{port}/dashboard")
         print_info(f"OAuth: {self.auth.get_authorization_url()}")
         print_info(f"Webhook: http://{host}:{port}/webhook/bling\n")
-        # O Render/servidor de produção exige que o host seja 0.0.0.0
-        self.app.run(host='0.0.0.0', port=port, debug=False)
+        self.app.run(host=host, port=port, debug=False)
 
 # ============================================================================
 # TEMPLATES HTML
@@ -1345,6 +1343,7 @@ document.addEventListener('DOMContentLoaded', function() {
         logsElement.innerHTML = '';
         if (data.logs && data.logs.length > 0) {
           appendLogs(data.logs.slice(-50)); // Últimos 50 logs
+          lastLogIndex = data.logs.length;
         } else {
           logsElement.innerHTML = '<div class="text-muted">Nenhum log disponível</div>';
         }
@@ -1528,8 +1527,9 @@ document.addEventListener('DOMContentLoaded', function() {
   loadStock();
   loadNeeds();
   loadKits();
+  loadLogs();
   
-  // Conecta WebSocket para logs em tempo real
+  // Tenta conectar WebSocket, senão usa polling
   connectWebSocket();
   
   // Atualização automática a cada 60 segundos
@@ -1665,9 +1665,9 @@ Exemplos de uso:
         auth = BlingAuth(config)
         orchestrator = AutomationOrchestrator(config)
 
-        # Carrega dados iniciais do Bling
+        # Tenta carregar dados iniciais do Bling (não bloqueia se falhar)
         try:
-            print_info("Carregando dados iniciais do Bling...")
+            print_info("Tentando carregar dados iniciais do Bling...")
             kits = orchestrator.api.get_all_kits_and_components()
             if kits:
                 all_comps = [comp for kit in kits for comp in kit.components]
@@ -1677,20 +1677,22 @@ Exemplos de uso:
             else:
                 print_warning("⚠ Nenhum kit encontrado no Bling")
         except BlingAuthError as e:
-            print_warning(f"⚠ Autenticação necessária: {e}")
-            print_info(f"Acesse: {auth.get_authorization_url()}")
+            print_info(f"⚠ Autenticação necessária - acesse {auth.get_authorization_url()}")
         except Exception as e:
-            print_warning(f"⚠ Falha ao carregar dados iniciais: {e}")
+            print_info(f"⚠ Não foi possível carregar dados iniciais (normal na primeira execução)")
+            logger.debug(f"Detalhes do erro: {e}")
 
-        # Inicia servidor
+        # Inicia servidor SEMPRE, mesmo sem token
         try:
             port = args.port or int(os.environ.get("PORT", 8000))
+            print_info(f"🚀 Iniciando servidor na porta {port}...")
             server = WebServer(auth, orchestrator)
             server.run(host="0.0.0.0", port=port)
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado pelo usuário")
         except Exception as e:
             print_error(f"Erro ao iniciar servidor: {e}")
+            error_logger.exception("Erro fatal ao iniciar servidor:")
             sys.exit(1)
         return
 
