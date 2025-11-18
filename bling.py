@@ -239,21 +239,32 @@ class BlingAuth:
                 'code': code,
                 'redirect_uri': self.redirect_uri
             }
+
             creds = f"{self.client_id}:{self.client_secret}".encode('utf-8')
             basic = base64.b64encode(creds).decode('utf-8')
+
             headers = {
                 'Authorization': f'Basic {basic}',
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded',
                 'Accept': '1.0'
             }
-            response = requests.post(self.token_url, json=payload, headers=headers, timeout=Config.REQUEST_TIMEOUT)
+
+            response = requests.post(
+                self.token_url,
+                data=payload,  # CORRETO: form-urlencoded
+                headers=headers,
+                timeout=Config.REQUEST_TIMEOUT
+            )
+
             if response.status_code not in (200, 201):
                 error_logger.error(f"Token exchange failed: {response.status_code} - {response.text}")
                 response.raise_for_status()
+
             data = response.json()
             self._save_tokens(data)
-            logger.info("✓ Tokens obtidos e salvos com sucesso!")
+            logger.info("✓ Tokens obtidos com sucesso")
             return True
+
         except Exception as e:
             error_logger.error(f"Falha ao trocar code: {e}")
             return False
@@ -312,31 +323,40 @@ class BlingAuth:
         if not self.refresh_token:
             logger.error("Refresh token não disponível")
             return False
-        
+
         try:
             payload = {
                 'grant_type': 'refresh_token',
                 'refresh_token': self.refresh_token
             }
+
             creds = f"{self.client_id}:{self.client_secret}".encode('utf-8')
             basic = base64.b64encode(creds).decode('utf-8')
+
             headers = {
                 'Authorization': f'Basic {basic}',
-                'Content-Type': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded',
                 'Accept': '1.0'
             }
-            response = requests.post(self.token_url, json=payload, headers=headers, timeout=Config.REQUEST_TIMEOUT)
-            
+
+            response = requests.post(
+                self.token_url,
+                data=payload,  # CORRETO
+                headers=headers,
+                timeout=Config.REQUEST_TIMEOUT
+            )
+
             if response.status_code not in (200, 201):
                 error_logger.error(f"Refresh token failed: {response.status_code} - {response.text}")
                 return False
-            
+
             data = response.json()
             self._save_tokens(data)
-            logger.info("✓ Token renovado automaticamente!")
+            logger.info("✓ Token renovado com sucesso")
             return True
+
         except Exception as e:
-            error_logger.error(f"Falha ao renovar token: {e}")
+            error_logger.error(f"Erro ao renovar token: {e}")
             return False
 
     def ensure_valid_token(self) -> bool:
@@ -1668,14 +1688,20 @@ Exemplos de uso:
         # Tenta carregar dados iniciais do Bling (não bloqueia se falhar)
         try:
             print_info("Tentando carregar dados iniciais do Bling...")
-            kits = orchestrator.api.get_all_kits_and_components()
-            if kits:
-                all_comps = [comp for kit in kits for comp in kit.components]
-                unique_comps = {c.sku: c for c in all_comps}.values()
-                orchestrator.purchase_manager.check_min_stock_needs(list(unique_comps))
-                print_success(f"✓ Estoque inicial carregado: {len(kits)} kits, {len(unique_comps)} componentes")
+
+            if not auth.access_token:
+                print_warning("⚠ Nenhum token disponível. Ignorando chamada inicial à API.")
             else:
-                print_warning("⚠ Nenhum kit encontrado no Bling")
+                try:
+                    kits = orchestrator.api.get_all_kits_and_components()
+                    if kits:
+                        all_comps = [comp for kit in kits for comp in kit.components]
+                        unique_comps = {c.sku: c for c in all_comps}.values()
+                        orchestrator.purchase_manager.check_min_stock_needs(list(unique_comps))
+                        print_success(f"✓ Estoque inicial carregado: {len(kits)} kits, {len(unique_comps)} componentes")
+                    print_success("Dados iniciais carregados")
+                except Exception as e:
+                    print_warning(f"⚠ Falha ao carregar kits iniciais: {e}")
         except BlingAuthError as e:
             print_info(f"⚠ Autenticação necessária - acesse {auth.get_authorization_url()}")
         except Exception as e:
