@@ -243,10 +243,10 @@ class BlingAuth:
             basic = base64.b64encode(creds).decode('utf-8')
             headers = {
                 'Authorization': f'Basic {basic}',
-                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Type': 'application/json',
                 'Accept': '1.0'
             }
-            response = requests.post(self.token_url, data=payload, headers=headers, timeout=Config.REQUEST_TIMEOUT)
+            response = requests.post(self.token_url, json=payload, headers=headers, timeout=Config.REQUEST_TIMEOUT)
             if response.status_code not in (200, 201):
                 error_logger.error(f"Token exchange failed: {response.status_code} - {response.text}")
                 response.raise_for_status()
@@ -322,10 +322,10 @@ class BlingAuth:
             basic = base64.b64encode(creds).decode('utf-8')
             headers = {
                 'Authorization': f'Basic {basic}',
-                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Type': 'application/json',
                 'Accept': '1.0'
             }
-            response = requests.post(self.token_url, data=payload, headers=headers, timeout=Config.REQUEST_TIMEOUT)
+            response = requests.post(self.token_url, json=payload, headers=headers, timeout=Config.REQUEST_TIMEOUT)
             
             if response.status_code not in (200, 201):
                 error_logger.error(f"Refresh token failed: {response.status_code} - {response.text}")
