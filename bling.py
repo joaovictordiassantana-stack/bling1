@@ -37,45 +37,6 @@ except ImportError:
 load_dotenv()
 
 # Colorama
-try:#!/usr/bin/env python3
-"""
-bling_enhanced.py - Sistema completo de automação Bling com:
-- Autenticação automática persistente
-- Logs em tempo real via WebSocket
-- Interface web sem erros
-- Configuração automática de componentes
-"""
-
-import os
-import sys
-import json
-import time
-import logging
-import argparse
-import base64
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
-from urllib.parse import urlencode
-from collections import defaultdict
-from threading import Lock
-
-import requests
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for
-from dotenv import load_dotenv
-
-# Tenta importar flask_sock, mas funciona sem ele
-try:
-    from flask_sock import Sock
-    WEBSOCKET_AVAILABLE = True
-except ImportError:
-    WEBSOCKET_AVAILABLE = False
-    Sock = None
-
-load_dotenv()
-
-# Colorama
 try:
     from colorama import init, Fore, Style
     init(autoreset=True)
