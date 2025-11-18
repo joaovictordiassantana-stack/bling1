@@ -110,7 +110,8 @@ class Config:
     """Configurações globais"""
     CLIENT_ID = os.getenv('BLING_CLIENT_ID', '')
     CLIENT_SECRET = os.getenv('BLING_CLIENT_SECRET', '')
-    REDIRECT_URI = os.getenv('BLING_REDIRECT_URI', 'http://localhost:8000/callback')
+    # NÃO use localhost como default em produção — prefira exigir a env ou informar o seu domínio.
+    REDIRECT_URI = os.getenv('BLING_REDIRECT_URI', 'https://bling-automacao.onrender.com/callback')
 
     CHECK_MIN_STOCK = os.getenv('BLING_CHECK_MIN_STOCK', 'true').lower() == 'true'
     MIN_STOCK_THRESHOLD = int(os.getenv('BLING_MIN_STOCK', '10'))
@@ -279,8 +280,7 @@ class BlingAuth:
         token_data = {
             'access_token': self.access_token,
             'refresh_token': self.refresh_token,
-            'expires_at': self.expires_at,
-            'saved_at': datetime.now().isoformat()
+            'expires_at': self.expires_at
         }
         
         try:
@@ -306,12 +306,10 @@ class BlingAuth:
             self.refresh_token = data.get('refresh_token')
             self.expires_at = data.get('expires_at')
             
-            # Verifica se o token está válido
-            if self.expires_at:
-                expires = datetime.fromisoformat(self.expires_at)
-                if datetime.now() >= expires - timedelta(minutes=5):
-                    logger.info("Token expirado, renovando automaticamente...")
-                    return self.refresh_access_token()
+            # Verifica se os tokens essenciais foram carregados
+            if not self.access_token or not self.refresh_token or not self.expires_at:
+                logger.warning("Tokens incompletos no arquivo.")
+                return False
             
             return True
         except Exception as e:
@@ -360,18 +358,21 @@ class BlingAuth:
             return False
 
     def ensure_valid_token(self) -> bool:
-        """Garante que existe um token válido"""
+        """Garante que existe um token válido (Checklist 4)"""
+        
+        # 1. Carregar tokens se não estiverem em memória
         if not self.access_token:
             if not self.load_tokens():
-                raise BlingAuthError("Token não encontrado. Autenticação necessária.")
-        
-        if self.expires_at:
-            expires = datetime.fromisoformat(self.expires_at)
-            if datetime.now() >= expires - timedelta(minutes=5):
-                if not self.refresh_access_token():
-                    raise BlingAuthError("Token expirado e falha ao renovar")
-        
-        return True
+                raise BlingAuthError("Nenhum token encontrado.")
+
+        # 2. Checar expiração e fazer refresh se faltar < 5 min
+        exp = datetime.fromisoformat(self.expires_at)
+        if datetime.now() >= exp - timedelta(minutes=5):
+            logger.info("Token expirado ou a expirar em menos de 5 minutos. Tentando renovar...")
+            self.refresh_access_token()
+            
+        # 3. Retorna se o access_token está disponível após as tentativas
+        return self.access_token is not None
 
     def get_token_info(self) -> Dict:
         """Retorna informações sobre o token atual"""
@@ -1657,6 +1658,8 @@ SUCCESS_TEMPLATE = """
 # ============================================================================
 
 def main():
+    # Checklist 7: Garantir que a pasta logs exista
+    Path("logs").mkdir(exist_ok=True)
     parser = argparse.ArgumentParser(
         description='Automação Bling Enhanced - Sistema completo de automação ERP',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1678,6 +1681,15 @@ Exemplos de uso:
         args.serve = True
 
     config = Config()
+
+    # validação obrigatória de credenciais (colocar logo após criar config)
+    if not config.CLIENT_ID or not config.CLIENT_SECRET:
+        print_error("✗ BLING_CLIENT_ID e/ou BLING_CLIENT_SECRET não definidos. Configure as ENV vars no Render.")
+        sys.exit(1)
+
+    if not config.REDIRECT_URI:
+        print_error("✗ BLING_REDIRECT_URI não definido. Defina para 'https://<seu-servico>.onrender.com/callback' no Render.")
+        sys.exit(1)
 
     if args.serve:
         print_header("BLING AUTOMAÇÃO - MODO SERVIDOR")
@@ -1710,7 +1722,8 @@ Exemplos de uso:
 
         # Inicia servidor SEMPRE, mesmo sem token
         try:
-            port = args.port or int(os.environ.get("PORT", 8000))
+            # prefer PORT do ambiente (necessário no Render). Usar args.port só como fallback local.
+            port = int(os.environ.get("PORT", 8000))
             print_info(f"🚀 Iniciando servidor na porta {port}...")
             server = WebServer(auth, orchestrator)
             server.run(host="0.0.0.0", port=port)
