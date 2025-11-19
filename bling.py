@@ -1691,7 +1691,7 @@ Exemplos de uso:
         print_error("✗ BLING_REDIRECT_URI não definido. Defina para 'https://<seu-servico>.onrender.com/callback' no Render.")
         sys.exit(1)
 
-if args.serve:
+    if args.serve:
         print_header("BLING AUTOMAÇÃO - MODO SERVIDOR")
 
         auth = BlingAuth(config)
@@ -1796,16 +1796,8 @@ if args.run:
             error_logger.exception("Erro detalhado:")
             sys.exit(1)
 
-parser.print_help()
+
 
 
 if __name__ == '__main__':
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n✓ Encerrado pelo usuário")
-        sys.exit(0)
-    except Exception as e:
-        print_error(f"ERRO FATAL: {e}")
-        error_logger.exception("Erro fatal:")
-        sys.exit(1)
+    main()
