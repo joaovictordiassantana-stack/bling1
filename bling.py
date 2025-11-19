@@ -1761,7 +1761,7 @@ if args.serve:
             sys.exit(0)
         return
 
-    if args.run:
+if args.run:
         print_header("BLING AUTOMAÇÃO - MODO PROCESSAMENTO")
         
         try:
