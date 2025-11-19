@@ -1798,7 +1798,7 @@ if args.run:
             sys.exit(1)
         return
 
-    parser.print_help()
+parser.print_help()
 
 
 if __name__ == '__main__':
