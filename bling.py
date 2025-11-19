@@ -200,29 +200,9 @@ class BlingAuth:
         self.refresh_token = None
         self.expires_at = None
         
-        # Carrega tokens ao inicializar
-        self._initialize_tokens()
+        # Carrega tokens sob demanda via ensure_valid_token()
 
-    def _initialize_tokens(self):
-        """Inicializa tokens de forma inteligente"""
-        # 1. Tenta carregar do arquivo local
-        if self.load_tokens():
-            logger.info("✓ Tokens carregados do arquivo local")
-            return
-        
-        # 2. Tenta carregar do ambiente (produção)
-        env_refresh = os.getenv('BLING_REFRESH_TOKEN')
-        if env_refresh:
-            logger.info("✓ Refresh token encontrado no ambiente")
-            self.refresh_token = env_refresh
-            try:
-                if self.refresh_access_token():
-                    logger.info("✓ Token renovado automaticamente com sucesso")
-                    return
-            except Exception as e:
-                logger.error(f"✗ Falha ao renovar token do ambiente: {e}")
-        
-        logger.warning("⚠ Nenhum token válido encontrado. Autenticação necessária.")
+
 
     def get_authorization_url(self) -> str:
         params = {
