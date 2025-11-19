@@ -1759,7 +1759,6 @@ if args.serve:
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado pelo usuário")
             sys.exit(0)
-        return
 
 if args.run:
         print_header("BLING AUTOMAÇÃO - MODO PROCESSAMENTO")
