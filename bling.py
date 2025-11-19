@@ -1770,7 +1770,7 @@ if args.run:
             
             if not kits:
                 print_error("✗ Nenhum kit encontrado no Bling")
-                return
+                sys.exit(0)
             
             print_success(f"✓ {len(kits)} kits carregados")
             print_info("Iniciando processamento...")
@@ -1795,7 +1795,6 @@ if args.run:
             print_error(f"✗ Erro durante processamento: {e}")
             error_logger.exception("Erro detalhado:")
             sys.exit(1)
-        return
 
 parser.print_help()
 
