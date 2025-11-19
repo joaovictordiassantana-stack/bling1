@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from urllib.parse import urlencode
 from collections import defaultdict
-from threading import Lock
+from threading import Lock, Thread
 
 import requests
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
@@ -1691,25 +1691,48 @@ Exemplos de uso:
         print_error("✗ BLING_REDIRECT_URI não definido. Defina para 'https://<seu-servico>.onrender.com/callback' no Render.")
         sys.exit(1)
 
-    if args.serve:
+if args.serve:
         print_header("BLING AUTOMAÇÃO - MODO SERVIDOR")
-        
+
         auth = BlingAuth(config)
         orchestrator = AutomationOrchestrator(config)
 
-        # ✅ DEFINE PORTA PRIMEIRO (antes de qualquer carregamento)
-        port = int(os.environ.get("PORT", args.port if args.port else 8000))
-        print_info(f"🚀 Servidor Flask será iniciado na porta {port}")
-        
-        # ✅ Carregamento inicial opcional (NÃO BLOQUEIA o servidor)
+        # ---------------------------
+        # 1) pega a porta do ambiente
+        # ---------------------------
         try:
-            print_info("Tentando carregar dados iniciais do Bling...")
-            
+            port = int(os.environ.get("PORT", args.port if args.port else 8000))
+        except Exception:
+            print_error("✗ Valor inválido em PORT. Usando 8000 como fallback.")
+            port = 8000
+
+        print_info(f"🚀 Servidor Flask será iniciado na porta {port} (binding imediato)")
+
+        # ---------------------------
+        # 2) inicia o servidor IMEDIATAMENTE em thread
+        #    - use_reloader=False evita spawn de processo filho
+        # ---------------------------
+        server = WebServer(auth, orchestrator)
+
+        def run_server():
+            # garante que o reloader não crie processo filho
+            server.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+        server_thread = Thread(target=run_server, daemon=False)
+        server_thread.start()
+
+        # Aguarda um breve momento para permitir bind (opcional)
+        time.sleep(0.5)
+
+        # ---------------------------
+        # 3) carregamento inicial não-bloqueante (após bind)
+        # ---------------------------
+        try:
+            print_info("Tentando carregar dados iniciais do Bling (após bind)...")
+
             # Tenta carregar tokens primeiro
             if auth.load_tokens():
                 print_success("✓ Tokens encontrados")
-                
-                # Tenta buscar dados do Bling (com timeout implícito)
                 try:
                     kits = orchestrator.api.get_all_kits_and_components()
                     if kits:
@@ -1718,27 +1741,24 @@ Exemplos de uso:
                         orchestrator.purchase_manager.check_min_stock_needs(list(unique_comps))
                         print_success(f"✓ Carregados {len(kits)} kits e {len(unique_comps)} componentes")
                 except Exception as e:
-                    print_warning(f"⚠ Erro ao buscar dados do Bling: {str(e)[:100]}")
-                    logger.debug(f"Detalhes completos: {e}", exc_info=True)
+                    print_warning(f"⚠ Erro ao buscar dados do Bling: {str(e)[:200]}")
+                    logger.debug("Detalhes completos:", exc_info=True)
             else:
                 print_warning("⚠ Nenhum token encontrado - autorização necessária")
                 print_info(f"📍 Autorize em: {auth.get_authorization_url()}")
-                
-        except Exception as e:
-            print_warning(f"⚠ Erro no carregamento inicial (continuando): {str(e)[:100]}")
-            logger.debug(f"Detalhes do erro: {e}", exc_info=True)
 
-        # ✅ INICIA SERVIDOR (SEMPRE EXECUTA, INDEPENDENTE DE ERROS ANTERIORES)
+        except Exception as e:
+            print_warning(f"⚠ Erro no carregamento inicial (continuando): {str(e)[:200]}")
+            logger.debug("Detalhes do erro:", exc_info=True)
+
+        # ---------------------------
+        # 4) mantém o thread vivo (bloqueante)
+        # ---------------------------
         try:
-            print_info(f"🚀 Iniciando servidor Flask em 0.0.0.0:{port}...")
-            server = WebServer(auth, orchestrator)
-            server.run(host="0.0.0.0", port=port)
+            server_thread.join()
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado pelo usuário")
-        except Exception as e:
-            print_error(f"Erro fatal ao iniciar servidor: {e}")
-            error_logger.exception("Erro fatal:")
-            sys.exit(1)
+            sys.exit(0)
         return
 
     if args.run:
