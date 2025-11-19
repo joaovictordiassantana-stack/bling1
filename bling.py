@@ -276,8 +276,12 @@ class BlingAuth:
         """Carrega tokens do arquivo local"""
         try:
             token_path = Path(self.TOKEN_FILE)
+            
             if not token_path.exists():
+                logger.info(f"Arquivo {self.TOKEN_FILE} não existe")
                 return False
+            
+            logger.info(f"Carregando tokens de {token_path.absolute()}")
             
             with open(token_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -291,7 +295,11 @@ class BlingAuth:
                 logger.warning("Tokens incompletos no arquivo.")
                 return False
             
+            logger.info("✓ Tokens carregados com sucesso")
             return True
+        except json.JSONDecodeError as e:
+            logger.error(f"Arquivo de tokens corrompido: {e}")
+            return False
         except Exception as e:
             logger.error(f"Erro ao carregar tokens: {e}")
             return False
@@ -458,9 +466,14 @@ class BlingAPI:
     def get_all_kits_and_components(self) -> List[Kit]:
         kits = []
         try:
+            logger.info("Iniciando busca de produtos no Bling...")
             products = self.get_all_products()
+            logger.info(f"Total de {len(products)} produtos encontrados")
+            
+            kit_count = 0
             for prod in products:
                 if prod.get('formato') == 'E':  # Estrutura
+                    kit_count += 1
                     kit_sku = prod['codigo']
                     kit_name = prod['nome']
                     components = []
@@ -492,7 +505,7 @@ class BlingAPI:
                             kit = Kit(sku=kit_sku, name=kit_name, components=components)
                             kits.append(kit)
             
-            logger.info(f"✓ Carregados {len(kits)} kits com estrutura")
+            logger.info(f"✓ Carregados {len(kits)} kits com estrutura (de {kit_count} produtos tipo E)")
         except Exception as e:
             logger.error(f"Erro ao carregar kits: {e}")
         
@@ -956,9 +969,16 @@ class WebServer:
     def run(self, host='0.0.0.0', port=8000):
         print_header("SERVIDOR WEB BLING")
         print_info(f"Interface: http://{host}:{port}/dashboard")
+        print_info(f"Health Check: http://{host}:{port}/health")
         print_info(f"OAuth: {self.auth.get_authorization_url()}")
-        print_info(f"Webhook: http://{host}:{port}/webhook/bling\n")
-        self.app.run(host=host, port=port, debug=False)
+        print_info(f"Webhook: http://{host}:{port}/webhook/bling")
+        print_success(f"✓ Servidor Flask iniciando em {host}:{port}...\n")
+        
+        try:
+            self.app.run(host=host, port=port, debug=False)
+        except Exception as e:
+            print_error(f"Erro ao iniciar Flask: {e}")
+            raise
 
 # ============================================================================
 # TEMPLATES HTML
@@ -1677,41 +1697,47 @@ Exemplos de uso:
         auth = BlingAuth(config)
         orchestrator = AutomationOrchestrator(config)
 
-        # Tenta carregar dados iniciais do Bling (não bloqueia se falhar)
+        # ✅ DEFINE PORTA PRIMEIRO (antes de qualquer carregamento)
+        port = int(os.environ.get("PORT", args.port if args.port else 8000))
+        print_info(f"🚀 Servidor Flask será iniciado na porta {port}")
+        
+        # ✅ Carregamento inicial opcional (NÃO BLOQUEIA o servidor)
         try:
             print_info("Tentando carregar dados iniciais do Bling...")
-
-            if not auth.access_token:
-                print_warning("⚠ Nenhum token disponível. Ignorando chamada inicial à API.")
-            else:
+            
+            # Tenta carregar tokens primeiro
+            if auth.load_tokens():
+                print_success("✓ Tokens encontrados")
+                
+                # Tenta buscar dados do Bling (com timeout implícito)
                 try:
                     kits = orchestrator.api.get_all_kits_and_components()
                     if kits:
                         all_comps = [comp for kit in kits for comp in kit.components]
                         unique_comps = {c.sku: c for c in all_comps}.values()
                         orchestrator.purchase_manager.check_min_stock_needs(list(unique_comps))
-                        print_success(f"✓ Estoque inicial carregado: {len(kits)} kits, {len(unique_comps)} componentes")
-                    print_success("Dados iniciais carregados")
+                        print_success(f"✓ Carregados {len(kits)} kits e {len(unique_comps)} componentes")
                 except Exception as e:
-                    print_warning(f"⚠ Falha ao carregar kits iniciais: {e}")
-        except BlingAuthError as e:
-            print_info(f"⚠ Autenticação necessária - acesse {auth.get_authorization_url()}")
+                    print_warning(f"⚠ Erro ao buscar dados do Bling: {str(e)[:100]}")
+                    logger.debug(f"Detalhes completos: {e}", exc_info=True)
+            else:
+                print_warning("⚠ Nenhum token encontrado - autorização necessária")
+                print_info(f"📍 Autorize em: {auth.get_authorization_url()}")
+                
         except Exception as e:
-            print_info(f"⚠ Não foi possível carregar dados iniciais (normal na primeira execução)")
-            logger.debug(f"Detalhes do erro: {e}")
+            print_warning(f"⚠ Erro no carregamento inicial (continuando): {str(e)[:100]}")
+            logger.debug(f"Detalhes do erro: {e}", exc_info=True)
 
-        # Inicia servidor SEMPRE, mesmo sem token
+        # ✅ INICIA SERVIDOR (SEMPRE EXECUTA, INDEPENDENTE DE ERROS ANTERIORES)
         try:
-            # prefer PORT do ambiente (necessário no Render). Usar args.port só como fallback local.
-            port = int(os.environ.get("PORT", 8000))
-            print_info(f"🚀 Iniciando servidor na porta {port}...")
+            print_info(f"🚀 Iniciando servidor Flask em 0.0.0.0:{port}...")
             server = WebServer(auth, orchestrator)
             server.run(host="0.0.0.0", port=port)
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado pelo usuário")
         except Exception as e:
-            print_error(f"Erro ao iniciar servidor: {e}")
-            error_logger.exception("Erro fatal ao iniciar servidor:")
+            print_error(f"Erro fatal ao iniciar servidor: {e}")
+            error_logger.exception("Erro fatal:")
             sys.exit(1)
         return
 
