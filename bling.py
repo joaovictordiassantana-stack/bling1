@@ -1667,43 +1667,43 @@ Exemplos de uso:
             print_error("✗ Valor inválido em PORT. Usando 8000 como fallback.")
             port = 8000
 
-        print_info(f"🚀 Servidor Flask será iniciado na porta {port} (binding imediato)")
+        print_info(f"🚀 Iniciando servidor Flask na porta {port}...")
 
+        # Carrega dados em BACKGROUND após o servidor estar rodando
+        def load_initial_data():
+            """Carrega dados do Bling em background após servidor iniciar"""
+            time.sleep(2)  # Aguarda servidor estar 100% pronto
+            try:
+                print_info("📦 Carregando dados iniciais do Bling em background...")
+                
+                if auth.load_tokens():
+                    print_success("✓ Tokens encontrados")
+                    try:
+                        kits = orchestrator.api.get_all_kits_and_components()
+                        if kits:
+                            all_comps = [comp for kit in kits for comp in kit.components]
+                            unique_comps = {c.sku: c for c in all_comps}.values()
+                            orchestrator.purchase_manager.check_min_stock_needs(list(unique_comps))
+                            print_success(f"✓ Carregados {len(kits)} kits e {len(unique_comps)} componentes")
+                    except Exception as e:
+                        print_warning(f"⚠ Erro ao buscar dados do Bling: {str(e)[:200]}")
+                        logger.debug("Detalhes completos:", exc_info=True)
+                else:
+                    print_warning("⚠ Nenhum token encontrado - autorização necessária")
+                    print_info(f"🔗 Autorize em: {auth.get_authorization_url()}")
+                    
+            except Exception as e:
+                print_warning(f"⚠ Erro no carregamento inicial: {str(e)[:200]}")
+                logger.debug("Detalhes do erro:", exc_info=True)
+
+        # Inicia thread de carregamento em background
+        data_thread = Thread(target=load_initial_data, daemon=True)
+        data_thread.start()
+
+        # Inicia servidor Flask DIRETAMENTE (bloqueante) - BIND IMEDIATO!
         server = WebServer(auth, orchestrator)
-
-        def run_server():
+        try:
             server.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
-        server_thread = Thread(target=run_server, daemon=False)
-        server_thread.start()
-
-        time.sleep(0.5)
-
-        try:
-            print_info("Tentando carregar dados iniciais do Bling (após bind)...")
-
-            if auth.load_tokens():
-                print_success("✓ Tokens encontrados")
-                try:
-                    kits = orchestrator.api.get_all_kits_and_components()
-                    if kits:
-                        all_comps = [comp for kit in kits for comp in kit.components]
-                        unique_comps = {c.sku: c for c in all_comps}.values()
-                        orchestrator.purchase_manager.check_min_stock_needs(list(unique_comps))
-                        print_success(f"✓ Carregados {len(kits)} kits e {len(unique_comps)} componentes")
-                except Exception as e:
-                    print_warning(f"⚠ Erro ao buscar dados do Bling: {str(e)[:200]}")
-                    logger.debug("Detalhes completos:", exc_info=True)
-            else:
-                print_warning("⚠ Nenhum token encontrado - autorização necessária")
-                print_info(f"🔗 Autorize em: {auth.get_authorization_url()}")
-
-        except Exception as e:
-            print_warning(f"⚠ Erro no carregamento inicial (continuando): {str(e)[:200]}")
-            logger.debug("Detalhes do erro:", exc_info=True)
-
-        try:
-            server_thread.join()
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado pelo usuário")
             sys.exit(0)
