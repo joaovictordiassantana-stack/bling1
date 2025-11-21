@@ -1661,14 +1661,6 @@ Exemplos de uso:
         auth = BlingAuth(config)
         orchestrator = AutomationOrchestrator(config)
 
-        try:
-            port = int(os.environ.get("PORT", args.port if args.port else 8000))
-        except Exception:
-            print_error("✗ Valor inválido em PORT. Usando 8000 como fallback.")
-            port = 8000
-
-        print_info(f"🚀 Iniciando servidor Flask na porta {port}...")
-
         # Carrega dados em BACKGROUND após o servidor estar rodando
         def load_initial_data():
             """Carrega dados do Bling em background após servidor iniciar"""
@@ -1700,14 +1692,14 @@ Exemplos de uso:
         data_thread = Thread(target=load_initial_data, daemon=True)
         data_thread.start()
 
-        # Inicia servidor Flask DIRETAMENTE (bloqueante) - BIND IMEDIATO!
+        # Cria a instância do servidor, mas não a executa (Gunicorn fará isso)
         server = WebServer(auth, orchestrator)
-        try:
-            server.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-        except KeyboardInterrupt:
-            print("\n✓ Servidor encerrado pelo usuário")
-            sys.exit(0)
-
+        
+        # O Gunicorn precisa que a instância do Flask esteja no escopo global
+        # A instância do Flask está em server.app. Vamos expor ela no final do arquivo.
+        
+        # O código restante do modo --serve é removido, pois o Gunicorn assume o controle.
+        
     if args.run:
         print_header("BLING AUTOMAÇÃO - MODO PROCESSAMENTO")
         
@@ -1747,3 +1739,18 @@ Exemplos de uso:
 
 if __name__ == '__main__':
     main()
+
+# Variável global para o Gunicorn encontrar a aplicação Flask
+# Esta linha deve estar no final do arquivo, fora de qualquer função.
+# O WebServer é instanciado dentro de main(), mas o Gunicorn precisa de um objeto
+# acessível no escopo global. Vamos criar uma função para obter o app.
+
+def create_app():
+    config = Config()
+    auth = BlingAuth(config)
+    orchestrator = AutomationOrchestrator(config)
+    server = WebServer(auth, orchestrator)
+    return server.app
+
+# app = create_app() # Descomente se precisar de acesso global imediato, mas o Gunicorn
+                     # pode chamar a função diretamente.
