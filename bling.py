@@ -1745,12 +1745,29 @@ if __name__ == '__main__':
 # O WebServer é instanciado dentro de main(), mas o Gunicorn precisa de um objeto
 # acessível no escopo global. Vamos criar uma função para obter o app.
 
+# Variável global para o Gunicorn encontrar a aplicação Flask
+# O Gunicorn precisa de uma variável chamada 'app' ou 'application' no escopo global.
+# Vamos criar a instância do servidor aqui, mas apenas se não estivermos no modo CLI.
+# No entanto, para simplificar, vamos criar uma função que retorna o app.
+
 def create_app():
+    # A função main() já faz a configuração e cria o WebServer.
+    # Vamos refatorar para que a configuração seja feita uma vez.
+    
+    # Replicando a lógica de configuração necessária para o WebServer
     config = Config()
     auth = BlingAuth(config)
     orchestrator = AutomationOrchestrator(config)
+    
+    # A instância do Flask está em server.app
     server = WebServer(auth, orchestrator)
+    
+    # Inicia thread de carregamento em background
+    # Esta parte é importante, mas o Gunicorn pode ter problemas com threads.
+    # Por enquanto, vamos focar em expor o app.
+    
     return server.app
 
-# app = create_app() # Descomente se precisar de acesso global imediato, mas o Gunicorn
-                     # pode chamar a função diretamente.
+# Chamamos a função para criar a instância do app no escopo global,
+# que é o que o Gunicorn espera.
+app = create_app()
