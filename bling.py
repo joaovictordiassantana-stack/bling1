@@ -110,7 +110,6 @@ class Config:
     """Configurações globais"""
     CLIENT_ID = os.getenv('BLING_CLIENT_ID', '')
     CLIENT_SECRET = os.getenv('BLING_CLIENT_SECRET', '')
-    # NÃO use localhost como default em produção — prefira exigir a env ou informar o seu domínio.
     REDIRECT_URI = os.getenv('BLING_REDIRECT_URI', 'https://bling-automacao.onrender.com/callback')
 
     CHECK_MIN_STOCK = os.getenv('BLING_CHECK_MIN_STOCK', 'true').lower() == 'true'
@@ -199,10 +198,6 @@ class BlingAuth:
         self.access_token = None
         self.refresh_token = None
         self.expires_at = None
-        
-        # Carrega tokens sob demanda via ensure_valid_token()
-
-
 
     def get_authorization_url(self) -> str:
         params = {
@@ -232,7 +227,7 @@ class BlingAuth:
 
             response = requests.post(
                 self.token_url,
-                data=payload,  # CORRETO: form-urlencoded
+                data=payload,
                 headers=headers,
                 timeout=Config.REQUEST_TIMEOUT
             )
@@ -290,7 +285,6 @@ class BlingAuth:
             self.refresh_token = data.get('refresh_token')
             self.expires_at = data.get('expires_at')
             
-            # Verifica se os tokens essenciais foram carregados
             if not self.access_token or not self.refresh_token or not self.expires_at:
                 logger.warning("Tokens incompletos no arquivo.")
                 return False
@@ -327,7 +321,7 @@ class BlingAuth:
 
             response = requests.post(
                 self.token_url,
-                data=payload,  # CORRETO
+                data=payload,
                 headers=headers,
                 timeout=Config.REQUEST_TIMEOUT
             )
@@ -346,20 +340,16 @@ class BlingAuth:
             return False
 
     def ensure_valid_token(self) -> bool:
-        """Garante que existe um token válido (Checklist 4)"""
-        
-        # 1. Carregar tokens se não estiverem em memória
+        """Garante que existe um token válido"""
         if not self.access_token:
             if not self.load_tokens():
                 raise BlingAuthError("Nenhum token encontrado.")
 
-        # 2. Checar expiração e fazer refresh se faltar < 5 min
         exp = datetime.fromisoformat(self.expires_at)
         if datetime.now() >= exp - timedelta(minutes=5):
             logger.info("Token expirado ou a expirar em menos de 5 minutos. Tentando renovar...")
             self.refresh_access_token()
             
-        # 3. Retorna se o access_token está disponível após as tentativas
         return self.access_token is not None
 
     def get_token_info(self) -> Dict:
@@ -458,7 +448,7 @@ class BlingAPI:
                 data = response.json()
                 if data.get('data') and len(data['data']) > 0:
                     return data['data'][0]
-            return {'saldo': 0}  # Retorna estoque zero se não encontrar
+            return {'saldo': 0}
         except Exception as e:
             logger.error(f"Erro ao buscar estoque do produto {product_id}: {e}")
             return {'saldo': 0}
@@ -472,7 +462,7 @@ class BlingAPI:
             
             kit_count = 0
             for prod in products:
-                if prod.get('formato') == 'E':  # Estrutura
+                if prod.get('formato') == 'E':
                     kit_count += 1
                     kit_sku = prod['codigo']
                     kit_name = prod['nome']
@@ -681,7 +671,6 @@ class AutomationOrchestrator:
             except Exception as e:
                 logger.error(f"Erro ao carregar {self.COMPONENT_CONFIG_FILE}: {e}")
         
-        # Cria arquivo padrão se não existir
         default_config = {
             "component_defaults": {
                 "supplier": "FORNECEDOR_PADRAO",
@@ -764,7 +753,6 @@ class WebServer:
     def __init__(self, auth: BlingAuth, orchestrator: AutomationOrchestrator):
         self.app = Flask(__name__)
         
-        # Só inicializa Sock se disponível
         if WEBSOCKET_AVAILABLE:
             self.sock = Sock(self.app)
             logger.info("✓ WebSocket disponível")
@@ -913,7 +901,6 @@ class WebServer:
                 event_type = data.get('event') or data.get('tipo') or 'unknown'
                 logger.info(f"🪝 Webhook recebido: {event_type}")
                 
-                # Tratamento de eventos de pedido
                 is_order_event = (
                     event_type == 'order.created' or 
                     event_type == 'pedido.pago' or 
@@ -935,7 +922,6 @@ class WebServer:
                         logger.warning(f"⚠ Webhook de Pedido recebido, mas ID não encontrado")
                         return jsonify({'status': 'warning', 'message': 'ID do pedido não encontrado'}), 200
                 
-                # Evento de estoque
                 if event_type == 'estoque.atualizado' or data.get('tipo') == 'estoque':
                     logger.info(f"📦 Evento estoque.atualizado recebido")
                 
@@ -944,7 +930,6 @@ class WebServer:
                 error_logger.error(f"Erro no webhook: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        # WebSocket para logs em tempo real (apenas se disponível)
         if WEBSOCKET_AVAILABLE and self.sock:
             @self.sock.route('/ws/logs')
             def ws_logs(ws):
@@ -956,13 +941,12 @@ class WebServer:
                         logs = memory_handler.get_logs()
                         current_count = len(logs)
                         
-                        # Envia apenas novos logs
                         if current_count > last_log_count:
                             new_logs = logs[last_log_count:]
                             ws.send(json.dumps({"logs": new_logs}))
                             last_log_count = current_count
                         
-                        time.sleep(1)  # Verifica a cada segundo
+                        time.sleep(1)
                 except Exception as e:
                     logger.info(f"🔌 Cliente desconectado do WebSocket: {e}")
 
@@ -1063,7 +1047,6 @@ DASHBOARD_TEMPLATE = """
   
   <div class="tab-content p-4 bg-white border border-top-0" style="border-radius: 0 0 1rem 1rem;">
     
-    <!-- DASHBOARD TAB -->
     <div class="tab-pane fade show active" id="tabDashboard" role="tabpanel">
       <h4 class="mb-4">📊 Visão Geral da Automação</h4>
       
@@ -1114,7 +1097,6 @@ DASHBOARD_TEMPLATE = """
       </div>
     </div>
     
-    <!-- ESTOQUE TAB -->
     <div class="tab-pane fade" id="tabStock" role="tabpanel">
       <h4 class="mb-3">📦 Situação do Estoque de Componentes</h4>
       <div class="alert alert-info d-none" id="stock-alert"></div>
@@ -1136,7 +1118,6 @@ DASHBOARD_TEMPLATE = """
       </div>
     </div>
     
-    <!-- NECESSIDADES TAB -->
     <div class="tab-pane fade" id="tabNeeds" role="tabpanel">
       <h4 class="mb-3">🛒 Necessidades de Compra (POs)</h4>
       <div class="table-responsive">
@@ -1157,7 +1138,6 @@ DASHBOARD_TEMPLATE = """
       </div>
     </div>
     
-    <!-- KITS TAB -->
     <div class="tab-pane fade" id="tabKits" role="tabpanel">
       <h4 class="mb-3">📦 Kits e Componentes</h4>
       <div class="table-responsive">
@@ -1186,7 +1166,6 @@ document.addEventListener('DOMContentLoaded', function() {
   let processingChart;
   let wsConnection;
 
-  // ========== Sistema de Logs (Polling ou WebSocket) ==========
   let lastLogIndex = 0;
   let logsPollingInterval;
   
@@ -1199,7 +1178,6 @@ document.addEventListener('DOMContentLoaded', function() {
       
       ws.onopen = function() {
         console.log('✓ WebSocket conectado');
-        // Para polling se WebSocket conectar
         if (logsPollingInterval) {
           clearInterval(logsPollingInterval);
         }
@@ -1228,14 +1206,10 @@ document.addEventListener('DOMContentLoaded', function() {
   }
   
   function startLogsPolling() {
-    if (logsPollingInterval) return; // Já está rodando
+    if (logsPollingInterval) return;
     
     console.log('✓ Iniciando polling de logs (a cada 3s)');
-    
-    // Primeira carga
     loadLogsIncremental();
-    
-    // Polling a cada 3 segundos
     logsPollingInterval = setInterval(() => {
       loadLogsIncremental();
     }, 3000);
@@ -1265,13 +1239,11 @@ document.addEventListener('DOMContentLoaded', function() {
     });
     logsElement.scrollTop = logsElement.scrollHeight;
     
-    // Limita o número de logs exibidos
     while (logsElement.children.length > 100) {
       logsElement.removeChild(logsElement.firstChild);
     }
   }
 
-  // ========== Funções de carregamento ==========
   function loadStatus() {
     fetch(`${API_BASE}/status`)
       .then(response => response.json())
@@ -1319,7 +1291,6 @@ document.addEventListener('DOMContentLoaded', function() {
         `).join('');
         document.getElementById('stats-kpis').innerHTML = kpisHtml;
 
-        // Atualiza gráfico
         updateProcessingChart(data.success, data.failed);
       })
       .catch(error => console.error('Erro ao carregar estatísticas:', error));
@@ -1363,7 +1334,7 @@ document.addEventListener('DOMContentLoaded', function() {
         const logsElement = document.getElementById('logs-content');
         logsElement.innerHTML = '';
         if (data.logs && data.logs.length > 0) {
-          appendLogs(data.logs.slice(-50)); // Últimos 50 logs
+          appendLogs(data.logs.slice(-50));
           lastLogIndex = data.logs.length;
         } else {
           logsElement.innerHTML = '<div class="text-muted">Nenhum log disponível</div>';
@@ -1542,7 +1513,6 @@ document.addEventListener('DOMContentLoaded', function() {
       });
   }
 
-  // ========== Inicialização ==========
   loadStatus();
   loadStats();
   loadStock();
@@ -1550,10 +1520,8 @@ document.addEventListener('DOMContentLoaded', function() {
   loadKits();
   loadLogs();
   
-  // Tenta conectar WebSocket, senão usa polling
   connectWebSocket();
   
-  // Atualização automática a cada 60 segundos
   setInterval(() => {
     loadStatus();
     const activeTab = document.querySelector('.nav-link.active').getAttribute('href');
@@ -1562,10 +1530,8 @@ document.addEventListener('DOMContentLoaded', function() {
     if (activeTab === '#tabDashboard') loadStats();
   }, 60000);
   
-  // Event listeners
   document.getElementById('recheck-button').addEventListener('click', recheckStock);
   
-  // Carregar dados ao trocar de aba
   document.querySelectorAll('.nav-link').forEach(tab => {
     tab.addEventListener('shown.bs.tab', function(event) {
       const tabId = event.target.getAttribute('href');
@@ -1658,8 +1624,8 @@ SUCCESS_TEMPLATE = """
 # ============================================================================
 
 def main():
-    # Checklist 7: Garantir que a pasta logs exista
     Path("logs").mkdir(exist_ok=True)
+    
     parser = argparse.ArgumentParser(
         description='Automação Bling Enhanced - Sistema completo de automação ERP',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1676,13 +1642,11 @@ Exemplos de uso:
 
     args = parser.parse_args()
 
-    # Se nenhuma flag, assume modo servidor (produção)
     if not args.serve and not args.run:
         args.serve = True
 
     config = Config()
 
-    # validação obrigatória de credenciais (colocar logo após criar config)
     if not config.CLIENT_ID or not config.CLIENT_SECRET:
         print_error("✗ BLING_CLIENT_ID e/ou BLING_CLIENT_SECRET não definidos. Configure as ENV vars no Render.")
         sys.exit(1)
@@ -1697,9 +1661,6 @@ Exemplos de uso:
         auth = BlingAuth(config)
         orchestrator = AutomationOrchestrator(config)
 
-        # ---------------------------
-        # 1) pega a porta do ambiente
-        # ---------------------------
         try:
             port = int(os.environ.get("PORT", args.port if args.port else 8000))
         except Exception:
@@ -1708,29 +1669,19 @@ Exemplos de uso:
 
         print_info(f"🚀 Servidor Flask será iniciado na porta {port} (binding imediato)")
 
-        # ---------------------------
-        # 2) inicia o servidor IMEDIATAMENTE em thread
-        #    - use_reloader=False evita spawn de processo filho
-        # ---------------------------
         server = WebServer(auth, orchestrator)
 
         def run_server():
-            # garante que o reloader não crie processo filho
             server.app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
         server_thread = Thread(target=run_server, daemon=False)
         server_thread.start()
 
-        # Aguarda um breve momento para permitir bind (opcional)
         time.sleep(0.5)
 
-        # ---------------------------
-        # 3) carregamento inicial não-bloqueante (após bind)
-        # ---------------------------
         try:
             print_info("Tentando carregar dados iniciais do Bling (após bind)...")
 
-            # Tenta carregar tokens primeiro
             if auth.load_tokens():
                 print_success("✓ Tokens encontrados")
                 try:
@@ -1745,22 +1696,19 @@ Exemplos de uso:
                     logger.debug("Detalhes completos:", exc_info=True)
             else:
                 print_warning("⚠ Nenhum token encontrado - autorização necessária")
-                print_info(f"📍 Autorize em: {auth.get_authorization_url()}")
+                print_info(f"🔗 Autorize em: {auth.get_authorization_url()}")
 
         except Exception as e:
             print_warning(f"⚠ Erro no carregamento inicial (continuando): {str(e)[:200]}")
             logger.debug("Detalhes do erro:", exc_info=True)
 
-        # ---------------------------
-        # 4) mantém o thread vivo (bloqueante)
-        # ---------------------------
         try:
             server_thread.join()
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado pelo usuário")
             sys.exit(0)
 
-if args.run:
+    if args.run:
         print_header("BLING AUTOMAÇÃO - MODO PROCESSAMENTO")
         
         try:
@@ -1782,7 +1730,7 @@ if args.run:
             print(f"✗ Falhas: {results['failed']}")
             print(f"🏭 OPs Criadas: {results['ops_created']}")
             print(f"🛒 POs Criadas: {results['pos_created']}")
-            print(f"⏱️  Tempo Total: {results['elapsed_time_seconds']}s")
+            print(f"⏱️ Tempo Total: {results['elapsed_time_seconds']}s")
             
             if orch.failed_items:
                 print_warning(f"\n⚠ Itens com falha: {', '.join(orch.failed_items)}")
@@ -1795,8 +1743,6 @@ if args.run:
             print_error(f"✗ Erro durante processamento: {e}")
             error_logger.exception("Erro detalhado:")
             sys.exit(1)
-
-
 
 
 if __name__ == '__main__':
