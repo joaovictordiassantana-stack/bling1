@@ -2,7 +2,7 @@
 
 # Define a porta de bind usando a variável de ambiente PORT
 # O Gunicorn usará esta variável
-GUNICORN_CMD="gunicorn bling:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --log-level debug"
+GUNICORN_CMD="gunicorn bling:app --bind 0.0.0.0:$PORT --workers 2 --timeout 300 --log-level debug --access-logfile -"
 
 echo "Iniciando com o comando: $GUNICORN_CMD"
 
