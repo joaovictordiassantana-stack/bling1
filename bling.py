@@ -1049,7 +1049,7 @@ def run_cli():
         flask_app = create_app()
         
         # Obtém a porta da variável de ambiente PORT (padrão Render) ou do argumento --port
-        port = int(os.getenv('PORT', args.port if args.port else 8000))
+        port = int(os.getenv('PORT', args.port if args.port else 10000))
         
         print_info(f"Interface: http://localhost:{port}/dashboard")
         print_info(f"Health Check: http://localhost:{port}/health")
