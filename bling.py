@@ -1045,18 +1045,20 @@ def run_cli():
     if args.serve:
         print_header("BLING AUTOMAÇÃO - MODO SERVIDOR")
         
-        # No modo servidor local, usa a mesma factory function
+        # A inicialização do servidor Flask no modo CLI não é mais necessária
+        # para o deploy, pois o 'start.sh' usa o Gunicorn/Waitress.
+        # Mantemos a chamada a create_app() para inicializar a aplicação
+        # e permitir o uso do modo CLI para processamento local.
         flask_app = create_app()
         
-        # Obtém a porta da variável de ambiente PORT (padrão Render) ou do argumento --port
-        port = int(os.getenv('PORT', args.port if args.port else 10000))
-        
+        # Se o usuário rodar localmente com --serve, usamos a porta 8000
+        port = args.port if args.port else 8000
         print_info(f"Interface: http://localhost:{port}/dashboard")
         print_info(f"Health Check: http://localhost:{port}/health")
         print_success(f"✓ Servidor Flask iniciando em localhost:{port}...\n")
         
         try:
-            # Usa a porta obtida da variável de ambiente ou argumento
+            # Para o modo CLI, usamos o servidor de desenvolvimento do Flask
             flask_app.run(host='0.0.0.0', port=port, debug=False)
         except Exception as e:
             print_error(f"Erro ao iniciar Flask: {e}")

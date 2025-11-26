@@ -1,10 +1,11 @@
 #!/bin/bash
+set -e
 
-# Define a porta de bind usando a variável de ambiente PORT
-# O Waitress usará esta variável
-WAITRESS_CMD="waitress-serve --listen=0.0.0.0:$PORT --call bling:create_app"
+# O Gunicorn é mais robusto para produção do que o Waitress.
+# Ele usa automaticamente a variável de ambiente $PORT fornecida pelo Render.
+# "bling:app" aponta para o módulo bling.py e para a variável app criada por create_app().
 
-echo "Iniciando com o comando: $WAITRESS_CMD"
+echo "Iniciando app Bling com Gunicorn..."
 
-# Executa o Waitress
-exec $WAITRESS_CMD
+# Executa o servidor
+exec gunicorn --bind 0.0.0.0:$PORT --workers 1 "bling:app"
