@@ -1048,12 +1048,15 @@ def run_cli():
         # No modo servidor local, usa a mesma factory function
         flask_app = create_app()
         
-        port = args.port if args.port else 8000
+        # Obtém a porta da variável de ambiente PORT (padrão Render) ou do argumento --port
+        port = int(os.getenv('PORT', args.port if args.port else 8000))
+        
         print_info(f"Interface: http://localhost:{port}/dashboard")
         print_info(f"Health Check: http://localhost:{port}/health")
         print_success(f"✓ Servidor Flask iniciando em localhost:{port}...\n")
         
         try:
+            # Usa a porta obtida da variável de ambiente ou argumento
             flask_app.run(host='0.0.0.0', port=port, debug=False)
         except Exception as e:
             print_error(f"Erro ao iniciar Flask: {e}")
