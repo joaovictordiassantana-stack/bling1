@@ -1133,7 +1133,7 @@ def main():
             server = WebServer(auth, orchestrator)
             # Usa a porta do argumento, que por padrão é 8000
             print_info(f"Interface: http://localhost:{args.port}/dashboard")
-            server.app.run(host="0.0.0.0", port=args.port, debug=False)
+            server.app.run(host="0.0.0.0", port=os.environ.get("PORT", args.port), debug=False)
         except KeyboardInterrupt:
             print("\n✓ Servidor encerrado")
         return
