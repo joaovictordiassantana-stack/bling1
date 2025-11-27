@@ -1,7 +1,7 @@
 
 #!/usr/bin/env python3
 """
-bling_enhanced.py - Versão leve do BLING com controle de estoque, OPs, POs,
+bling.py - Versão leve do BLING com controle de estoque, OPs, POs,
 webhooks e API REST (adaptação direta do bling.py fornecido).
 
 Principais adições:
@@ -242,7 +242,7 @@ class BlingAuth:
     def ensure_valid_token(self) -> bool:
         if not self.access_token:
             if not self.load_tokens():
-                raise BlingAuthError("Execute: python bling_enhanced.py --serve")
+                raise BlingAuthError("Execute: python bling.py --serve")
         if self.expires_at:
             expires = datetime.fromisoformat(self.expires_at)
             if datetime.now() >= expires - timedelta(minutes=5):
