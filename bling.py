@@ -17,10 +17,25 @@ import requests
 from flask import Flask, request, render_template_string, jsonify
 
 # ============================================================================
-# CONFIGURAÇÃO DE LOGS
+# CONFIGURAÇÃO
 # ============================================================================
 
-Path('logs').mkdir(exist_ok=True)
+BLING_API_KEY = os.environ.get('BLING_API_KEY', '')
+BLING_API_URL = 'https://www.bling.com.br/Api/v3'
+
+# ============================================================================
+# ROTAS DA API
+# ============================================================================
+
+from flask import Flask, request, jsonify
+from flask_sock import Sock
+
+app = Flask(__name__)
+sock = Sock(app)
+
+# ============================================================================
+# CONFIGURAÇÃO DE LOGS (Definição da classe, mas não a inicialização)
+# ============================================================================
 
 class InMemoryLogHandler(logging.Handler):
     def __init__(self, max_logs=500):
@@ -47,36 +62,9 @@ class InMemoryLogHandler(logging.Handler):
                 return self.logs[-limit:]
             return self.logs.copy()
 
-memory_handler = InMemoryLogHandler()
-memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/bling.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout),
-        memory_handler
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# CONFIGURAÇÃO
-# ============================================================================
-
-BLING_API_KEY = os.environ.get('BLING_API_KEY', '')
-BLING_API_URL = 'https://www.bling.com.br/Api/v3'
-
-# ============================================================================
-# ROTAS DA API
-# ============================================================================
-
-from flask import Flask, request, jsonify
-from flask_sock import Sock
-
-app = Flask(__name__)
-sock = Sock(app)
+# Variáveis de log inicializadas como None para serem configuradas no main
+memory_handler = None
+logger = None
 
 @app.route('/')
 @app.route('/dashboard')
@@ -115,7 +103,7 @@ def get_produtos():
             }), response.status_code
             
     except Exception as e:
-        logger.error(f"Erro ao buscar produtos: {e}")
+        logger.error(f"Erro ao buscar produtos: {e}") if logger else print(f"Erro ao buscar produtos: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/logs')
@@ -124,7 +112,7 @@ def get_logs():
         logs = memory_handler.get_logs(limit=50)
         return jsonify({'logs': logs})
     except Exception as e:
-        logger.error(f"Erro ao buscar logs: {e}")
+        logger.error(f"Erro ao buscar logs: {e}") if logger else print(f"Erro ao buscar logs: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/kits')
@@ -171,17 +159,17 @@ def get_kits():
             }), response.status_code
             
     except Exception as e:
-        logger.error(f"Erro ao buscar kits: {e}")
+        logger.error(f"Erro ao buscar kits: {e}") if logger else print(f"Erro ao buscar kits: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/recheck', methods=['POST'])
 def recheck():
     try:
-        logger.info("🔄 Verificação manual iniciada via API")
+        logger.info("🔄 Verificação manual iniciada via API") if logger else print("🔄 Verificação manual iniciada via API")
         # Aqui você pode adicionar lógica de verificação de estoque
         return jsonify({"status": "ok", "message": "Verificação iniciada"})
     except Exception as e:
-        logger.error(f"Erro na verificação: {e}")
+        logger.error(f"Erro na verificação: {e}") if logger else print(f"Erro na verificação: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
 @app.route('/webhook/bling', methods=['POST'])
@@ -189,7 +177,7 @@ def webhook_bling():
     try:
         data = request.get_json(force=True)
         event_type = data.get('event') or data.get('tipo') or 'unknown'
-        logger.info(f"🪝 Webhook recebido: {event_type}")
+        logger.info(f"🪝 Webhook recebido: {event_type}") if logger else print(f"🪝 Webhook recebido: {event_type}")
         
         is_order_event = (
             event_type == 'order.created' or 
@@ -200,47 +188,13 @@ def webhook_bling():
         if is_order_event:
             pedido_id = data.get('id') or (data.get('retorno', {}).get('pedidos', [{}])[0].get('pedido', {}).get('id'))
             if pedido_id:
-                logger.info(f"✅ Pedido ID {pedido_id} identificado")
+                logger.info(f"✅ Pedido ID {pedido_id} identificado") if logger else print(f"✅ Pedido ID {pedido_id} identificado")
                 return jsonify({'status': 'ok', 'message': f'Pedido {pedido_id} processado'}), 200
         
         return jsonify({'status': 'ok', 'message': f'Webhook {event_type} recebido'}), 200
     except Exception as e:
-        logger.error(f"Erro no webhook: {e}")
+        logger.error(f"Erro no webhook: {e}") if logger else print(f"Erro no webhook: {e}")
         return jsonify({'error': str(e)}), 500
-
-# ============================================================================
-# FACTORY FUNCTION PARA DEPLOY
-# ============================================================================
-
-def create_app():
-    """Factory function para criar a instância Flask para o deploy"""
-    logger.info("🚀 Iniciando aplicação Bling...")
-    
-    if not BLING_API_KEY:
-        logger.warning("⚠️ BLING_API_KEY não configurada")
-    else:
-        logger.info("✅ BLING_API_KEY encontrada")
-    
-    logger.info("✅ Aplicação Flask pronta")
-    return app
-
-# Variável global para o WSGI
-application = create_app()
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-# O bloco if __name__ == '__main__': foi movido para o final do arquivo,
-# após a definição do DASHBOARD_TEMPLATE, para evitar o erro de sintaxe.
-# O código de execução foi ajustado para usar a porta 5000 como fallback,
-# conforme a instrução.
-# O bloco original foi removido/comentado para evitar duplicação.
-# if __name__ == '__main__':
-#     port = int(os.environ.get('PORT', 10000))
-#     logger.info(f"🌐 Iniciando servidor na porta {port}")
-#     app.run(host='0.0.0.0', port=port, debug=False)
-
 
 # ============================================================================
 # TEMPLATE HTML (Design completo do Bling 2)
@@ -1095,9 +1049,43 @@ DASHBOARD_TEMPLATE = """
 </html>
 """
 
-if __name__ == "__main__":
-    print("🚀 Iniciando aplicação Bling...", flush=True)
+# ============================================================================
+# MAIN
+# ============================================================================
 
+# Variável global para o WSGI (Render/Gunicorn/Waitress)
+# A variável 'application' é o ponto de entrada para o servidor WSGI
+application = app
+
+if __name__ == "__main__":
+    # Inicialização de logs e serviços que só devem rodar no modo de execução direta
+    Path('logs').mkdir(exist_ok=True)
+    
+    global memory_handler
+    memory_handler = InMemoryLogHandler()
+    memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('logs/bling.log', encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+            memory_handler
+        ]
+    )
+    global logger
+    logger = logging.getLogger(__name__)
+    
+    logger.info("🚀 Iniciando aplicação Bling...")
+    
+    if not BLING_API_KEY:
+        logger.warning("⚠️ BLING_API_KEY não configurada")
+    else:
+        logger.info("✅ BLING_API_KEY encontrada")
+    
+    logger.info("✅ Aplicação Flask pronta")
+    
     port = int(os.environ.get("PORT", 5000))
     host = "0.0.0.0"
 
