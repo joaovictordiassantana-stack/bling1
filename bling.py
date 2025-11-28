@@ -1052,12 +1052,7 @@ DASHBOARD_TEMPLATE = """
 </body>
 </html>
 """;
-}).join('') + '</div>';
-            
-            container.innerHTML = html;
-        }
-
-        function updateStockTable(products) {
+function updateStockTable(products) {
             const tbody = document.getElementById('stock-table-body');
             tbody.innerHTML = '';
             
