@@ -948,7 +948,9 @@ DASHBOARD_TEMPLATE = """
                         </div>
                     </div>
                 `;
-            });
+            }).join('') + '</div>';
+
+            container.innerHTML = html;
         }
 
         async function fetchLogs() {
