@@ -1054,14 +1054,16 @@ DASHBOARD_TEMPLATE = """
 # ============================================================================
 
 # Variável global para o WSGI (Render/Gunicorn/Waitress)
-# A variável 'application' é o ponto de entrada para o servidor WSGI
 application = app
 
 if __name__ == "__main__":
-    # Inicialização de logs e serviços que só devem rodar no modo de execução direta
+    # Declarar globais ANTES de usar
+    global memory_handler
+    global logger
+
+    # Inicialização de logs e serviços
     Path('logs').mkdir(exist_ok=True)
     
-    global memory_handler
     memory_handler = InMemoryLogHandler()
     memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     
@@ -1074,22 +1076,21 @@ if __name__ == "__main__":
             memory_handler
         ]
     )
-    global logger
+
     logger = logging.getLogger(__name__)
     
     logger.info("🚀 Iniciando aplicação Bling...")
-    
+
     if not BLING_API_KEY:
         logger.warning("⚠️ BLING_API_KEY não configurada")
     else:
         logger.info("✅ BLING_API_KEY encontrada")
-    
+
     logger.info("✅ Aplicação Flask pronta")
     
     port = int(os.environ.get("PORT", 5000))
     host = "0.0.0.0"
 
-    # TESTE IMEDIATO: Coloque isso logo antes do app.run:
     print("DEBUG: ENTROU NO app.run", flush=True)
 
     app.run(host=host, port=port)
