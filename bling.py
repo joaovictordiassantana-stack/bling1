@@ -1095,8 +1095,13 @@ DASHBOARD_TEMPLATE = """
 </html>
 """
 
-if __name__ == '__main__':
-    import os
+if __name__ == "__main__":
+    print("🚀 Iniciando aplicação Bling...", flush=True)
+
     port = int(os.environ.get("PORT", 5000))
-    logger.info(f"🚀 Servidor rodando na porta {port}")
-    app.run(host="0.0.0.0", port=port)
+    host = "0.0.0.0"
+
+    # TESTE IMEDIATO: Coloque isso logo antes do app.run:
+    print("DEBUG: ENTROU NO app.run", flush=True)
+
+    app.run(host=host, port=port)
