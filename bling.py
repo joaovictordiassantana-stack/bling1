@@ -231,10 +231,15 @@ application = create_app()
 # MAIN
 # ============================================================================
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Iniciando servidor na porta {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+# O bloco if __name__ == '__main__': foi movido para o final do arquivo,
+# após a definição do DASHBOARD_TEMPLATE, para evitar o erro de sintaxe.
+# O código de execução foi ajustado para usar a porta 5000 como fallback,
+# conforme a instrução.
+# O bloco original foi removido/comentado para evitar duplicação.
+# if __name__ == '__main__':
+#     port = int(os.environ.get('PORT', 10000))
+#     logger.info(f"🌐 Iniciando servidor na porta {port}")
+#     app.run(host='0.0.0.0', port=port, debug=False)
 
 
 # ============================================================================
@@ -1054,6 +1059,9 @@ DASHBOARD_TEMPLATE = """
         }
 
         document.addEventListener('DOMContentLoaded', initDashboard);
+        
+        // A função updateStockTable estava fora do template, causando SyntaxError.
+        // Ela foi movida para dentro do template, como instruído.
         function updateStockTable(products) {
             const tbody = document.getElementById('stock-table-body');
             tbody.innerHTML = '';
@@ -1083,12 +1091,10 @@ DASHBOARD_TEMPLATE = """
     </script>
 </body>
 </html>
-""";
+"""
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     import os
     port = int(os.environ.get("PORT", 5000))
+    logger.info(f"🚀 Servidor rodando na porta {port}")
     app.run(host="0.0.0.0", port=port)
-
-
-                
