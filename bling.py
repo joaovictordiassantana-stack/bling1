@@ -72,6 +72,12 @@ BLING_API_URL = 'https://www.bling.com.br/Api/v3'
 # ROTAS DA API
 # ============================================================================
 
+from flask import Flask, request, jsonify
+from flask_sock import Sock
+
+app = Flask(__name__)
+sock = Sock(app)
+
 @app.route('/')
 @app.route('/dashboard')
 def dashboard():
