@@ -1052,7 +1052,7 @@ DASHBOARD_TEMPLATE = """
 </body>
 </html>
 """;
-        }).join('') + '</div>';
+}).join('') + '</div>';
             
             container.innerHTML = html;
         }
@@ -1080,4 +1080,4 @@ DASHBOARD_TEMPLATE = """
                         <td>${minStock}</td>
                         <td>${isAlert ? '🚨 ABAIXO' : 'OK'}</td>
                     </tr>
-                `
+                
