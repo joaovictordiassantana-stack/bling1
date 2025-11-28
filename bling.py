@@ -1054,23 +1054,7 @@ DASHBOARD_TEMPLATE = """
 # ============================================================================
 
 if __name__ == "__main__":
-    global memory_handler
-    global logger
 
-    Path('logs').mkdir(exist_ok=True)
-
-    memory_handler = InMemoryLogHandler()
-    memory_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('logs/bling.log', encoding='utf-8'),
-            logging.StreamHandler(sys.stdout),
-            memory_handler
-        ]
-    )
 
     logger = logging.getLogger(__name__)
 
