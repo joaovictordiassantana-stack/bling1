@@ -580,7 +580,7 @@ DASHBOARD_TEMPLATE = """
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark">
         <div class="container-fluid">
-            <a class="navbar-brand" href="#">🚀 Bling Automação ERP</a>
+            <a class="navbar-brand" href="#">🚀 Bling Automação Wesley</a>
             <div class="d-flex align-items-center">
                 <span class="status-badge" id="status-badge">Sistema Online</span>
             </div>
@@ -1048,11 +1048,7 @@ DASHBOARD_TEMPLATE = """
         }
 
         document.addEventListener('DOMContentLoaded', initDashboard);
-    </script>
-</body>
-</html>
-""";
-function updateStockTable(products) {
+        function updateStockTable(products) {
             const tbody = document.getElementById('stock-table-body');
             tbody.innerHTML = '';
             
@@ -1063,7 +1059,7 @@ function updateStockTable(products) {
             
             products.forEach(product => {
                 const stock = product.estoque || 0;
-                const minStock = 10; // Valor padrão
+                const minStock = 10;
                 const isAlert = stock < minStock;
                 const rowClass = isAlert ? 'table-danger' : '';
                 
@@ -1075,4 +1071,12 @@ function updateStockTable(products) {
                         <td>${minStock}</td>
                         <td>${isAlert ? '🚨 ABAIXO' : 'OK'}</td>
                     </tr>
+                `;
+            });
+        }
+    </script>
+</body>
+</html>
+""";
+
                 
