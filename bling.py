@@ -1052,7 +1052,7 @@ DASHBOARD_TEMPLATE = """
 </body>
 </html>
 """;
-            }).join('') + '</div>';
+        }).join('') + '</div>';
             
             container.innerHTML = html;
         }
