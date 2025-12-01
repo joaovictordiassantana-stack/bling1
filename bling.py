@@ -180,30 +180,57 @@ class InMemoryLogHandler(logging.Handler):
 # error_logger = None
 
 # ============================================================================
-# CONFIGURAÇÃO GLOBAL DE LOGS (CORREÇÃO 1)
+# CONFIGURAÇÃO GLOBAL DE LOGS (Refatorado para evitar globals e basicConfig)
 # ============================================================================
 
-Path('logs').mkdir(exist_ok=True)
+# Variável global para o handler de memória, que será injetado
+# em WebServer e acessado pelo WebSocket. É a única exceção global controlada.
+global_memory_handler = None
 
-memory_handler = InMemoryLogHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-memory_handler.setFormatter(formatter)
+def configure_logging(level=logging.INFO):
+    """Configura o sistema de logging de forma segura para ambientes WSGI."""
+    global global_memory_handler
+    
+    Path("logs").mkdir(exist_ok=True)
+    
+    # 1. Cria o handler de memória (Singleton para a aplicação)
+    if global_memory_handler is None:
+        global_memory_handler = InMemoryLogHandler()
+    
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    global_memory_handler.setFormatter(formatter)
+    
+    # 2. Configura o logger principal
+    logger = logging.getLogger(__name__)
+    logger.setLevel(level)
+    logger.handlers.clear() # Limpa handlers antigos para evitar duplicação
+    
+    # Adiciona handlers
+    logger.addHandler(logging.FileHandler("logs/automacao_bling.log", encoding="utf-8"))
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.addHandler(global_memory_handler)
+    
+    # 3. Configura o logger de erros
+    error_logger = logging.getLogger("errors")
+    error_logger.setLevel(logging.ERROR)
+    error_logger.handlers.clear() # Limpa handlers antigos
+    
+    error_handler = logging.FileHandler("logs/errors.log", encoding="utf-8")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    error_logger.addHandler(error_handler)
+    
+    # 4. Configura o logger de requests do Flask
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    
+    # Retorna os loggers configurados
+    return logger, error_logger, global_memory_handler
 
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('logs/automacao_bling.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout),
-        memory_handler
-    ]
-)
-
+# Inicializa os loggers no escopo global para que outras classes possam importá-los
+# Mas a configuração real só acontece em create_app ou run_cli.
+# Apenas para compatibilidade de import.
 logger = logging.getLogger(__name__)
-error_logger = logging.getLogger('errors')
-error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
-error_handler.setLevel(logging.ERROR)
-error_handler.setFormatter(formatter)
-error_logger.addHandler(error_handler)
+error_logger = logging.getLogger("errors")
 
 # ============================================================================
 # CLASSES DE AUTENTICAÇÃO E API
@@ -606,11 +633,12 @@ class PurchaseNeedsManager:
 class AutomationOrchestrator:
     COMPONENT_CONFIG_FILE = 'component_config.json'
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, api: BlingAPI):
         self.config = config
         self.auth = BlingAuth(config)
+        self.api = api # Injeção de dependência
         self.component_config = self._load_or_create_component_config()
-        self.api = BlingAPI(self.auth, component_config=self.component_config)
+        self.api.component_config = self.component_config # Atualiza a config na API
         self.stats = StatisticsManager()
         self.purchase_manager = PurchaseNeedsManager(self.api)
         self.failed_items: List[str] = []
@@ -728,10 +756,11 @@ class AutomationOrchestrator:
 # ============================================================================
 
 class WebServer:
-    def __init__(self, auth: BlingAuth, orchestrator: AutomationOrchestrator):
+    def __init__(self, auth: BlingAuth, orchestrator: AutomationOrchestrator, memory_handler: InMemoryLogHandler):
         self.app = Flask(__name__)
         self.auth = auth
         self.orchestrator = orchestrator
+        self.memory_handler = memory_handler # Injeção de dependência
         self.setup_routes()
         
         if WEBSOCKET_AVAILABLE:
@@ -911,7 +940,7 @@ class WebServer:
         last_log_count = 0
         try:
             while True:
-                logs = memory_handler.get_logs()
+                logs = self.memory_handler.get_logs()
                 current_count = len(logs)
                 
                 if current_count > last_log_count:
@@ -1707,65 +1736,38 @@ def create_app():
     Factory function para Waitress/Gunicorn
     Lazy loading para evitar timeout no Render
     """
-    # Configuração de logs para o modo WSGI
-    Path('logs').mkdir(exist_ok=True)
-    
-    global memory_handler
-    memory_handler = InMemoryLogHandler()
-    
-    global logger
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    
-    global error_logger
-    error_logger = logging.getLogger('errors')
-    error_logger.setLevel(logging.ERROR)
-    
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    memory_handler.setFormatter(formatter)
-    
-    # Configuração do logger principal
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[
-            logging.FileHandler('logs/automacao_bling.log', encoding='utf-8'),
-            logging.StreamHandler(sys.stdout),
-            memory_handler
-        ]
-    )
-    
-    # Configuração do logger de erros
-    error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(formatter)
-    error_logger.addHandler(error_handler)
-    
-    logger.info("🚀 Iniciando create_app()...")
-    
+    # 1. Configura o logging (garante que é feito apenas uma vez por processo)
+    main_logger, error_logger, memory_handler = configure_logging()
+    main_logger.info("🚀 Iniciando factory create_app().")
+        
+    # 2. Inicializa as dependências
     config = Config()
     auth = BlingAuth(config)
-    orchestrator = AutomationOrchestrator(config)
-    server = WebServer(auth, orchestrator)
+    api = BlingAPI(auth) # BlingAPI agora recebe auth
+    orchestrator = AutomationOrchestrator(config, api) # Orchestrator agora recebe api
     
+    # 3. Cria o servidor web, injetando o memory_handler
+    server = WebServer(auth, orchestrator, memory_handler)
+    
+    # 4. Inicia a thread de carregamento de dados
     _data_loaded = {'done': False}
     
     def background_load():
         if _data_loaded['done']:
             return
         
-        time.sleep(3)  # Aguarda servidor estar pronto
-        
+        main_logger.info("Iniciando carregamento de dados em background...")
         try:
-            logger.info("Iniciando carregamento em background...")
-            if auth.load_tokens():
-                # Simulação de carregamento de dados
+            # Garante que o token está válido antes de carregar
+            if auth.is_token_valid() or auth.refresh_access_token():
                 kits = orchestrator.api.get_all_kits_and_components()
-                logger.info(f"Kits carregados em background: {len(kits)}")
+                orchestrator.kits = kits
+                main_logger.info(f"Kits carregados em background: {len(kits)}")
                 # Aqui você pode adicionar a verificação de estoque inicial
             _data_loaded['done'] = True
-            logger.info("Carregamento em background concluído.")
+            main_logger.info("Carregamento em background concluído.")
         except Exception as e:
-            logger.error(f"Erro no background: {e}")
+            error_logger.error(f"Erro no background: {e}", exc_info=True)
     
     Thread(target=background_load, daemon=True).start()
     
@@ -1783,42 +1785,15 @@ def run_cli():
     
     args = parser.parse_args()
     
-    # Configuração de logs para o modo CLI
-    Path('logs').mkdir(exist_ok=True)
-    
-    global memory_handler
-    memory_handler = InMemoryLogHandler()
-    
-    global logger
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    
-    global error_logger
-    error_logger = logging.getLogger('errors')
-    error_logger.setLevel(logging.ERROR)
-    
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    memory_handler.setFormatter(formatter)
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[
-            logging.FileHandler('logs/automacao_bling.log', encoding='utf-8'),
-            logging.StreamHandler(sys.stdout),
-            memory_handler
-        ]
-    )
-    
-    error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(formatter)
-    error_logger.addHandler(error_handler)
+    # Configuração de logs para o modo CLI (usa a função refatorada)
+    main_logger, error_logger, memory_handler = configure_logging()
     
     print_header("Sistema de Automação Bling ERP")
     
     config = Config()
     auth = BlingAuth(config)
-    orchestrator = AutomationOrchestrator(config)
+    api = BlingAPI(auth) # BlingAPI agora recebe auth
+    orchestrator = AutomationOrchestrator(config, api) # Orchestrator agora recebe api
     
     if not auth.access_token:
         print_warning("Token de acesso não encontrado ou expirado.")
@@ -1826,7 +1801,8 @@ def run_cli():
         
     if args.serve:
         print_info(f"Iniciando servidor web na porta {args.port}...")
-        server = WebServer(auth, orchestrator)
+        # Injeta memory_handler no WebServer
+        server = WebServer(auth, orchestrator, memory_handler)
         server.app.run(host='0.0.0.0', port=args.port, debug=False)
         
     elif args.run:
@@ -1851,12 +1827,11 @@ def run_cli():
 app = create_app()
 
 if __name__ == '__main__':
-    # Detecta se está rodando no Render (sem argumentos CLI)
-    if len(sys.argv) == 1:
-        # Modo servidor web (Render/Heroku)
-        port = int(os.environ.get("PORT", 8000))
-        logger.info(f"🚀 Iniciando servidor web na porta {port} (Render mode)")
-        app.run(host='0.0.0.0', port=port, debug=False)
-    else:
-        # Modo CLI com argumentos
-        run_cli()
+    # O bloco if __name__ == '__main__': é removido para evitar execução dupla
+    # e garantir que o Gunicorn/Render use a variável 'app' diretamente.
+    # A lógica de execução CLI/Serve é movida para run_cli() e o Gunicorn
+    # será usado no Render com o comando: gunicorn bling:app --bind 0.0.0.0:$PORT
+    
+    # Se o usuário executar o arquivo diretamente, ele ainda pode usar o CLI
+    # para iniciar o servidor de desenvolvimento ou rodar o processamento.
+    run_cli()
