@@ -1700,10 +1700,44 @@ DASHBOARD_TEMPLATE = """
 # ============================================================================
 
 def create_app():
+    # 1. Configuração de Logs
+    memory_handler = InMemoryLogHandler()
+    
+    # Configura o logger principal e o de erros
+    main_logger = logging.getLogger(__name__)
+    error_logger = logging.getLogger("errors")
+    
+    # Remove handlers existentes para evitar duplicação
+    for handler in main_logger.handlers[:]:
+        main_logger.removeHandler(handler)
+    for handler in error_logger.handlers[:]:
+        error_logger.removeHandler(handler)
+        
+    # Configura o nível e adiciona handlers
+    main_logger.setLevel(logging.INFO)
+    error_logger.setLevel(logging.ERROR)
+    
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Console Handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    
+    main_logger.addHandler(ch)
+    error_logger.addHandler(ch)
+    
+    # Memory Handler (para o dashboard)
+    memory_handler.setFormatter(formatter)
+    main_logger.addHandler(memory_handler)
+    error_logger.addHandler(memory_handler)
+    
+    # 2. Inicialização das Classes
     auth = BlingAuth(Config)
     api = BlingAPI(auth, {}) # Configuração de componentes vazia, será carregada pelo Orchestrator
     orchestrator = AutomationOrchestrator(Config, api)
-    server = WebServer(orchestrator.auth, orchestrator)
+    
+    # 3. Inicialização do WebServer com o novo argumento
+    server = WebServer(orchestrator.auth, orchestrator, memory_handler)
     return server.app
 
 # ============================================================================
