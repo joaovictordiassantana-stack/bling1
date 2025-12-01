@@ -185,46 +185,14 @@ class InMemoryLogHandler(logging.Handler):
 
 # Variável global para o handler de memória, que será injetado
 # em WebServer e acessado pelo WebSocket. É a única exceção global controlada.
-global_memory_handler = None
+# global_memory_handler = None # REMOVIDO: Variável global problemática
 
-def configure_logging(level=logging.INFO):
-    """Configura o sistema de logging de forma segura para ambientes WSGI."""
-    global global_memory_handler
-    
-    Path("logs").mkdir(exist_ok=True)
-    
-    # 1. Cria o handler de memória (Singleton para a aplicação)
-    if global_memory_handler is None:
-        global_memory_handler = InMemoryLogHandler()
-    
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    global_memory_handler.setFormatter(formatter)
-    
-    # 2. Configura o logger principal
-    logger = logging.getLogger(__name__)
-    logger.setLevel(level)
-    logger.handlers.clear() # Limpa handlers antigos para evitar duplicação
-    
-    # Adiciona handlers
-    logger.addHandler(logging.FileHandler("logs/automacao_bling.log", encoding="utf-8"))
-    logger.addHandler(logging.StreamHandler(sys.stdout))
-    logger.addHandler(global_memory_handler)
-    
-    # 3. Configura o logger de erros
-    error_logger = logging.getLogger("errors")
-    error_logger.setLevel(logging.ERROR)
-    error_logger.handlers.clear() # Limpa handlers antigos
-    
-    error_handler = logging.FileHandler("logs/errors.log", encoding="utf-8")
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(formatter)
-    error_logger.addHandler(error_handler)
-    
-    # 4. Configura o logger de requests do Flask
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    
-    # Retorna os loggers configurados
-    return logger, error_logger, global_memory_handler
+# REMOVIDO: Função configure_logging() complexa. A configuração será feita em create_app()
+
+# Variáveis de log inicializadas como None para serem configuradas no main
+# memory_handler = None
+# logger = None
+# error_logger = None
 
 # Inicializa os loggers no escopo global para que outras classes possam importá-los
 # Mas a configuração real só acontece em create_app ou run_cli.
@@ -1731,13 +1699,40 @@ DASHBOARD_TEMPLATE = """
 # FACTORY FUNCTION PARA DEPLOY
 # ============================================================================
 
-def create_app():
+def create_app() -> Tuple[Flask, InMemoryLogHandler]:
     """
     Factory function para Waitress/Gunicorn
     Lazy loading para evitar timeout no Render
     """
-    # 1. Configura o logging (garante que é feito apenas uma vez por processo)
-    main_logger, error_logger, memory_handler = configure_logging()
+    # 1. Configura o logging (garante que é feito apenas uma    # 1. Configura logs (Simplificado conforme instruções do usuário)
+    Path("logs").mkdir(exist_ok=True)
+    
+    # Cria o handler de memória (necessário para o WebServer)
+    memory_handler = InMemoryLogHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    memory_handler.setFormatter(formatter)
+    
+    # Configura o logger principal
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear() # Limpa handlers antigos para evitar duplicação
+    
+    # Adiciona handlers
+    logger.addHandler(logging.FileHandler("logs/automacao_bling.log", encoding="utf-8"))
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.addHandler(memory_handler)
+    
+    # Configura o logger de erros (opcional, mas mantido para consistência)
+    error_logger = logging.getLogger("errors")
+    error_logger.setLevel(logging.ERROR)
+    error_logger.handlers.clear()
+    error_handler = logging.FileHandler("logs/errors.log", encoding="utf-8")
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    error_logger.addHandler(error_handler)
+    
+    # Configura o logger de requests do Flask
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
     main_logger.info("🚀 Iniciando factory create_app().")
         
     # 2. Inicializa as dependências
@@ -1786,8 +1781,34 @@ def run_cli():
     args = parser.parse_args()
     
     # Configuração de logs para o modo CLI (usa a função refatorada)
-    main_logger, error_logger, memory_handler = configure_logging()
+    # A configuração de logs já foi feita em create_app() para o WSGI.
+    # Para o CLI, vamos apenas garantir que o logger está pronto.
+    # Se o CLI for executado sem o WSGI, a configuração de logs será feita aqui.
     
+    # A configuração de logs é movida para create_app() (que é chamada por 'app = create_app()')
+    # Para o modo CLI, vamos apenas garantir que o logger est    # Configuração de logs para o modo CLI
+    # A configuração de logs é feita em create_app(), que é chamada antes de run_cli().
+    # Apenas garantimos que o logger e o memory_handler estão disponíveis.
+    main_logger = logging.getLogger(__name__)
+    
+    # O memory_handler é definido globalmente após a chamada de create_app()
+    # Não precisamos de lógica complexa aqui, apenas garantir que a variável existe.
+    # Se run_cli for chamado diretamente, a variável global 'memory_handler' não existirá.
+    # Vamos usar a lógica de fallback para garantir que o logging funcione no modo CLI puro.
+    
+    try:
+        # Tenta usar o memory_handler global definido por create_app()
+        memory_handler = globals()['memory_handler']
+    except KeyError:
+        # Fallback para modo CLI puro (sem WSGI)
+        Path("logs").mkdir(exist_ok=True)
+        memory_handler = InMemoryLogHandler()
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        memory_handler.setFormatter(formatter)
+        
+        main_logger.addHandler(logging.StreamHandler(sys.stdout))
+        main_logger.addHandler(memory_handler)
+        main_logger.setLevel(logging.INFO) 
     print_header("Sistema de Automação Bling ERP")
     
     config = Config()
@@ -1802,6 +1823,7 @@ def run_cli():
     if args.serve:
         print_info(f"Iniciando servidor web na porta {args.port}...")
         # Injeta memory_handler no WebServer
+        # O memory_handler é obtido da variável global 'memory_handler' definida após create_app()
         server = WebServer(auth, orchestrator, memory_handler)
         server.app.run(host='0.0.0.0', port=args.port, debug=False)
         
@@ -1824,7 +1846,7 @@ def run_cli():
         parser.print_help()
 
 # CRÍTICO: Variável global para WSGI
-app = create_app()
+app, memory_handler = create_app()
 
 # if __name__ == '__main__':
     # O bloco if __name__ == '__main__': é removido para evitar execução dupla
@@ -1834,4 +1856,4 @@ app = create_app()
     
     # Se o usuário executar o arquivo diretamente, ele ainda pode usar o CLI
     # para iniciar o servidor de desenvolvimento ou rodar o processamento.
-    # run_cli()
+    # run_cli() # Comentado para garantir que o Gunicorn/Render use a variável 'app' diretamente.
