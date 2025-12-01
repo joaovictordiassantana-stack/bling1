@@ -1700,7 +1700,9 @@ DASHBOARD_TEMPLATE = """
 # ============================================================================
 
 def create_app():
-    orchestrator = AutomationOrchestrator(Config)
+    auth = BlingAuth(Config)
+    api = BlingAPI(auth, {}) # Configuração de componentes vazia, será carregada pelo Orchestrator
+    orchestrator = AutomationOrchestrator(Config, api)
     server = WebServer(orchestrator.auth, orchestrator)
     return server.app
 
