@@ -1713,14 +1713,14 @@ def create_app() -> Tuple[Flask, InMemoryLogHandler]:
     memory_handler.setFormatter(formatter)
     
     # Configura o logger principal
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear() # Limpa handlers antigos para evitar duplicação
+    main_logger = logging.getLogger(__name__)
+    main_logger.setLevel(logging.INFO)
+    main_logger.handlers.clear() # Limpa handlers antigos para evitar duplicação
     
     # Adiciona handlers
-    logger.addHandler(logging.FileHandler("logs/automacao_bling.log", encoding="utf-8"))
-    logger.addHandler(logging.StreamHandler(sys.stdout))
-    logger.addHandler(memory_handler)
+    main_logger.addHandler(logging.FileHandler("logs/automacao_bling.log", encoding="utf-8"))
+    main_logger.addHandler(logging.StreamHandler(sys.stdout))
+    main_logger.addHandler(memory_handler)
     
     # Configura o logger de erros (opcional, mas mantido para consistência)
     error_logger = logging.getLogger("errors")
