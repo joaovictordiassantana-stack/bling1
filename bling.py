@@ -1851,4 +1851,12 @@ def run_cli():
 app = create_app()
 
 if __name__ == '__main__':
-    run_cli()
+    # Detecta se está rodando no Render (sem argumentos CLI)
+    if len(sys.argv) == 1:
+        # Modo servidor web (Render/Heroku)
+        port = int(os.environ.get("PORT", 8000))
+        logger.info(f"🚀 Iniciando servidor web na porta {port} (Render mode)")
+        app.run(host='0.0.0.0', port=port, debug=False)
+    else:
+        # Modo CLI com argumentos
+        run_cli()
