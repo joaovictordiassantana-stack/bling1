@@ -1781,10 +1781,29 @@ def run_cli():
     else:
         parser.print_help()
 
-# Variável que o Render procura
+# ============================================================================
+# PONTO DE ENTRADA PARA WSGI (Render / Gunicorn)
+# ============================================================================
+
+# Variável que o Render/Gunicorn procura
 application = create_app()
 
-# Execução local apenas
+# ============================================================================
+# EXECUÇÃO LOCAL (apenas para testes, não usado no Render)
+# ============================================================================
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    application.run(host="0.0.0.0", port=port)
+    # Importar os aqui para garantir que está disponível, embora já esteja no topo
+    import os 
+    
+    # Porta do Render (padrão 10000, não 5000!)
+    port = int(os.environ.get("PORT", 10000))
+    
+    print(f"🌐 Iniciando servidor Flask na porta {port}")
+    
+    # CRÍTICO: host DEVE ser 0.0.0.0, NÃO localhost/127.0.0.1
+    application.run(
+        host="0.0.0.0",  # ← OBRIGATÓRIO para Render
+        port=port,
+        debug=False  # ← NUNCA True em produção
+    )
