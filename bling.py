@@ -1053,12 +1053,5 @@ DASHBOARD_TEMPLATE = """
 # MAIN
 # ============================================================================
 
-if __name__ == "__main__":
-
-
-    logger = logging.getLogger(__name__)
-
-    logger.info("🚀 Iniciando aplicação Bling...")
-
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+logger = logging.getLogger(__name__)
+logger.info("🚀 Aplicação Bling carregada (produção)")
