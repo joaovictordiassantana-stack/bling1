@@ -1696,15 +1696,15 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ============================================================================
-# FACTORY FUNCTION PARA DEPLOY
+# PONTO DE ENTRADA PARA WSGI (Render / Gunicorn)
 # ============================================================================
 
-def create_app() -> Tuple[Flask, InMemoryLogHandler]:
-    """
-    Factory function para Waitress/Gunicorn
-    Lazy loading para evitar timeout no Render
-    """
-    # 1. Configura o logging (garante que é feito apenas uma    # 1. Configura logs (Simplificado conforme instruções do usuário)
+def create_app():
+    # A lógica de inicialização complexa (logs, threads, etc.) deve ser movida
+    # para dentro desta função para garantir que seja executada apenas uma vez
+    # e que o Flask seja criado corretamente.
+    
+    # 1. Configura o logging (Simplificado conforme instruções anteriores)
     Path("logs").mkdir(exist_ok=True)
     
     # Cria o handler de memória (necessário para o WebServer)
@@ -1734,7 +1734,7 @@ def create_app() -> Tuple[Flask, InMemoryLogHandler]:
     # Configura o logger de requests do Flask
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     main_logger.info("🚀 Iniciando factory create_app().")
-        
+    
     # 2. Inicializa as dependências
     config = Config()
     auth = BlingAuth(config)
@@ -1744,7 +1744,7 @@ def create_app() -> Tuple[Flask, InMemoryLogHandler]:
     # 3. Cria o servidor web, injetando o memory_handler
     server = WebServer(auth, orchestrator, memory_handler)
     
-    # 4. Inicia a thread de carregamento de dados
+    # 4. Inicia a thread de carregamento de dados (se necessário)
     _data_loaded = {'done': False}
     
     def background_load():
@@ -1819,15 +1819,7 @@ def run_cli():
     if not auth.access_token:
         print_warning("Token de acesso não encontrado ou expirado.")
         print_info(f"Acesse a URL para autorizar: {auth.get_authorization_url()}")
-        
-    if args.serve:
-        print_info(f"Iniciando servidor web na porta {args.port}...")
-        # Injeta memory_handler no WebServer
-        # O memory_handler é obtido da variável global 'memory_handler' definida após create_app()
-        server = WebServer(auth, orchestrator, memory_handler)
-        server.app.run(host='0.0.0.0', port=args.port, debug=False)
-        
-    elif args.run:
+           if args.run:
         print_info("Executando processamento de kits e verificação de compra...")
         if auth.is_token_valid() or auth.refresh_access_token():
             kits = orchestrator.api.get_all_kits_and_components()
@@ -1845,15 +1837,10 @@ def run_cli():
     else:
         parser.print_help()
 
-# CRÍTICO: Variável global para WSGI
-app, memory_handler = create_app()
+# Variável que o Render procura
+application = create_app()
 
-# if __name__ == '__main__':
-    # O bloco if __name__ == '__main__': é removido para evitar execução dupla
-    # e garantir que o Gunicorn/Render use a variável 'app' diretamente.
-    # A lógica de execução CLI/Serve é movida para run_cli() e o Gunicorn
-    # será usado no Render com o comando: gunicorn bling:app --bind 0.0.0.0:$PORT
-    
-    # Se o usuário executar o arquivo diretamente, ele ainda pode usar o CLI
-    # para iniciar o servidor de desenvolvimento ou rodar o processamento.
-    # run_cli() # Comentado para garantir que o Gunicorn/Render use a variável 'app' diretamente.
+# Execução local apenas
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    application.run(host="0.0.0.0", port=port)
