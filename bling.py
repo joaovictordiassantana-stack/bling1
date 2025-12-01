@@ -1700,72 +1700,8 @@ DASHBOARD_TEMPLATE = """
 # ============================================================================
 
 def create_app():
-    # A lógica de inicialização complexa (logs, threads, etc.) deve ser movida
-    # para dentro desta função para garantir que seja executada apenas uma vez
-    # e que o Flask seja criado corretamente.
-    
-    # 1. Configura o logging (Simplificado conforme instruções anteriores)
-    Path("logs").mkdir(exist_ok=True)
-    
-    # Cria o handler de memória (necessário para o WebServer)
-    memory_handler = InMemoryLogHandler()
-    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    memory_handler.setFormatter(formatter)
-    
-    # Configura o logger principal
-    main_logger = logging.getLogger(__name__)
-    main_logger.setLevel(logging.INFO)
-    main_logger.handlers.clear() # Limpa handlers antigos para evitar duplicação
-    
-    # Adiciona handlers
-    main_logger.addHandler(logging.FileHandler("logs/automacao_bling.log", encoding="utf-8"))
-    main_logger.addHandler(logging.StreamHandler(sys.stdout))
-    main_logger.addHandler(memory_handler)
-    
-    # Configura o logger de erros (opcional, mas mantido para consistência)
-    error_logger = logging.getLogger("errors")
-    error_logger.setLevel(logging.ERROR)
-    error_logger.handlers.clear()
-    error_handler = logging.FileHandler("logs/errors.log", encoding="utf-8")
-    error_handler.setLevel(logging.ERROR)
-    error_handler.setFormatter(formatter)
-    error_logger.addHandler(error_handler)
-    
-    # Configura o logger de requests do Flask
-    logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    main_logger.info("🚀 Iniciando factory create_app().")
-    
-    # 2. Inicializa as dependências
-    config = Config()
-    auth = BlingAuth(config)
-    api = BlingAPI(auth) # BlingAPI agora recebe auth
-    orchestrator = AutomationOrchestrator(config, api) # Orchestrator agora recebe api
-    
-    # 3. Cria o servidor web, injetando o memory_handler
-    server = WebServer(auth, orchestrator, memory_handler)
-    
-    # 4. Inicia a thread de carregamento de dados (se necessário)
-    _data_loaded = {'done': False}
-    
-    def background_load():
-        if _data_loaded['done']:
-            return
-        
-        main_logger.info("Iniciando carregamento de dados em background...")
-        try:
-            # Garante que o token está válido antes de carregar
-            if auth.is_token_valid() or auth.refresh_access_token():
-                kits = orchestrator.api.get_all_kits_and_components()
-                orchestrator.kits = kits
-                main_logger.info(f"Kits carregados em background: {len(kits)}")
-                # Aqui você pode adicionar a verificação de estoque inicial
-            _data_loaded['done'] = True
-            main_logger.info("Carregamento em background concluído.")
-        except Exception as e:
-            error_logger.error(f"Erro no background: {e}", exc_info=True)
-    
-    Thread(target=background_load, daemon=True).start()
-    
+    orchestrator = AutomationOrchestrator(Config)
+    server = WebServer(orchestrator.auth, orchestrator)
     return server.app
 
 # ============================================================================
@@ -1774,41 +1710,13 @@ def create_app():
 
 def run_cli():
     parser = argparse.ArgumentParser(description="Sistema de Automação Bling ERP.")
-    parser.add_argument('--serve', action='store_true', help="Inicia o servidor web Flask.")
     parser.add_argument('--run', action='store_true', help="Executa o processamento de kits e verificação de compra via CLI.")
-    parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', 8000)), help="Define a porta para o servidor web (padrão: 8000 ou variável de ambiente PORT).")
     
     args = parser.parse_args()
     
-    # Configuração de logs para o modo CLI (usa a função refatorada)
-    # A configuração de logs já foi feita em create_app() para o WSGI.
-    # Para o CLI, vamos apenas garantir que o logger está pronto.
-    # Se o CLI for executado sem o WSGI, a configuração de logs será feita aqui.
-    
-    # A configuração de logs é movida para create_app() (que é chamada por 'app = create_app()')
-    # Para o modo CLI, vamos apenas garantir que o logger est    # Configuração de logs para o modo CLI
-    # A configuração de logs é feita em create_app(), que é chamada antes de run_cli().
-    # Apenas garantimos que o logger e o memory_handler estão disponíveis.
+    # Configuração de logs para o modo CLI
     main_logger = logging.getLogger(__name__)
     
-    # O memory_handler é definido globalmente após a chamada de create_app()
-    # Não precisamos de lógica complexa aqui, apenas garantir que a variável existe.
-    # Se run_cli for chamado diretamente, a variável global 'memory_handler' não existirá.
-    # Vamos usar a lógica de fallback para garantir que o logging funcione no modo CLI puro.
-    
-    try:
-        # Tenta usar o memory_handler global definido por create_app()
-        memory_handler = globals()['memory_handler']
-    except KeyError:
-        # Fallback para modo CLI puro (sem WSGI)
-        Path("logs").mkdir(exist_ok=True)
-        memory_handler = InMemoryLogHandler()
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        memory_handler.setFormatter(formatter)
-        
-        main_logger.addHandler(logging.StreamHandler(sys.stdout))
-        main_logger.addHandler(memory_handler)
-        main_logger.setLevel(logging.INFO) 
     print_header("Sistema de Automação Bling ERP")
     
     config = Config()
