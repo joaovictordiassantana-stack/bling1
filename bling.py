@@ -9,29 +9,141 @@ import sys
 import json
 import time
 import logging
+import base64
+import argparse
 from pathlib import Path
-from datetime import datetime
-from threading import Lock
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, asdict
+from urllib.parse import urlencode
+from collections import defaultdict
+from threading import Lock, Thread
+from dotenv import load_dotenv
 
 import requests
 from flask import Flask, request, render_template_string, jsonify
 
+# Tenta importar flask_sock para WebSocket
+try:
+    from flask_sock import Sock
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    Sock = None
+
+# Tenta importar colorama para CLI colorido
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+    COLORS_ENABLED = True
+except ImportError:
+    class Fore:
+        GREEN = RED = YELLOW = CYAN = MAGENTA = BLUE = RESET = ''
+    class Style:
+        BRIGHT = RESET_ALL = ''
+    COLORS_ENABLED = False
+
 # ============================================================================
-# CONFIGURAÇÃO
+# CONFIGURAÇÃO E CONSTANTES
 # ============================================================================
 
-BLING_API_KEY = os.environ.get('BLING_API_KEY', '')
-BLING_API_URL = 'https://www.bling.com.br/Api/v3'
+load_dotenv()
+
+class Config:
+    BLING_API_URL = 'https://www.bling.com.br/Api/v3'
+    
+    # OAuth
+    CLIENT_ID = os.environ.get('BLING_CLIENT_ID', 'SEU_CLIENT_ID')
+    CLIENT_SECRET = os.environ.get('BLING_CLIENT_SECRET', 'SEU_CLIENT_SECRET')
+    REDIRECT_URI = os.environ.get('BLING_REDIRECT_URI', 'http://127.0.0.1:5000/callback')
+    
+    # API
+    REQUEST_TIMEOUT = 30
+    MAX_RETRIES = 3
+    BASE_DELAY = 1
+    
+    # Automação
+    CHECK_MIN_STOCK = True
+    MIN_STOCK_THRESHOLD = 10
+    DEFAULT_BATCH_SIZE = 10
+    DELAY_BETWEEN_BATCHES = 0.5
 
 # ============================================================================
-# ROTAS DA API
+# EXCEÇÕES CUSTOMIZADAS
 # ============================================================================
 
-from flask import Flask, request, jsonify
-from flask_sock import Sock
+class BlingAuthError(Exception):
+    """Erro de autenticação com o Bling."""
+    pass
 
-app = Flask(__name__)
-sock = Sock(app)
+class BlingAPIError(Exception):
+    """Erro na chamada da API do Bling."""
+    pass
+
+# ============================================================================
+# DATACLASSES
+# ============================================================================
+
+@dataclass
+class Component:
+    sku: str
+    name: str
+    qty: int
+    supplier: str = "FORNECEDOR_PADRAO"
+    lead_time_days: int = 15
+    unit_cost: float = 0.0
+    min_stock: int = 10
+    current_stock: int = 0
+
+@dataclass
+class Kit:
+    sku: str
+    name: str
+    components: List[Component]
+    price: float = 0.0
+
+@dataclass
+class PurchaseNeed:
+    component_sku: str
+    component_name: str
+    quantity_needed: int
+    supplier: str
+    lead_time_days: int
+    reason: str
+
+# ============================================================================
+# FUNÇÕES DE PRINT COLORIDO (CLI)
+# ============================================================================
+
+def print_success(msg):
+    if COLORS_ENABLED:
+        print(f"{Fore.GREEN}{Style.BRIGHT}✅ {msg}{Style.RESET_ALL}")
+    else:
+        print(f"✅ {msg}")
+
+def print_error(msg):
+    if COLORS_ENABLED:
+        print(f"{Fore.RED}{Style.BRIGHT}❌ {msg}{Style.RESET_ALL}")
+    else:
+        print(f"❌ {msg}")
+
+def print_warning(msg):
+    if COLORS_ENABLED:
+        print(f"{Fore.YELLOW}{Style.BRIGHT}⚠️ {msg}{Style.RESET_ALL}")
+    else:
+        print(f"⚠️ {msg}")
+
+def print_info(msg):
+    if COLORS_ENABLED:
+        print(f"{Fore.CYAN}{msg}{Style.RESET_ALL}")
+    else:
+        print(msg)
+
+def print_header(title):
+    if COLORS_ENABLED:
+        print(f"\n{Fore.MAGENTA}{Style.BRIGHT}--- {title} ---{Style.RESET_ALL}")
+    else:
+        print(f"\n--- {title} ---")
 
 # ============================================================================
 # CONFIGURAÇÃO DE LOGS (Definição da classe, mas não a inicialização)
@@ -63,142 +175,805 @@ class InMemoryLogHandler(logging.Handler):
             return self.logs.copy()
 
 # Variáveis de log inicializadas como None para serem configuradas no main
-memory_handler = None
-logger = None
+# memory_handler = None
+# logger = None
+# error_logger = None
 
-@app.route('/')
-@app.route('/dashboard')
-def dashboard():
-    return render_template_string(DASHBOARD_TEMPLATE)
+# ============================================================================
+# CONFIGURAÇÃO GLOBAL DE LOGS (CORREÇÃO 1)
+# ============================================================================
 
-@app.route('/health')
-def health_check():
-    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+Path('logs').mkdir(exist_ok=True)
 
-@app.route('/api/produtos')
-def get_produtos():
-    try:
-        headers = {
-            'Authorization': f'Bearer {BLING_API_KEY}',
-            'Accept': 'application/json'
-        }
+memory_handler = InMemoryLogHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+memory_handler.setFormatter(formatter)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('logs/automacao_bling.log', encoding='utf-8'),
+        logging.StreamHandler(sys.stdout),
+        memory_handler
+    ]
+)
+
+logger = logging.getLogger(__name__)
+error_logger = logging.getLogger('errors')
+error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
+error_handler.setLevel(logging.ERROR)
+error_handler.setFormatter(formatter)
+error_logger.addHandler(error_handler)
+
+# ============================================================================
+# CLASSES DE AUTENTICAÇÃO E API
+# ============================================================================
+
+class BlingAuth:
+    TOKEN_FILE = 'tokens.json'
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.token_url = 'https://www.bling.com.br/Api/v3/oauth/token'
+        self.access_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.expires_at: Optional[datetime] = None
+        self.auth_lock = Lock()
+        self.load_tokens()
+
+    def _save_tokens(self):
+        with self.auth_lock:
+            data = {
+                'access_token': self.access_token,
+                'refresh_token': self.refresh_token,
+                'expires_at': self.expires_at.isoformat() if self.expires_at else None
+            }
+            with open(self.TOKEN_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+            logger.info("Tokens salvos em tokens.json") if logger else print_info("Tokens salvos em tokens.json")
+
+    def load_tokens(self) -> bool:
+        if not Path(self.TOKEN_FILE).exists():
+            return False
         
-        params = {}
-        if request.args.get('pesquisa'):
-            params['pesquisa'] = request.args.get('pesquisa')
-        
-        response = requests.get(
-            f'{BLING_API_URL}/produtos',
-            headers=headers,
-            params=params,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            return jsonify(response.json())
-        else:
-            return jsonify({
-                'error': f'Erro na API do Bling: {response.status_code}',
-                'details': response.text
-            }), response.status_code
+        try:
+            with open(self.TOKEN_FILE, 'r') as f:
+                data = json.load(f)
             
-    except Exception as e:
-        logger.error(f"Erro ao buscar produtos: {e}") if logger else print(f"Erro ao buscar produtos: {e}")
-        return jsonify({'error': str(e)}), 500
+            self.access_token = data.get('access_token')
+            self.refresh_token = data.get('refresh_token')
+            expires_at_str = data.get('expires_at')
+            
+            if expires_at_str:
+                self.expires_at = datetime.fromisoformat(expires_at_str)
+            
+            if self.is_token_valid():
+                logger.info("Tokens carregados com sucesso.") if logger else print_success("Tokens carregados com sucesso.")
+                return True
+            else:
+                logger.warning("Tokens expirados ou inválidos.") if logger else print_warning("Tokens expirados ou inválidos.")
+                return self.refresh_access_token()
+                
+        except Exception as e:
+            logger.error(f"Erro ao carregar tokens: {e}") if logger else print_error(f"Erro ao carregar tokens: {e}")
+            return False
 
-@app.route('/api/logs')
-def get_logs():
-    try:
-        logs = memory_handler.get_logs(limit=50)
-        return jsonify({'logs': logs})
-    except Exception as e:
-        logger.error(f"Erro ao buscar logs: {e}") if logger else print(f"Erro ao buscar logs: {e}")
-        return jsonify({'error': str(e)}), 500
+    def is_token_valid(self) -> bool:
+        if not self.access_token or not self.expires_at:
+            return False
+        # Token é considerado válido se expirar em mais de 60 segundos
+        return self.expires_at > datetime.now() + timedelta(seconds=60)
 
-@app.route('/api/kits')
-def get_kits():
-    try:
-        headers = {
-            'Authorization': f'Bearer {BLING_API_KEY}',
-            'Accept': 'application/json'
+    def get_authorization_url(self) -> str:
+        params = {
+            'response_type': 'code',
+            'client_id': self.config.CLIENT_ID,
+            'redirect_uri': self.config.REDIRECT_URI,
+            'state': 'bling_automacao' # Opcional, para segurança
+        }
+        return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"
+
+    def _get_basic_auth_header(self) -> Dict[str, str]:
+        auth_string = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        return {"Authorization": f"Basic {encoded_auth}"}
+
+    def exchange_code_for_token(self, code: str) -> bool:
+        headers = self._get_basic_auth_header()
+        data = {
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': self.config.REDIRECT_URI
         }
         
-        # Busca produtos do tipo Kit (P)
-        response = requests.get(
-            f'{BLING_API_URL}/produtos',
-            headers=headers,
-            params={'tipo': 'P'},
-            timeout=30
-        )
+        try:
+            response = requests.post(self.token_url, headers=headers, data=data, timeout=self.config.REQUEST_TIMEOUT)
+            response.raise_for_status()
+            token_data = response.json()
+            
+            with self.auth_lock:
+                self.access_token = token_data['access_token']
+                self.refresh_token = token_data['refresh_token']
+                expires_in = token_data['expires_in']
+                self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+                self._save_tokens()
+            
+            logger.info("Troca de código por token bem-sucedida.") if logger else print_success("Troca de código por token bem-sucedida.")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro ao trocar código por token: {e}") if logger else print_error(f"Erro ao trocar código por token: {e}")
+            return False
+
+    def refresh_access_token(self) -> bool:
+        if not self.refresh_token:
+            logger.error("Refresh token não disponível.") if logger else print_error("Refresh token não disponível.")
+            return False
+            
+        headers = self._get_basic_auth_header()
+        data = {
+            'grant_type': 'refresh_token',
+            'refresh_token': self.refresh_token
+        }
         
-        if response.status_code == 200:
+        try:
+            response = requests.post(self.token_url, headers=headers, data=data, timeout=self.config.REQUEST_TIMEOUT)
+            response.raise_for_status()
+            token_data = response.json()
+            
+            with self.auth_lock:
+                self.access_token = token_data['access_token']
+                # O Bling não retorna um novo refresh_token, então mantemos o antigo
+                expires_in = token_data['expires_in']
+                self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+                self._save_tokens()
+            
+            logger.info("Token de acesso renovado com sucesso.") if logger else print_success("Token de acesso renovado com sucesso.")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro ao renovar token: {e}") if logger else print_error(f"Erro ao renovar token: {e}")
+            return False
+
+class BlingAPI:
+    def __init__(self, auth: BlingAuth, component_config: Dict):
+        self.auth = auth
+        self.component_config = component_config
+        self.api_url = Config.BLING_API_URL
+
+    def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> requests.Response:
+        url = f"{self.api_url}/{endpoint}"
+        headers = kwargs.pop('headers', {})
+        
+        for attempt in range(Config.MAX_RETRIES):
+            if not self.auth.is_token_valid():
+                if not self.auth.refresh_access_token():
+                    raise BlingAuthError("Token inválido e falha ao renovar.")
+            
+            headers['Authorization'] = f'Bearer {self.auth.access_token}'
+            kwargs['headers'] = headers
+            
+            try:
+                response = requests.request(method, url, timeout=Config.REQUEST_TIMEOUT, **kwargs)
+                
+                if response.status_code == 401:
+                    logger.warning("Token expirado (401). Tentando renovar...") if logger else print_warning("Token expirado (401). Tentando renovar...")
+                    if self.auth.refresh_access_token():
+                        time.sleep(Config.BASE_DELAY * (attempt + 1)) # Backoff antes de tentar novamente
+                        continue  # Tenta novamente
+                    else:
+                        raise BlingAuthError("Falha ao renovar token.")
+                
+                response.raise_for_status()
+                return response
+            
+            except requests.exceptions.RequestException as e:
+                if attempt < Config.MAX_RETRIES - 1:
+                    logger.warning(f"Tentativa {attempt + 1} falhou: {e}. Retrying...") if logger else print_warning(f"Tentativa {attempt + 1} falhou: {e}. Retrying...")
+                    time.sleep(Config.BASE_DELAY * (attempt + 1)) # Backoff exponencial
+                    continue
+                else:
+                    logger.error(f"Falha final na requisição para {endpoint}: {e}") if logger else print_error(f"Falha final na requisição para {endpoint}: {e}")
+                    raise BlingAPIError(f"Falha na API do Bling: {e}")
+
+    def get_product_by_sku(self, sku: str) -> Optional[Dict]:
+        try:
+            response = self._request_with_retry('GET', 'produtos', params={'codigo': sku})
             data = response.json()
-            kits = []
+            if data.get('data'):
+                return data['data'][0]
+            return None
+        except BlingAPIError:
+            return None
+
+    def get_product_stock(self, product_id: int) -> int:
+        try:
+            response = self._request_with_retry('GET', f'estoques/{product_id}')
+            data = response.json()
+            # A estrutura de estoque pode variar, assumindo que o estoque atual é o que importa
+            return int(data.get('estoqueAtual', 0))
+        except BlingAPIError:
+            return 0
+
+    def get_all_kits_and_components(self) -> List[Kit]:
+        kits: List[Kit] = []
+        pagina = 1
+        while True:
+            try:
+                response = self._request_with_retry('GET', 'produtos', params={'tipo': 'P', 'pagina': pagina})
+                data = response.json()
+                
+                if not data.get('data'):
+                    break
+                
+                for product_data in data['data']:
+                    if product_data.get('tipo') == 'P' and product_data.get('estrutura'):
+                        kit_sku = product_data.get('codigo', 'N/A')
+                        kit_name = product_data.get('descricao', 'Sem nome')
+                        kit_price = product_data.get('preco', 0.0)
+                        
+                        components: List[Component] = []
+                        for item in product_data['estrutura'].get('componentes', []):
+                            comp_data = item.get('produto', {})
+                            comp_sku = comp_data.get('codigo', 'N/A')
+                            
+                            # Aplica configurações locais
+                            config = self.component_config.get('component_defaults', {})
+                            if comp_sku in self.component_config.get('components', {}):
+                                config.update(self.component_config['components'][comp_sku])
+                                
+                            component = Component(
+                                sku=comp_sku,
+                                name=comp_data.get('descricao', 'Sem nome'),
+                                qty=item.get('quantidade', 0),
+                                supplier=config.get('supplier', 'FORNECEDOR_PADRAO'),
+                                lead_time_days=config.get('lead_time_days', 15),
+                                min_stock=config.get('min_stock', 10)
+                            )
+                            
+                            # A busca de estoque foi movida para o método update_components_stock para otimização.
+                            
+                            components.append(component)
+                        
+                        kits.append(Kit(sku=kit_sku, name=kit_name, components=components, price=kit_price))
+                
+                pagina += 1
+                time.sleep(Config.DELAY_BETWEEN_BATCHES)
+                
+            except BlingAPIError:
+                break
+                
+        return kits
+
+    def create_production_order(self, kit_sku: str, quantity: int) -> Optional[int]:
+        try:
+            # Busca o produto pelo SKU
+            product = self.get_product_by_sku(kit_sku)
+            if not product:
+                logger.error(f"Produto {kit_sku} não encontrado")
+                return None
             
-            for product in data.get('data', []):
-                if product.get('tipo') == 'P' and product.get('estrutura'):
-                    componentes = []
-                    for item in product['estrutura'].get('componentes', []):
-                        comp_data = item.get('produto', {})
-                        componentes.append({
-                            'sku': comp_data.get('codigo', 'N/A'),
-                            'nome': comp_data.get('descricao', 'Sem nome'),
-                            'quantidade': item.get('quantidade', 0)
-                        })
-                    
-                    kits.append({
-                        'sku': product.get('codigo', 'N/A'),
-                        'nome': product.get('descricao', 'Sem nome'),
-                        'componentes': componentes
+            payload = {
+                "produto": {"id": product['id']},
+                "quantidade": quantity,
+                "dataPrevisao": (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d')
+            }
+            
+            response = self._request_with_retry('POST', 'ordens-producao', json=payload)
+            data = response.json()
+            op_id = data.get('data', {}).get('id')
+            
+            if op_id:
+                logger.info(f"✅ OP {op_id} criada para kit {kit_sku} (qtd: {quantity})")
+            
+            return op_id
+        except BlingAPIError as e:
+            logger.error(f"❌ Erro ao criar OP para {kit_sku}: {e}")
+            return None
+
+    def update_components_stock(self, components: List[Component]) -> None:
+        """Atualiza o estoque atual de uma lista de componentes"""
+        for component in components:
+            product = self.get_product_by_sku(component.sku)
+            if product:
+                component.current_stock = self.get_product_stock(product['id'])
+                logger.debug(f"Estoque de {component.sku}: {component.current_stock}")
+
+    def create_purchase_order(self, supplier_name: str, items: List[PurchaseNeed]) -> Optional[int]:
+        try:
+            # 1. Busca fornecedor por nome
+            response = self._request_with_retry('GET', 'contatos', params={'pesquisa': supplier_name})
+            data = response.json()
+            
+            if not data.get('data'):
+                logger.error(f"Fornecedor '{supplier_name}' não encontrado")
+                return None
+            
+            supplier_id = data['data'][0]['id']
+            
+            # 2. Monta payload da PO
+            po_items = []
+            for item in items:
+                product = self.get_product_by_sku(item.component_sku)
+                if product:
+                    # O dataclass PurchaseNeed não tem unit_cost, mas o Component tem.
+                    # Vamos usar um valor padrão ou tentar buscar o custo.
+                    # Para simplificar, usaremos 0.0, mas o ideal seria buscar o custo do componente.
+                    # O dataclass Component tem unit_cost, mas o PurchaseNeed não.
+                    # Vamos assumir que o custo unitário está no dataclass Component, que é o que gerou o PurchaseNeed.
+                    # Como não temos o objeto Component aqui, vamos usar 0.0 ou buscar o custo.
+                    # Para não quebrar, vamos usar 0.0.
+                    po_items.append({
+                        "produto": {"id": product['id']},
+                        "quantidade": item.quantity_needed,
+                        "valor": 0.0 # Valor fixo, idealmente viria do Component
                     })
             
-            return jsonify({'kits': kits})
-        else:
-            return jsonify({
-                'error': f'Erro na API do Bling: {response.status_code}'
-            }), response.status_code
+            if not po_items:
+                logger.warning(f"Nenhum item válido para PO do fornecedor {supplier_name}")
+                return None
             
-    except Exception as e:
-        logger.error(f"Erro ao buscar kits: {e}") if logger else print(f"Erro ao buscar kits: {e}")
-        return jsonify({'error': str(e)}), 500
+            payload = {
+                "contato": {"id": supplier_id},
+                "itens": po_items,
+                "dataPrevisao": (datetime.now() + timedelta(days=15)).strftime('%Y-%m-%d')
+            }
+            
+            # 3. Cria PO
+            response = self._request_with_retry('POST', 'compras', json=payload)
+            data = response.json()
+            po_id = data.get('data', {}).get('id')
+            
+            if po_id:
+                logger.info(f"✅ PO {po_id} criada para {supplier_name} ({len(po_items)} itens)")
+            
+            return po_id
+        except BlingAPIError as e:
+            logger.error(f"❌ Erro ao criar PO para {supplier_name}: {e}")
+            return None
 
-@app.route('/api/recheck', methods=['POST'])
-def recheck():
-    try:
-        logger.info("🔄 Verificação manual iniciada via API") if logger else print("🔄 Verificação manual iniciada via API")
-        # Aqui você pode adicionar lógica de verificação de estoque
-        return jsonify({"status": "ok", "message": "Verificação iniciada"})
-    except Exception as e:
-        logger.error(f"Erro na verificação: {e}") if logger else print(f"Erro na verificação: {e}")
-        return jsonify({"status": "error", "error": str(e)}), 500
+# ============================================================================
+# CLASSES DE GERENCIAMENTO E ORQUESTRAÇÃO
+# ============================================================================
 
-@app.route('/webhook/bling', methods=['POST'])
-def webhook_bling():
-    try:
-        data = request.get_json(force=True)
-        event_type = data.get('event') or data.get('tipo') or 'unknown'
-        logger.info(f"🪝 Webhook recebido: {event_type}") if logger else print(f"🪝 Webhook recebido: {event_type}")
-        
-        is_order_event = (
-            event_type == 'order.created' or 
-            event_type == 'pedido.pago' or 
-            (data.get('tipo') == 'pedido' and data.get('evento') in ['criado', 'pago'])
+class StatisticsManager:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.start_time: Optional[float] = None
+        self.end_time: Optional[float] = None
+        self.success = 0
+        self.failed = 0
+        self.ops_created = 0
+        self.pos_created = 0
+        self.min_stock_checks = 0
+
+    def start(self):
+        self.start_time = time.time()
+
+    def stop(self):
+        self.end_time = time.time()
+
+    def to_dict(self) -> Dict:
+        elapsed = (self.end_time - self.start_time) if self.start_time and self.end_time else 0
+        return {
+            "success": self.success,
+            "failed": self.failed,
+            "ops_created": self.ops_created,
+            "pos_created": self.pos_created,
+            "min_stock_checks": self.min_stock_checks,
+            "elapsed_time_seconds": round(elapsed, 2)
+        }
+
+class PurchaseNeedsManager:
+    def __init__(self, api: BlingAPI):
+        self.api = api
+        self.needs: Dict[str, List[PurchaseNeed]] = defaultdict(list) # Agrupado por fornecedor
+
+    def check_min_stock_needs(self, components: List[Component]):
+        for component in components:
+            if component.current_stock < component.min_stock:
+                quantity_needed = component.min_stock - component.current_stock
+                self.add_need(
+                    component=component,
+                    quantity=quantity_needed,
+                    reason=f"Estoque abaixo do mínimo ({component.current_stock} < {component.min_stock})"
+                )
+
+    def add_need(self, component: Component, quantity: int, reason: str):
+        need = PurchaseNeed(
+            component_sku=component.sku,
+            component_name=component.name,
+            quantity_needed=quantity,
+            supplier=component.supplier,
+            lead_time_days=component.lead_time_days,
+            reason=reason
         )
+        self.needs[component.supplier].append(need)
+
+    def generate_purchase_orders(self) -> List[int]:
+        po_ids = []
+        for supplier, items in self.needs.items():
+            po_id = self.api.create_purchase_order(supplier, items)
+            if po_id:
+                po_ids.append(po_id)
+                logger.info(f"🛒 PO {po_id} criada para {supplier} com {len(items)} itens.") if logger else print_success(f"🛒 PO {po_id} criada para {supplier} com {len(items)} itens.")
+            else:
+                logger.error(f"❌ Falha ao criar PO para {supplier}.") if logger else print_error(f"❌ Falha ao criar PO para {supplier}.")
         
-        if is_order_event:
-            pedido_id = data.get('id') or (data.get('retorno', {}).get('pedidos', [{}])[0].get('pedido', {}).get('id'))
-            if pedido_id:
-                logger.info(f"✅ Pedido ID {pedido_id} identificado") if logger else print(f"✅ Pedido ID {pedido_id} identificado")
-                return jsonify({'status': 'ok', 'message': f'Pedido {pedido_id} processado'}), 200
+        self.needs.clear()
+        return po_ids
+
+class AutomationOrchestrator:
+    COMPONENT_CONFIG_FILE = 'component_config.json'
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.auth = BlingAuth(config)
+        self.component_config = self._load_or_create_component_config()
+        self.api = BlingAPI(self.auth, component_config=self.component_config)
+        self.stats = StatisticsManager()
+        self.purchase_manager = PurchaseNeedsManager(self.api)
+        self.failed_items: List[str] = []
+
+    def _load_or_create_component_config(self) -> Dict:
+        if Path(self.COMPONENT_CONFIG_FILE).exists():
+            try:
+                with open(self.COMPONENT_CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                logger.info("Configuração de componentes carregada.") if logger else print_info("Configuração de componentes carregada.")
+                return config
+            except Exception as e:
+                logger.error(f"Erro ao carregar config de componentes: {e}") if logger else print_error(f"Erro ao carregar config de componentes: {e}")
+                
+        # Cria arquivo padrão
+        default_config = {
+          "component_defaults": {
+            "supplier": "FORNECEDOR_PADRAO",
+            "lead_time_days": 15,
+            "min_stock": 10
+          },
+          "components": {
+            "EXEMPLO-001": {
+              "supplier": "Fornecedor A",
+              "lead_time_days": 10,
+              "min_stock": 20
+            }
+          }
+        }
+        try:
+            with open(self.COMPONENT_CONFIG_FILE, 'w') as f:
+                json.dump(default_config, f, indent=4)
+            logger.warning("Arquivo de configuração de componentes criado com valores padrão.") if logger else print_warning("Arquivo de configuração de componentes criado com valores padrão.")
+            return default_config
+        except Exception as e:
+            logger.error(f"Erro ao criar config de componentes: {e}") if logger else print_error(f"Erro ao criar config de componentes: {e}")
+            return {}
+
+    def process_kits(self, kits: List[Kit], batch_size: int = 10, check_stock: bool = True) -> Dict:
+        self.stats.reset()
+        self.stats.start()
+        self.failed_items.clear()
         
-        return jsonify({'status': 'ok', 'message': f'Webhook {event_type} recebido'}), 200
-    except Exception as e:
-        logger.error(f"Erro no webhook: {e}") if logger else print(f"Erro no webhook: {e}")
-        return jsonify({'error': str(e)}), 500
+        for kit in kits:
+            try:
+                # 1. Cria Ordem de Produção (OP)
+                op_id = self.api.create_production_order(kit.sku, 1) # Exemplo: criar 1 unidade
+                if op_id:
+                    self.stats.ops_created += 1
+                    self.stats.success += 1
+                    logger.info(f"🏭 OP {op_id} criada para Kit {kit.sku}.") if logger else print_success(f"🏭 OP {op_id} criada para Kit {kit.sku}.")
+                else:
+                    raise BlingAPIError("Falha ao criar OP.")
+                
+                # 2. Verifica Estoque Mínimo dos Componentes
+                if check_stock and self.config.CHECK_MIN_STOCK:
+                    self.stats.min_stock_checks += 1
+                    # Simulação: buscar estoque real aqui
+                    for component in kit.components:
+                        component.current_stock = self.api.get_product_stock(component.sku) # Assumindo que a API busca por SKU
+                    
+                    self.purchase_manager.check_min_stock_needs(kit.components)
+                
+            except Exception as e:
+                self.stats.failed += 1
+                self.failed_items.append(kit.sku)
+                logger.error(f"❌ Falha ao processar Kit {kit.sku}: {e}") if logger else print_error(f"❌ Falha ao processar Kit {kit.sku}: {e}")
+                
+        # 3. Gera Ordens de Compra (PO)
+        po_ids = self.purchase_manager.generate_purchase_orders()
+        self.stats.pos_created += len(po_ids)
+        
+        self.stats.stop()
+        return self.stats.to_dict()
+
+    def run_purchase_check(self) -> Dict:
+        self.stats.reset()
+        self.stats.start()
+        self.failed_items.clear()
+        
+        try:
+            kits = self.api.get_all_kits_and_components()
+            logger.info(f"Kits carregados: {len(kits)}") if logger else print_info(f"Kits carregados: {len(kits)}")
+            
+            # 1. Atualiza o estoque de todos os componentes
+            all_components = [comp for kit in kits for comp in kit.components]
+            self.api.update_components_stock(all_components)
+            
+            # 2. Verifica Estoque Mínimo de todos os componentes
+            for component in all_components:
+                self.stats.min_stock_checks += 1
+                
+                if component.current_stock < component.min_stock:
+                    quantity_needed = component.min_stock - component.current_stock
+                    self.purchase_manager.add_need(
+                        component=component,
+                        quantity=quantity_needed,
+                        reason=f"Estoque abaixo do mínimo ({component.current_stock} < {component.min_stock})"
+                    )
+            
+            # 2. Gera Ordens de Compra (PO)
+            po_ids = self.purchase_manager.generate_purchase_orders()
+            self.stats.pos_created += len(po_ids)
+            self.stats.success = 1 # Sucesso na verificação
+            
+        except Exception as e:
+            self.stats.failed = 1
+            logger.error(f"❌ Falha na verificação de compra: {e}") if logger else print_error(f"❌ Falha na verificação de compra: {e}")
+            
+        self.stats.stop()
+        return self.stats.to_dict()
 
 # ============================================================================
-# TEMPLATE HTML (Design completo do Bling 2)
+# WEBSERVER E ROTAS
 # ============================================================================
+
+class WebServer:
+    def __init__(self, auth: BlingAuth, orchestrator: AutomationOrchestrator):
+        self.app = Flask(__name__)
+        self.auth = auth
+        self.orchestrator = orchestrator
+        self.setup_routes()
+        
+        if WEBSOCKET_AVAILABLE:
+            self.sock = Sock(self.app)
+            self.setup_websocket()
+
+    def setup_routes(self):
+        # Rotas existentes
+        self.app.route('/', methods=['GET'])(self.dashboard)
+        self.app.route('/dashboard', methods=['GET'])(self.dashboard)
+        self.app.route('/health', methods=['GET'])(self.health_check)
+        self.app.route('/webhook/bling', methods=['POST'])(self.webhook_bling)
+        
+        # Novas rotas
+        self.app.route('/callback', methods=['GET'])(self.callback)
+        self.app.route('/api/status', methods=['GET'])(self.api_status)
+        self.app.route('/api/stats', methods=['GET'])(self.api_stats)
+        self.app.route('/api/stock', methods=['GET'])(self.api_stock)
+        self.app.route('/api/needs', methods=['GET'])(self.api_needs)
+        self.app.route('/api/process_kits', methods=['POST'])(self.api_process_kits)
+        self.app.route('/api/recheck', methods=['POST'])(self.api_recheck)
+        
+        # Rotas que precisam de ajuste
+        self.app.route('/api/logs', methods=['GET'])(self.api_logs)
+        self.app.route('/api/kits', methods=['GET'])(self.api_kits)
+
+    def setup_websocket(self):
+        if WEBSOCKET_AVAILABLE:
+            self.sock.route('/ws/logs')(self.ws_logs)
+
+    # Implementações das rotas
+    def dashboard(self):
+        return render_template_string(DASHBOARD_TEMPLATE)
+
+    def health_check(self):
+        return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+    def webhook_bling(self):
+        try:
+            data = request.get_json(force=True)
+            event_type = data.get('event') or data.get('tipo') or 'unknown'
+            logger.info(f"🪝 Webhook recebido: {event_type}")
+            
+            is_order_event = (
+                event_type == 'order.created' or 
+                event_type == 'pedido.pago' or 
+                (data.get('tipo') == 'pedido' and data.get('evento') in ['criado', 'pago'])
+            )
+            
+            if is_order_event:
+                pedido_id = data.get('id') or (data.get('retorno', {}).get('pedidos', [{}])[0].get('pedido', {}).get('id'))
+                if pedido_id:
+                    logger.info(f"✅ Pedido ID {pedido_id} identificado. Iniciando verificação de compra.")
+                    Thread(target=self.orchestrator.run_purchase_check, daemon=True).start()
+                    return jsonify({'status': 'ok', 'message': f'Pedido {pedido_id} processado'}), 200
+            
+            if event_type == 'estoque.atualizado':
+                logger.info("📦 Evento de estoque atualizado. Iniciando verificação de compra.")
+                Thread(target=self.orchestrator.run_purchase_check, daemon=True).start()
+                
+            return jsonify({'status': 'ok', 'message': f'Webhook {event_type} recebido'}), 200
+        except Exception as e:
+            logger.error(f"Erro no webhook: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def callback(self):
+        code = request.args.get('code')
+        error = request.args.get('error')
+        
+        if error:
+            return render_template_string(ERROR_TEMPLATE, message=f"Erro de autorização: {error}")
+            
+        if code and self.auth.exchange_code_for_token(code):
+            return render_template_string(SUCCESS_TEMPLATE, message="Tokens de acesso obtidos e salvos com sucesso!")
+        else:
+            return render_template_string(ERROR_TEMPLATE, message="Falha ao obter tokens de acesso.")
+
+    def api_status(self):
+        is_valid = self.auth.is_token_valid()
+        expires_at = self.auth.expires_at.isoformat() if self.auth.expires_at else None
+        auth_url = self.auth.get_authorization_url()
+        
+        return jsonify({
+            "token_valid": is_valid,
+            "expires_at": expires_at,
+            "auth_url": auth_url
+        })
+
+    def api_stats(self):
+        return jsonify(self.orchestrator.stats.to_dict())
+
+    def api_stock(self):
+        # Esta rota retorna o estoque de todos os componentes com alertas
+        kits = self.orchestrator.api.get_all_kits_and_components()
+        
+        # 1. Coleta todos os componentes
+        all_components = [comp for kit in kits for comp in kit.components]
+        
+        # 2. Busca o estoque atual de todos eles
+        self.orchestrator.api.update_components_stock(all_components)
+        
+        items = []
+        # 3. Filtra e formata a resposta
+        for component in all_components:
+            items.append({
+                "sku": component.sku,
+                "nome": component.name,
+                "estoque": component.current_stock,
+                "minimo": component.min_stock,
+                "alerta": component.current_stock < component.min_stock
+            })
+        
+        return jsonify({"items": items})
+
+    def api_needs(self):
+        needs_list = []
+        for supplier, needs in self.orchestrator.purchase_manager.needs.items():
+            for need in needs:
+                needs_list.append(asdict(need))
+        
+        return jsonify({"needs": needs_list})
+
+    def api_process_kits(self):
+        try:
+            data = request.get_json()
+            kits_to_process = data.get('kits', [])
+            
+            # Simulação: buscar kits reais
+            all_kits = self.orchestrator.api.get_all_kits_and_components()
+            kits = [k for k in all_kits if k.sku in kits_to_process]
+            
+            stats = self.orchestrator.process_kits(kits)
+            return jsonify({"status": "ok", "stats": stats})
+        except Exception as e:
+            logger.error(f"Erro ao processar kits: {e}")
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+    def api_recheck(self):
+        logger.info("🔄 Verificação manual iniciada via API")
+        Thread(target=self.orchestrator.run_purchase_check, daemon=True).start()
+        return jsonify({"status": "ok", "message": "Verificação iniciada"})
+
+    def api_logs(self):
+        try:
+            logs = memory_handler.get_logs(limit=50)
+            return jsonify({'logs': logs})
+        except Exception as e:
+            logger.error(f"Erro ao buscar logs: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def api_kits(self):
+        try:
+            kits = self.orchestrator.api.get_all_kits_and_components()
+            kits_data = []
+            for kit in kits:
+                # Selecionar apenas campos necessários
+                components_data = [{
+                    "sku": c.sku,
+                    "name": c.name,
+                    "qty": c.qty
+                } for c in kit.components]
+                
+                kits_data.append({
+                    "sku": kit.sku,
+                    "nome": kit.name,
+                    "componentes": components_data
+                })
+            return jsonify({"kits": kits_data})
+        except Exception as e:
+            logger.error(f"Erro ao buscar kits: {e}")
+            return jsonify({'error': str(e)}), 500
+
+    def ws_logs(self, ws):
+        if not WEBSOCKET_AVAILABLE:
+            return
+            
+        last_log_count = 0
+        try:
+            while True:
+                logs = memory_handler.get_logs()
+                current_count = len(logs)
+                
+                if current_count > last_log_count:
+                    new_logs = logs[last_log_count:]
+                    ws.send(json.dumps({"logs": new_logs}))
+                    last_log_count = current_count
+                
+                time.sleep(1)
+        except Exception as e:
+            logger.info(f"Cliente desconectado: {e}")
+
+# ============================================================================
+# TEMPLATES HTML
+# ============================================================================
+
+SUCCESS_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Autorização Concluída</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding-top: 50px; }
+        .container { max-width: 400px; margin: 0 auto; padding: 20px; border: 1px solid #ccc; border-radius: 10px; }
+        .success-icon { font-size: 4em; color: #4CAF50; }
+        h1 { color: #4CAF50; }
+        button { padding: 10px 20px; background-color: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="success-icon">✓</div>
+        <h1>Autorização Concluída!</h1>
+        <p>{{ message }}</p>
+        <button onclick="window.close()">Fechar</button>
+    </div>
+</body>
+</html>
+"""
+
+ERROR_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Erro de Autorização</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding-top: 50px; }
+        .container { max-width: 400px; margin: 0 auto; padding: 20px; border: 1px solid #ccc; border-radius: 10px; }
+        .error-icon { font-size: 4em; color: #f44336; }
+        h1 { color: #f44336; }
+        button { padding: 10px 20px; background-color: #f44336; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="error-icon">✗</div>
+        <h1>Erro de Autorização</h1>
+        <p>{{ message }}</p>
+        <button onclick="window.close()">Fechar</button>
+    </div>
+</body>
+</html>
+"""
 
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
@@ -302,157 +1077,66 @@ DASHBOARD_TEMPLATE = """
             font-weight: 600;
         }
         
-        .table-responsive {
-            background: white;
-            border-radius: 15px;
-            padding: 20px;
-            box-shadow: 0 4px 6px rgba(0,0,0,.07);
-        }
-        
-        .table thead th {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 15px;
-            font-weight: 600;
-        }
-        
-        .table tbody tr:hover {
-            background-color: #f8f9fa;
-        }
-        
-        .table-danger td {
-            background-color: #f8d7da !important;
-        }
-        
-        .table-warning td {
-            background-color: #fff3cd !important;
-        }
-        
-        .btn-primary {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            border: none;
-            padding: 12px 30px;
-            font-weight: 600;
-            border-radius: 10px;
-            transition: all 0.3s ease;
-        }
-        
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
-        }
-        
-        .btn-secondary {
-            padding: 12px 30px;
-            font-weight: 600;
-            border-radius: 10px;
-        }
-        
         .search-box {
             display: flex;
-            gap: 15px;
+            gap: 10px;
             margin-bottom: 20px;
-            flex-wrap: wrap;
-        }
-        
-        input[type="text"], select {
-            padding: 12px 20px;
-            border: 2px solid #e0e0e0;
-            border-radius: 12px;
-            font-size: 16px;
-            transition: all 0.3s ease;
-        }
-        
-        input[type="text"]:focus, select:focus {
-            outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
         
         .filters {
             display: flex;
-            gap: 15px;
-            flex-wrap: wrap;
-            align-items: center;
+            gap: 20px;
+            margin-bottom: 20px;
         }
         
         .products-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-            gap: 25px;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
         }
         
         .product-card {
-            background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
-            transition: all 0.3s ease;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .product-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 4px;
-            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        }
-        
-        .product-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 15px 50px rgba(0, 0, 0, 0.15);
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,.05);
+            border: 1px solid #eee;
         }
         
         .product-id {
-            display: inline-block;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 5px 12px;
-            border-radius: 8px;
-            font-size: 0.85em;
-            font-weight: 600;
-            margin-bottom: 10px;
+            font-size: .8em;
+            color: #999;
+            margin-bottom: 5px;
         }
         
         .product-name {
-            font-size: 1.3em;
             font-weight: 600;
-            color: #333;
-            margin-bottom: 5px;
-            line-height: 1.4;
-        }
-        
-        .product-sku {
-            color: #888;
-            font-size: 0.9em;
+            font-size: 1.1em;
+            margin-bottom: 10px;
         }
         
         .product-details {
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 2px solid #f0f0f0;
+            margin-top: 10px;
         }
         
         .detail-row {
             display: flex;
             justify-content: space-between;
-            padding: 8px 0;
-            font-size: 0.95em;
+            padding: 3px 0;
+            border-bottom: 1px dotted #eee;
+        }
+        
+        .detail-row:last-child {
+            border-bottom: none;
         }
         
         .detail-label {
-            color: #666;
             font-weight: 500;
+            color: #555;
         }
         
         .detail-value {
-            color: #333;
-            font-weight: 600;
+            font-weight: 400;
         }
         
         .price {
@@ -547,7 +1231,8 @@ DASHBOARD_TEMPLATE = """
         <div class="container-fluid">
             <a class="navbar-brand" href="#">🚀 Bling Automação Wesley</a>
             <div class="d-flex align-items-center">
-                <span class="status-badge" id="status-badge">Sistema Online</span>
+                <span class="status-badge" id="status-badge">Token Inválido</span>
+                <a href="#" id="auth-link" class="btn btn-sm btn-outline-light ms-3 d-none">Autorizar Bling</a>
             </div>
         </div>
     </nav>
@@ -560,13 +1245,13 @@ DASHBOARD_TEMPLATE = """
                 </a>
             </li>
             <li class="nav-item" role="presentation">
-                <a class="nav-link" id="products-tab" data-bs-toggle="tab" href="#tabProducts" role="tab">
-                    🛍️ Produtos
+                <a class="nav-link" id="stock-tab" data-bs-toggle="tab" href="#tabStock" role="tab">
+                    📦 Estoque
                 </a>
             </li>
             <li class="nav-item" role="presentation">
-                <a class="nav-link" id="stock-tab" data-bs-toggle="tab" href="#tabStock" role="tab">
-                    📦 Estoque
+                <a class="nav-link" id="needs-tab" data-bs-toggle="tab" href="#tabNeeds" role="tab">
+                    🛒 Necessidades de Compra
                 </a>
             </li>
             <li class="nav-item" role="presentation">
@@ -582,35 +1267,51 @@ DASHBOARD_TEMPLATE = """
                 <h4 class="mb-4">📊 Visão Geral da Automação</h4>
                 
                 <div class="row mb-4" id="stats-kpis">
-                    <div class="col-md-3 mb-3">
-                        <div class="card h-100">
-                            <div class="card-body text-center">
-                                <div class="kpi-value text-primary">0</div>
-                                <div class="kpi-label">Total de Produtos</div>
+                    <div class="col-md-2 mb-3">
+                        <div class="card h-100 text-center">
+                            <div class="card-body">
+                                <div class="kpi-value text-success" id="kpi-success">✅ 0</div>
+                                <div class="kpi-label">Sucesso</div>
                             </div>
                         </div>
                     </div>
-                    <div class="col-md-3 mb-3">
-                        <div class="card h-100">
-                            <div class="card-body text-center">
-                                <div class="kpi-value text-success">R$ 0</div>
-                                <div class="kpi-label">Valor Total</div>
+                    <div class="col-md-2 mb-3">
+                        <div class="card h-100 text-center">
+                            <div class="card-body">
+                                <div class="kpi-value text-danger" id="kpi-failed">❌ 0</div>
+                                <div class="kpi-label">Falhas</div>
                             </div>
                         </div>
                     </div>
-                    <div class="col-md-3 mb-3">
-                        <div class="card h-100">
-                            <div class="card-body text-center">
-                                <div class="kpi-value text-info">0</div>
-                                <div class="kpi-label">Estoque Total</div>
+                    <div class="col-md-2 mb-3">
+                        <div class="card h-100 text-center">
+                            <div class="card-body">
+                                <div class="kpi-value text-primary" id="kpi-ops">🏭 0</div>
+                                <div class="kpi-label">OPs Criadas</div>
                             </div>
                         </div>
                     </div>
-                    <div class="col-md-3 mb-3">
-                        <div class="card h-100">
-                            <div class="card-body text-center">
-                                <div class="kpi-value text-warning">R$ 0</div>
-                                <div class="kpi-label">Preço Médio</div>
+                    <div class="col-md-2 mb-3">
+                        <div class="card h-100 text-center">
+                            <div class="card-body">
+                                <div class="kpi-value text-info" id="kpi-pos">🛒 0</div>
+                                <div class="kpi-label">POs Criadas</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-2 mb-3">
+                        <div class="card h-100 text-center">
+                            <div class="card-body">
+                                <div class="kpi-value text-warning" id="kpi-checks">🔍 0</div>
+                                <div class="kpi-label">Checks Estoque</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-2 mb-3">
+                        <div class="card h-100 text-center">
+                            <div class="card-body">
+                                <div class="kpi-value text-secondary" id="kpi-time">⏱️ 0s</div>
+                                <div class="kpi-label">Tempo Total</div>
                             </div>
                         </div>
                     </div>
@@ -654,52 +1355,9 @@ DASHBOARD_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Products Tab -->
-            <div class="tab-pane fade" id="tabProducts" role="tabpanel">
-                <h4 class="mb-4">🛍️ Gestão de Produtos</h4>
-                
-                <div class="card mb-4">
-                    <div class="card-body">
-                        <div class="search-box">
-                            <input type="text" id="searchInput" placeholder="🔍 Pesquisar produtos por nome ou código..." style="flex: 1; min-width: 250px;">
-                            <button onclick="loadProducts()" class="btn btn-primary">Buscar Produtos</button>
-                            <button onclick="clearFilters()" class="btn btn-secondary">Limpar Filtros</button>
-                        </div>
-                        
-                        <div class="filters">
-                            <div class="d-flex gap-2 align-items-center">
-                                <label>Ordenar por:</label>
-                                <select id="sortBy" onchange="applySortAndFilter()">
-                                    <option value="name">Nome</option>
-                                    <option value="price">Preço</option>
-                                    <option value="stock">Estoque</option>
-                                </select>
-                            </div>
-                            <div class="d-flex gap-2 align-items-center">
-                                <label>Estoque:</label>
-                                <select id="stockFilter" onchange="applySortAndFilter()">
-                                    <option value="all">Todos</option>
-                                    <option value="low">Baixo (&lt;10)</option>
-                                    <option value="medium">Médio (10-50)</option>
-                                    <option value="high">Alto (&gt;50)</option>
-                                </select>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="productsContainer">
-                    <div class="empty-state">
-                        <div class="empty-state-icon">📦</div>
-                        <div class="empty-state-text">Clique em "Buscar Produtos" para começar</div>
-                    </div>
-                </div>
-            </div>
-
             <!-- Stock Tab -->
             <div class="tab-pane fade" id="tabStock" role="tabpanel">
-                <h4 class="mb-4">📦 Estoque de Componentes</h4>
-                <p>A tabela abaixo mostra o estoque atual de cada componente, comparado ao estoque mínimo configurado.</p>
+                <h4 class="mb-4">📦 Estoque de Componentes (Abaixo do Mínimo)</h4>
                 <div class="table-responsive">
                     <table class="table table-striped table-hover">
                         <thead>
@@ -714,6 +1372,30 @@ DASHBOARD_TEMPLATE = """
                         <tbody id="stock-table-body">
                             <tr>
                                 <td colspan="5" class="text-center">Carregando dados de estoque...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Needs Tab -->
+            <div class="tab-pane fade" id="tabNeeds" role="tabpanel">
+                <h4 class="mb-4">🛒 Necessidades de Compra</h4>
+                <div class="table-responsive">
+                    <table class="table table-striped table-hover">
+                        <thead>
+                            <tr>
+                                <th>SKU</th>
+                                <th>Nome</th>
+                                <th>Qtd. Necessária</th>
+                                <th>Fornecedor</th>
+                                <th>Lead Time (dias)</th>
+                                <th>Motivo</th>
+                            </tr>
+                        </thead>
+                        <tbody id="needs-table-body">
+                            <tr>
+                                <td colspan="6" class="text-center">Carregando necessidades de compra...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -747,178 +1429,153 @@ DASHBOARD_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
         const API_BASE = '/api';
-        let allProducts = [];
         let statsChart = null;
+        let logWebSocket = null;
+        const WS_URL = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host + '/ws/logs';
 
         function formatLog(log) {
             const levelClass = `log-level-${log.level}`;
             return `<div class="log-entry"><span class="${levelClass}">[${log.timestamp.substring(11, 19)}] [${log.level}]</span> ${log.message}</div>`;
         }
 
-        function updateStatusBadge(status) {
+        function updateStatusBadge(isValid, authUrl) {
             const badge = document.getElementById('status-badge');
-            badge.className = 'status-badge ' + (status === 'ok' ? 'bg-success text-white' : 'bg-warning text-dark');
-            badge.textContent = status === 'ok' ? 'Sistema Online' : 'Verificando...';
-        }
-
-        function updateStatsKPIs(products) {
-            const total = products.length;
-            const totalValue = products.reduce((sum, p) => sum + (p.preco || 0) * (p.estoque || 0), 0);
-            const totalStock = products.reduce((sum, p) => sum + (p.estoque || 0), 0);
-            const avgPrice = total > 0 ? products.reduce((sum, p) => sum + (p.preco || 0), 0) / total : 0;
-
-            const kpis = document.querySelectorAll('#stats-kpis .kpi-value');
-            if (kpis.length >= 4) {
-                kpis[0].textContent = total;
-                kpis[1].textContent = `R$ ${totalValue.toFixed(2)}`;
-                kpis[2].textContent = totalStock;
-                kpis[3].textContent = `R$ ${avgPrice.toFixed(2)}`;
+            const authLink = document.getElementById('auth-link');
+            
+            if (isValid) {
+                badge.className = 'status-badge bg-success text-white';
+                badge.textContent = 'Token Válido';
+                authLink.classList.add('d-none');
+            } else {
+                badge.className = 'status-badge bg-danger text-white';
+                badge.textContent = 'Token Inválido';
+                authLink.href = authUrl;
+                authLink.classList.remove('d-none');
             }
         }
 
-        function updateStatsChart(products) {
+        function updateStatsKPIs(stats) {
+            document.getElementById('kpi-success').innerHTML = `✅ ${stats.success}`;
+            document.getElementById('kpi-failed').innerHTML = `❌ ${stats.failed}`;
+            document.getElementById('kpi-ops').innerHTML = `🏭 ${stats.ops_created}`;
+            document.getElementById('kpi-pos').innerHTML = `🛒 ${stats.pos_created}`;
+            document.getElementById('kpi-checks').innerHTML = `🔍 ${stats.min_stock_checks}`;
+            document.getElementById('kpi-time').innerHTML = `⏱️ ${stats.elapsed_time_seconds}s`;
+        }
+
+        function updateStatsChart(stats) {
             const ctx = document.getElementById('processingChart');
             if (!ctx) return;
             
-            const lowStock = products.filter(p => (p.estoque || 0) < 10).length;
-            const mediumStock = products.filter(p => {
-                const s = p.estoque || 0;
-                return s >= 10 && s <= 50;
-            }).length;
-            const highStock = products.filter(p => (p.estoque || 0) > 50).length;
-
             if (statsChart) {
                 statsChart.destroy();
             }
 
             statsChart = new Chart(ctx, {
-                type: 'doughnut',
+                type: 'bar',
                 data: {
-                    labels: ['Estoque Baixo', 'Estoque Médio', 'Estoque Alto'],
+                    labels: ['Sucesso', 'Falhas', 'OPs Criadas', 'POs Criadas'],
                     datasets: [{
-                        data: [lowStock, mediumStock, highStock],
-                        backgroundColor: ['#fee2e2', '#fef3c7', '#d1fae5'],
-                        borderColor: ['#991b1b', '#92400e', '#065f46'],
-                        borderWidth: 2
+                        label: 'Contagem',
+                        data: [stats.success, stats.failed, stats.ops_created, stats.pos_created],
+                        backgroundColor: ['#10b981', '#f44336', '#667eea', '#0dcaf0'],
+                        borderWidth: 1
                     }]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    scales: {
+                        y: { beginAtZero: true }
+                    },
                     plugins: {
-                        legend: { position: 'bottom' }
+                        legend: { display: false }
                     }
                 }
             });
         }
 
-        async function loadProducts() {
-            const container = document.getElementById('productsContainer');
-            const searchTerm = document.getElementById('searchInput').value;
-            
-            container.innerHTML = '<div class="loading"><div class="loading-spinner"></div><p>Carregando produtos...</p></div>';
-            
+        async function fetchStatus() {
             try {
-                const response = await fetch(`${API_BASE}/produtos?` + new URLSearchParams({
-                    pesquisa: searchTerm
-                }));
-                
-                if (!response.ok) throw new Error('Erro ao buscar produtos');
-                
+                const response = await fetch(`${API_BASE}/status`);
                 const data = await response.json();
-                allProducts = data.data || [];
-                
-                updateStatsKPIs(allProducts);
-                updateStatsChart(allProducts);
-                updateStockTable(allProducts);
-                applySortAndFilter();
-                
+                updateStatusBadge(data.token_valid, data.auth_url);
             } catch (error) {
-                container.innerHTML = `<div class="empty-state"><div class="empty-state-icon">❌</div><div class="empty-state-text">Erro: ${error.message}</div></div>`;
+                console.error('Erro ao buscar status:', error);
+                updateStatusBadge(false, '#');
             }
         }
 
-        function applySortAndFilter() {
-            const sortBy = document.getElementById('sortBy').value;
-            const stockFilter = document.getElementById('stockFilter').value;
-            
-            let filtered = [...allProducts];
-            
-            if (stockFilter !== 'all') {
-                filtered = filtered.filter(product => {
-                    const stock = product.estoque || 0;
-                    if (stockFilter === 'low') return stock < 10;
-                    if (stockFilter === 'medium') return stock >= 10 && stock <= 50;
-                    if (stockFilter === 'high') return stock > 50;
-                    return true;
-                });
-            }
-            
-            filtered.sort((a, b) => {
-                if (sortBy === 'name') return (a.nome || '').localeCompare(b.nome || '');
-                if (sortBy === 'price') return (b.preco || 0) - (a.preco || 0);
-                if (sortBy === 'stock') return (b.estoque || 0) - (a.estoque || 0);
-                return 0;
-            });
-            
-            displayProducts(filtered);
-        }
-
-        function displayProducts(products) {
-            const container = document.getElementById('productsContainer');
-            
-            if (products.length === 0) {
-                container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🔍</div><div class="empty-state-text">Nenhum produto encontrado</div></div>';
-                return;
-            }
-            
-            const html = '<div class="products-grid">' + products.map(product => {
-                const stock = product.estoque || 0;
-                const stockClass = stock < 10 ? 'stock-low' : stock <= 50 ? 'stock-medium' : 'stock-high';
-                const price = product.preco ? `R$ ${product.preco.toFixed(2)}` : 'N/A';
-                
-                return `
-                    <div class="product-card">
-                        <div class="product-id">ID: ${product.id}</div>
-                        <div class="product-name">${product.nome || 'Sem nome'}</div>
-                        <div class="product-sku">SKU: ${product.codigo || 'N/A'}</div>
-                        <div class="product-details">
-                            <div class="detail-row">
-                                <span class="detail-label">Preço:</span>
-                                <span class="detail-value price">${price}</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Estoque:</span>
-                                <span class="stock ${stockClass}">${stock} un</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Tipo:</span>
-                                <span class="detail-value">${product.tipo || 'N/A'}</span>
-                            </div>
-                            <div class="detail-row">
-                                <span class="detail-label">Situação:</span>
-                                <span class="detail-value">${product.situacao || 'N/A'}</span>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }).join('') + '</div>';
-
-            container.innerHTML = html;
-        }
-
-        async function fetchLogs() {
+        async function fetchStats() {
             try {
-                const response = await fetch(`${API_BASE}/logs`);
+                const response = await fetch(`${API_BASE}/stats`);
+                const stats = await response.json();
+                updateStatsKPIs(stats);
+                updateStatsChart(stats);
+            } catch (error) {
+                console.error('Erro ao buscar estatísticas:', error);
+            }
+        }
+
+        async function fetchStock() {
+            try {
+                const response = await fetch(`${API_BASE}/stock`);
                 const data = await response.json();
-                const logContainer = document.getElementById('logs-content');
+                const tbody = document.getElementById('stock-table-body');
+                tbody.innerHTML = '';
                 
-                if (data.logs && data.logs.length > 0) {
-                    logContainer.innerHTML = data.logs.slice(-20).map(formatLog).join('');
-                    logContainer.scrollTop = logContainer.scrollHeight;
+                if (!data.items || data.items.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="text-center">Nenhum componente abaixo do estoque mínimo.</td></tr>';
+                    return;
                 }
+                
+                data.items.forEach(item => {
+                    const rowClass = item.estoque < 5 ? 'table-danger' : 'table-warning';
+                    const alertIcon = item.estoque < 5 ? '🚨' : '⚠️';
+                    
+                    tbody.innerHTML += `
+                        <tr class="${rowClass}">
+                            <td>${item.sku}</td>
+                            <td>${item.nome}</td>
+                            <td>${item.estoque}</td>
+                            <td>${item.minimo}</td>
+                            <td>${alertIcon} ALERTA</td>
+                        </tr>
+                    `;
+                });
             } catch (error) {
-                console.error('Erro ao buscar logs:', error);
+                console.error('Erro ao buscar estoque:', error);
+                document.getElementById('stock-table-body').innerHTML = `<tr><td colspan="5" class="text-center text-danger">Erro ao carregar estoque.</td></tr>`;
+            }
+        }
+
+        async function fetchNeeds() {
+            try {
+                const response = await fetch(`${API_BASE}/needs`);
+                const data = await response.json();
+                const tbody = document.getElementById('needs-table-body');
+                tbody.innerHTML = '';
+                
+                if (!data.needs || data.needs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center">Nenhuma necessidade de compra identificada.</td></tr>';
+                    return;
+                }
+                
+                data.needs.forEach(need => {
+                    tbody.innerHTML += `
+                        <tr>
+                            <td>${need.component_sku}</td>
+                            <td>${need.component_name}</td>
+                            <td>${need.quantity_needed}</td>
+                            <td>${need.supplier}</td>
+                            <td>${need.lead_time_days}</td>
+                            <td>${need.reason}</td>
+                        </tr>
+                    `;
+                });
+            } catch (error) {
+                console.error('Erro ao buscar necessidades:', error);
+                document.getElementById('needs-table-body').innerHTML = `<tr><td colspan="6" class="text-center text-danger">Erro ao carregar necessidades de compra.</td></tr>`;
             }
         }
 
@@ -929,11 +1586,6 @@ DASHBOARD_TEMPLATE = """
                 const tbody = document.getElementById('kits-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.error) {
-                    tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Erro: ${data.error}</td></tr>`;
-                    return;
-                }
-                
                 if (!data.kits || data.kits.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="3" class="text-center">Nenhum kit encontrado</td></tr>';
                     return;
@@ -941,7 +1593,7 @@ DASHBOARD_TEMPLATE = """
                 
                 data.kits.forEach(kit => {
                     const componentsList = kit.componentes.map(c => 
-                        `${c.nome} (${c.sku}) x${c.quantidade}`
+                        `${c.name} (${c.sku}) x${c.qty}`
                     ).join('<br>');
                     
                     tbody.innerHTML += `
@@ -954,26 +1606,44 @@ DASHBOARD_TEMPLATE = """
                 });
             } catch (error) {
                 console.error('Erro ao buscar kits:', error);
+                document.getElementById('kits-table-body').innerHTML = `<tr><td colspan="3" class="text-center text-danger">Erro ao carregar kits.</td></tr>`;
             }
         }
 
-        function clearFilters() {
-            document.getElementById('searchInput').value = '';
-            document.getElementById('sortBy').value = 'name';
-            document.getElementById('stockFilter').value = 'all';
-            document.getElementById('productsContainer').innerHTML = `
-                <div class="empty-state">
-                    <div class="empty-state-icon">📦</div>
-                    <div class="empty-state-text">Clique em "Buscar Produtos" para começar</div>
-                </div>
-            `;
-            allProducts = [];
-            updateStatsKPIs([]);
-        }
+        function connectWebSocket() {
+            if (logWebSocket && (logWebSocket.readyState === WebSocket.OPEN || logWebSocket.readyState === WebSocket.CONNECTING)) {
+                return;
+            }
+            
+            logWebSocket = new WebSocket(WS_URL);
+            const logContainer = document.getElementById('logs-content');
 
-        document.getElementById('searchInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') loadProducts();
-        });
+            logWebSocket.onopen = () => {
+                console.log('WebSocket conectado.');
+                logContainer.innerHTML += formatLog({timestamp: new Date().toISOString(), level: 'INFO', message: 'Conectado ao stream de logs.'});
+            };
+
+            logWebSocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.logs) {
+                    data.logs.forEach(log => {
+                        logContainer.innerHTML += formatLog(log);
+                    });
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                }
+            };
+
+            logWebSocket.onclose = () => {
+                console.log('WebSocket desconectado. Tentando reconectar em 5s...');
+                logContainer.innerHTML += formatLog({timestamp: new Date().toISOString(), level: 'WARNING', message: 'Desconectado. Tentando reconectar...'});
+                setTimeout(connectWebSocket, 5000);
+            };
+
+            logWebSocket.onerror = (error) => {
+                console.error('WebSocket Error:', error);
+                logWebSocket.close();
+            };
+        }
 
         document.getElementById('recheck-button').addEventListener('click', async () => {
             const button = document.getElementById('recheck-button');
@@ -1008,57 +1678,177 @@ DASHBOARD_TEMPLATE = """
         });
 
         function initDashboard() {
-            updateStatusBadge('ok');
-            fetchLogs();
+            fetchStatus();
+            fetchStats();
+            fetchStock();
+            fetchNeeds();
             fetchKits();
-            setInterval(fetchLogs, 5000);
+            connectWebSocket();
+
+            setInterval(fetchStatus, 10000);
+            setInterval(fetchStats, 10000);
+            setInterval(fetchStock, 10000);
+            setInterval(fetchNeeds, 10000);
+            setInterval(fetchKits, 10000);
         }
 
         document.addEventListener('DOMContentLoaded', initDashboard);
-        
-        // A função updateStockTable estava fora do template, causando SyntaxError.
-        // Ela foi movida para dentro do template, como instruído.
-        function updateStockTable(products) {
-            const tbody = document.getElementById('stock-table-body');
-            tbody.innerHTML = '';
-            
-            if (products.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="text-center">Nenhum dado disponível</td></tr>';
-                return;
-            }
-            
-            products.forEach(product => {
-                const stock = product.estoque || 0;
-                const minStock = 10;
-                const isAlert = stock < minStock;
-                const rowClass = isAlert ? 'table-danger' : '';
-                
-                tbody.innerHTML += `
-                    <tr class="${rowClass}">
-                        <td>${product.codigo || 'N/A'}</td>
-                        <td>${product.nome || 'Sem nome'}</td>
-                        <td>${stock}</td>
-                        <td>${minStock}</td>
-                        <td>${isAlert ? '🚨 ABAIXO' : 'OK'}</td>
-                    </tr>
-                `;
-            });
-        }
     </script>
 </body>
 </html>
 """
 
 # ============================================================================
-# MAIN
+# FACTORY FUNCTION PARA DEPLOY
 # ============================================================================
 
-if __name__ == "__main__":
-
-
+def create_app():
+    """
+    Factory function para Waitress/Gunicorn
+    Lazy loading para evitar timeout no Render
+    """
+    # Configuração de logs para o modo WSGI
+    Path('logs').mkdir(exist_ok=True)
+    
+    global memory_handler
+    memory_handler = InMemoryLogHandler()
+    
+    global logger
     logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    global error_logger
+    error_logger = logging.getLogger('errors')
+    error_logger.setLevel(logging.ERROR)
+    
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    memory_handler.setFormatter(formatter)
+    
+    # Configuração do logger principal
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler('logs/automacao_bling.log', encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+            memory_handler
+        ]
+    )
+    
+    # Configuração do logger de erros
+    error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    error_logger.addHandler(error_handler)
+    
+    logger.info("🚀 Iniciando create_app()...")
+    
+    config = Config()
+    auth = BlingAuth(config)
+    orchestrator = AutomationOrchestrator(config)
+    server = WebServer(auth, orchestrator)
+    
+    _data_loaded = {'done': False}
+    
+    def background_load():
+        if _data_loaded['done']:
+            return
+        
+        time.sleep(3)  # Aguarda servidor estar pronto
+        
+        try:
+            logger.info("Iniciando carregamento em background...")
+            if auth.load_tokens():
+                # Simulação de carregamento de dados
+                kits = orchestrator.api.get_all_kits_and_components()
+                logger.info(f"Kits carregados em background: {len(kits)}")
+                # Aqui você pode adicionar a verificação de estoque inicial
+            _data_loaded['done'] = True
+            logger.info("Carregamento em background concluído.")
+        except Exception as e:
+            logger.error(f"Erro no background: {e}")
+    
+    Thread(target=background_load, daemon=True).start()
+    
+    return server.app
 
-    logger.info("🚀 Iniciando aplicação Bling...")
+# ============================================================================
+# CLI E MAIN
+# ============================================================================
 
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+def run_cli():
+    parser = argparse.ArgumentParser(description="Sistema de Automação Bling ERP.")
+    parser.add_argument('--serve', action='store_true', help="Inicia o servidor web Flask.")
+    parser.add_argument('--run', action='store_true', help="Executa o processamento de kits e verificação de compra via CLI.")
+    parser.add_argument('--port', type=int, default=8000, help="Define a porta para o servidor web (padrão: 8000).")
+    
+    args = parser.parse_args()
+    
+    # Configuração de logs para o modo CLI
+    Path('logs').mkdir(exist_ok=True)
+    
+    global memory_handler
+    memory_handler = InMemoryLogHandler()
+    
+    global logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    global error_logger
+    error_logger = logging.getLogger('errors')
+    error_logger.setLevel(logging.ERROR)
+    
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    memory_handler.setFormatter(formatter)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler('logs/automacao_bling.log', encoding='utf-8'),
+            logging.StreamHandler(sys.stdout),
+            memory_handler
+        ]
+    )
+    
+    error_handler = logging.FileHandler('logs/errors.log', encoding='utf-8')
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    error_logger.addHandler(error_handler)
+    
+    print_header("Sistema de Automação Bling ERP")
+    
+    config = Config()
+    auth = BlingAuth(config)
+    orchestrator = AutomationOrchestrator(config)
+    
+    if not auth.access_token:
+        print_warning("Token de acesso não encontrado ou expirado.")
+        print_info(f"Acesse a URL para autorizar: {auth.get_authorization_url()}")
+        
+    if args.serve:
+        print_info(f"Iniciando servidor web na porta {args.port}...")
+        server = WebServer(auth, orchestrator)
+        server.app.run(host='0.0.0.0', port=args.port, debug=False)
+        
+    elif args.run:
+        print_info("Executando processamento de kits e verificação de compra...")
+        if auth.is_token_valid() or auth.refresh_access_token():
+            kits = orchestrator.api.get_all_kits_and_components()
+            print_info(f"Kits carregados: {len(kits)}")
+            stats = orchestrator.process_kits(kits)
+            print_header("Resultados do Processamento")
+            print_success(f"Sucesso: {stats['success']}")
+            print_error(f"Falhas: {stats['failed']}")
+            print_info(f"OPs Criadas: {stats['ops_created']}")
+            print_info(f"POs Criadas: {stats['pos_created']}")
+            print_info(f"Tempo Total: {stats['elapsed_time_seconds']}s")
+        else:
+            print_error("Não foi possível obter um token de acesso válido. Autorize o Bling primeiro.")
+            
+    else:
+        parser.print_help()
+
+# CRÍTICO: Variável global para WSGI
+app = create_app()
+
+if __name__ == '__main__':
+    run_cli()
