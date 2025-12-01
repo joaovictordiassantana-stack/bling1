@@ -1819,7 +1819,7 @@ def run_cli():
     if not auth.access_token:
         print_warning("Token de acesso não encontrado ou expirado.")
         print_info(f"Acesse a URL para autorizar: {auth.get_authorization_url()}")
-           if args.run:
+    if args.run:
         print_info("Executando processamento de kits e verificação de compra...")
         if auth.is_token_valid() or auth.refresh_access_token():
             kits = orchestrator.api.get_all_kits_and_components()
