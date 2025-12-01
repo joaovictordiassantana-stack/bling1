@@ -1781,7 +1781,7 @@ def run_cli():
     parser = argparse.ArgumentParser(description="Sistema de Automação Bling ERP.")
     parser.add_argument('--serve', action='store_true', help="Inicia o servidor web Flask.")
     parser.add_argument('--run', action='store_true', help="Executa o processamento de kits e verificação de compra via CLI.")
-    parser.add_argument('--port', type=int, default=8000, help="Define a porta para o servidor web (padrão: 8000).")
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', 8000)), help="Define a porta para o servidor web (padrão: 8000 ou variável de ambiente PORT).")
     
     args = parser.parse_args()
     
@@ -1826,7 +1826,7 @@ def run_cli():
 # CRÍTICO: Variável global para WSGI
 app = create_app()
 
-if __name__ == '__main__':
+# if __name__ == '__main__':
     # O bloco if __name__ == '__main__': é removido para evitar execução dupla
     # e garantir que o Gunicorn/Render use a variável 'app' diretamente.
     # A lógica de execução CLI/Serve é movida para run_cli() e o Gunicorn
@@ -1834,4 +1834,4 @@ if __name__ == '__main__':
     
     # Se o usuário executar o arquivo diretamente, ele ainda pode usar o CLI
     # para iniciar o servidor de desenvolvimento ou rodar o processamento.
-    run_cli()
+    # run_cli()
