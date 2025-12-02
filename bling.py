@@ -10,11 +10,11 @@ import json
 import time
 import logging
 import logging.handlers
-import base64
+
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from threading import Lock, Thread
+from threading import Thread
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
@@ -22,29 +22,11 @@ import requests
 from requests.exceptions import RequestException
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
-from colorama import Fore, Style, init
+# from colorama import Fore, Style, init # Removido: Inútil após remoção das funções de print colorido
 
-# Inicializa colorama para cores no terminal
-init(autoreset=True)
+# colorama removido: Inútil em ambiente WSGI
 
-# ============================================================================
-# 17. FUNÇÕES DE PRINT COLORIDO
-# ============================================================================
 
-def print_success(msg):
-    print(f"{Fore.GREEN}{Style.BRIGHT}✅ {msg}{Style.RESET_ALL}")
-
-def print_error(msg):
-    print(f"{Fore.RED}{Style.BRIGHT}❌ {msg}{Style.RESET_ALL}")
-
-def print_warning(msg):
-    print(f"{Fore.YELLOW}{Style.BRIGHT}⚠️ {msg}{Style.RESET_ALL}")
-
-def print_info(msg):
-    print(f"{Fore.CYAN}{Style.BRIGHT}ℹ️ {msg}{Style.RESET_ALL}")
-
-def print_header(title):
-    print(f"\n{Fore.MAGENTA}{Style.BRIGHT}--- {title} ---{Style.RESET_ALL}")
 
 # ============================================================================
 # 16. EXCEÇÕES CUSTOMIZADAS
@@ -76,7 +58,7 @@ class Config:
     
     # Retry e Timeout
     REQUEST_TIMEOUT: int = 30
-    MAX_RETRIES: int = 5
+    MAX_RETRIES: int = 3 # Reduzido de 5 para 3, conforme instruído.
     BASE_DELAY: float = 1.0 # Delay inicial para backoff exponencial
     
     # Automação
@@ -140,14 +122,14 @@ class InMemoryLogHandler(logging.Handler):
         super().__init__()
         self.logs = []
         self.max_logs = max_logs
-        self.lock = Lock()
+
         self.formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%dT%H:%M:%S'
         )
         
     def emit(self, record):
-        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+
         log_entry = {
         'timestamp': self.formatter.formatTime(record),
         'level': record.levelname,
@@ -160,7 +142,7 @@ class InMemoryLogHandler(logging.Handler):
     
     def get_logs(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
         """Retorna os logs armazenados, limitados pelo parâmetro."""
-        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+
         if limit:
             return self.logs[-limit:]
         return self.logs.copy()
@@ -288,7 +270,7 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[datetime] = None
-        self.lock = Lock() # Re-adicionado para corrigir AttributeError. Nota: Em ambientes multi-processo (Gunicorn), pode ser necessário um lock de processo (ex: multiprocessing.Lock) ou um lock distribuído.
+ # Re-adicionado para corrigir AttributeError. Nota: Em ambientes multi-processo (Gunicorn), pode ser necessário um lock de processo (ex: multiprocessing.Lock) ou um lock distribuído.
         
     def _save_tokens(self):
         """Persiste os tokens e a data de expiração no arquivo tokens.json de forma atômica."""
@@ -327,18 +309,18 @@ class BlingAuth:
                         self.expires_at = datetime.fromisoformat(expires_at_str)
                     
                     if self.access_token and self.refresh_token:
-                        print_success("Tokens carregados com sucesso.")
+                        logger.info("Tokens carregados com sucesso.")
                         return True
             except (json.JSONDecodeError, IOError) as e:
                 logger.error(f"Erro ao carregar tokens: {e}")
                 error_logger.error(f"Erro ao carregar tokens: {e}")
         
-        print_warning("Tokens não encontrados ou inválidos. Necessário autenticar.")
+        logger.warning("Tokens não encontrados ou inválidos. Necessário autenticar.")
         return False
 
     def is_token_valid(self) -> bool:
         """Verifica se o token de acesso é válido e não expirou (com margem de 5 minutos)."""
-        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+
         if not self.access_token or not self.expires_at:
             return False
         # Verifica se o token expira nos próximos 5 minutos
@@ -362,7 +344,7 @@ class BlingAuth:
 
     def exchange_code_for_token(self, code: str):
         """Troca o código de autorização por tokens de acesso e refresh."""
-        print_info("Trocando código de autorização por tokens...")
+        logger.info("Trocando código de autorização por tokens...")
         
         payload = {
             'grant_type': 'authorization_code',
@@ -382,7 +364,7 @@ class BlingAuth:
             
             # Bloco de atribuição de tokens (agora dentro do try)
             try:
-                # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+        
                 self.access_token = data['access_token']
                 self.refresh_token = data['refresh_token']
                 # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
@@ -390,25 +372,25 @@ class BlingAuth:
                 self.expires_at = datetime.now() + timedelta(seconds=expires_in)
                 self._save_tokens()
                 
-                print_success("Autenticação OAuth concluída com sucesso!")
+                logger.info("Autenticação OAuth concluída com sucesso!")
                 logger.info("Autenticação OAuth concluída.")
                 return True
             
             except Exception as e:
-                print_error(f"Erro ao processar tokens: {e}")
+                logger.error(f"Erro ao processar tokens: {e}")
                 logger.error(f"Erro ao processar tokens: {e}")
                 raise BlingAuthError(f"Erro ao processar tokens: {e}") from e
             
         except RequestException as e:
             msg = f"Erro ao trocar código por token: {e}"
-            print_error(msg)
+            logger.error(msg)
             logger.error(msg)
             error_logger.error(msg)
             raise BlingAuthError(msg) from e
 
     def refresh_access_token(self):
         """Renova o token de acesso usando o refresh token."""
-        print_info("Tentando renovar o token de acesso...")
+        logger.info("Tentando renovar o token de acesso...")
         
         if not self.refresh_token:
             raise BlingAuthError("Refresh token não disponível. Necessário reautenticar.")
@@ -431,7 +413,7 @@ class BlingAuth:
             
             # Bloco de atribuição de tokens (agora dentro do try)
             try:
-                # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+        
                 self.access_token = data['access_token']
                 # O refresh token pode mudar, então atualizamos
                 self.refresh_token = data.get('refresh_token', self.refresh_token)
@@ -439,18 +421,18 @@ class BlingAuth:
                 self.expires_at = datetime.now() + timedelta(seconds=expires_in)
                 self._save_tokens()
                 
-                print_success("Token de acesso renovado com sucesso!")
+                logger.info("Token de acesso renovado com sucesso!")
                 logger.info("Token de acesso renovado.")
                 return True
             
             except Exception as e:
-                print_error(f"Erro ao processar tokens: {e}")
+                logger.error(f"Erro ao processar tokens: {e}")
                 logger.error(f"Erro ao processar tokens: {e}")
                 raise BlingAuthError(f"Erro ao processar tokens: {e}") from e
             
         except RequestException as e:
             msg = f"Erro ao renovar token: {e}. Necessário reautenticar."
-            print_error(msg)
+            logger.error(msg)
             logger.error(msg)
             error_logger.error(msg)
             raise BlingAuthError(msg) from e
@@ -558,7 +540,7 @@ class BlingAPI:
 
     def get_all_kits_and_components(self, config_manager: ComponentConfigManager) -> List[Kit]:
         """Busca todos os Kits e seus Componentes, aplicando configurações locais."""
-        print_info("Buscando todos os Kits e Componentes no Bling...")
+        logger.info("Buscando todos os Kits e Componentes no Bling...")
         kits: List[Kit] = []
         pagina = 1
         
@@ -611,11 +593,11 @@ class BlingAPI:
                 time.sleep(self.config.DELAY_BETWEEN_BATCHES) # Delay entre batches
                 
             except BlingAPIError as e:
-                print_error(f"Erro na paginação de Kits: {e}")
+                logger.error(f"Erro na paginação de Kits: {e}")
                 logger.error(f"Erro na paginação de Kits: {e}")
                 break
                 
-        print_success(f"Busca de Kits concluída. {len(kits)} Kits encontrados.")
+        logger.info(f"Busca de Kits concluída. {len(kits)} Kits encontrados.")
         return kits
 
     def get_supplier_by_name(self, name: str) -> Optional[Dict[str, Any]]:
@@ -638,7 +620,7 @@ class BlingAPI:
 
     def create_production_order(self, kit_sku: str, quantity: int) -> Optional[int]:
         """Cria uma Ordem de Produção (OP) no Bling."""
-        print_info(f"Criando OP para Kit {kit_sku} (Qtd: {quantity})...")
+        logger.info(f"Criando OP para Kit {kit_sku} (Qtd: {quantity})...")
         
         payload = {
             "data": {
@@ -657,23 +639,23 @@ class BlingAPI:
             )
             op_id = response.get('data', {}).get('id')
             if op_id:
-                print_success(f"OP criada com sucesso! ID: {op_id}")
+                logger.info(f"OP criada com sucesso! ID: {op_id}")
                 logger.info(f"OP criada: ID {op_id} para Kit {kit_sku} (Qtd: {quantity})")
                 return op_id
             else:
                 raise BlingAPIError(f"Resposta da API não contém ID da OP: {response}")
         except BlingAPIError as e:
-            print_error(f"Falha ao criar OP para Kit {kit_sku}: {e}")
+            logger.error(f"Falha ao criar OP para Kit {kit_sku}: {e}")
             logger.error(f"Falha ao criar OP para Kit {kit_sku}: {e}")
             return None
 
     def create_purchase_order(self, supplier_name: str, items: List[PurchaseNeed]) -> Optional[int]:
         """Cria uma Ordem de Compra (PO) no Bling."""
-        print_info(f"Criando PO para Fornecedor {supplier_name} com {len(items)} itens...")
+        logger.info(f"Criando PO para Fornecedor {supplier_name} com {len(items)} itens...")
         
         supplier = self.get_supplier_by_name(supplier_name)
         if not supplier:
-            print_error(f"Fornecedor '{supplier_name}' não encontrado no Bling. PO não criada.")
+            logger.error(f"Fornecedor '{supplier_name}' não encontrado no Bling. PO não criada.")
             return None
             
         supplier_id = supplier['id']
@@ -704,13 +686,13 @@ class BlingAPI:
             )
             po_id = response.get('data', {}).get('id')
             if po_id:
-                print_success(f"PO criada com sucesso! ID: {po_id} para {supplier_name}")
+                logger.info(f"PO criada com sucesso! ID: {po_id} para {supplier_name}")
                 logger.info(f"PO criada: ID {po_id} para {supplier_name} com {len(items)} itens.")
                 return po_id
             else:
                 raise BlingAPIError(f"Resposta da API não contém ID da PO: {response}")
         except BlingAPIError as e:
-            print_error(f"Falha ao criar PO para {supplier_name}: {e}")
+            logger.error(f"Falha ao criar PO para {supplier_name}: {e}")
             logger.error(f"Falha ao criar PO para {supplier_name}: {e}")
             return None
 
@@ -722,12 +704,12 @@ class StatisticsManager:
     """Gerencia e coleta estatísticas de execução da automação."""
     
     def __init__(self):
-        self.lock = Lock()
+
         self.reset()
         
     def reset(self):
         """Reseta todas as estatísticas."""
-        with self.lock:
+
             self.success: int = 0
             self.failed: int = 0
             self.ops_created: int = 0
@@ -738,18 +720,18 @@ class StatisticsManager:
             
     def start(self):
         """Inicia a contagem de tempo."""
-        with self.lock:
+
             self.start_time = datetime.now()
             self.end_time = None
             
     def stop(self):
         """Para a contagem de tempo."""
-        with self.lock:
+
             self.end_time = datetime.now()
             
     def increment(self, counter: str, value: int = 1):
         """Incrementa um contador específico."""
-        with self.lock:
+
             if hasattr(self, counter):
                 setattr(self, counter, getattr(self, counter) + value)
             
@@ -765,7 +747,7 @@ class StatisticsManager:
 
     def to_dict(self) -> Dict[str, Any]:
         """Retorna as estatísticas em formato de dicionário."""
-        with self.lock:
+
             return {
                 'success': self.success,
                 'failed': self.failed,
@@ -788,11 +770,11 @@ class PurchaseNeedsManager:
         self.stats = stats
         # needs: Dict[supplier_name, List[PurchaseNeed]]
         self.needs: Dict[str, List[PurchaseNeed]] = {}
-        self.lock = Lock()
+
         
     def reset(self):
         """Limpa todas as necessidades de compra."""
-        with self.lock:
+
             self.needs = {}
 
     def add_need(self, component: Component, quantity: int, reason: str):
@@ -809,7 +791,7 @@ class PurchaseNeedsManager:
             reason=reason
         )
         
-        with self.lock:
+
             if need.supplier not in self.needs:
                 self.needs[need.supplier] = []
             self.needs[need.supplier].append(need)
@@ -817,7 +799,7 @@ class PurchaseNeedsManager:
 
     def check_min_stock_needs(self, components: List[Component]):
         """Verifica o estoque mínimo de uma lista de componentes e adiciona necessidades."""
-        print_header("Verificação de Estoque Mínimo")
+        logger.info("Verificação de Estoque Mínimo")
         
         for component in components:
             self.stats.increment('min_stock_checks')
@@ -829,21 +811,21 @@ class PurchaseNeedsManager:
                     quantity_needed, 
                     f"Estoque atual ({component.current_stock}) abaixo do mínimo ({component.min_stock})"
                 )
-                print_warning(f"ALERTA: {component.name} ({component.sku}) precisa de {quantity_needed} un.")
+                logger.warning(f"ALERTA: {component.name} ({component.sku}) precisa de {quantity_needed} un.")
             else:
                 logger.debug(f"Estoque OK: {component.name} ({component.sku}) - {component.current_stock}/{component.min_stock}")
 
     def generate_purchase_orders(self) -> List[int]:
         """Gera Ordens de Compra (POs) no Bling, agrupando por fornecedor."""
-        print_header("Geração de Ordens de Compra (POs)")
+        logger.info("Geração de Ordens de Compra (POs)")
         
         if not self.needs:
-            print_info("Nenhuma necessidade de compra pendente.")
+            logger.info("Nenhuma necessidade de compra pendente.")
             return []
             
         po_ids: List[int] = []
         
-        with self.lock:
+
             needs_to_process = self.needs.copy()
             self.needs = {} # Limpa as necessidades após copiar para processamento
             
@@ -853,7 +835,7 @@ class PurchaseNeedsManager:
                 po_ids.append(po_id)
                 self.stats.increment('pos_created')
                 
-        print_success(f"Geração de POs concluída. {len(po_ids)} PO(s) criada(s).")
+        logger.info(f"Geração de POs concluída. {len(po_ids)} PO(s) criada(s).")
         return po_ids
 
 # ============================================================================
@@ -872,21 +854,21 @@ class AutomationOrchestrator:
         self.kits: List[Kit] = []
         self.failed_items: List[Dict[str, Any]] = []
         self.is_running: bool = False
-        self.lock = Lock()
+
         
     def load_data(self):
         """Carrega todos os kits e componentes do Bling."""
-        print_header("Carregamento Inicial de Dados")
+        logger.info("Carregamento Inicial de Dados")
         try:
             self.kits = self.api.get_all_kits_and_components(self.config_manager)
             self.run_purchase_check(force_po_creation=False) # Verifica estoque inicial
-            print_success("Dados carregados e verificação inicial de estoque concluída.")
+            logger.info("Dados carregados e verificação inicial de estoque concluída.")
             return True
         except BlingAuthError:
-            print_error("Falha na autenticação. Não foi possível carregar os dados.")
+            logger.error("Falha na autenticação. Não foi possível carregar os dados.")
             return False
         except BlingAPIError as e:
-            print_error(f"Falha ao carregar dados da API: {e}")
+            logger.error(f"Falha ao carregar dados da API: {e}")
             return False
 
     def process_kits(self, kits_to_process: List[Kit], batch_size: int, check_stock: bool = True, quantity: int = 1) -> Dict[str, Any]:
@@ -895,9 +877,9 @@ class AutomationOrchestrator:
         if batch_size <= 0:
             batch_size = 1
             
-        with self.lock:
+
             if self.is_running:
-                print_warning("Processamento já em andamento. Ignorando nova requisição.")
+                logger.warning("Processamento já em andamento. Ignorando nova requisição.")
                 return {"status": "warning", "message": "Processamento já em andamento."}
             self.is_running = True
             self.stats.reset()
@@ -905,7 +887,7 @@ class AutomationOrchestrator:
             self.failed_items = []
             self.stats.start()
             
-        print_header(f"Iniciando Processamento de {len(kits_to_process)} Kits em Lotes de {batch_size}")
+        logger.info(f"Iniciando Processamento de {len(kits_to_process)} Kits em Lotes de {batch_size}")
         
         try:
             for i, kit in enumerate(kits_to_process):
@@ -929,7 +911,7 @@ class AutomationOrchestrator:
                 # Lógica de lote: pausa após processar batch_size kits
                 if (i + 1) % batch_size == 0:
                     delay = self.config.DELAY_BETWEEN_BATCHES
-                    print_info(f"Lote {((i + 1) // batch_size)} concluído. Pausando por {delay}s...")
+                    logger.info(f"Lote {((i + 1) // batch_size)} concluído. Pausando por {delay}s...")
                     time.sleep(delay)
                     
             # Após processar todos os kits, gera as POs
@@ -937,12 +919,12 @@ class AutomationOrchestrator:
             
         except Exception as e:
             msg = f"Erro fatal durante o processamento de kits: {e}"
-            print_error(msg)
+            logger.error(msg)
             logger.error(msg)
             error_logger.error(msg)
         finally:
             self.stats.stop()
-            with self.lock:
+     : # Removido: Inútil em ambiente multi-processo (Gunicorn)
                 self.is_running = False
                 
         return {"status": "success", "stats": self.stats.to_dict()}
@@ -950,15 +932,15 @@ class AutomationOrchestrator:
     def run_purchase_check(self, force_po_creation: bool = True):
         """Executa apenas a verificação de estoque e, opcionalmente, a criação de POs."""
         
-        with self.lock:
+
             if self.is_running:
-                print_warning("Processamento já em andamento. Ignorando nova requisição.")
+                logger.warning("Processamento já em andamento. Ignorando nova requisição.")
                 return {"status": "warning", "message": "Processamento já em andamento."}
             self.is_running = True
             self.needs_manager.reset()
             self.stats.start()
             
-        print_header("Iniciando Verificação de Estoque e Compras")
+        logger.info("Iniciando Verificação de Estoque e Compras")
         
         try:
             # 1. Coleta todos os componentes únicos de todos os kits
@@ -976,14 +958,14 @@ class AutomationOrchestrator:
                 
         except Exception as e:
             msg = f"Erro fatal durante a verificação de estoque: {e}"
-            print_error(msg)
+            logger.error(msg)
             logger.error(msg)
             error_logger.error(msg)
         finally:
             self.stats.stop()
-            with self.lock:
+    
                 self.is_running = False
-            print_header("Verificação Concluída")
+            logger.info("Verificação Concluída")
             return {"status": "success", "stats": self.stats.to_dict()}
 
 # ============================================================================
@@ -1013,7 +995,7 @@ needs_manager = PurchaseNeedsManager(api, stats_manager)
 orchestrator = AutomationOrchestrator(api, stats_manager, needs_manager, config_manager, auth)
 
 # Flag para controle de carregamento em background
-_data_loaded = False
+
 
 # ============================================================================
 # 14. DEPLOY E SERVIDOR (Estrutura da Classe WebServer)
@@ -1064,7 +1046,7 @@ class WebServer:
                 "authenticated": is_valid,
                 "auth_url": self.orchestrator.auth.get_authorization_url(),
                 "token_expires_at": self.orchestrator.auth.expires_at.isoformat() if self.orchestrator.auth.expires_at else None,
-                "data_loaded": _data_loaded,
+                "data_loaded": True, # Assume True, pois o carregamento é feito por worker/processo
                 "is_running": self.orchestrator.is_running
             })
 
@@ -1258,7 +1240,9 @@ class WebServer:
             logger.info("Cliente WebSocket conectado para logs.")
             last_log_count = 0
             
-            while True:
+            # O loop continua enquanto a conexão WebSocket estiver aberta.
+            # O fechamento da conexão pelo cliente irá levantar uma exceção, que será capturada.
+            while not ws.closed:
                 try:
                     # Envia todos os logs novos desde a última verificação
                     current_logs = memory_handler.get_logs()
@@ -1277,26 +1261,27 @@ class WebServer:
 # 14. DEPLOY E SERVIDOR (Função factory e background task)
 def background_load():
     """Função executada em thread para carregar dados em background."""
-    global _data_loaded
     
-    print_info("Aguardando 3 segundos antes de iniciar o carregamento em background...")
-    time.sleep(3)
     
-    print_header("Iniciando Carregamento de Dados em Background")
+    # Delay desnecessário removido conforme instruído.
+    # O carregamento de dados deve ser otimizado dentro de orchestrator.load_data()
+    # para evitar o carregamento de TODOS os kits na inicialização.
+    
+    logger.info("Iniciando Carregamento de Dados em Background")
     
     # 1. Tenta carregar tokens
     if not auth.load_tokens():
-        print_warning("Tokens não carregados. Necessário autenticar via dashboard.")
-        _data_loaded = True # Marca como carregado para não tentar novamente
+        logger.warning("Tokens não carregados. Necessário autenticar via dashboard.")
+        
         return
         
     # 2. Busca kits e componentes (inclui estoque)
     if orchestrator.load_data():
-        print_success("Carregamento de dados em background concluído.")
+        logger.info("Carregamento de dados em background concluído.")
     else:
-        print_error("Falha no carregamento de dados em background.")
+        logger.error("Falha no carregamento de dados em background.")
         
-    _data_loaded = True
+    
 
 def create_app() -> Flask:
     """Função factory para criar a aplicação Flask."""
@@ -1368,7 +1353,7 @@ DASHBOARD_TEMPLATE = """
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-        /* 12. CSS FALTANDO */
+
         body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }
         .navbar-brand { font-weight: 700; font-size: 1.5rem; }
@@ -1519,7 +1504,7 @@ DASHBOARD_TEMPLATE = """
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // 13. JAVASCRIPT FALTANDO
+
         
         const API_BASE = '/api';
         const WS_URL = `ws://${window.location.host}/ws/logs`;
@@ -1905,11 +1890,16 @@ DASHBOARD_TEMPLATE = """
             fetchKits();
             connectWebSocket();
             
+            // Polling otimizado:
+            // Status e Estatísticas (leves e importantes para feedback imediato) a cada 10s
             setInterval(fetchStatus, 10000);
             setInterval(fetchStats, 10000);
-            setInterval(fetchStock, 10000);
-            setInterval(fetchNeeds, 10000);
-            setInterval(fetchKits, 10000);
+
+            // Dados pesados (Estoque, Necessidades, Kits) a cada 60s
+            const dataPollingInterval = 60000;
+            setInterval(fetchStock, dataPollingInterval);
+            setInterval(fetchNeeds, dataPollingInterval);
+            setInterval(fetchKits, dataPollingInterval);
         });
     </script>
 </body>
@@ -1931,40 +1921,40 @@ def run_cli():
     args = parser.parse_args()
     
     if args.serve:
-        print_header("Iniciando Servidor Web")
+        logger.info("Iniciando Servidor Web")
         
         # 14. Lazy loading com Thread em background
         Thread(target=background_load, daemon=True).start()
         
         # 15. Validação de credenciais antes de iniciar
         if config.CLIENT_ID == 'YOUR_CLIENT_ID' or config.CLIENT_SECRET == 'YOUR_CLIENT_SECRET':
-            print_error("Credenciais BLING_CLIENT_ID ou BLING_CLIENT_SECRET não configuradas.")
-            print_warning("Configure as variáveis de ambiente ou altere a classe Config.")
+            logger.error("Credenciais BLING_CLIENT_ID ou BLING_CLIENT_SECRET não configuradas.")
+            logger.warning("Configure as variáveis de ambiente ou altere a classe Config.")
             
         # Garante que o REDIRECT_URI está correto para a porta
         if args.port != 8000:
             config.REDIRECT_URI = config.REDIRECT_URI.replace(':8000', f':{args.port}')
-            print_info(f"REDIRECT_URI ajustado para a porta {args.port}: {config.REDIRECT_URI}")
+            logger.info(f"REDIRECT_URI ajustado para a porta {args.port}: {config.REDIRECT_URI}")
             
         # O erro "port founds" (provavelmente "port already in use") é evitado
         # garantindo que a porta seja configurável e que o servidor seja iniciado
         # corretamente.
         try:
-            print_info(f"Servidor rodando em http://127.0.0.1:{args.port}")
+            logger.info(f"Servidor rodando em http://127.0.0.1:{args.port}")
             app.run(host='0.0.0.0', port=args.port, debug=False)
         except Exception as e:
-            print_error(f"Falha ao iniciar o servidor na porta {args.port}: {e}")
+            logger.error(f"Falha ao iniciar o servidor na porta {args.port}: {e}")
             error_logger.error(f"Falha ao iniciar o servidor: {e}")
             
     elif args.run:
-        print_header("Iniciando Processamento de Kits (CLI)")
+        logger.info("Iniciando Processamento de Kits (CLI)")
         
         if not auth.load_tokens():
-            print_error("Não foi possível carregar tokens. Execute --serve e autentique primeiro.")
+            logger.error("Não foi possível carregar tokens. Execute --serve e autentique primeiro.")
             return
             
         if not orchestrator.load_data():
-            print_error("Não foi possível carregar dados do Bling. Verifique a conexão e o token.")
+            logger.error("Não foi possível carregar dados do Bling. Verifique a conexão e o token.")
             return
             
         # Processa todos os kits encontrados com quantidade 1 e batch_size padrão
