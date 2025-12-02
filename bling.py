@@ -15,7 +15,7 @@ import base64
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from threading import Thread
+from threading import Lock, Thread
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 
@@ -50,6 +50,11 @@ class Config:
     CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', 'YOUR_CLIENT_ID')
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', 'http://localhost:8000/callback')
+    
+    @staticmethod
+    def validate_credentials():
+        if Config.CLIENT_ID == 'YOUR_CLIENT_ID' or Config.CLIENT_SECRET == 'YOUR_CLIENT_SECRET':
+            raise ValueError("As credenciais BLING_CLIENT_ID e BLING_CLIENT_SECRET devem ser configuradas. Verifique as variáveis de ambiente ou a classe Config.")
     
     # API
     BLING_API_URL: str = 'https://www.bling.com.br/Api/v3'
@@ -425,10 +430,12 @@ class BlingAuth:
 class BlingAPI:
     """Cliente robusto para a API do Bling, com retry e renovação de token."""
     
-    def __init__(self, config: Config, auth: BlingAuth):
-        self.config = config
+    def __init__(self, auth: BlingAuth, config: Config):
         self.auth = auth
+        self.config = config
         self.base_url = config.BLING_API_URL
+        self._stock_cache: Dict[int, Dict[str, Any]] = {} # {product_id: {'stock': int, 'expiry': datetime}}
+        self._cache_ttl = timedelta(minutes=5)
         
     def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         """
@@ -507,14 +514,32 @@ class BlingAPI:
             return None
 
     def get_product_stock(self, product_id: int) -> int:
-        """Busca o estoque atual de um produto pelo ID."""
+        """Busca o estoque atual de um produto pelo ID, usando cache com TTL de 5 minutos."""
+        
+        # 1. Verifica o cache
+        if product_id in self._stock_cache:
+            cache_entry = self._stock_cache[product_id]
+            if datetime.now() < cache_entry['expiry']:
+                return cache_entry['stock']
+            # Cache expirado, remove
+            del self._stock_cache[product_id]
+            
+        # 2. Busca na API
         try:
             response = self._request_with_retry(
                 'GET', 
                 f'estoques/produtos/{product_id}'
             )
             # A API retorna o estoque em um formato específico
-            return int(response.get('data', {}).get('estoque', {}).get('estoqueAtual', 0))
+            stock = int(response.get('data', {}).get('estoque', {}).get('estoqueAtual', 0))
+            
+            # 3. Atualiza o cache
+            self._stock_cache[product_id] = {
+                'stock': stock,
+                'expiry': datetime.now() + self._cache_ttl
+            }
+            
+            return stock
         except BlingAPIError as e:
             logger.error(f"Erro ao buscar estoque do produto ID {product_id}: {e}")
             return 0
@@ -524,8 +549,9 @@ class BlingAPI:
         logger.info("Buscando todos os Kits e Componentes no Bling...")
         kits: List[Kit] = []
         pagina = 1
+        MAX_PAGES = 100 # Limite de segurança para evitar loop infinito em caso de bug na API
         
-        while True:
+        while pagina <= MAX_PAGES:
             try:
                 response = self._request_with_retry(
                     'GET', 
@@ -536,6 +562,8 @@ class BlingAPI:
                 data = response.get('data', [])
                 if not data:
                     break # Fim da paginação
+                
+                pagina += 1 # Incrementa a página para a próxima iteração
                 
                 for item in data:
                     product = item.get('produto', {})
@@ -685,12 +713,14 @@ class StatisticsManager:
     """Gerencia e coleta estatísticas de execução da automação."""
     
     def __init__(self):
+        self.lock = Lock()
 
         self.reset()
         
     def reset(self):
         """Reseta todas as estatísticas."""
-        self.success: int = 0
+        with self.lock:
+            self.success: int = 0
             self.failed: int = 0
             self.ops_created: int = 0
             self.pos_created: int = 0
@@ -700,16 +730,19 @@ class StatisticsManager:
             
     def start(self):
         """Inicia a contagem de tempo."""
-        self.start_time = datetime.now()
+        with self.lock:
+            self.start_time = datetime.now()
             self.end_time = None
             
     def stop(self):
         """Para a contagem de tempo."""
-        self.end_time = datetime.now()
+        with self.lock:
+            self.end_time = datetime.now()
             
     def increment(self, counter: str, value: int = 1):
         """Incrementa um contador específico."""
-        if hasattr(self, counter):
+        with self.lock:
+            if hasattr(self, counter):
                 setattr(self, counter, getattr(self, counter) + value)
             
     @property
@@ -724,7 +757,7 @@ class StatisticsManager:
 
     def to_dict(self) -> Dict[str, Any]:
         """Retorna as estatísticas em formato de dicionário."""
-
+        with self.lock:
             return {
                 'success': self.success,
                 'failed': self.failed,
@@ -739,40 +772,39 @@ class StatisticsManager:
 # 6. GESTÃO DE COMPRAS (PO)
 # ============================================================================
 
-class PurchaseNeedsManager:
-    """Gerencia as necessidades de compra de componentes."""
+class NeedsManager:
+    """Gerencia as necessidades de compra e a criação de Ordens de Compra (POs)."""
     
     def __init__(self, api: BlingAPI, stats: StatisticsManager):
         self.api = api
         self.stats = stats
         # needs: Dict[supplier_name, List[PurchaseNeed]]
         self.needs: Dict[str, List[PurchaseNeed]] = {}
-
-        
+        self.lock = Lock()        
     def reset(self):
         """Limpa todas as necessidades de compra."""
-
+        with self.lock:
             self.needs = {}
 
     def add_need(self, component: Component, quantity: int, reason: str):
         """Adiciona uma necessidade de compra."""
-        if quantity <= 0:
-            return
+        with self.lock:
+            if quantity <= 0:
+                return
             
-        need = PurchaseNeed(
-            component_sku=component.sku,
-            component_name=component.name,
-            quantity_needed=quantity,
-            supplier=component.supplier,
-            lead_time_days=component.lead_time_days,
-            reason=reason
-        )
-        
-
-            if need.supplier not in self.needs:
-                self.needs[need.supplier] = []
-            self.needs[need.supplier].append(need)
-            logger.info(f"Necessidade adicionada: {need.component_name} ({need.quantity_needed} un.) para {need.supplier}")
+	        need = PurchaseNeed(
+	            component_sku=component.sku,
+	            component_name=component.name,
+	            quantity_needed=quantity,
+	            supplier=component.supplier,
+	            lead_time_days=component.lead_time_days,
+	            reason=reason
+	        )
+	        
+	        if need.supplier not in self.needs:
+	            self.needs[need.supplier] = []
+	        self.needs[need.supplier].append(need)
+	        logger.info(f"Necessidade adicionada: {need.component_name} ({need.quantity_needed} un.) para {need.supplier}")
 
     def check_min_stock_needs(self, components: List[Component]):
         """Verifica o estoque mínimo de uma lista de componentes e adiciona necessidades."""
@@ -792,25 +824,24 @@ class PurchaseNeedsManager:
             else:
                 logger.debug(f"Estoque OK: {component.name} ({component.sku}) - {component.current_stock}/{component.min_stock}")
 
-    def generate_purchase_orders(self) -> List[int]:
+     def generate_purchase_orders(self) -> List[int]:
         """Gera Ordens de Compra (POs) no Bling, agrupando por fornecedor."""
-        logger.info("Geração de Ordens de Compra (POs)")
-        
-        if not self.needs:
-            logger.info("Nenhuma necessidade de compra pendente.")
-            return []
+        with self.lock:
+            logger.info("Geração de Ordens de Compra (POs)")
             
-        po_ids: List[int] = []
-        
-
+            if not self.needs:
+                logger.info("Nenhuma necessidade de compra pendente.")
+                return []
+            
+            po_ids: List[int] = []
             needs_to_process = self.needs.copy()
             self.needs = {} # Limpa as necessidades após copiar para processamento
             
-        for supplier_name, items in needs_to_process.items():
-            po_id = self.api.create_purchase_order(supplier_name, items)
-            if po_id:
-                po_ids.append(po_id)
-                self.stats.increment('pos_created')
+            for supplier_name, items in needs_to_process.items():
+                po_id = self.api.create_purchase_order(supplier_name, items)
+                if po_id:
+                    po_ids.append(po_id)
+                    self.stats.increment('pos_created')
                 
         logger.info(f"Geração de POs concluída. {len(po_ids)} PO(s) criada(s).")
         return po_ids
@@ -853,16 +884,15 @@ class AutomationOrchestrator:
         
         if batch_size <= 0:
             batch_size = 1
-            
-
-            if self.is_running:
-                logger.warning("Processamento já em andamento. Ignorando nova requisição.")
-                return {"status": "warning", "message": "Processamento já em andamento."}
-            self.is_running = True
-            self.stats.reset()
-            self.needs_manager.reset()
-            self.failed_items = []
-            self.stats.start()
+        if self.is_running:
+            logger.warning("Processamento já em andamento. Ignorando nova requisição.")
+            return {"status": "warning", "message": "Processamento já em andamento."}
+        
+        self.is_running = True
+        self.stats.reset()
+        self.needs_manager.reset()
+        self.failed_items = []
+        self.stats.start()
             
         logger.info(f"Iniciando Processamento de {len(kits_to_process)} Kits em Lotes de {batch_size}")
         
@@ -885,37 +915,38 @@ class AutomationOrchestrator:
                         "reason": "Falha ao criar Ordem de Produção"
                     })
                 
-                # Lógica de lote: pausa após processar batch_size kits
-                if (i + 1) % batch_size == 0:
-                    delay = self.config.DELAY_BETWEEN_BATCHES
-                    logger.info(f"Lote {((i + 1) // batch_size)} concluído. Pausando por {delay}s...")
-                    time.sleep(delay)
+                # Otimização de Rate Limiting: Pausa após cada item para respeitar o limite de requisições.
+                # O delay é distribuído pelo tamanho do lote para evitar sleeps longos e desnecessários.
+                if self.config.DELAY_BETWEEN_BATCHES > 0:
+                    delay_per_item = self.config.DELAY_BETWEEN_BATCHES / batch_size
+                    time.sleep(delay_per_item)
                     
             # Após processar todos os kits, gera as POs
             self.needs_manager.generate_purchase_orders()
             
-        except Exception as e:
-            msg = f"Erro fatal durante o processamento de kits: {e}"
+        except BlingAPIError as e:
+            msg = f"Erro de API durante o processamento de kits: {e}"
             logger.error(msg)
+            error_logger.error(msg)
+        except Exception as e:
+            msg = f"Erro inesperado durante o processamento de kits: {e}"
             logger.error(msg)
             error_logger.error(msg)
         finally:
             self.stats.stop()
-     : # Removido: Inútil em ambiente multi-processo (Gunicorn)
-                self.is_running = False
-                
+            self.is_running = False
+            
         return {"status": "success", "stats": self.stats.to_dict()}
 
     def run_purchase_check(self, force_po_creation: bool = True):
         """Executa apenas a verificação de estoque e, opcionalmente, a criação de POs."""
+        if self.is_running:
+            logger.warning("Processamento já em andamento. Ignorando nova requisição.")
+            return {"status": "warning", "message": "Processamento já em andamento."}
         
-
-            if self.is_running:
-                logger.warning("Processamento já em andamento. Ignorando nova requisição.")
-                return {"status": "warning", "message": "Processamento já em andamento."}
-            self.is_running = True
-            self.needs_manager.reset()
-            self.stats.start()
+        self.is_running = True
+        self.needs_manager.reset()
+        self.stats.start()
             
         logger.info("Iniciando Verificação de Estoque e Compras")
         
@@ -933,17 +964,20 @@ class AutomationOrchestrator:
             if force_po_creation:
                 self.needs_manager.generate_purchase_orders()
                 
-        except Exception as e:
-            msg = f"Erro fatal durante a verificação de estoque: {e}"
+        except BlingAPIError as e:
+            msg = f"Erro de API durante a verificação de estoque: {e}"
             logger.error(msg)
+            error_logger.error(msg)
+        except Exception as e:
+            msg = f"Erro inesperado durante a verificação de estoque: {e}"
             logger.error(msg)
             error_logger.error(msg)
         finally:
             self.stats.stop()
-    
-                self.is_running = False
-            logger.info("Verificação Concluída")
-            return {"status": "success", "stats": self.stats.to_dict()}
+            self.is_running = False
+            
+        logger.info("Verificação Concluída")
+        return {"status": "success", "stats": self.stats.to_dict()}
 
 # ============================================================================
 # INSTÂNCIAS GLOBAIS
@@ -971,7 +1005,7 @@ needs_manager = PurchaseNeedsManager(api, stats_manager)
 # 7. ORQUESTRADOR DE AUTOMAÇÃO (Instância)
 orchestrator = AutomationOrchestrator(api, stats_manager, needs_manager, config_manager, auth)
 
-# Flag para controle de carregamento em background
+
 
 
 # ============================================================================
@@ -1239,7 +1273,6 @@ class WebServer:
 def background_load():
     """Função executada em thread para carregar dados em background."""
     
-    
     # Delay desnecessário removido conforme instruído.
     # O carregamento de dados deve ser otimizado dentro de orchestrator.load_data()
     # para evitar o carregamento de TODOS os kits na inicialização.
@@ -1249,12 +1282,11 @@ def background_load():
     # 1. Tenta carregar tokens
     if not auth.load_tokens():
         logger.warning("Tokens não carregados. Necessário autenticar via dashboard.")
-        
         return
         
     # 2. Busca kits e componentes (inclui estoque)
     if orchestrator.load_data():
-        logger.info("Carregamento de dados em background concluído.")
+        logger.info("Carregamento de dados em background concluído com sucesso.")
     else:
         logger.error("Falha no carregamento de dados em background.")
         
