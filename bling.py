@@ -148,22 +148,22 @@ class InMemoryLogHandler(logging.Handler):
         
     def emit(self, record):
         # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
-            log_entry = {
-                'timestamp': self.formatter.formatTime(record),
-                'level': record.levelname,
-                'message': self.format(record),
-                'name': record.name
-            }
-            self.logs.append(log_entry)
-            if len(self.logs) > self.max_logs:
-                self.logs.pop(0)
+        log_entry = {
+        'timestamp': self.formatter.formatTime(record),
+        'level': record.levelname,
+        'message': self.format(record),
+        'name': record.name
+        }
+        self.logs.append(log_entry)
+        if len(self.logs) > self.max_logs:
+            self.logs.pop(0)
     
     def get_logs(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
         """Retorna os logs armazenados, limitados pelo parâmetro."""
         # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
-            if limit:
-                return self.logs[-limit:]
-            return self.logs.copy()
+        if limit:
+            return self.logs[-limit:]
+        return self.logs.copy()
 
 # Configuração inicial de logs
 def setup_logging():
