@@ -10,6 +10,7 @@ import json
 import time
 import logging
 import logging.handlers
+import base64
 
 import argparse
 from pathlib import Path
@@ -22,9 +23,7 @@ import requests
 from requests.exceptions import RequestException
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
-# from colorama import Fore, Style, init # Removido: Inútil após remoção das funções de print colorido
 
-# colorama removido: Inútil em ambiente WSGI
 
 
 
@@ -362,24 +361,15 @@ class BlingAuth:
             response.raise_for_status()
             data = response.json()
             
-            # Bloco de atribuição de tokens (agora dentro do try)
-            try:
-        
-                self.access_token = data['access_token']
-                self.refresh_token = data['refresh_token']
-                # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
-                expires_in = data.get('expires_in', 3600)
-                self.expires_at = datetime.now() + timedelta(seconds=expires_in)
-                self._save_tokens()
-                
-                logger.info("Autenticação OAuth concluída com sucesso!")
-                logger.info("Autenticação OAuth concluída.")
-                return True
+            self.access_token = data['access_token']
+            self.refresh_token = data['refresh_token']
+            # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
+            expires_in = data.get('expires_in', 3600)
+            self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+            self._save_tokens()
             
-            except Exception as e:
-                logger.error(f"Erro ao processar tokens: {e}")
-                logger.error(f"Erro ao processar tokens: {e}")
-                raise BlingAuthError(f"Erro ao processar tokens: {e}") from e
+            logger.info("Autenticação OAuth concluída com sucesso!")
+            return True
             
         except RequestException as e:
             msg = f"Erro ao trocar código por token: {e}"
@@ -411,24 +401,15 @@ class BlingAuth:
             response.raise_for_status()
             data = response.json()
             
-            # Bloco de atribuição de tokens (agora dentro do try)
-            try:
-        
-                self.access_token = data['access_token']
-                # O refresh token pode mudar, então atualizamos
-                self.refresh_token = data.get('refresh_token', self.refresh_token)
-                expires_in = data.get('expires_in', 3600)
-                self.expires_at = datetime.now() + timedelta(seconds=expires_in)
-                self._save_tokens()
-                
-                logger.info("Token de acesso renovado com sucesso!")
-                logger.info("Token de acesso renovado.")
-                return True
+            self.access_token = data['access_token']
+            # O refresh token pode mudar, então atualizamos
+            self.refresh_token = data.get('refresh_token', self.refresh_token)
+            expires_in = data.get('expires_in', 3600)
+            self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+            self._save_tokens()
             
-            except Exception as e:
-                logger.error(f"Erro ao processar tokens: {e}")
-                logger.error(f"Erro ao processar tokens: {e}")
-                raise BlingAuthError(f"Erro ao processar tokens: {e}") from e
+            logger.info("Token de acesso renovado com sucesso!")
+            return True
             
         except RequestException as e:
             msg = f"Erro ao renovar token: {e}. Necessário reautenticar."
@@ -709,8 +690,7 @@ class StatisticsManager:
         
     def reset(self):
         """Reseta todas as estatísticas."""
-
-            self.success: int = 0
+        self.success: int = 0
             self.failed: int = 0
             self.ops_created: int = 0
             self.pos_created: int = 0
@@ -720,19 +700,16 @@ class StatisticsManager:
             
     def start(self):
         """Inicia a contagem de tempo."""
-
-            self.start_time = datetime.now()
+        self.start_time = datetime.now()
             self.end_time = None
             
     def stop(self):
         """Para a contagem de tempo."""
-
-            self.end_time = datetime.now()
+        self.end_time = datetime.now()
             
     def increment(self, counter: str, value: int = 1):
         """Incrementa um contador específico."""
-
-            if hasattr(self, counter):
+        if hasattr(self, counter):
                 setattr(self, counter, getattr(self, counter) + value)
             
     @property
