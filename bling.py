@@ -288,46 +288,53 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[datetime] = None
-        self.lock = Lock()
+        # self.lock = Lock() # Removido, pois locks de thread não funcionam entre workers do Gunicorn
         
     def _save_tokens(self):
-        """Persiste os tokens e a data de expiração no arquivo tokens.json."""
-        with self.lock:
-            data = {
-                'access_token': self.access_token,
-                'refresh_token': self.refresh_token,
-                'expires_at': self.expires_at.isoformat() if self.expires_at else None
-            }
-            try:
-                with open(self.config.TOKENS_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2)
-                logger.info("Tokens salvos com sucesso.")
-            except IOError as e:
-                logger.error(f"Erro ao salvar tokens: {e}")
-                error_logger.error(f"Erro ao salvar tokens: {e}")
+        """Persiste os tokens e a data de expiração no arquivo tokens.json de forma atômica."""
+        # Remove o lock de thread, pois não funciona entre processos (workers do Gunicorn).
+        # A escrita é feita para um arquivo temporário e depois renomeada para garantir atomicidade.
+        data = {
+            'access_token': self.access_token,
+            'refresh_token': self.refresh_token,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None
+        }
+        
+        temp_file = self.config.TOKENS_FILE.with_suffix('.tmp')
+        
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            
+            # Renomeia o arquivo temporário para o arquivo final (operação atômica)
+            temp_file.rename(self.config.TOKENS_FILE)
+            logger.info("Tokens salvos com sucesso.")
+        except IOError as e:
+            logger.error(f"Erro ao salvar tokens: {e}")
+            error_logger.error(f"Erro ao salvar tokens: {e}")
 
     def load_tokens(self) -> bool:
         """Carrega os tokens do arquivo tokens.json."""
-        with self.lock:
-            if self.config.TOKENS_FILE.exists():
-                try:
-                    with open(self.config.TOKENS_FILE, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        self.access_token = data.get('access_token')
-                        self.refresh_token = data.get('refresh_token')
-                        expires_at_str = data.get('expires_at')
-                        if expires_at_str:
-                            self.expires_at = datetime.fromisoformat(expires_at_str)
-                        
-                        if self.access_token and self.refresh_token:
-                            print_success("Tokens carregados com sucesso.")
-                            return True
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.error(f"Erro ao carregar tokens: {e}")
-                    error_logger.error(f"Erro ao carregar tokens: {e}")
-            
-            print_warning("Tokens não encontrados ou inválidos. Necessário autenticar.")
-            return False
+        # Remove o lock de thread, pois não funciona entre processos (workers do Gunicorn).
+        if self.config.TOKENS_FILE.exists():
+            try:
+                with open(self.config.TOKENS_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.access_token = data.get('access_token')
+                    self.refresh_token = data.get('refresh_token')
+                    expires_at_str = data.get('expires_at')
+                    if expires_at_str:
+                        self.expires_at = datetime.fromisoformat(expires_at_str)
+                    
+                    if self.access_token and self.refresh_token:
+                        print_success("Tokens carregados com sucesso.")
+                        return True
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Erro ao carregar tokens: {e}")
+                error_logger.error(f"Erro ao carregar tokens: {e}")
+        
+        print_warning("Tokens não encontrados ou inválidos. Necessário autenticar.")
+        return False
 
     def is_token_valid(self) -> bool:
         """Verifica se o token de acesso é válido e não expirou (com margem de 5 minutos)."""
@@ -866,9 +873,12 @@ class AutomationOrchestrator:
             print_error(f"Falha ao carregar dados da API: {e}")
             return False
 
-    def process_kits(self, kits_to_process: List[Kit], quantity: int = 1, check_stock: bool = True) -> Dict[str, Any]:
-        """Processa uma lista de kits: cria OPs e verifica estoque de componentes."""
+    def process_kits(self, kits_to_process: List[Kit], batch_size: int, check_stock: bool = True, quantity: int = 1) -> Dict[str, Any]:
+        """Processa uma lista de kits: cria OPs e verifica estoque de componentes. Implementa processamento em lotes."""
         
+        if batch_size <= 0:
+            batch_size = 1
+            
         with self.lock:
             if self.is_running:
                 print_warning("Processamento já em andamento. Ignorando nova requisição.")
@@ -879,10 +889,10 @@ class AutomationOrchestrator:
             self.failed_items = []
             self.stats.start()
             
-        print_header(f"Iniciando Processamento de {len(kits_to_process)} Kits")
+        print_header(f"Iniciando Processamento de {len(kits_to_process)} Kits em Lotes de {batch_size}")
         
         try:
-            for kit in kits_to_process:
+            for i, kit in enumerate(kits_to_process):
                 op_id = self.api.create_production_order(kit.sku, quantity)
                 
                 if op_id:
@@ -899,9 +909,13 @@ class AutomationOrchestrator:
                         "name": kit.name,
                         "reason": "Falha ao criar Ordem de Produção"
                     })
-                    
-                time.sleep(self.config_manager.config.get('DELAY_BETWEEN_BATCHES', 0.5))
                 
+                # Lógica de lote: pausa após processar batch_size kits
+                if (i + 1) % batch_size == 0:
+                    delay = self.config.DELAY_BETWEEN_BATCHES
+                    print_info(f"Lote {((i + 1) // batch_size)} concluído. Pausando por {delay}s...")
+                    time.sleep(delay)
+                    
             # Após processar todos os kits, gera as POs
             self.needs_manager.generate_purchase_orders()
             
@@ -1167,6 +1181,7 @@ class WebServer:
             data = request.get_json(silent=True) or {}
             sku_list = data.get('skus', [])
             quantity = data.get('quantity', 1)
+            batch_size = data.get('batch_size', self.orchestrator.config.DEFAULT_BATCH_SIZE)
             
             kits_to_process = [k for k in self.orchestrator.kits if k.sku in sku_list]
             
@@ -1174,7 +1189,7 @@ class WebServer:
                 return jsonify({"status": "error", "message": "Nenhum kit encontrado com os SKUs fornecidos."}), 404
             
             # Executa o processamento em uma thread
-            Thread(target=self.orchestrator.process_kits, args=(kits_to_process, quantity, True), daemon=True).start()
+            Thread(target=self.orchestrator.process_kits, args=(kits_to_process, batch_size, True, quantity), daemon=True).start()
             
             return jsonify({"status": "ok", "message": f"Processamento de {len(kits_to_process)} kits iniciado em background."})
 
@@ -1936,8 +1951,13 @@ def run_cli():
             print_error("Não foi possível carregar dados do Bling. Verifique a conexão e o token.")
             return
             
-        # Simplesmente processa todos os kits encontrados com quantidade 1
-        orchestrator.process_kits(orchestrator.kits, quantity=1, check_stock=True)
+        # Processa todos os kits encontrados com quantidade 1 e batch_size padrão
+        orchestrator.process_kits(
+            orchestrator.kits, 
+            batch_size=config.DEFAULT_BATCH_SIZE, 
+            check_stock=True, 
+            quantity=1
+        )
         
     else:
         parser.print_help()
