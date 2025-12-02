@@ -380,17 +380,24 @@ class BlingAuth:
             response.raise_for_status()
             data = response.json()
             
-            # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
-        self.access_token = data['access_token']
-        self.refresh_token = data['refresh_token']
-        # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
-        expires_in = data.get('expires_in', 3600)
-        self.expires_at = datetime.now() + timedelta(seconds=expires_in)
-        self._save_tokens()
+            # Bloco de atribuição de tokens (agora dentro do try)
+            try:
+                # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+                self.access_token = data['access_token']
+                self.refresh_token = data['refresh_token']
+                # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
+                expires_in = data.get('expires_in', 3600)
+                self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+                self._save_tokens()
+                
+                print_success("Autenticação OAuth concluída com sucesso!")
+                logger.info("Autenticação OAuth concluída.")
+                return True
             
-            print_success("Autenticação OAuth concluída com sucesso!")
-            logger.info("Autenticação OAuth concluída.")
-            return True
+            except Exception as e:
+                print_error(f"Erro ao processar tokens: {e}")
+                logger.error(f"Erro ao processar tokens: {e}")
+                raise BlingAuthError(f"Erro ao processar tokens: {e}") from e
             
         except RequestException as e:
             msg = f"Erro ao trocar código por token: {e}"
@@ -422,17 +429,24 @@ class BlingAuth:
             response.raise_for_status()
             data = response.json()
             
-            # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
-        self.access_token = data['access_token']
-        # O refresh token pode mudar, então atualizamos
-        self.refresh_token = data.get('refresh_token', self.refresh_token)
-        expires_in = data.get('expires_in', 3600)
-        self.expires_at = datetime.now() + timedelta(seconds=expires_in)
-        self._save_tokens()
+            # Bloco de atribuição de tokens (agora dentro do try)
+            try:
+                # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+                self.access_token = data['access_token']
+                # O refresh token pode mudar, então atualizamos
+                self.refresh_token = data.get('refresh_token', self.refresh_token)
+                expires_in = data.get('expires_in', 3600)
+                self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+                self._save_tokens()
+                
+                print_success("Token de acesso renovado com sucesso!")
+                logger.info("Token de acesso renovado.")
+                return True
             
-            print_success("Token de acesso renovado com sucesso!")
-            logger.info("Token de acesso renovado.")
-            return True
+            except Exception as e:
+                print_error(f"Erro ao processar tokens: {e}")
+                logger.error(f"Erro ao processar tokens: {e}")
+                raise BlingAuthError(f"Erro ao processar tokens: {e}") from e
             
         except RequestException as e:
             msg = f"Erro ao renovar token: {e}. Necessário reautenticar."
@@ -778,7 +792,7 @@ class PurchaseNeedsManager:
         
     def reset(self):
         """Limpa todas as necessidades de compra."""
-        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
+        with self.lock:
             self.needs = {}
 
     def add_need(self, component: Component, quantity: int, reason: str):
@@ -931,7 +945,7 @@ class AutomationOrchestrator:
             with self.lock:
                 self.is_running = False
                 
-        return self.stats.to_dict()                   return {"status": "success", "stats": self.stats.to_dict()}
+        return {"status": "success", "stats": self.stats.to_dict()}
 
     def run_purchase_check(self, force_po_creation: bool = True):
         """Executa apenas a verificação de estoque e, opcionalmente, a criação de POs."""
