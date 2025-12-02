@@ -791,20 +791,20 @@ class NeedsManager:
         with self.lock:
             if quantity <= 0:
                 return
+                
+            need = PurchaseNeed(
+                component_sku=component.sku,
+                component_name=component.name,
+                quantity_needed=quantity,
+                supplier=component.supplier,
+                lead_time_days=component.lead_time_days,
+                reason=reason
+            )
             
-	        need = PurchaseNeed(
-	            component_sku=component.sku,
-	            component_name=component.name,
-	            quantity_needed=quantity,
-	            supplier=component.supplier,
-	            lead_time_days=component.lead_time_days,
-	            reason=reason
-	        )
-	        
-	        if need.supplier not in self.needs:
-	            self.needs[need.supplier] = []
-	        self.needs[need.supplier].append(need)
-	        logger.info(f"Necessidade adicionada: {need.component_name} ({need.quantity_needed} un.) para {need.supplier}")
+            if need.supplier not in self.needs:
+                self.needs[need.supplier] = []
+            self.needs[need.supplier].append(need)
+            logger.info(f"Necessidade adicionada: {need.component_name} ({need.quantity_needed} un.) para {need.supplier}")
 
     def check_min_stock_needs(self, components: List[Component]):
         """Verifica o estoque mínimo de uma lista de componentes e adiciona necessidades."""
