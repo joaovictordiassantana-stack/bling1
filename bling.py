@@ -147,7 +147,7 @@ class InMemoryLogHandler(logging.Handler):
         )
         
     def emit(self, record):
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             log_entry = {
                 'timestamp': self.formatter.formatTime(record),
                 'level': record.levelname,
@@ -160,7 +160,7 @@ class InMemoryLogHandler(logging.Handler):
     
     def get_logs(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
         """Retorna os logs armazenados, limitados pelo parâmetro."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             if limit:
                 return self.logs[-limit:]
             return self.logs.copy()
@@ -288,7 +288,7 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[datetime] = None
-        # self.lock = Lock() # Removido, pois locks de thread não funcionam entre workers do Gunicorn
+        self.lock = Lock() # Re-adicionado para corrigir AttributeError. Nota: Em ambientes multi-processo (Gunicorn), pode ser necessário um lock de processo (ex: multiprocessing.Lock) ou um lock distribuído.
         
     def _save_tokens(self):
         """Persiste os tokens e a data de expiração no arquivo tokens.json de forma atômica."""
@@ -338,7 +338,7 @@ class BlingAuth:
 
     def is_token_valid(self) -> bool:
         """Verifica se o token de acesso é válido e não expirou (com margem de 5 minutos)."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             if not self.access_token or not self.expires_at:
                 return False
             # Verifica se o token expira nos próximos 5 minutos
@@ -366,7 +366,8 @@ class BlingAuth:
         
         payload = {
             'grant_type': 'authorization_code',
-            'code': code
+            'code': code,
+            'redirect_uri': self.config.REDIRECT_URI # O Bling V3 exige o redirect_uri no payload
         }
         
         try:
@@ -379,7 +380,7 @@ class BlingAuth:
             response.raise_for_status()
             data = response.json()
             
-            with self.lock:
+            # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
                 self.access_token = data['access_token']
                 self.refresh_token = data['refresh_token']
                 # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
@@ -407,7 +408,8 @@ class BlingAuth:
             
         payload = {
             'grant_type': 'refresh_token',
-            'refresh_token': self.refresh_token
+            'refresh_token': self.refresh_token,
+            'redirect_uri': self.config.REDIRECT_URI # O Bling V3 exige o redirect_uri no payload
         }
         
         try:
@@ -420,7 +422,7 @@ class BlingAuth:
             response.raise_for_status()
             data = response.json()
             
-            with self.lock:
+            # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
                 self.access_token = data['access_token']
                 # O refresh token pode mudar, então atualizamos
                 self.refresh_token = data.get('refresh_token', self.refresh_token)
@@ -711,7 +713,7 @@ class StatisticsManager:
         
     def reset(self):
         """Reseta todas as estatísticas."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             self.success: int = 0
             self.failed: int = 0
             self.ops_created: int = 0
@@ -722,18 +724,18 @@ class StatisticsManager:
             
     def start(self):
         """Inicia a contagem de tempo."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             self.start_time = datetime.now()
             self.end_time = None
             
     def stop(self):
         """Para a contagem de tempo."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             self.end_time = datetime.now()
             
     def increment(self, counter: str, value: int = 1):
         """Incrementa um contador específico."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             if hasattr(self, counter):
                 setattr(self, counter, getattr(self, counter) + value)
             
@@ -749,7 +751,7 @@ class StatisticsManager:
 
     def to_dict(self) -> Dict[str, Any]:
         """Retorna as estatísticas em formato de dicionário."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             return {
                 'success': self.success,
                 'failed': self.failed,
@@ -776,7 +778,7 @@ class PurchaseNeedsManager:
         
     def reset(self):
         """Limpa todas as necessidades de compra."""
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             self.needs = {}
 
     def add_need(self, component: Component, quantity: int, reason: str):
@@ -793,7 +795,7 @@ class PurchaseNeedsManager:
             reason=reason
         )
         
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             if need.supplier not in self.needs:
                 self.needs[need.supplier] = []
             self.needs[need.supplier].append(need)
@@ -827,7 +829,7 @@ class PurchaseNeedsManager:
             
         po_ids: List[int] = []
         
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             needs_to_process = self.needs.copy()
             self.needs = {} # Limpa as necessidades após copiar para processamento
             
@@ -879,7 +881,7 @@ class AutomationOrchestrator:
         if batch_size <= 0:
             batch_size = 1
             
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             if self.is_running:
                 print_warning("Processamento já em andamento. Ignorando nova requisição.")
                 return {"status": "warning", "message": "Processamento já em andamento."}
@@ -926,7 +928,7 @@ class AutomationOrchestrator:
             error_logger.error(msg)
         finally:
             self.stats.stop()
-            with self.lock:
+            # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
                 self.is_running = False
             print_header("Processamento Concluído")
             return {"status": "success", "stats": self.stats.to_dict()}
@@ -934,7 +936,7 @@ class AutomationOrchestrator:
     def run_purchase_check(self, force_po_creation: bool = True):
         """Executa apenas a verificação de estoque e, opcionalmente, a criação de POs."""
         
-        with self.lock:
+        # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
             if self.is_running:
                 print_warning("Processamento já em andamento. Ignorando nova requisição.")
                 return {"status": "warning", "message": "Processamento já em andamento."}
@@ -965,7 +967,7 @@ class AutomationOrchestrator:
             error_logger.error(msg)
         finally:
             self.stats.stop()
-            with self.lock:
+            # with self.lock: # Removido: Lock de thread não é adequado para ambientes multi-processo (Gunicorn)
                 self.is_running = False
             print_header("Verificação Concluída")
             return {"status": "success", "stats": self.stats.to_dict()}
