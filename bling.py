@@ -1949,4 +1949,4 @@ if __name__ == '__main__':
     # O código base já tinha a estrutura de logs em memória, agora está completa.
     # O código base tinha rotas simples, agora estão completas e na classe WebServer.
     
-    run_cli()
+    run_cli() 
