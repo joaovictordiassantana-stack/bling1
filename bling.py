@@ -733,11 +733,12 @@ class StatisticsManager:
     @property
     def elapsed_time_seconds(self) -> float:
         """Calcula o tempo decorrido em segundos."""
-        with self.lock:
-            if self.start_time:
-                end = self.end_time if self.end_time else datetime.now()
-                return (end - self.start_time).total_seconds()
-            return 0.0
+        # Não precisa de lock aqui, pois é uma propriedade que só lê
+        # e é chamada dentro de to_dict, que já tem o lock.
+        if self.start_time:
+            end = self.end_time if self.end_time else datetime.now()
+            return (end - self.start_time).total_seconds()
+        return 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         """Retorna as estatísticas em formato de dicionário."""
@@ -1949,4 +1950,4 @@ if __name__ == '__main__':
     # O código base já tinha a estrutura de logs em memória, agora está completa.
     # O código base tinha rotas simples, agora estão completas e na classe WebServer.
     
-    run_cli() 
+    run_cli()
