@@ -1116,14 +1116,163 @@ orchestrator = AutomationOrchestrator(api, stats_manager, needs_manager, config_
 
 # ============================================================================
 # 14. DEPLOY E SERVIDOR (Estrutura da Classe WebServer)
-# ============================================================================
+
+# PARTE 4 — TEMPLATE HTML DO FRONT-END (INTERFACE DO USUÁRIO)
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Consulta de Produto Bling</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .container { max-width: 800px; margin-top: 50px; }
+        .product-card { border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
+        .product-image { max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }
+        .product-detail { margin-bottom: 5px; }
+        .product-detail strong { display: inline-block; width: 120px; }
+        #descricao { border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mb-4 text-center">Consulta de Produto Bling</h1>
+        
+        <div class="input-group mb-3">
+            <input type="text" class="form-control" id="skuInput" placeholder="Digite o SKU do produto" aria-label="SKU do produto">
+            <button class="btn btn-primary" type="button" id="searchButton">Buscar</button>
+        </div>
+
+        <div id="loading" class="alert alert-info hidden" role="alert">
+            Buscando produto...
+        </div>
+
+        <div id="errorAlert" class="alert alert-danger hidden" role="alert">
+            Produto não encontrado. Verifique o SKU.
+        </div>
+
+        <div id="productDetails" class="product-card hidden">
+            <div class="row">
+                <div class="col-md-4 text-center">
+                    <img id="imgProduto" src="/placeholder.png" alt="Imagem do Produto" class="product-image">
+                </div>
+                <div class="col-md-8">
+                    <h2 id="nome" class="mb-3"></h2>
+                    <div class="product-detail"><strong>Código:</strong> <span id="codigo"></span></div>
+                    <div class="product-detail"><strong>Tipo:</strong> <span id="tipo"></span></div>
+                    <div class="product-detail"><strong>Situação:</strong> <span id="situacao"></span></div>
+                    <div class="product-detail"><strong>Formato:</strong> <span id="formato"></span></div>
+                    <div class="product-detail"><strong>Preço:</strong> <span id="preco"></span></div>
+                    <div class="product-detail"><strong>Preço Custo:</strong> <span id="precoCusto"></span></div>
+                    <div class="product-detail"><strong>Estoque:</strong> <span id="estoque"></span></div>
+                </div>
+            </div>
+            <div id="descricao">
+                <h4>Descrição</h4>
+                <!-- A descrição será inserida aqui com innerHTML -->
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('searchButton').addEventListener('click', buscarProduto);
+        document.getElementById('skuInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                buscarProduto();
+            }
+        });
+
+        function showElement(id) { document.getElementById(id).classList.remove('hidden'); }
+        function hideElement(id) { document.getElementById(id).classList.add('hidden'); }
+
+        function exibirErro(mensagem) {
+            hideElement('productDetails');
+            showElement('errorAlert');
+            document.getElementById('errorAlert').innerText = mensagem;
+        }
+
+        function limparDetalhes() {
+            hideElement('productDetails');
+            hideElement('errorAlert');
+            document.getElementById('nome').innerText = '';
+            document.getElementById('codigo').innerText = '';
+            document.getElementById('tipo').innerText = '';
+            document.getElementById('situacao').innerText = '';
+            document.getElementById('formato').innerText = '';
+            document.getElementById('preco').innerText = '';
+            document.getElementById('precoCusto').innerText = '';
+            document.getElementById('estoque').innerText = '';
+            document.getElementById('descricao').innerHTML = '<h4>Descrição</h4>';
+            document.getElementById('imgProduto').src = '/placeholder.png';
+        }
+
+        async function buscarProduto() {
+            const sku = document.getElementById('skuInput').value.trim();
+            if (!sku) {
+                exibirErro("Por favor, digite um SKU.");
+                return;
+            }
+
+            limparDetalhes();
+            showElement('loading');
+
+            try {
+                const response = await fetch(`/api/produtos?sku=${sku}`);
+                const data = await response.json();
+                
+                // ✅ 1. Ajustar o fetch da API: Ler sempre json.data[0] e armazenar como const p.
+                const p = data.data?.[0]; 
+
+                hideElement('loading');
+
+                // ✅ 5. Ajustar verificação se o produto existe
+                if (!p) {
+                    exibirErro("Produto não encontrado. Verifique o SKU.");
+                    return;
+                }
+
+                // ✅ 2. Atualizar os campos que aparecem na interface (com fallback)
+                document.getElementById("nome").innerText = p.nome || "Sem nome";
+                document.getElementById("codigo").innerText = p.codigo || "N/D";
+                document.getElementById("tipo").innerText = p.tipo || "N/D";
+                document.getElementById("situacao").innerText = p.situacao || "N/D";
+                document.getElementById("formato").innerText = p.formato || "N/D";
+                
+                // Formatação de preço simples (pode ser melhorada com Intl.NumberFormat)
+                document.getElementById("preco").innerText = p.preco ? `R$ ${parseFloat(p.preco).toFixed(2).replace('.', ',')}` : "N/D";
+                document.getElementById("precoCusto").innerText = p.precoCusto ? `R$ ${parseFloat(p.precoCusto).toFixed(2).replace('.', ',')}` : "N/D";
+                
+                // ✅ Estoque em p.estoque.saldoVirtualTotal (com fallback)
+                document.getElementById("estoque").innerText = p.estoque?.saldoVirtualTotal ?? "0";
+
+                // ✅ 4. Ajustar descrição (ela é HTML) - Usar innerHTML
+                document.getElementById("descricao").innerHTML = `<h4>Descrição</h4>${p.descricaoCurta || "Sem descrição."}`;
+
+                // ✅ 3. Ajustar exibição da imagem - Usar p.imagemURL
+                document.getElementById("imgProduto").src = p.imagemURL || "/placeholder.png";
+
+                showElement('productDetails');
+
+            } catch (error) {
+                hideElement('loading');
+                console.error('Erro ao buscar produto:', error);
+                exibirErro("Ocorreu um erro ao comunicar com a API.");
+            }
+        }
+    </script>
+</body>
+</html>
+"""}],path:
 
 class WebServer:
     """Gerencia o servidor Flask, rotas e websocket."""
     
     def __init__(self, app: Flask, orchestrator: AutomationOrchestrator):
         self.app = app
-        self.orchestrator = orchestrator
+	        self.orchestrator = orchestrator
         self.sock = Sock(app)
         self.setup_routes()
         self.setup_websocket()
@@ -1132,11 +1281,13 @@ class WebServer:
         """Configura todas as rotas da API e do Dashboard."""
         
         # 1. Dashboard e Páginas de Auth
-        @self.app.route('/')
-        @self.app.route('/dashboard')
+
+
+        # PARTE 5 — ROTA DO FRONT-END
+        @self.app.route("/")
         def dashboard():
-            auth_url = self.orchestrator.auth.get_authorization_url()
-            return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
+            """Rota principal que serve o dashboard de consulta de produto."""
+            return render_template_string(DASHBOARD_TEMPLATE)
 
         @self.app.route('/callback')
         def callback():
@@ -1769,12 +1920,17 @@ DASHBOARD_TEMPLATE = """
             
             try {
                 const response = await fetch(`${API_BASE}/produtos?sku=${sku}`);
-                const data = await response.json();
+                const json = await response.json();
                 
                 if (response.ok) {
-                    renderProductDetails(data);
+                    if (!json.data || json.data.length === 0) {
+                        resultsDiv.innerHTML = `<p class="text-danger">Erro: Produto não encontrado.</p>`;
+                        return;
+                    }
+                    const p = json.data[0];
+                    renderProductDetails(p);
                 } else {
-                    resultsDiv.innerHTML = `<p class="text-danger">Erro: ${data.error || 'Produto não encontrado.'}</p>`;
+                    resultsDiv.innerHTML = `<p class="text-danger">Erro: ${json.error || 'Produto não encontrado.'}</p>`;
                 }
             } catch (error) {
                 console.error('Erro ao buscar detalhes do produto:', error);
@@ -1782,52 +1938,47 @@ DASHBOARD_TEMPLATE = """
             }
         }
         
-        function renderProductDetails(data) {
+        function renderProductDetails(p) {
             const resultsDiv = document.getElementById('product-search-results');
+            
+            // 1. Criar os elementos de exibição (IDs fictícios para o exemplo, pois o HTML não foi fornecido)
+            // No código real, esses elementos seriam buscados por ID (ex: document.getElementById('nomeEl'))
+            // Como estamos injetando HTML, vamos construir a string completa.
+            
             let html = `
                 <div class="card bg-light p-3">
-                    <h5>Detalhes do Produto: ${data.name} (${data.sku})</h5>
-                    <p><strong>Tipo:</strong> ${data.type}</p>
+                    <div class="row">
+                        <div class="col-md-4 text-center">
+                            <img id="produtoImagem" src="${p.imagemURL}" class="img-fluid rounded" alt="Imagem do Produto">
+                        </div>
+                        <div class="col-md-8">
+                            <h5>Detalhes do Produto: ${p.nome} (${p.codigo})</h5>
+                            <p><strong>Tipo:</strong> ${p.tipo}</p>
+                            <p><strong>Situação:</strong> ${p.situacao}</p>
+                            <p><strong>Formato:</strong> ${p.formato}</p>
+                            <p><strong>Preço:</strong> R$ ${p.preco.toFixed(2)}</p>
+                            <p><strong>Preço de Custo:</strong> R$ ${p.precoCusto.toFixed(2)}</p>
+                            <p><strong>Estoque:</strong> ${p.estoque.saldoVirtualTotal}</p>
+                        </div>
+                    </div>
+                    <h6 class="mt-3">Descrição Curta:</h6>
+                    <div id="descricaoEl" class="card-text"></div>
+                </div>
             `;
             
-            if (data.type === 'Kit') {
-                html += `
-                    <p><strong>Componentes Necessários:</strong></p>
-                    <div class="table-responsive">
-                        <table class="table table-sm table-bordered">
-                            <thead>
-                                <tr>
-                                    <th>SKU</th>
-                                    <th>Nome</th>
-                                    <th>Qtd.</th>
-                                    <th>Estoque Atual</th>
-                                    <th>Fornecedor</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                `;
-                data.components.forEach(c => {
-                    html += `
-                        <tr>
-                            <td>${c.sku}</td>
-                            <td>${c.name}</td>
-                            <td>${c.qty}</td>
-                            <td>${c.current_stock}</td>
-                            <td>${c.supplier}</td>
-                        </tr>
-                    `;
-                });
-                html += `
-                            </tbody>
-                        </table>
-                    </div>
-                `;
-            } else {
-                html += `<p><strong>Estoque Atual:</strong> ${data.current_stock}</p>`;
+            resultsDiv.innerHTML = html;
+            
+            // 4. Ajustar descrição (ela é HTML) - Usar innerHTML
+            const descricaoEl = document.getElementById('descricaoEl');
+            if (descricaoEl) {
+                descricaoEl.innerHTML = p.descricaoCurta;
             }
             
-            html += `</div>`;
-            resultsDiv.innerHTML = html;
+            // 3. Ajustar exibição da imagem - Já está no HTML, mas garantindo o src
+            const imgProduto = document.getElementById('produtoImagem');
+            if (imgProduto) {
+                imgProduto.src = p.imagemURL;
+            }
         }
         
         function connectWebSocket() {
