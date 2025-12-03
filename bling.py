@@ -1214,44 +1214,16 @@ class WebServer:
             return jsonify({"status": "ok", "message": f"Processamento de {len(kits_to_process)} kits iniciado em background."})
 
         # 5. Webhook
-        @self.app.route('/webhook/bling', methods=['POST'])
+        @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
             try:
-                data = request.get_json(force=True)
-                event_type = data.get('event') or data.get('tipo') or 'unknown'
-                logger.info(f"🪝 Webhook recebido: {event_type}")
-                
-                # 20. WEBHOOK MELHORADO
-                is_order_event = (
-                    event_type == 'order.created' or 
-                    event_type == 'pedido.pago' or 
-                    (data.get('tipo') == 'pedido' and data.get('evento') in ['criado', 'pago'])
-                )
-                
-                is_stock_event = (
-                    event_type == 'estoque.atualizado' or
-                    (data.get('tipo') == 'estoque' and data.get('evento') == 'atualizado')
-                )
-                
-                if is_order_event:
-                    # Extração robusta do pedido_id
-                    pedido_id = data.get('id') or data.get('retorno', {}).get('pedidos', [{}])[0].get('pedido', {}).get('id')
-                    if pedido_id:
-                        logger.info(f"✅ Pedido ID {pedido_id} identificado. Disparando verificação de compras.")
-                        # Disparo de run_purchase_check() em Thread
-                        Thread(target=self.orchestrator.run_purchase_check, args=(True,), daemon=True).start()
-                        return jsonify({'status': 'ok', 'message': f'Pedido {pedido_id} processado. Verificação de compras iniciada.'}), 200
-                
-                if is_stock_event:
-                    logger.info("✅ Evento de estoque atualizado. Disparando verificação de compras.")
-                    Thread(target=self.orchestrator.run_purchase_check, args=(True,), daemon=True).start()
-                    return jsonify({'status': 'ok', 'message': 'Estoque atualizado. Verificação de compras iniciada.'}), 200
-                
-                return jsonify({'status': 'ok', 'message': f'Webhook {event_type} recebido e ignorado.'}), 200
-            except Exception as e:
-                logger.error(f"Erro no webhook: {e}")
-                error_logger.error(f"Erro no webhook: {e}")
-                return jsonify({'error': str(e)}), 500
+                data = request.get_json(silent=True)
+            except Exception:
+                data = None
+
+            print("WEBHOOK RECEBIDO:", data, flush=True)
+
+            return jsonify({"status": "ok"}), 200
 
     # 10. WEBSOCKET PARA LOGS
     def setup_websocket(self):
