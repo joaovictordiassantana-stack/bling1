@@ -342,7 +342,7 @@ class BlingAuth:
         self.token_url = config.TOKEN_URL
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
-        self.expires_at: Optional[datetime] = None
+        self.expires_at: Optional[float] = None # Timestamp UNIX (float)
         self.lock = Lock() # Re-adicionado para garantir thread safety na manipulação de tokens.
         
     def _save_tokens(self):
@@ -352,7 +352,7 @@ class BlingAuth:
             data = {
             'access_token': self.access_token,
             'refresh_token': self.refresh_token,
-            'expires_at': self.expires_at.isoformat() if self.expires_at else None
+            'expires_at': self.expires_at if self.expires_at else None
         }
         
         temp_file = self.config.TOKENS_FILE.with_suffix('.tmp')
@@ -377,7 +377,7 @@ class BlingAuth:
                         data = json.load(f)
                         self.access_token = data.get('access_token')
                         self.refresh_token = data.get('refresh_token')
-                        expires_at_str = data.get('expires_at')
+                        expires_at_val = data.get('expires_at')
                         
                         if not self.refresh_token:
                             logger.warning("Arquivo tokens.json incompleto (refresh_token ausente). Necessário reautenticar.")
@@ -385,8 +385,13 @@ class BlingAuth:
                             self.expires_at = None
                             return False
                             
-                        if expires_at_str:
-                            self.expires_at = datetime.fromisoformat(expires_at_str)
+                        if expires_at_val:
+                            # Garante que expires_at seja um float (timestamp UNIX)
+                            try:
+                                self.expires_at = float(expires_at_val)
+                            except (ValueError, TypeError):
+                                logger.error(f"Valor inválido para expires_at: {expires_at_val}. Tratando como expirado.")
+                                self.expires_at = 0.0
                         
                         if self.access_token:
                             logger.info("Tokens carregados com sucesso.")
@@ -403,8 +408,8 @@ class BlingAuth:
 
         if not self.access_token or not self.expires_at:
             return False
-        # Verifica se o token expira nos próximos 5 minutos
-        return self.expires_at > datetime.now() + timedelta(minutes=5)
+        # Verifica se o token expira nos próximos 5 minutos (300 segundos)
+        return self.expires_at > time.time() + 300
 
     def get_authorization_url(self) -> str:
         """Retorna a URL para iniciar o fluxo de autorização OAuth."""
@@ -446,7 +451,7 @@ class BlingAuth:
             self.refresh_token = data['refresh_token']
             # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
             expires_in = data.get('expires_in', 3600)
-            self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+            self.expires_at = time.time() + expires_in
             self._save_tokens()
             
             logger.info("Autenticação OAuth concluída com sucesso!")
@@ -486,7 +491,7 @@ class BlingAuth:
             # O refresh token pode mudar, então atualizamos
             self.refresh_token = data.get('refresh_token', self.refresh_token)
             expires_in = data.get('expires_in', 3600)
-            self.expires_at = datetime.now() + timedelta(seconds=expires_in)
+            self.expires_at = time.time() + expires_in
             self._save_tokens()
             
             logger.info("Token de acesso renovado com sucesso!")
