@@ -59,7 +59,7 @@ def is_token_valid(token_data):
     if not expires_at:
         return False
     # Subtrai 20 segundos para garantir que o token não expire durante a requisição
-    return time.time() < expires_at - 20
+    return time.time() < float(expires_at) - 20
 
 def refresh_access_token():
     token_data = load_tokens()
