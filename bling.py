@@ -28,6 +28,30 @@ from flask_sock import Sock
 
 
 # ============================================================================
+# 0. FUNÇÕES DE PERSISTÊNCIA DE TOKENS (RE-ADICIONADAS)
+# ============================================================================
+
+def load_tokens():
+    if not os.path.exists("tokens.json"):
+        return None
+    try:
+        with open("tokens.json", "r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as e:
+        print(f"Erro ao carregar tokens: {e}")
+        return None
+
+
+def save_tokens(data):
+    try:
+        with open("tokens.json", "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=4, ensure_ascii=False)
+        print("INFO: Tokens salvos com sucesso.")
+    except Exception as e:
+        print(f"Erro ao salvar tokens: {e}")
+
+
+# ============================================================================
 # 16. EXCEÇÕES CUSTOMIZADAS
 # ============================================================================
 
