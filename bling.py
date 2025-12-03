@@ -453,16 +453,16 @@ class BlingAPI:
         
         for attempt in range(self.config.MAX_RETRIES):
             try:
-            # 1. Verifica e renova o token se necessário
-            if not self.auth.access_token:
-                if not self.auth.refresh_token:
-                    raise BlingAuthError("Aplicação não autorizada. Acesse /auth para configurar.")
-                # Se tiver refresh token, tenta renovar antes de prosseguir
-                self.auth.refresh_access_token()
-            
-            # 2. Adiciona cabeçalhos de autorização
-            headers = kwargs.pop('headers', {})
-            headers['Authorization'] = f'Bearer {self.auth.access_token}'
+                # 1. Verifica e renova o token se necessário
+                if not self.auth.access_token:
+                    if not self.auth.refresh_token:
+                        raise BlingAuthError("Aplicação não autorizada. Acesse /auth para configurar.")
+                    # Se tiver refresh token, tenta renovar antes de prosseguir
+                    self.auth.refresh_access_token()
+                
+                # 2. Adiciona cabeçalhos de autorização
+                headers = kwargs.pop('headers', {})
+                headers['Authorization'] = f'Bearer {self.auth.access_token}'
                 headers['Accept'] = 'application/json'
                 kwargs['headers'] = headers
                 
