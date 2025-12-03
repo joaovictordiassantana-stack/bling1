@@ -11,6 +11,7 @@ import time
 import logging
 import logging.handlers
 import base64
+import argparse
 
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -273,13 +274,13 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[datetime] = None
- # Re-adicionado para corrigir AttributeError. Nota: Em ambientes multi-processo (Gunicorn), pode ser necessário um lock de processo (ex: multiprocessing.Lock) ou um lock distribuído.
+        self.lock = Lock() # Re-adicionado para garantir thread safety na manipulação de tokens.
         
     def _save_tokens(self):
         """Persiste os tokens e a data de expiração no arquivo tokens.json de forma atômica."""
-        # Remove o lock de thread, pois não funciona entre processos (workers do Gunicorn).
-        # A escrita é feita para um arquivo temporário e depois renomeada para garantir atomicidade.
-        data = {
+        with self.lock:
+            # A escrita é feita para um arquivo temporário e depois renomeada para garantir atomicidade.
+            data = {
             'access_token': self.access_token,
             'refresh_token': self.refresh_token,
             'expires_at': self.expires_at.isoformat() if self.expires_at else None
@@ -300,8 +301,8 @@ class BlingAuth:
 
     def load_tokens(self) -> bool:
         """Carrega os tokens do arquivo tokens.json."""
-        # Remove o lock de thread, pois não funciona entre processos (workers do Gunicorn).
-        if self.config.TOKENS_FILE.exists():
+        with self.lock:
+            if self.config.TOKENS_FILE.exists():
             try:
                 with open(self.config.TOKENS_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
@@ -979,17 +980,18 @@ class AutomationOrchestrator:
 # ============================================================================
 
 # 21. ESTRUTURA DE ARQUIVOS (Garantida pelo setup_logging e ComponentConfigManager)
-# 19. CONFIGURAÇÕES (Instância)
+# 19# 1. CONFIGURAÇÕES (Instância)
 config = Config()
+config.validate_credentials() # Chamada de validação adicionada
 
-# 1. AUTENTICAÇÃO (Instância)
+# 2. AUTENTICAÇÃO (Instância)
 auth = BlingAuth(config)
 
-# 3. CONFIGURAÇÃO DE COMPONENTES (Instância)
-config_manager = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
+# 3. API (Instância)
+api = BlingAPI(auth, config) # Ordem corrigida (auth, config)
 
-# 4. CLASSE BlingAPI (Instância)
-api = BlingAPI(config, auth)
+# 4. CONFIGURAÇÃO DE COMPONENTES (Instância)
+config_manager = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
 
 # 5. SISTEMA DE ESTATÍSTICAS (Instância)
 stats_manager = StatisticsManager()
@@ -1274,16 +1276,21 @@ def background_load():
     
     logger.info("Iniciando Carregamento de Dados em Background")
     
-    # 1. Tenta carregar tokens
-    if not auth.load_tokens():
-        logger.warning("Tokens não carregados. Necessário autenticar via dashboard.")
-        return
-        
-    # 2. Busca kits e componentes (inclui estoque)
-    if orchestrator.load_data():
-        logger.info("Carregamento de dados em background concluído com sucesso.")
-    else:
-        logger.error("Falha no carregamento de dados em background.")
+    try:
+        # 1. Tenta carregar tokens
+        if not auth.load_tokens():
+            logger.warning("Tokens não carregados. Necessário autenticar via dashboard.")
+            return
+            
+        # 2. Busca kits e componentes (inclui estoque)
+        if orchestrator.load_data():
+            logger.info("Carregamento de dados em background concluído com sucesso.")
+        else:
+            logger.error("Falha no carregamento de dados em background.")
+            
+    except Exception as e:
+        logger.error(f"Erro crítico no background_load: {e}")
+        error_logger.error(f"Erro crítico no background_load: {e}")
         
     
 
