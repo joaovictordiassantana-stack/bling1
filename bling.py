@@ -51,6 +51,51 @@ def save_tokens(data):
         print(f"Erro ao salvar tokens: {e}")
 
 
+
+def is_token_valid(token_data):
+    if not token_data:
+        return False
+    expires_at = token_data.get("expires_at")
+    if not expires_at:
+        return False
+    # Subtrai 20 segundos para garantir que o token não expire durante a requisição
+    return time.time() < expires_at - 20
+
+def refresh_access_token():
+    token_data = load_tokens()
+    if not token_data or "refresh_token" not in token_data:
+        print("ERRO: refresh_token não encontrado.")
+        return None
+
+    refresh_token = token_data["refresh_token"]
+
+    client_id = Config.CLIENT_ID
+    client_secret = Config.CLIENT_SECRET
+        
+    url = "https://www.bling.com.br/Api/v3/oauth/token"
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret
+    }
+
+    try:
+        response = requests.post(url, data=payload)
+        new_data = response.json()
+
+        new_data["expires_at"] = time.time() + new_data.get("expires_in", 3600)
+
+        save_tokens(new_data)
+
+        print("Token renovado com sucesso.")
+        return new_data
+
+    except Exception as e:
+        print("Erro ao renovar token:", e)
+        return None
+
+
 # ============================================================================
 # 16. EXCEÇÕES CUSTOMIZADAS
 # ============================================================================
