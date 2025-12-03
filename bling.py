@@ -431,6 +431,31 @@ class BlingAuth:
             raise BlingAuthError(msg) from e
 
 # ============================================================================
+
+def get_bling_product_by_sku(sku):
+    token_data = load_tokens()
+
+    # Se o token estiver expirado → renova automaticamente
+    if not is_token_valid(token_data):
+        token_data = refresh_access_token()
+
+    access_token = token_data["access_token"]
+
+    url = f"https://www.bling.com.br/Api/v3/produtos?codigo={sku}"
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json"
+    }
+
+    response = requests.get(url, headers=headers)
+
+    try:
+        return response.json()
+    except Exception:
+        return {"error": "Falha ao interpretar resposta do Bling", "raw": response.text}
+
+# ============================================================================
 # 4. CLASSE BlingAPI COMPLETA
 # ============================================================================
 
@@ -1073,58 +1098,18 @@ class WebServer:
             return jsonify(self.orchestrator.stats.to_dict())
 
         # 3. Rotas de Dados
-        @self.app.route('/api/produtos')
+        @self.app.route("/api/produtos", methods=["GET"])
         def api_produtos():
-            sku = request.args.get('sku')
-            name = request.args.get('name')
-            
-            if not sku and not name:
-                return jsonify({"error": "Parâmetro 'sku' ou 'name' é obrigatório."}), 400
-                
-            # A busca por SKU é mais precisa
-            try:
-                if sku:
-                    product_data = self.orchestrator.api.get_product_by_sku(sku)
-                else:
-                    # A API do Bling V3 não tem uma busca direta por nome que retorne a estrutura.
-                    # Para simplificar, vamos usar a busca por kits se for um kit, ou buscar o produto.
-                    # Como a busca por SKU é a mais eficiente e a que o usuário provavelmente usará,
-                    # vamos focar nela. Se o usuário buscar por nome, ele pode usar a aba Kits.
-                    return jsonify({"error": "Busca por nome ainda não implementada para estrutura detalhada. Use a aba Kits ou busque por SKU."}), 400
-                    
-                if not product_data:
-                    return jsonify({"error": "Produto não encontrado."}), 404
-            
-            except BlingAuthError as e:
-                return jsonify({"error": str(e), "reauth": True}), 401
-                
-            # Se for um Kit, retorna a estrutura
-            if product_data.get('tipo') == 'P' and product_data.get('estrutura'):
-                components = []
-                for comp_item in product_data['estrutura'].get('componentes', []):
-                    comp_data = comp_item.get('produto', {})
-                    components.append({
-                        'sku': comp_data.get('codigo', 'N/A'),
-                        'name': comp_data.get('descricao', 'Sem nome'),
-                        'qty': int(comp_item.get('quantidade', 0)),
-                        'unit_cost': float(comp_data.get('precoCusto', 0.0)),
-                        'current_stock': self.orchestrator.api.get_product_stock(comp_data.get('id')) if comp_data.get('id') else 0
-                    })
-                
-                return jsonify({
-                    "sku": product_data.get('codigo', 'N/A'),
-                    "name": product_data.get('descricao', 'Sem nome'),
-                    "type": "Kit",
-                    "components": components
-                })
-            
-            # Se for um produto simples, retorna os dados básicos
-            return jsonify({
-                "sku": product_data.get('codigo', 'N/A'),
-                "name": product_data.get('descricao', 'Sem nome'),
-                "type": "Produto Simples",
-                "current_stock": self.orchestrator.api.get_product_stock(product_data.get('id')) if product_data.get('id') else 0
-            })
+            sku = request.args.get("sku")
+
+            if not sku:
+                return jsonify({"error": "SKU não informado"}), 400
+
+            print("Consulta de produto recebida:", sku, flush=True)
+
+            data = get_bling_product_by_sku(sku)
+
+            return jsonify(data), 200
 
         @self.app.route('/api/kits')
         def api_kits():
