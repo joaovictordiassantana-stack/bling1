@@ -12,7 +12,6 @@ import logging
 import logging.handlers
 import base64
 
-import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Lock, Thread
@@ -603,7 +602,6 @@ class BlingAPI:
                 
             except BlingAPIError as e:
                 logger.error(f"Erro na paginação de Kits: {e}")
-                logger.error(f"Erro na paginação de Kits: {e}")
                 break
                 
         logger.info(f"Busca de Kits concluída. {len(kits)} Kits encontrados.")
@@ -648,13 +646,11 @@ class BlingAPI:
             )
             op_id = response.get('data', {}).get('id')
             if op_id:
-                logger.info(f"OP criada com sucesso! ID: {op_id}")
-                logger.info(f"OP criada: ID {op_id} para Kit {kit_sku} (Qtd: {quantity})")
+                logger.info(f"OP criada com sucesso! ID: {op_id} para Kit {kit_sku} (Qtd: {quantity})")
                 return op_id
             else:
                 raise BlingAPIError(f"Resposta da API não contém ID da OP: {response}")
         except BlingAPIError as e:
-            logger.error(f"Falha ao criar OP para Kit {kit_sku}: {e}")
             logger.error(f"Falha ao criar OP para Kit {kit_sku}: {e}")
             return None
 
@@ -695,13 +691,11 @@ class BlingAPI:
             )
             po_id = response.get('data', {}).get('id')
             if po_id:
-                logger.info(f"PO criada com sucesso! ID: {po_id} para {supplier_name}")
-                logger.info(f"PO criada: ID {po_id} para {supplier_name} com {len(items)} itens.")
+                logger.info(f"PO criada com sucesso! ID: {po_id} para {supplier_name} com {len(items)} itens.")
                 return po_id
             else:
                 raise BlingAPIError(f"Resposta da API não contém ID da PO: {response}")
         except BlingAPIError as e:
-            logger.error(f"Falha ao criar PO para {supplier_name}: {e}")
             logger.error(f"Falha ao criar PO para {supplier_name}: {e}")
             return None
 
@@ -780,7 +774,8 @@ class NeedsManager:
         self.stats = stats
         # needs: Dict[supplier_name, List[PurchaseNeed]]
         self.needs: Dict[str, List[PurchaseNeed]] = {}
-        self.lock = Lock()        
+        self.lock = Lock()
+
     def reset(self):
         """Limpa todas as necessidades de compra."""
         with self.lock:
@@ -824,7 +819,7 @@ class NeedsManager:
             else:
                 logger.debug(f"Estoque OK: {component.name} ({component.sku}) - {component.current_stock}/{component.min_stock}")
 
-     def generate_purchase_orders(self) -> List[int]:
+    def generate_purchase_orders(self) -> List[int]:
         """Gera Ordens de Compra (POs) no Bling, agrupando por fornecedor."""
         with self.lock:
             logger.info("Geração de Ordens de Compra (POs)")
@@ -853,7 +848,7 @@ class NeedsManager:
 class AutomationOrchestrator:
     """Orquestra o fluxo de automação: OPs, verificação de estoque e POs."""
     
-    def __init__(self, api: BlingAPI, stats: StatisticsManager, needs_manager: PurchaseNeedsManager, config_manager: ComponentConfigManager, auth: BlingAuth):
+    def __init__(self, api: BlingAPI, stats: StatisticsManager, needs_manager: NeedsManager, config_manager: ComponentConfigManager, auth: BlingAuth):
         self.api = api
         self.stats = stats
         self.needs_manager = needs_manager
@@ -1000,7 +995,7 @@ api = BlingAPI(config, auth)
 stats_manager = StatisticsManager()
 
 # 6. GESTÃO DE COMPRAS (Instância)
-needs_manager = PurchaseNeedsManager(api, stats_manager)
+needs_manager = NeedsManager(api, stats_manager)
 
 # 7. ORQUESTRADOR DE AUTOMAÇÃO (Instância)
 orchestrator = AutomationOrchestrator(api, stats_manager, needs_manager, config_manager, auth)
