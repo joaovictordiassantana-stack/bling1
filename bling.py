@@ -1162,7 +1162,11 @@ class WebServer:
             return jsonify({
                 "authenticated": is_valid,
                 "auth_url": self.orchestrator.auth.get_authorization_url(),
-                "token_expires_at": self.orchestrator.auth.expires_at.isoformat() if self.orchestrator.auth.expires_at else None,
+                "token_expires_at": (
+                    datetime.fromtimestamp(self.orchestrator.auth.expires_at).isoformat()
+                    if self.orchestrator.auth.expires_at
+                    else None
+                ),
                 "data_loaded": True, # Assume True, pois o carregamento é feito por worker/processo
                 "is_running": self.orchestrator.is_running
             })
