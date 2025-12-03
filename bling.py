@@ -303,21 +303,21 @@ class BlingAuth:
         """Carrega os tokens do arquivo tokens.json."""
         with self.lock:
             if self.config.TOKENS_FILE.exists():
-            try:
-                with open(self.config.TOKENS_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.access_token = data.get('access_token')
-                    self.refresh_token = data.get('refresh_token')
-                    expires_at_str = data.get('expires_at')
-                    if expires_at_str:
-                        self.expires_at = datetime.fromisoformat(expires_at_str)
-                    
-                    if self.access_token and self.refresh_token:
-                        logger.info("Tokens carregados com sucesso.")
-                        return True
-            except (json.JSONDecodeError, IOError) as e:
-                logger.error(f"Erro ao carregar tokens: {e}")
-                error_logger.error(f"Erro ao carregar tokens: {e}")
+                try:
+                    with open(self.config.TOKENS_FILE, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        self.access_token = data.get('access_token')
+                        self.refresh_token = data.get('refresh_token')
+                        expires_at_str = data.get('expires_at')
+                        if expires_at_str:
+                            self.expires_at = datetime.fromisoformat(expires_at_str)
+                        
+                        if self.access_token and self.refresh_token:
+                            logger.info("Tokens carregados com sucesso.")
+                            return True
+                except (json.JSONDecodeError, IOError) as e:
+                    logger.error(f"Erro ao carregar tokens: {e}")
+                    error_logger.error(f"Erro ao carregar tokens: {e}")
         
         logger.warning("Tokens não encontrados ou inválidos. Necessário autenticar.")
         return False
