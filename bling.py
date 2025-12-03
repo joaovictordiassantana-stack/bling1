@@ -309,10 +309,17 @@ class BlingAuth:
                         self.access_token = data.get('access_token')
                         self.refresh_token = data.get('refresh_token')
                         expires_at_str = data.get('expires_at')
+                        
+                        if not self.refresh_token:
+                            logger.warning("Arquivo tokens.json incompleto (refresh_token ausente). Necessário reautenticar.")
+                            self.access_token = None
+                            self.expires_at = None
+                            return False
+                            
                         if expires_at_str:
                             self.expires_at = datetime.fromisoformat(expires_at_str)
                         
-                        if self.access_token and self.refresh_token:
+                        if self.access_token:
                             logger.info("Tokens carregados com sucesso.")
                             return True
                 except (json.JSONDecodeError, IOError) as e:
@@ -446,13 +453,16 @@ class BlingAPI:
         
         for attempt in range(self.config.MAX_RETRIES):
             try:
-                # 1. Verifica e renova o token se necessário
-                if not self.auth.is_token_valid():
-                    self.auth.refresh_access_token()
-                
-                # 2. Adiciona cabeçalhos de autorização
-                headers = kwargs.pop('headers', {})
-                headers['Authorization'] = f'Bearer {self.auth.access_token}'
+            # 1. Verifica e renova o token se necessário
+            if not self.auth.access_token:
+                if not self.auth.refresh_token:
+                    raise BlingAuthError("Aplicação não autorizada. Acesse /auth para configurar.")
+                # Se tiver refresh token, tenta renovar antes de prosseguir
+                self.auth.refresh_access_token()
+            
+            # 2. Adiciona cabeçalhos de autorização
+            headers = kwargs.pop('headers', {})
+            headers['Authorization'] = f'Bearer {self.auth.access_token}'
                 headers['Accept'] = 'application/json'
                 kwargs['headers'] = headers
                 
@@ -1072,17 +1082,21 @@ class WebServer:
                 return jsonify({"error": "Parâmetro 'sku' ou 'name' é obrigatório."}), 400
                 
             # A busca por SKU é mais precisa
-            if sku:
-                product_data = self.orchestrator.api.get_product_by_sku(sku)
-            else:
-                # A API do Bling V3 não tem uma busca direta por nome que retorne a estrutura.
-                # Para simplificar, vamos usar a busca por kits se for um kit, ou buscar o produto.
-                # Como a busca por SKU é a mais eficiente e a que o usuário provavelmente usará,
-                # vamos focar nela. Se o usuário buscar por nome, ele pode usar a aba Kits.
-                return jsonify({"error": "Busca por nome ainda não implementada para estrutura detalhada. Use a aba Kits ou busque por SKU."}), 400
-                
-            if not product_data:
-                return jsonify({"error": "Produto não encontrado."}), 404
+            try:
+                if sku:
+                    product_data = self.orchestrator.api.get_product_by_sku(sku)
+                else:
+                    # A API do Bling V3 não tem uma busca direta por nome que retorne a estrutura.
+                    # Para simplificar, vamos usar a busca por kits se for um kit, ou buscar o produto.
+                    # Como a busca por SKU é a mais eficiente e a que o usuário provavelmente usará,
+                    # vamos focar nela. Se o usuário buscar por nome, ele pode usar a aba Kits.
+                    return jsonify({"error": "Busca por nome ainda não implementada para estrutura detalhada. Use a aba Kits ou busque por SKU."}), 400
+                    
+                if not product_data:
+                    return jsonify({"error": "Produto não encontrado."}), 404
+            
+            except BlingAuthError as e:
+                return jsonify({"error": str(e), "reauth": True}), 401
                 
             # Se for um Kit, retorna a estrutura
             if product_data.get('tipo') == 'P' and product_data.get('estrutura'):
@@ -1813,10 +1827,10 @@ DASHBOARD_TEMPLATE = """
                 setTimeout(connectWebSocket, 5000); // Reconexão automática
             };
 
-            logWebSocket.onerror = (err) => {
-                console.error('WebSocket erro:', err);
-                logWebSocket.close();
-            };
+	            logWebSocket.onerror = (err) => {
+	                console.error('WebSocket erro:', err);
+	                // Não chama close() aqui. Deixa o onclose() tratar a reconexão
+	            };
         }
         
         // Handler do botão recheck
