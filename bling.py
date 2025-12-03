@@ -1127,14 +1127,14 @@ DASHBOARD_TEMPLATE = """
     <title>Consulta de Produto Bling</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { background-color: #f8f9fa; }
-        .container { max-width: 800px; margin-top: 50px; }
-        .product-card { border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
-        .product-image { max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }
-        .product-detail { margin-bottom: 5px; }
-        .product-detail strong { display: inline-block; width: 120px; }
-        #descricao { border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }
-        .hidden { display: none; }
+        body {{ background-color: #f8f9fa; }}
+        .container {{ max-width: 800px; margin-top: 50px; }}
+        .product-card {{ border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }}
+        .product-image {{ max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }}
+        .product-detail {{ margin-bottom: 5px; }}
+        .product-detail strong {{ display: inline-block; width: 120px; }}
+        #descricao {{ border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }}
+        .hidden {{ display: none; }}
     </style>
 </head>
 <body>
@@ -1179,22 +1179,22 @@ DASHBOARD_TEMPLATE = """
 
     <script>
         document.getElementById('searchButton').addEventListener('click', buscarProduto);
-        document.getElementById('skuInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
+        document.getElementById('skuInput').addEventListener('keypress', function(e) {{
+            if (e.key === 'Enter') {{
                 buscarProduto();
-            }
-        });
+            }}
+        }});
 
-        function showElement(id) { document.getElementById(id).classList.remove('hidden'); }
-        function hideElement(id) { document.getElementById(id).classList.add('hidden'); }
+        function showElement(id) {{ document.getElementById(id).classList.remove('hidden'); }}
+        function hideElement(id) {{ document.getElementById(id).classList.add('hidden'); }}
 
-        function exibirErro(mensagem) {
+        function exibirErro(mensagem) {{
             hideElement('productDetails');
             showElement('errorAlert');
             document.getElementById('errorAlert').innerText = mensagem;
-        }
+        }}
 
-        function limparDetalhes() {
+        function limparDetalhes() {{
             hideElement('productDetails');
             hideElement('errorAlert');
             document.getElementById('nome').innerText = '';
@@ -1207,20 +1207,20 @@ DASHBOARD_TEMPLATE = """
             document.getElementById('estoque').innerText = '';
             document.getElementById('descricao').innerHTML = '<h4>Descrição</h4>';
             document.getElementById('imgProduto').src = '/placeholder.png';
-        }
+        }}
 
-        async function buscarProduto() {
+        async function buscarProduto() {{
             const sku = document.getElementById('skuInput').value.trim();
-            if (!sku) {
+            if (!sku) {{
                 exibirErro("Por favor, digite um SKU.");
                 return;
-            }
+            }}
 
             limparDetalhes();
             showElement('loading');
 
-            try {
-                const response = await fetch(`/api/produtos?sku=${sku}`);
+            try {{
+                const response = await fetch(`/api/produtos?sku=${{sku}}`);
                 const data = await response.json();
                 
                 // ✅ 1. Ajustar o fetch da API: Ler sempre json.data[0] e armazenar como const p.
@@ -1229,10 +1229,10 @@ DASHBOARD_TEMPLATE = """
                 hideElement('loading');
 
                 // ✅ 5. Ajustar verificação se o produto existe
-                if (!p) {
+                if (!p) {{
                     exibirErro("Produto não encontrado. Verifique o SKU.");
                     return;
-                }
+                }}
 
                 // ✅ 2. Atualizar os campos que aparecem na interface (com fallback)
                 document.getElementById("nome").innerText = p.nome || "Sem nome";
@@ -1242,26 +1242,26 @@ DASHBOARD_TEMPLATE = """
                 document.getElementById("formato").innerText = p.formato || "N/D";
                 
                 // Formatação de preço simples (pode ser melhorada com Intl.NumberFormat)
-                document.getElementById("preco").innerText = p.preco ? `R$ ${parseFloat(p.preco).toFixed(2).replace('.', ',')}` : "N/D";
-                document.getElementById("precoCusto").innerText = p.precoCusto ? `R$ ${parseFloat(p.precoCusto).toFixed(2).replace('.', ',')}` : "N/D";
+                document.getElementById("preco").innerText = p.preco ? `R$ ${{parseFloat(p.preco).toFixed(2).replace('.', ',')}}` : "N/D";
+                document.getElementById("precoCusto").innerText = p.precoCusto ? `R$ ${{parseFloat(p.precoCusto).toFixed(2).replace('.', ',')}}` : "N/D";
                 
                 // ✅ Estoque em p.estoque.saldoVirtualTotal (com fallback)
                 document.getElementById("estoque").innerText = p.estoque?.saldoVirtualTotal ?? "0";
 
                 // ✅ 4. Ajustar descrição (ela é HTML) - Usar innerHTML
-                document.getElementById("descricao").innerHTML = `<h4>Descrição</h4>${p.descricaoCurta || "Sem descrição."}`;
+                document.getElementById("descricao").innerHTML = `<h4>Descrição</h4>${{p.descricaoCurta || "Sem descrição."}}`;
 
                 // ✅ 3. Ajustar exibição da imagem - Usar p.imagemURL
                 document.getElementById("imgProduto").src = p.imagemURL || "/placeholder.png";
 
                 showElement('productDetails');
 
-            } catch (error) {
+            }} catch (error) {{
                 hideElement('loading');
                 console.error('Erro ao buscar produto:', error);
                 exibirErro("Ocorreu um erro ao comunicar com a API.");
-            }
-        }
+            }}
+        }}
     </script>
 </body>
 </html>
@@ -1565,29 +1565,29 @@ DASHBOARD_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
 
-        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }
-        .navbar-brand { font-weight: 700; font-size: 1.5rem; }
-        .status-badge { padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }
-        .card { border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }
-        .card:hover { transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }
-        .card-title { font-weight: 600; color: #343a40; margin-bottom: 1rem; }
-        .kpi-value { font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }
-        .kpi-label { font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }
-        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
-        .log-entry { padding: .25rem 0; border-bottom: 1px solid #333; }
-        .log-entry:last-child { border-bottom: none; }
-        .log-level-INFO { color: #4ec9b0; }
-        .log-level-WARNING { color: #dcdcaa; }
-        .log-level-ERROR { color: #f48771; }
-        .log-level-DEBUG { color: #9cdcfe; }
-        .nav-tabs .nav-link { color: #6c757d; font-weight: 500; }
-        .nav-tabs .nav-link.active { background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }
-        .table-danger td { background-color: #f8d7da !important; }
-        .table-warning td { background-color: #fff3cd !important; }
-        .btn-primary { background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }
-        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }
-        .spinner-border-sm { width: 1rem; height: 1rem; border-width: .15em; }
+        body {{ background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+        .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }}
+        .navbar-brand {{ font-weight: 700; font-size: 1.5rem; }}
+        .status-badge {{ padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }}
+        .card {{ border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }}
+        .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }}
+        .card-title {{ font-weight: 600; color: #343a40; margin-bottom: 1rem; }}
+        .kpi-value {{ font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }}
+        .kpi-label {{ font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }}
+        .log-box {{ font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }}
+        .log-entry {{ padding: .25rem 0; border-bottom: 1px solid #333; }}
+        .log-entry:last-child {{ border-bottom: none; }}
+        .log-level-INFO {{ color: #4ec9b0; }}
+        .log-level-WARNING {{ color: #dcdcaa; }}
+        .log-level-ERROR {{ color: #f48771; }}
+        .log-level-DEBUG {{ color: #9cdcfe; }}
+        .nav-tabs .nav-link {{ color: #6c757d; font-weight: 500; }}
+        .nav-tabs .nav-link.active {{ background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }}
+        .table-danger td {{ background-color: #f8d7da !important; }}
+        .table-warning td {{ background-color: #fff3cd !important; }}
+        .btn-primary {{ background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }}
+        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }}
+        .spinner-border-sm {{ width: 1rem; height: 1rem; border-width: .15em; }}
     </style>
 </head>
 <body>
@@ -1596,7 +1596,7 @@ DASHBOARD_TEMPLATE = """
             <a class="navbar-brand text-white" href="#">Bling Automação</a>
             <div class="d-flex">
                 <span id="status-badge" class="status-badge bg-secondary text-white me-2">Carregando...</span>
-                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar Bling</a>
+                <a id="auth-link" href="{{{{ auth_url }}}}" class="btn btn-sm btn-outline-light">Autenticar Bling</a>
             </div>
         </div>
     </nav>
@@ -1718,129 +1718,129 @@ DASHBOARD_TEMPLATE = """
 
         
         const API_BASE = '/api';
-        const WS_URL = `ws://${window.location.host}/ws/logs`;
+        const WS_URL = `ws://${{window.location.host}}/ws/logs`;
         let logWebSocket;
         let processingChart;
 
         // a) Funções
-        function formatLog(log) {
+        function formatLog(log) {{
             const level = log.level;
-            const levelClass = `log-level-${level}`;
-            return `<div class="log-entry"><span class="${levelClass}">[${log.timestamp}] [${level}]</span> ${log.message}</div>`;
-        }
+            const levelClass = `log-level-${{level}}`;
+            return `<div class="log-entry"><span class="${{levelClass}}">[${{log.timestamp}}] [${{level}}]</span> ${{log.message}}</div>`;
+        }}
 
-        function updateStatusBadge(isValid, expiresAt) {
+        function updateStatusBadge(isValid, expiresAt) {{
             const badge = document.getElementById('status-badge');
             const authLink = document.getElementById('auth-link');
             
-            if (isValid) {
+            if (isValid) {{
                 badge.className = 'status-badge bg-success text-white me-2';
                 badge.textContent = 'Token Válido';
                 authLink.className = 'btn btn-sm btn-outline-light d-none';
-            } else {
+            }} else {{
                 badge.className = 'status-badge bg-danger text-white me-2';
                 badge.textContent = 'Token Inválido';
                 authLink.className = 'btn btn-sm btn-outline-light';
-            }
+            }}
             
-            if (expiresAt) {
+            if (expiresAt) {{
                 const expiry = new Date(expiresAt);
                 const now = new Date();
                 const diffMinutes = Math.round((expiry - now) / 60000);
-                if (diffMinutes < 60 && diffMinutes > 0) {
-                    badge.textContent += ` (Expira em ${diffMinutes} min)`;
+                if (diffMinutes < 60 && diffMinutes > 0) {{
+                    badge.textContent += ` (Expira em ${{diffMinutes}} min)`;
                     badge.className = 'status-badge bg-warning text-dark me-2';
-                }
-            }
-        }
+                }}
+            }}
+        }}
 
-        function updateStatsKPIs(stats) {
+        function updateStatsKPIs(stats) {{
             document.getElementById('kpi-success').textContent = stats.success;
             document.getElementById('kpi-failed').textContent = stats.failed;
             document.getElementById('kpi-ops').textContent = stats.ops_created;
             document.getElementById('kpi-pos').textContent = stats.pos_created;
             document.getElementById('kpi-checks').textContent = stats.min_stock_checks;
-            document.getElementById('kpi-time').textContent = `${stats.elapsed_time_seconds}s`;
-        }
+            document.getElementById('kpi-time').textContent = `${{stats.elapsed_time_seconds}}s`;
+        }}
 
-        function updateStatsChart(stats) {
+        function updateStatsChart(stats) {{
             const ctx = document.getElementById('processingChart').getContext('2d');
             const data = [stats.success, stats.failed, stats.ops_created, stats.pos_created];
             
-            if (!processingChart) {
-                processingChart = new Chart(ctx, {
+            if (!processingChart) {{
+                processingChart = new Chart(ctx, {{
                     type: 'bar',
-                    data: {
+                    data: {{
                         labels: ['Sucesso', 'Falhas', 'OPs Criadas', 'POs Criadas'],
-                        datasets: [{
+                        datasets: [{{
                             label: 'Contagem',
                             data: data,
                             backgroundColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
                             borderColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
                             borderWidth: 1
-                        }]
-                    },
-                    options: {
+                        }}]
+                    }},
+                    options: {{
                         responsive: true,
-                        scales: {
-                            y: { beginAtZero: true, ticks: { precision: 0 } }
-                        },
-                        plugins: { legend: { display: false } }
-                    }
-                });
-            } else {
+                        scales: {{
+                            y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}
+                        }},
+                        plugins: {{ legend: {{ display: false }} }}
+                    }}
+                }});
+            }} else {{
                 processingChart.data.datasets[0].data = data;
                 processingChart.update();
-            }
-        }
+            }}
+        }}
 
-        async function fetchStatus() {
-            try {
-                const response = await fetch(`${API_BASE}/status`);
+        async function fetchStatus() {{
+            try {{
+                const response = await fetch(`${{API_BASE}}/status`);
                 const data = await response.json();
                 updateStatusBadge(data.authenticated, data.token_expires_at);
                 
                 const recheckButton = document.getElementById('recheck-button');
                 const recheckSpinner = document.getElementById('recheck-spinner');
-                if (data.is_running) {
+                if (data.is_running) {{
                     recheckButton.disabled = true;
                     recheckSpinner.classList.remove('d-none');
                     document.getElementById('recheck-status').textContent = 'Processamento em andamento...';
-                } else {
+                }} else {{
                     recheckButton.disabled = false;
                     recheckSpinner.classList.add('d-none');
                     document.getElementById('recheck-status').textContent = '';
-                }
+                }}
                 
-            } catch (error) {
+            }} catch (error) {{
                 console.error('Erro ao buscar status:', error);
-            }
-        }
+            }}
+        }}
 
-        async function fetchStats() {
-            try {
-                const response = await fetch(`${API_BASE}/stats`);
+        async function fetchStats() {{
+            try {{
+                const response = await fetch(`${{API_BASE}}/stats`);
                 const stats = await response.json();
                 updateStatsKPIs(stats);
                 updateStatsChart(stats);
-            } catch (error) {
+            }} catch (error) {{
                 console.error('Erro ao buscar estatísticas:', error);
-            }
-        }
+            }}
+        }}
 
-        async function fetchStock() {
-            try {
-                const response = await fetch(`${API_BASE}/stock`);
+        async function fetchStock() {{
+            try {{
+                const response = await fetch(`${{API_BASE}}/stock`);
                 const data = await response.json();
                 const tbody = document.getElementById('stock-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.stock.length === 0) {
+                if (data.stock.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="7" class="text-center">Nenhum componente encontrado.</td></tr>';
                     return;
-                }
+                }}
                 
-                data.stock.forEach(item => {
+                data.stock.forEach(item => {{
                     const row = tbody.insertRow();
                     row.className = item.alert_level === 'danger' ? 'table-danger' : (item.alert_level === 'warning' ? 'table-warning' : '');
                     
@@ -1851,26 +1851,26 @@ DASHBOARD_TEMPLATE = """
                     row.insertCell().textContent = item.supplier;
                     row.insertCell().textContent = item.lead_time_days;
                     row.insertCell().innerHTML = item.alert_level === 'danger' ? '🚨 Baixo' : (item.alert_level === 'warning' ? '⚠️ Atenção' : '✅ OK');
-                });
-            } catch (error) {
+                }});
+            }} catch (error) {{
                 console.error('Erro ao buscar estoque:', error);
                 document.getElementById('stock-table-body').innerHTML = '<tr><td colspan="7" class="text-center text-danger">Erro ao carregar dados de estoque.</td></tr>';
-            }
-        }
+            }}
+        }}
 
-        async function fetchNeeds() {
-            try {
-                const response = await fetch(`${API_BASE}/needs`);
+        async function fetchNeeds() {{
+            try {{
+                const response = await fetch(`${{API_BASE}}/needs`);
                 const data = await response.json();
                 const tbody = document.getElementById('needs-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.needs.length === 0) {
+                if (data.needs.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="6" class="text-center">Nenhuma necessidade de compra pendente.</td></tr>';
                     return;
-                }
+                }}
                 
-                data.needs.forEach(item => {
+                data.needs.forEach(item => {{
                     const row = tbody.insertRow();
                     row.insertCell().textContent = item.component_sku;
                     row.insertCell().textContent = item.component_name;
@@ -1878,67 +1878,67 @@ DASHBOARD_TEMPLATE = """
                     row.insertCell().textContent = item.supplier;
                     row.insertCell().textContent = item.lead_time_days;
                     row.insertCell().textContent = item.reason;
-                });
-            } catch (error) {
+                }});
+            }} catch (error) {{
                 console.error('Erro ao buscar necessidades:', error);
                 document.getElementById('needs-table-body').innerHTML = '<tr><td colspan="6" class="text-center text-danger">Erro ao carregar necessidades de compra.</td></tr>';
-            }
-        }
+            }}
+        }}
 
-        async function fetchKits() {
-            try {
-                const response = await fetch(`${API_BASE}/kits`);
+        async function fetchKits() {{
+            try {{
+                const response = await fetch(`${{API_BASE}}/kits`);
                 const data = await response.json();
                 const tbody = document.getElementById('kits-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.kits.length === 0) {
+                if (data.kits.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="4" class="text-center">Nenhum kit encontrado.</td></tr>';
                     return;
-                }
+                }}
                 
-                data.kits.forEach(kit => {
+                data.kits.forEach(kit => {{
                     const row = tbody.insertRow();
                     row.insertCell().textContent = kit.sku;
                     row.insertCell().textContent = kit.name;
-                    row.insertCell().textContent = `R$ ${kit.price.toFixed(2)}`;
+                    row.insertCell().textContent = `R$ ${{kit.price.toFixed(2)}}`;
                     
                     const componentsCell = row.insertCell();
                     componentsCell.innerHTML = kit.components.map(c => 
-                        `${c.name} (${c.sku}) x${c.qty}`
+                        `${{c.name}} (${{c.sku}}) x${{c.qty}}`
                     ).join('<br>');
-                });
-            } catch (error) {
+                }});
+            }} catch (error) {{
                 console.error('Erro ao buscar kits:', error);
                 document.getElementById('kits-table-body').innerHTML = '<tr><td colspan="4" class="text-center text-danger">Erro ao carregar dados de kits.</td></tr>';
-            }
-        }
+            }}
+        }}
         
-        async function fetchProductDetails(sku) {
+        async function fetchProductDetails(sku) {{
             const resultsDiv = document.getElementById('product-search-results');
             resultsDiv.innerHTML = '<p class="text-info">Buscando produto...</p>';
             
-            try {
-                const response = await fetch(`${API_BASE}/produtos?sku=${sku}`);
+            try {{
+                const response = await fetch(`${{API_BASE}}/produtos?sku=${{sku}}`);
                 const json = await response.json();
                 
-                if (response.ok) {
-                    if (!json.data || json.data.length === 0) {
+                if (response.ok) {{
+                    if (!json.data || json.data.length === 0) {{
                         resultsDiv.innerHTML = `<p class="text-danger">Erro: Produto não encontrado.</p>`;
                         return;
-                    }
+                    }}
                     const p = json.data[0];
                     renderProductDetails(p);
-                } else {
-                    resultsDiv.innerHTML = `<p class="text-danger">Erro: ${json.error || 'Produto não encontrado.'}</p>`;
-                }
-            } catch (error) {
+                }} else {{
+                    resultsDiv.innerHTML = `<p class="text-danger">Erro: ${{json.error || 'Produto não encontrado.'}}</p>`;
+                }}
+            }} catch (error) {{
                 console.error('Erro ao buscar detalhes do produto:', error);
                 resultsDiv.innerHTML = '<p class="text-danger">Erro de conexão ao buscar detalhes do produto.</p>';
-            }
-        }
+            }}
+        }}
         
-        function renderProductDetails(p) {
+        function renderProductDetails(p) {{
             const resultsDiv = document.getElementById('product-search-results');
             
             // 1. Criar os elementos de exibição (IDs fictícios para o exemplo, pois o HTML não foi fornecido)
@@ -1949,16 +1949,16 @@ DASHBOARD_TEMPLATE = """
                 <div class="card bg-light p-3">
                     <div class="row">
                         <div class="col-md-4 text-center">
-                            <img id="produtoImagem" src="${p.imagemURL}" class="img-fluid rounded" alt="Imagem do Produto">
+                            <img id="produtoImagem" src="${{p.imagemURL}}" class="img-fluid rounded" alt="Imagem do Produto">
                         </div>
                         <div class="col-md-8">
-                            <h5>Detalhes do Produto: ${p.nome} (${p.codigo})</h5>
-                            <p><strong>Tipo:</strong> ${p.tipo}</p>
-                            <p><strong>Situação:</strong> ${p.situacao}</p>
-                            <p><strong>Formato:</strong> ${p.formato}</p>
-                            <p><strong>Preço:</strong> R$ ${p.preco.toFixed(2)}</p>
-                            <p><strong>Preço de Custo:</strong> R$ ${p.precoCusto.toFixed(2)}</p>
-                            <p><strong>Estoque:</strong> ${p.estoque.saldoVirtualTotal}</p>
+                            <h5>Detalhes do Produto: ${{p.nome}} (${{p.codigo}})</h5>
+                            <p><strong>Tipo:</strong> ${{p.tipo}}</p>
+                            <p><strong>Situação:</strong> ${{p.situacao}}</p>
+                            <p><strong>Formato:</strong> ${{p.formato}}</p>
+                            <p><strong>Preço:</strong> R$ ${{p.preco.toFixed(2)}}</p>
+                            <p><strong>Preço de Custo:</strong> R$ ${{p.precoCusto.toFixed(2)}}</p>
+                            <p><strong>Estoque:</strong> ${{p.estoque.saldoVirtualTotal}}</p>
                         </div>
                     </div>
                     <h6 class="mt-3">Descrição Curta:</h6>
@@ -1970,57 +1970,57 @@ DASHBOARD_TEMPLATE = """
             
             // 4. Ajustar descrição (ela é HTML) - Usar innerHTML
             const descricaoEl = document.getElementById('descricaoEl');
-            if (descricaoEl) {
+            if (descricaoEl) {{
                 descricaoEl.innerHTML = p.descricaoCurta;
-            }
+            }}
             
             // 3. Ajustar exibição da imagem - Já está no HTML, mas garantindo o src
             const imgProduto = document.getElementById('produtoImagem');
-            if (imgProduto) {
+            if (imgProduto) {{
                 imgProduto.src = p.imagemURL;
-            }
-        }
+            }}
+        }}
         
-        function connectWebSocket() {
+        function connectWebSocket() {{
             const logContent = document.getElementById('logs-content');
             logContent.innerHTML = '<p class="text-white-50">Tentando conectar ao WebSocket...</p>';
             
             logWebSocket = new WebSocket(WS_URL);
 
-            logWebSocket.onopen = () => {
+            logWebSocket.onopen = () => {{
                 console.log('WebSocket conectado.');
                 logContent.innerHTML = ''; // Limpa a mensagem de conexão
-            };
+            }};
 
-            logWebSocket.onmessage = (event) => {
+            logWebSocket.onmessage = (event) => {{
                 const data = JSON.parse(event.data);
-                if (data.logs) {
-                    data.logs.forEach(log => {
+                if (data.logs) {{
+                    data.logs.forEach(log => {{
                         logContent.innerHTML += formatLog(log);
-                    });
+                    }});
                     // Scroll para o final
                     logContent.scrollTop = logContent.scrollHeight;
-                }
-            };
+                }}
+            }};
 
-            logWebSocket.onclose = (event) => {
+            logWebSocket.onclose = (event) => {{
                 console.warn('WebSocket desconectado. Tentando reconectar em 5s...', event.reason);
-                logContent.innerHTML += formatLog({
+                logContent.innerHTML += formatLog({{
                     timestamp: new Date().toISOString().slice(0, 19),
                     level: 'WARNING',
                     message: 'Conexão WebSocket perdida. Tentando reconectar...'
-                });
+                }});
                 setTimeout(connectWebSocket, 5000); // Reconexão automática
-            };
+            }};
 
-	            logWebSocket.onerror = (err) => {
+	            logWebSocket.onerror = (err) => {{
 	                console.error('WebSocket erro:', err);
 	                // Não chama close() aqui. Deixa o onclose() tratar a reconexão
-	            };
-        }
+	            }};
+        }}
         
         // Handler do botão recheck
-        document.getElementById('recheck-button').addEventListener('click', async () => {
+        document.getElementById('recheck-button').addEventListener('click', async () => {{
             const button = document.getElementById('recheck-button');
             const spinner = document.getElementById('recheck-spinner');
             const statusText = document.getElementById('recheck-status');
@@ -2029,40 +2029,40 @@ DASHBOARD_TEMPLATE = """
             spinner.classList.remove('d-none');
             statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
             
-            try {
-                const response = await fetch(`${API_BASE}/recheck`, { method: 'POST' });
+            try {{
+                const response = await fetch(`${{API_BASE}}/recheck`, {{ method: 'POST' }});
                 const data = await response.json();
                 
-                if (response.ok) {
+                if (response.ok) {{
                     statusText.textContent = data.message;
-                } else {
-                    statusText.textContent = `Erro: ${data.error || 'Falha na requisição.'}`;
+                }} else {{
+                    statusText.textContent = `Erro: ${{data.error || 'Falha na requisição.'}}`;
                     button.disabled = false;
                     spinner.classList.add('d-none');
-                }
+                }}
                 
-            } catch (error) {
+            }} catch (error) {{
                 console.error('Erro ao chamar /api/recheck:', error);
                 statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
                 button.disabled = false;
                 spinner.classList.add('d-none');
-            }
+            }}
             // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-        });
+        }});
         
         // Handler do botão de busca de produto
-        document.getElementById('search-product-button').addEventListener('click', () => {
+        document.getElementById('search-product-button').addEventListener('click', () => {{
             const skuInput = document.getElementById('product-search-sku');
             const sku = skuInput.value.trim();
-            if (sku) {
+            if (sku) {{
                 fetchProductDetails(sku);
-            } else {
+            }} else {{
                 document.getElementById('product-search-results').innerHTML = '<p class="text-warning">Por favor, digite um SKU para buscar.</p>';
-            }
-        });
+            }}
+        }});
 
         // Handler do botão recheck
-        document.getElementById('recheck-button').addEventListener('click', async () => {
+        document.getElementById('recheck-button').addEventListener('click', async () => {{
             const button = document.getElementById('recheck-button');
             const spinner = document.getElementById('recheck-spinner');
             const statusText = document.getElementById('recheck-status');
@@ -2071,29 +2071,29 @@ DASHBOARD_TEMPLATE = """
             spinner.classList.remove('d-none');
             statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
             
-            try {
-                const response = await fetch(`${API_BASE}/recheck`, { method: 'POST' });
+            try {{
+                const response = await fetch(`${{API_BASE}}/recheck`, {{ method: 'POST' }});
                 const data = await response.json();
                 
-                if (response.ok) {
+                if (response.ok) {{
                     statusText.textContent = data.message;
-                } else {
-                    statusText.textContent = `Erro: ${data.message || 'Falha na requisição.'}`;
+                }} else {{
+                    statusText.textContent = `Erro: ${{data.message || 'Falha na requisição.'}}`;
                     button.disabled = false;
                     spinner.classList.add('d-none');
-                }
+                }}
                 
-            } catch (error) {
+            }} catch (error) {{
                 console.error('Erro ao chamar /api/recheck:', error);
                 statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
                 button.disabled = false;
                 spinner.classList.add('d-none');
-            }
+            }}
             // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-        });
+        }});
 
         // b) Intervalos
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', () => {{
             fetchStatus();
             fetchStats();
             fetchStock();
@@ -2111,7 +2111,7 @@ DASHBOARD_TEMPLATE = """
             setInterval(fetchStock, dataPollingInterval);
             setInterval(fetchNeeds, dataPollingInterval);
             setInterval(fetchKits, dataPollingInterval);
-        });
+        }});
     </script>
 </body>
 </html>
