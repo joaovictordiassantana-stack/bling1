@@ -24,9 +24,6 @@ from requests.exceptions import RequestException
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
 
-
-
-
 # ============================================================================
 # 0. FUNÇÕES DE PERSISTÊNCIA DE TOKENS (RE-ADICIONADAS)
 # ============================================================================
@@ -49,8 +46,6 @@ def save_tokens(data):
         print("INFO: Tokens salvos com sucesso.")
     except Exception as e:
         print(f"Erro ao salvar tokens: {e}")
-
-
 
 def is_token_valid(token_data):
     if not token_data:
@@ -1111,9 +1106,6 @@ needs_manager = NeedsManager(api, stats_manager)
 # 7. ORQUESTRADOR DE AUTOMAÇÃO (Instância)
 orchestrator = AutomationOrchestrator(api, stats_manager, needs_manager, config_manager, auth)
 
-
-
-
 # ============================================================================
 # 14. DEPLOY E SERVIDOR (Estrutura da Classe WebServer)
 
@@ -1127,14 +1119,14 @@ DASHBOARD_TEMPLATE = """
     <title>Consulta de Produto Bling</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body {{ background-color: #f8f9fa; }
-        .container {{ max-width: 800px; margin-top: 50px; }
-        .product-card {{ border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
-        .product-image {{ max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }
-        .product-detail {{ margin-bottom: 5px; }
-        .product-detail strong {{ display: inline-block; width: 120px; }
-        #descricao {{ border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }
-        .hidden {{ display: none; }
+        body { background-color: #f8f9fa; }
+        .container { max-width: 800px; margin-top: 50px; }
+        .product-card { border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
+        .product-image { max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }
+        .product-detail { margin-bottom: 5px; }
+        .product-detail strong { display: inline-block; width: 120px; }
+        #descricao { border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }
+        .hidden { display: none; }
     </style>
 </head>
 <body>
@@ -1288,7 +1280,7 @@ class WebServer:
         @self.app.route("/")
         def dashboard():
             """Rota principal que serve o dashboard de consulta de produto."""
-            return render_template_string(DASHBOARD_TEMPLATE)
+            return render_template_string(DASHBOARD_TEMPLATE, auth_url=self.orchestrator.auth.get_auth_url() if hasattr(self.orchestrator, 'auth') else '#', api_base='/api')
 
         @self.app.route('/callback')
         def callback():
