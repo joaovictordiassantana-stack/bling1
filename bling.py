@@ -1265,14 +1265,14 @@ DASHBOARD_TEMPLATE = """
     </script>
 </body>
 </html>
-"""}],path:
+"""
 
 class WebServer:
     """Gerencia o servidor Flask, rotas e websocket."""
     
     def __init__(self, app: Flask, orchestrator: AutomationOrchestrator):
         self.app = app
-	        self.orchestrator = orchestrator
+        self.orchestrator = orchestrator
         self.sock = Sock(app)
         self.setup_routes()
         self.setup_websocket()
@@ -2013,10 +2013,10 @@ DASHBOARD_TEMPLATE = """
                 setTimeout(connectWebSocket, 5000); // Reconexão automática
             }};
 
-	            logWebSocket.onerror = (err) => {{
-	                console.error('WebSocket erro:', err);
-	                // Não chama close() aqui. Deixa o onclose() tratar a reconexão
-	            }};
+                    logWebSocket.onerror = (err) => {{
+                        console.error('WebSocket erro:', err);
+                        // Não chama close() aqui. Deixa o onclose() tratar a reconexão
+                    }};
         }}
         
         // Handler do botão recheck
