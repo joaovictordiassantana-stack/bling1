@@ -233,7 +233,7 @@ def setup_logging():
     )
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S'
+        datefmt='%Y-%m-dT%H:%M:%S'
     ))
     
     # Handler de erro separado
@@ -244,7 +244,7 @@ def setup_logging():
     )
     error_file_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S'
+        datefmt='%Y-%m-dT%H:%M:%S'
     ))
     error_logger.addHandler(error_file_handler)
     
@@ -1280,7 +1280,7 @@ class WebServer:
         @self.app.route("/")
         def dashboard():
             """Rota principal que serve o dashboard de consulta de produto."""
-            return render_template_string(DASHBOARD_TEMPLATE, auth_url=self.orchestrator.auth.get_auth_url() if hasattr(self.orchestrator, 'auth') else '#', api_base='/api')
+            return render_template_string(DASHBOARD_TEMPLATE, auth_url=self.orchestrator.auth.get_authorization_url() if hasattr(self.orchestrator, 'auth') else '#', api_base='/api')
 
         @self.app.route('/callback')
         def callback():
@@ -1558,29 +1558,29 @@ DASHBOARD_TEMPLATE = """
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
 
-        body {{ background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }
-        .navbar-brand {{ font-weight: 700; font-size: 1.5rem; }
-        .status-badge {{ padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }
-        .card {{ border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }
-        .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }
-        .card-title {{ font-weight: 600; color: #343a40; margin-bottom: 1rem; }
-        .kpi-value {{ font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }
-        .kpi-label {{ font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }
-        .log-box {{ font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
-        .log-entry {{ padding: .25rem 0; border-bottom: 1px solid #333; }
-        .log-entry:last-child {{ border-bottom: none; }
-        .log-level-INFO {{ color: #4ec9b0; }
-        .log-level-WARNING {{ color: #dcdcaa; }
-        .log-level-ERROR {{ color: #f48771; }
-        .log-level-DEBUG {{ color: #9cdcfe; }
-        .nav-tabs .nav-link {{ color: #6c757d; font-weight: 500; }
-        .nav-tabs .nav-link.active {{ background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }
-        .table-danger td {{ background-color: #f8d7da !important; }
-        .table-warning td {{ background-color: #fff3cd !important; }
-        .btn-primary {{ background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }
-        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }
-        .spinner-border-sm {{ width: 1rem; height: 1rem; border-width: .15em; }
+        body {{ background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
+        .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }}
+        .navbar-brand {{ font-weight: 700; font-size: 1.5rem; }}
+        .status-badge {{ padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }}
+        .card {{ border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }}
+        .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }}
+        .card-title {{ font-weight: 600; color: #343a40; margin-bottom: 1rem; }}
+        .kpi-value {{ font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }}
+        .kpi-label {{ font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }}
+        .log-box {{ font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }}
+        .log-entry {{ padding: .25rem 0; border-bottom: 1px solid #333; }}
+        .log-entry:last-child {{ border-bottom: none; }}
+        .log-level-INFO {{ color: #4ec9b0; }}
+        .log-level-WARNING {{ color: #dcdcaa; }}
+        .log-level-ERROR {{ color: #f48771; }}
+        .log-level-DEBUG {{ color: #9cdcfe; }}
+        .nav-tabs .nav-link {{ color: #6c757d; font-weight: 500; }}
+        .nav-tabs .nav-link.active {{ background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }}
+        .table-danger td {{ background-color: #f8d7da !important; }}
+        .table-warning td {{ background-color: #fff3cd !important; }}
+        .btn-primary {{ background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }}
+        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }}
+        .spinner-border-sm {{ width: 1rem; height: 1rem; border-width: .15em; }}
     </style>
 </head>
 <body>
@@ -1730,11 +1730,11 @@ DASHBOARD_TEMPLATE = """
                 badge.className = 'status-badge bg-success text-white me-2';
                 badge.textContent = 'Token Válido';
                 authLink.className = 'btn btn-sm btn-outline-light d-none';
-            } else {{
+            }} else {{
                 badge.className = 'status-badge bg-danger text-white me-2';
                 badge.textContent = 'Token Inválido';
                 authLink.className = 'btn btn-sm btn-outline-light';
-            }
+            }}
             
             if (expiresAt) {{
                 const expiry = new Date(expiresAt);
@@ -1743,8 +1743,8 @@ DASHBOARD_TEMPLATE = """
                 if (diffMinutes < 60 && diffMinutes > 0) {{
                     badge.textContent += ` (Expira em ${diffMinutes} min)`;
                     badge.className = 'status-badge bg-warning text-dark me-2';
-                }
-            }
+                }}
+            }}
         }
 
         function updateStatsKPIs(stats) {{
@@ -1754,7 +1754,7 @@ DASHBOARD_TEMPLATE = """
             document.getElementById('kpi-pos').textContent = stats.pos_created;
             document.getElementById('kpi-checks').textContent = stats.min_stock_checks;
             document.getElementById('kpi-time').textContent = `${stats.elapsed_time_seconds}s`;
-        }
+        }}
 
         function updateStatsChart(stats) {{
             const ctx = document.getElementById('processingChart').getContext('2d');
@@ -1771,21 +1771,21 @@ DASHBOARD_TEMPLATE = """
                             backgroundColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
                             borderColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
                             borderWidth: 1
-                        }]
-                    },
+                        }}]
+                    }},
                     options: {{
                         responsive: true,
                         scales: {{
-                            y: {{ beginAtZero: true, ticks: {{ precision: 0 } }
-                        },
-                        plugins: {{ legend: {{ display: false } }
-                    }
+                            y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}
+                        }},
+                        plugins: {{ legend: {{ display: false }} }}
+                    }}
                 });
-            } else {{
+            }} else {{
                 processingChart.data.datasets[0].data = data;
                 processingChart.update();
-            }
-        }
+            }}
+        }}
 
         async function fetchStatus() {{
             try {{
@@ -1799,16 +1799,16 @@ DASHBOARD_TEMPLATE = """
                     recheckButton.disabled = true;
                     recheckSpinner.classList.remove('d-none');
                     document.getElementById('recheck-status').textContent = 'Processamento em andamento...';
-                } else {{
+                }} else {{
                     recheckButton.disabled = false;
                     recheckSpinner.classList.add('d-none');
                     document.getElementById('recheck-status').textContent = '';
-                }
+                }}
                 
-            } catch (error) {{
+            }} catch (error) {{
                 console.error('Erro ao buscar status:', error);
-            }
-        }
+            }}
+        }}
 
         async function fetchStats() {{
             try {{
@@ -1816,10 +1816,10 @@ DASHBOARD_TEMPLATE = """
                 const stats = await response.json();
                 updateStatsKPIs(stats);
                 updateStatsChart(stats);
-            } catch (error) {{
+            }} catch (error) {{
                 console.error('Erro ao buscar estatísticas:', error);
-            }
-        }
+            }}
+        }}
 
         async function fetchStock() {{
             try {{
@@ -1831,7 +1831,7 @@ DASHBOARD_TEMPLATE = """
                 if (data.stock.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="7" class="text-center">Nenhum componente encontrado.</td></tr>';
                     return;
-                }
+                }}
                 
                 data.stock.forEach(item => {{
                     const row = tbody.insertRow();
@@ -1844,12 +1844,12 @@ DASHBOARD_TEMPLATE = """
                     row.insertCell().textContent = item.supplier;
                     row.insertCell().textContent = item.lead_time_days;
                     row.insertCell().innerHTML = item.alert_level === 'danger' ? '🚨 Baixo' : (item.alert_level === 'warning' ? '⚠️ Atenção' : '✅ OK');
-                });
-            } catch (error) {{
+                }});
+            }} catch (error) {{
                 console.error('Erro ao buscar estoque:', error);
                 document.getElementById('stock-table-body').innerHTML = '<tr><td colspan="7" class="text-center text-danger">Erro ao carregar dados de estoque.</td></tr>';
-            }
-        }
+            }}
+        }}
 
         async function fetchNeeds() {{
             try {{
@@ -1861,7 +1861,7 @@ DASHBOARD_TEMPLATE = """
                 if (data.needs.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="6" class="text-center">Nenhuma necessidade de compra pendente.</td></tr>';
                     return;
-                }
+                }}
                 
                 data.needs.forEach(item => {{
                     const row = tbody.insertRow();
@@ -1871,12 +1871,12 @@ DASHBOARD_TEMPLATE = """
                     row.insertCell().textContent = item.supplier;
                     row.insertCell().textContent = item.lead_time_days;
                     row.insertCell().textContent = item.reason;
-                });
-            } catch (error) {{
+                }});
+            }} catch (error) {{
                 console.error('Erro ao buscar necessidades:', error);
                 document.getElementById('needs-table-body').innerHTML = '<tr><td colspan="6" class="text-center text-danger">Erro ao carregar necessidades de compra.</td></tr>';
-            }
-        }
+            }}
+        }}
 
         async function fetchKits() {{
             try {{
@@ -1888,7 +1888,7 @@ DASHBOARD_TEMPLATE = """
                 if (data.kits.length === 0) {{
                     tbody.innerHTML = '<tr><td colspan="4" class="text-center">Nenhum kit encontrado.</td></tr>';
                     return;
-                }
+                }}
                 
                 data.kits.forEach(kit => {{
                     const row = tbody.insertRow();
@@ -1900,12 +1900,12 @@ DASHBOARD_TEMPLATE = """
                     componentsCell.innerHTML = kit.components.map(c => 
                         `${c.name} (${c.sku}) x${c.qty}`
                     ).join('<br>');
-                });
-            } catch (error) {{
+                }});
+            }} catch (error) {{
                 console.error('Erro ao buscar kits:', error);
                 document.getElementById('kits-table-body').innerHTML = '<tr><td colspan="4" class="text-center text-danger">Erro ao carregar dados de kits.</td></tr>';
-            }
-        }
+            }}
+        }}
         
         async function fetchProductDetails(sku) {{
             const resultsDiv = document.getElementById('product-search-results');
@@ -1919,17 +1919,17 @@ DASHBOARD_TEMPLATE = """
                     if (!json.data || json.data.length === 0) {{
                         resultsDiv.innerHTML = `<p class="text-danger">Erro: Produto não encontrado.</p>`;
                         return;
-                    }
+                    }}
                     const p = json.data[0];
                     renderProductDetails(p);
-                } else {{
+                }} else {{
                     resultsDiv.innerHTML = `<p class="text-danger">Erro: ${json.error || 'Produto não encontrado.'}</p>`;
-                }
-            } catch (error) {{
+                }}
+            }} catch (error) {{
                 console.error('Erro ao buscar detalhes do produto:', error);
                 resultsDiv.innerHTML = '<p class="text-danger">Erro de conexão ao buscar detalhes do produto.</p>';
-            }
-        }
+            }}
+        }}
         
         function renderProductDetails(p) {{
             const resultsDiv = document.getElementById('product-search-results');
@@ -1965,14 +1965,14 @@ DASHBOARD_TEMPLATE = """
             const descricaoEl = document.getElementById('descricaoEl');
             if (descricaoEl) {{
                 descricaoEl.innerHTML = p.descricaoCurta;
-            }
+            }}
             
             // 3. Ajustar exibição da imagem - Já está no HTML, mas garantindo o src
             const imgProduto = document.getElementById('produtoImagem');
             if (imgProduto) {{
                 imgProduto.src = p.imagemURL;
-            }
-        }
+            }}
+        }}
         
         function connectWebSocket() {{
             const logContent = document.getElementById('logs-content');
@@ -1983,18 +1983,18 @@ DASHBOARD_TEMPLATE = """
             logWebSocket.onopen = () => {{
                 console.log('WebSocket conectado.');
                 logContent.innerHTML = ''; // Limpa a mensagem de conexão
-            };
+            }};
 
             logWebSocket.onmessage = (event) => {{
                 const data = JSON.parse(event.data);
                 if (data.logs) {{
                     data.logs.forEach(log => {{
                         logContent.innerHTML += formatLog(log);
-                    });
+                    }});
                     // Scroll para o final
                     logContent.scrollTop = logContent.scrollHeight;
-                }
-            };
+                }}
+            }};
 
             logWebSocket.onclose = (event) => {{
                 console.warn('WebSocket desconectado. Tentando reconectar em 5s...', event.reason);
@@ -2002,15 +2002,15 @@ DASHBOARD_TEMPLATE = """
                     timestamp: new Date().toISOString().slice(0, 19),
                     level: 'WARNING',
                     message: 'Conexão WebSocket perdida. Tentando reconectar...'
-                });
+                }});
                 setTimeout(connectWebSocket, 5000); // Reconexão automática
-            };
+            }};
 
                     logWebSocket.onerror = (err) => {{
                         console.error('WebSocket erro:', err);
                         // Não chama close() aqui. Deixa o onclose() tratar a reconexão
-                    };
-        }
+                    }};
+        }}
         
         // Handler do botão recheck
         document.getElementById('recheck-button').addEventListener('click', async () => {{
@@ -2023,25 +2023,25 @@ DASHBOARD_TEMPLATE = """
             statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
             
             try {{
-                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' });
+                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' }});
                 const data = await response.json();
                 
                 if (response.ok) {{
                     statusText.textContent = data.message;
-                } else {{
+                }} else {{
                     statusText.textContent = `Erro: ${data.error || 'Falha na requisição.'}`;
                     button.disabled = false;
                     spinner.classList.add('d-none');
-                }
+                }}
                 
-            } catch (error) {{
+            }} catch (error) {{
                 console.error('Erro ao chamar /api/recheck:', error);
                 statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
                 button.disabled = false;
                 spinner.classList.add('d-none');
-            }
+            }}
             // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-        });
+        }});
         
         // Handler do botão de busca de produto
         document.getElementById('search-product-button').addEventListener('click', () => {{
@@ -2049,10 +2049,10 @@ DASHBOARD_TEMPLATE = """
             const sku = skuInput.value.trim();
             if (sku) {{
                 fetchProductDetails(sku);
-            } else {{
+            }} else {{
                 document.getElementById('product-search-results').innerHTML = '<p class="text-warning">Por favor, digite um SKU para buscar.</p>';
-            }
-        });
+            }}
+        }});
 
         // Handler do botão recheck
         document.getElementById('recheck-button').addEventListener('click', async () => {{
@@ -2065,25 +2065,25 @@ DASHBOARD_TEMPLATE = """
             statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
             
             try {{
-                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' });
+                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' }});
                 const data = await response.json();
                 
                 if (response.ok) {{
                     statusText.textContent = data.message;
-                } else {{
+                }} else {{
                     statusText.textContent = `Erro: ${data.message || 'Falha na requisição.'}`;
                     button.disabled = false;
                     spinner.classList.add('d-none');
-                }
+                }}
                 
-            } catch (error) {{
+            }} catch (error) {{
                 console.error('Erro ao chamar /api/recheck:', error);
                 statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
                 button.disabled = false;
                 spinner.classList.add('d-none');
-            }
+            }}
             // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-        });
+        }});
 
         // b) Intervalos
         document.addEventListener('DOMContentLoaded', () => {{
@@ -2104,7 +2104,7 @@ DASHBOARD_TEMPLATE = """
             setInterval(fetchStock, dataPollingInterval);
             setInterval(fetchNeeds, dataPollingInterval);
             setInterval(fetchKits, dataPollingInterval);
-        });
+        }});
     </script>
 </body>
 </html>
