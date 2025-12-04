@@ -540,7 +540,7 @@
 \n        self.auth = auth
 \n        self.config = config
 \n        self.base_url = config.BLING_API_URL
-\n        self._stock_cache: Dict[int, Dict[str, Any]] = {} # {product_id: {'stock': int, 'expiry': datetime}}
+\n        self._stock_cache: Dict[int, Dict[str, Any]] = {} # {product_id: {'stock': int, 'expiry': datetime}
 \n        self._cache_ttl = timedelta(minutes=5)
 \n        
 \n    def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
@@ -1127,14 +1127,14 @@
 \n    <title>Consulta de Produto Bling</title>
 \n    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 \n    <style>
-\n        body {{ background-color: #f8f9fa; }}
-\n        .container {{ max-width: 800px; margin-top: 50px; }}
-\n        .product-card {{ border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }}
-\n        .product-image {{ max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }}
-\n        .product-detail {{ margin-bottom: 5px; }}
-\n        .product-detail strong {{ display: inline-block; width: 120px; }}
-\n        #descricao {{ border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }}
-\n        .hidden {{ display: none; }}
+\n        body {{ background-color: #f8f9fa; }
+\n        .container {{ max-width: 800px; margin-top: 50px; }
+\n        .product-card {{ border: 1px solid #dee2e6; border-radius: 0.5rem; padding: 20px; background-color: #fff; box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075); }
+\n        .product-image {{ max-width: 100%; height: auto; border-radius: 0.25rem; margin-bottom: 15px; }
+\n        .product-detail {{ margin-bottom: 5px; }
+\n        .product-detail strong {{ display: inline-block; width: 120px; }
+\n        #descricao {{ border-top: 1px solid #eee; padding-top: 15px; margin-top: 15px; }
+\n        .hidden {{ display: none; }
 \n    </style>
 \n</head>
 \n<body>
@@ -1522,7 +1522,7 @@
 \n    <div class="container d-flex justify-content-center align-items-center" style="min-height: 100vh;">
 \n        <div class="card shadow-lg p-5 text-center">
 \n            <h1 class="text-success">✅ Sucesso!</h1>
-\n            <p class="lead">{{ message }}</p>
+\n            <p class="lead">{{ message }</p>
 \n            <p>Você pode fechar esta janela e voltar ao dashboard.</p>
 \n            <a href="/" class="btn btn-primary">Voltar ao Dashboard</a>
 \n        </div>
@@ -1544,7 +1544,7 @@
 \n    <div class="container d-flex justify-content-center align-items-center" style="min-height: 100vh;">
 \n        <div class="card shadow-lg p-5 text-center">
 \n            <h1 class="text-danger">❌ Erro!</h1>
-\n            <p class="lead">{{ message }}</p>
+\n            <p class="lead">{{ message }</p>
 \n            <p>Verifique o log para mais detalhes ou tente novamente.</p>
 \n            <a href="/" class="btn btn-primary">Voltar ao Dashboard</a>
 \n        </div>
@@ -1566,29 +1566,29 @@
 \n    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 \n    <style>
 \n
-\n        body {{ background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
-\n        .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }}
-\n        .navbar-brand {{ font-weight: 700; font-size: 1.5rem; }}
-\n        .status-badge {{ padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }}
-\n        .card {{ border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }}
-\n        .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }}
-\n        .card-title {{ font-weight: 600; color: #343a40; margin-bottom: 1rem; }}
-\n        .kpi-value {{ font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }}
-\n        .kpi-label {{ font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }}
-\n        .log-box {{ font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }}
-\n        .log-entry {{ padding: .25rem 0; border-bottom: 1px solid #333; }}
-\n        .log-entry:last-child {{ border-bottom: none; }}
-\n        .log-level-INFO {{ color: #4ec9b0; }}
-\n        .log-level-WARNING {{ color: #dcdcaa; }}
-\n        .log-level-ERROR {{ color: #f48771; }}
-\n        .log-level-DEBUG {{ color: #9cdcfe; }}
-\n        .nav-tabs .nav-link {{ color: #6c757d; font-weight: 500; }}
-\n        .nav-tabs .nav-link.active {{ background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }}
-\n        .table-danger td {{ background-color: #f8d7da !important; }}
-\n        .table-warning td {{ background-color: #fff3cd !important; }}
-\n        .btn-primary {{ background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }}
-\n        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }}
-\n        .spinner-border-sm {{ width: 1rem; height: 1rem; border-width: .15em; }}
+\n        body {{ background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+\n        .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }
+\n        .navbar-brand {{ font-weight: 700; font-size: 1.5rem; }
+\n        .status-badge {{ padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }
+\n        .card {{ border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }
+\n        .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }
+\n        .card-title {{ font-weight: 600; color: #343a40; margin-bottom: 1rem; }
+\n        .kpi-value {{ font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }
+\n        .kpi-label {{ font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }
+\n        .log-box {{ font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
+\n        .log-entry {{ padding: .25rem 0; border-bottom: 1px solid #333; }
+\n        .log-entry:last-child {{ border-bottom: none; }
+\n        .log-level-INFO {{ color: #4ec9b0; }
+\n        .log-level-WARNING {{ color: #dcdcaa; }
+\n        .log-level-ERROR {{ color: #f48771; }
+\n        .log-level-DEBUG {{ color: #9cdcfe; }
+\n        .nav-tabs .nav-link {{ color: #6c757d; font-weight: 500; }
+\n        .nav-tabs .nav-link.active {{ background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }
+\n        .table-danger td {{ background-color: #f8d7da !important; }
+\n        .table-warning td {{ background-color: #fff3cd !important; }
+\n        .btn-primary {{ background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }
+\n        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }
+\n        .spinner-border-sm {{ width: 1rem; height: 1rem; border-width: .15em; }
 \n    </style>
 \n</head>
 \n<body>
@@ -1597,7 +1597,7 @@
 \n            <a class="navbar-brand text-white" href="#">Bling Automação</a>
 \n            <div class="d-flex">
 \n                <span id="status-badge" class="status-badge bg-secondary text-white me-2">Carregando...</span>
-\n                <a id="auth-link" href="{{{{ auth_url }}}}" class="btn btn-sm btn-outline-light">Autenticar Bling</a>
+\n                <a id="auth-link" href="{{{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar Bling</a>
 \n            </div>
 \n        </div>
 \n    </nav>
@@ -1719,16 +1719,16 @@
 \n
 \n        
 \n        const API_BASE = '/api';
-\n        const WS_URL = `ws://${{window.location.host}}/ws/logs`;
+\n        const WS_URL = `ws://${window.location.host}/ws/logs`;
 \n        let logWebSocket;
 \n        let processingChart;
 \n
 \n        // a) Funções
 \n        function formatLog(log) {{
 \n            const level = log.level;
-\n            const levelClass = `log-level-${{level}}`;
-\n            return `<div class="log-entry"><span class="${{levelClass}}">[${{log.timestamp}}] [${{level}}]</span> ${{log.message}}</div>`;
-\n        }}
+\n            const levelClass = `log-level-${level}`;
+\n            return `<div class="log-entry"><span class="${levelClass}">[${log.timestamp}] [${level}]</span> ${log.message}</div>`;
+\n        }
 \n
 \n        function updateStatusBadge(isValid, expiresAt) {{
 \n            const badge = document.getElementById('status-badge');
@@ -1738,22 +1738,22 @@
 \n                badge.className = 'status-badge bg-success text-white me-2';
 \n                badge.textContent = 'Token Válido';
 \n                authLink.className = 'btn btn-sm btn-outline-light d-none';
-\n            }} else {{
+\n            } else {{
 \n                badge.className = 'status-badge bg-danger text-white me-2';
 \n                badge.textContent = 'Token Inválido';
 \n                authLink.className = 'btn btn-sm btn-outline-light';
-\n            }}
+\n            }
 \n            
 \n            if (expiresAt) {{
 \n                const expiry = new Date(expiresAt);
 \n                const now = new Date();
 \n                const diffMinutes = Math.round((expiry - now) / 60000);
 \n                if (diffMinutes < 60 && diffMinutes > 0) {{
-\n                    badge.textContent += ` (Expira em ${{diffMinutes}} min)`;
+\n                    badge.textContent += ` (Expira em ${diffMinutes} min)`;
 \n                    badge.className = 'status-badge bg-warning text-dark me-2';
-\n                }}
-\n            }}
-\n        }}
+\n                }
+\n            }
+\n        }
 \n
 \n        function updateStatsKPIs(stats) {{
 \n            document.getElementById('kpi-success').textContent = stats.success;
@@ -1761,8 +1761,8 @@
 \n            document.getElementById('kpi-ops').textContent = stats.ops_created;
 \n            document.getElementById('kpi-pos').textContent = stats.pos_created;
 \n            document.getElementById('kpi-checks').textContent = stats.min_stock_checks;
-\n            document.getElementById('kpi-time').textContent = `${{stats.elapsed_time_seconds}}s`;
-\n        }}
+\n            document.getElementById('kpi-time').textContent = `${stats.elapsed_time_seconds}s`;
+\n        }
 \n
 \n        function updateStatsChart(stats) {{
 \n            const ctx = document.getElementById('processingChart').getContext('2d');
@@ -1779,25 +1779,25 @@
 \n                            backgroundColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
 \n                            borderColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
 \n                            borderWidth: 1
-\n                        }}]
-\n                    }},
+\n                        }]
+\n                    },
 \n                    options: {{
 \n                        responsive: true,
 \n                        scales: {{
-\n                            y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}
-\n                        }},
-\n                        plugins: {{ legend: {{ display: false }} }}
-\n                    }}
-\n                }});
-\n            }} else {{
+\n                            y: {{ beginAtZero: true, ticks: {{ precision: 0 } }
+\n                        },
+\n                        plugins: {{ legend: {{ display: false } }
+\n                    }
+\n                });
+\n            } else {{
 \n                processingChart.data.datasets[0].data = data;
 \n                processingChart.update();
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n
 \n        async function fetchStatus() {{
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/status`);
+\n                const response = await fetch(`${API_BASE}/status`);
 \n                const data = await response.json();
 \n                updateStatusBadge(data.authenticated, data.token_expires_at);
 \n                
@@ -1807,31 +1807,31 @@
 \n                    recheckButton.disabled = true;
 \n                    recheckSpinner.classList.remove('d-none');
 \n                    document.getElementById('recheck-status').textContent = 'Processamento em andamento...';
-\n                }} else {{
+\n                } else {{
 \n                    recheckButton.disabled = false;
 \n                    recheckSpinner.classList.add('d-none');
 \n                    document.getElementById('recheck-status').textContent = '';
-\n                }}
+\n                }
 \n                
-\n            }} catch (error) {{
+\n            } catch (error) {{
 \n                console.error('Erro ao buscar status:', error);
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n
 \n        async function fetchStats() {{
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/stats`);
+\n                const response = await fetch(`${API_BASE}/stats`);
 \n                const stats = await response.json();
 \n                updateStatsKPIs(stats);
 \n                updateStatsChart(stats);
-\n            }} catch (error) {{
+\n            } catch (error) {{
 \n                console.error('Erro ao buscar estatísticas:', error);
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n
 \n        async function fetchStock() {{
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/stock`);
+\n                const response = await fetch(`${API_BASE}/stock`);
 \n                const data = await response.json();
 \n                const tbody = document.getElementById('stock-table-body');
 \n                tbody.innerHTML = '';
@@ -1839,7 +1839,7 @@
 \n                if (data.stock.length === 0) {{
 \n                    tbody.innerHTML = '<tr><td colspan="7" class="text-center">Nenhum componente encontrado.</td></tr>';
 \n                    return;
-\n                }}
+\n                }
 \n                
 \n                data.stock.forEach(item => {{
 \n                    const row = tbody.insertRow();
@@ -1852,16 +1852,16 @@
 \n                    row.insertCell().textContent = item.supplier;
 \n                    row.insertCell().textContent = item.lead_time_days;
 \n                    row.insertCell().innerHTML = item.alert_level === 'danger' ? '🚨 Baixo' : (item.alert_level === 'warning' ? '⚠️ Atenção' : '✅ OK');
-\n                }});
-\n            }} catch (error) {{
+\n                });
+\n            } catch (error) {{
 \n                console.error('Erro ao buscar estoque:', error);
 \n                document.getElementById('stock-table-body').innerHTML = '<tr><td colspan="7" class="text-center text-danger">Erro ao carregar dados de estoque.</td></tr>';
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n
 \n        async function fetchNeeds() {{
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/needs`);
+\n                const response = await fetch(`${API_BASE}/needs`);
 \n                const data = await response.json();
 \n                const tbody = document.getElementById('needs-table-body');
 \n                tbody.innerHTML = '';
@@ -1869,7 +1869,7 @@
 \n                if (data.needs.length === 0) {{
 \n                    tbody.innerHTML = '<tr><td colspan="6" class="text-center">Nenhuma necessidade de compra pendente.</td></tr>';
 \n                    return;
-\n                }}
+\n                }
 \n                
 \n                data.needs.forEach(item => {{
 \n                    const row = tbody.insertRow();
@@ -1879,16 +1879,16 @@
 \n                    row.insertCell().textContent = item.supplier;
 \n                    row.insertCell().textContent = item.lead_time_days;
 \n                    row.insertCell().textContent = item.reason;
-\n                }});
-\n            }} catch (error) {{
+\n                });
+\n            } catch (error) {{
 \n                console.error('Erro ao buscar necessidades:', error);
 \n                document.getElementById('needs-table-body').innerHTML = '<tr><td colspan="6" class="text-center text-danger">Erro ao carregar necessidades de compra.</td></tr>';
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n
 \n        async function fetchKits() {{
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/kits`);
+\n                const response = await fetch(`${API_BASE}/kits`);
 \n                const data = await response.json();
 \n                const tbody = document.getElementById('kits-table-body');
 \n                tbody.innerHTML = '';
@@ -1896,48 +1896,48 @@
 \n                if (data.kits.length === 0) {{
 \n                    tbody.innerHTML = '<tr><td colspan="4" class="text-center">Nenhum kit encontrado.</td></tr>';
 \n                    return;
-\n                }}
+\n                }
 \n                
 \n                data.kits.forEach(kit => {{
 \n                    const row = tbody.insertRow();
 \n                    row.insertCell().textContent = kit.sku;
 \n                    row.insertCell().textContent = kit.name;
-\n                    row.insertCell().textContent = `R$ ${{kit.price.toFixed(2)}}`;
+\n                    row.insertCell().textContent = `R$ ${kit.price.toFixed(2)}`;
 \n                    
 \n                    const componentsCell = row.insertCell();
 \n                    componentsCell.innerHTML = kit.components.map(c => 
-\n                        `${{c.name}} (${{c.sku}}) x${{c.qty}}`
+\n                        `${c.name} (${c.sku}) x${c.qty}`
 \n                    ).join('<br>');
-\n                }});
-\n            }} catch (error) {{
+\n                });
+\n            } catch (error) {{
 \n                console.error('Erro ao buscar kits:', error);
 \n                document.getElementById('kits-table-body').innerHTML = '<tr><td colspan="4" class="text-center text-danger">Erro ao carregar dados de kits.</td></tr>';
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n        
 \n        async function fetchProductDetails(sku) {{
 \n            const resultsDiv = document.getElementById('product-search-results');
 \n            resultsDiv.innerHTML = '<p class="text-info">Buscando produto...</p>';
 \n            
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/produtos?sku=${{sku}}`);
+\n                const response = await fetch(`${API_BASE}/produtos?sku=${sku}`);
 \n                const json = await response.json();
 \n                
 \n                if (response.ok) {{
 \n                    if (!json.data || json.data.length === 0) {{
 \n                        resultsDiv.innerHTML = `<p class="text-danger">Erro: Produto não encontrado.</p>`;
 \n                        return;
-\n                    }}
+\n                    }
 \n                    const p = json.data[0];
 \n                    renderProductDetails(p);
-\n                }} else {{
-\n                    resultsDiv.innerHTML = `<p class="text-danger">Erro: ${{json.error || 'Produto não encontrado.'}}</p>`;
-\n                }}
-\n            }} catch (error) {{
+\n                } else {{
+\n                    resultsDiv.innerHTML = `<p class="text-danger">Erro: ${json.error || 'Produto não encontrado.'}</p>`;
+\n                }
+\n            } catch (error) {{
 \n                console.error('Erro ao buscar detalhes do produto:', error);
 \n                resultsDiv.innerHTML = '<p class="text-danger">Erro de conexão ao buscar detalhes do produto.</p>';
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n        
 \n        function renderProductDetails(p) {{
 \n            const resultsDiv = document.getElementById('product-search-results');
@@ -1950,16 +1950,16 @@
 \n                <div class="card bg-light p-3">
 \n                    <div class="row">
 \n                        <div class="col-md-4 text-center">
-\n                            <img id="produtoImagem" src="${{p.imagemURL}}" class="img-fluid rounded" alt="Imagem do Produto">
+\n                            <img id="produtoImagem" src="${p.imagemURL}" class="img-fluid rounded" alt="Imagem do Produto">
 \n                        </div>
 \n                        <div class="col-md-8">
-\n                            <h5>Detalhes do Produto: ${{p.nome}} (${{p.codigo}})</h5>
-\n                            <p><strong>Tipo:</strong> ${{p.tipo}}</p>
-\n                            <p><strong>Situação:</strong> ${{p.situacao}}</p>
-\n                            <p><strong>Formato:</strong> ${{p.formato}}</p>
-\n                            <p><strong>Preço:</strong> R$ ${{p.preco.toFixed(2)}}</p>
-\n                            <p><strong>Preço de Custo:</strong> R$ ${{p.precoCusto.toFixed(2)}}</p>
-\n                            <p><strong>Estoque:</strong> ${{p.estoque.saldoVirtualTotal}}</p>
+\n                            <h5>Detalhes do Produto: ${p.nome} (${p.codigo})</h5>
+\n                            <p><strong>Tipo:</strong> ${p.tipo}</p>
+\n                            <p><strong>Situação:</strong> ${p.situacao}</p>
+\n                            <p><strong>Formato:</strong> ${p.formato}</p>
+\n                            <p><strong>Preço:</strong> R$ ${p.preco.toFixed(2)}</p>
+\n                            <p><strong>Preço de Custo:</strong> R$ ${p.precoCusto.toFixed(2)}</p>
+\n                            <p><strong>Estoque:</strong> ${p.estoque.saldoVirtualTotal}</p>
 \n                        </div>
 \n                    </div>
 \n                    <h6 class="mt-3">Descrição Curta:</h6>
@@ -1973,14 +1973,14 @@
 \n            const descricaoEl = document.getElementById('descricaoEl');
 \n            if (descricaoEl) {{
 \n                descricaoEl.innerHTML = p.descricaoCurta;
-\n            }}
+\n            }
 \n            
 \n            // 3. Ajustar exibição da imagem - Já está no HTML, mas garantindo o src
 \n            const imgProduto = document.getElementById('produtoImagem');
 \n            if (imgProduto) {{
 \n                imgProduto.src = p.imagemURL;
-\n            }}
-\n        }}
+\n            }
+\n        }
 \n        
 \n        function connectWebSocket() {{
 \n            const logContent = document.getElementById('logs-content');
@@ -1991,18 +1991,18 @@
 \n            logWebSocket.onopen = () => {{
 \n                console.log('WebSocket conectado.');
 \n                logContent.innerHTML = ''; // Limpa a mensagem de conexão
-\n            }};
+\n            };
 \n
 \n            logWebSocket.onmessage = (event) => {{
 \n                const data = JSON.parse(event.data);
 \n                if (data.logs) {{
 \n                    data.logs.forEach(log => {{
 \n                        logContent.innerHTML += formatLog(log);
-\n                    }});
+\n                    });
 \n                    // Scroll para o final
 \n                    logContent.scrollTop = logContent.scrollHeight;
-\n                }}
-\n            }};
+\n                }
+\n            };
 \n
 \n            logWebSocket.onclose = (event) => {{
 \n                console.warn('WebSocket desconectado. Tentando reconectar em 5s...', event.reason);
@@ -2010,15 +2010,15 @@
 \n                    timestamp: new Date().toISOString().slice(0, 19),
 \n                    level: 'WARNING',
 \n                    message: 'Conexão WebSocket perdida. Tentando reconectar...'
-\n                }});
+\n                });
 \n                setTimeout(connectWebSocket, 5000); // Reconexão automática
-\n            }};
+\n            };
 \n
 \n                    logWebSocket.onerror = (err) => {{
 \n                        console.error('WebSocket erro:', err);
 \n                        // Não chama close() aqui. Deixa o onclose() tratar a reconexão
-\n                    }};
-\n        }}
+\n                    };
+\n        }
 \n        
 \n        // Handler do botão recheck
 \n        document.getElementById('recheck-button').addEventListener('click', async () => {{
@@ -2031,25 +2031,25 @@
 \n            statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
 \n            
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/recheck`, {{ method: 'POST' }});
+\n                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' });
 \n                const data = await response.json();
 \n                
 \n                if (response.ok) {{
 \n                    statusText.textContent = data.message;
-\n                }} else {{
-\n                    statusText.textContent = `Erro: ${{data.error || 'Falha na requisição.'}}`;
+\n                } else {{
+\n                    statusText.textContent = `Erro: ${data.error || 'Falha na requisição.'}`;
 \n                    button.disabled = false;
 \n                    spinner.classList.add('d-none');
-\n                }}
+\n                }
 \n                
-\n            }} catch (error) {{
+\n            } catch (error) {{
 \n                console.error('Erro ao chamar /api/recheck:', error);
 \n                statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
 \n                button.disabled = false;
 \n                spinner.classList.add('d-none');
-\n            }}
+\n            }
 \n            // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-\n        }});
+\n        });
 \n        
 \n        // Handler do botão de busca de produto
 \n        document.getElementById('search-product-button').addEventListener('click', () => {{
@@ -2057,10 +2057,10 @@
 \n            const sku = skuInput.value.trim();
 \n            if (sku) {{
 \n                fetchProductDetails(sku);
-\n            }} else {{
+\n            } else {{
 \n                document.getElementById('product-search-results').innerHTML = '<p class="text-warning">Por favor, digite um SKU para buscar.</p>';
-\n            }}
-\n        }});
+\n            }
+\n        });
 \n
 \n        // Handler do botão recheck
 \n        document.getElementById('recheck-button').addEventListener('click', async () => {{
@@ -2073,25 +2073,25 @@
 \n            statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
 \n            
 \n            try {{
-\n                const response = await fetch(`${{API_BASE}}/recheck`, {{ method: 'POST' }});
+\n                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' });
 \n                const data = await response.json();
 \n                
 \n                if (response.ok) {{
 \n                    statusText.textContent = data.message;
-\n                }} else {{
-\n                    statusText.textContent = `Erro: ${{data.message || 'Falha na requisição.'}}`;
+\n                } else {{
+\n                    statusText.textContent = `Erro: ${data.message || 'Falha na requisição.'}`;
 \n                    button.disabled = false;
 \n                    spinner.classList.add('d-none');
-\n                }}
+\n                }
 \n                
-\n            }} catch (error) {{
+\n            } catch (error) {{
 \n                console.error('Erro ao chamar /api/recheck:', error);
 \n                statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
 \n                button.disabled = false;
 \n                spinner.classList.add('d-none');
-\n            }}
+\n            }
 \n            // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-\n        }});
+\n        });
 \n
 \n        // b) Intervalos
 \n        document.addEventListener('DOMContentLoaded', () => {{
@@ -2112,7 +2112,7 @@
 \n            setInterval(fetchStock, dataPollingInterval);
 \n            setInterval(fetchNeeds, dataPollingInterval);
 \n            setInterval(fetchKits, dataPollingInterval);
-\n        }});
+\n        });
 \n    </script>
 \n</body>
 \n</html>
