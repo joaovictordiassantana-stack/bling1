@@ -11,6 +11,7 @@ import time
 import logging
 import logging.handlers
 import base64
+import secrets
 import argparse
 
 from pathlib import Path
@@ -551,10 +552,12 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[float] = None
+        self.state: Optional[str] = None # Adicionado para o parâmetro state do OAuth
         
     def get_authorization_url(self) -> str:
-        """Retorna a URL de autorização OAuth."""
-        return f"{self.auth_url_base}?client_id={self.client_id}&redirect_uri={self.redirect_uri}&response_type=code"
+        """Retorna a URL de autorização OAuth, gerando e armazenando o parâmetro state."""
+        self.state = secrets.token_urlsafe(16) # Gera um state seguro
+        return f"{self.auth_url_base}?client_id={self.client_id}&redirect_uri={self.redirect_uri}&response_type=code&state={self.state}"
     
     def exchange_code_for_token(self, code: str) -> bool:
         """Troca o código de autorização por tokens de acesso."""
@@ -1305,6 +1308,12 @@ class WebServer:
         def callback():
             code = request.args.get('code')
             error = request.args.get('error')
+            received_state = request.args.get('state')
+            expected_state = self.orchestrator.auth.state
+            
+            # 1. Validação do state
+            if not received_state or received_state != expected_state:
+                return render_template_string(ERROR_TEMPLATE, message="Erro de Segurança: Parâmetro 'state' inválido ou ausente."), 400
             
             if error:
                 return render_template_string(ERROR_TEMPLATE, message=f"Erro de Autorização: {error}")
@@ -1312,6 +1321,8 @@ class WebServer:
             if code:
                 try:
                     self.orchestrator.auth.exchange_code_for_token(code)
+                    # Limpa o state após o uso
+                    self.orchestrator.auth.state = None
                     return render_template_string(SUCCESS_TEMPLATE, message="Autenticação concluída com sucesso!")
                 except BlingAuthError as e:
                     return render_template_string(ERROR_TEMPLATE, message=f"Falha na troca de código: {e}")
