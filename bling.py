@@ -1168,9 +1168,7 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
     </div>
-
-    <script>
-        
+    <script>\n        {% raw %}\n        
         document.getElementById('searchButton').addEventListener('click', buscarProduto);
         document.getElementById('skuInput').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
@@ -1254,9 +1252,7 @@ DASHBOARD_TEMPLATE = """
                 console.error('Erro ao buscar produto:', error);
                 exibirErro("Ocorreu um erro ao comunicar com a API.");
             }
-        }
-        
-    </script>\n</body>
+        }        {% endraw %}\n    </script>\n</body>
 </html>
 """
 
