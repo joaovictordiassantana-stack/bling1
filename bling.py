@@ -1487,6 +1487,17 @@ def background_load():
         
     
 
+# --- Compatibility shims: ensure both get_auth_url and get_authorization_url exist ---
+try:
+    if 'BlingAuth' in globals():
+        if hasattr(BlingAuth, 'get_authorization_url') and not hasattr(BlingAuth, 'get_auth_url'):
+            BlingAuth.get_auth_url = BlingAuth.get_authorization_url
+        elif hasattr(BlingAuth, 'get_auth_url') and not hasattr(BlingAuth, 'get_authorization_url'):
+            BlingAuth.get_authorization_url = BlingAuth.get_auth_url
+except Exception:
+    pass
+
+
 def create_app() -> Flask:
     """Função factory para criar a aplicação Flask."""
     app = Flask(__name__, template_folder='.')
