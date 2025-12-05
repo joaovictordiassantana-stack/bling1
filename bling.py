@@ -295,819 +295,837 @@ class ComponentConfigManager:
             },
             "components": []
         }
+        
         self._save_config(default_config)
         return default_config
-
-    def _save_config(self, data: Dict[str, Any]):
+    
+    def _save_config(self, config: Dict[str, Any]):
         """Salva a configuração no arquivo."""
         try:
             with open(self.file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+                json.dump(config, f, indent=4, ensure_ascii=False)
         except IOError as e:
             logger.error(f"Erro ao salvar {self.file_path}: {e}")
             error_logger.error(f"Erro ao salvar {self.file_path}: {e}")
+    
+    def get_component_config(self, sku: str) -> Dict[str, Any]:
+        """Retorna a configuração de um componente específico ou os valores padrão."""
+        return self.components_map.get(sku, self.defaults.copy())
+    
+    def update_component_config(self, sku: str, config: Dict[str, Any]):
+        """Atualiza a configuração de um componente específico."""
+        # Atualiza o mapa em memória
+        if sku in self.components_map:
+            self.components_map[sku].update(config)
+        else:
+            new_config = self.defaults.copy()
+            new_config.update(config)
+            new_config['sku'] = sku
+            self.components_map[sku] = new_config
+        
+        # Reconstrói a lista de componentes no config
+        self.config['components'] = list(self.components_map.values())
+        
+        # Salva no arquivo
+        self._save_config(self.config)
+        logger.info(f"Configuração do componente {sku} atualizada.")
 
-    def apply_config_to_component(self, component: Component) -> Component:
-        """Aplica as configurações locais (defaults e específicas) a um Component."""
-        
-        # 1. Aplica defaults
-        component.supplier = self.defaults.get('supplier', component.supplier)
-        component.lead_time_days = self.defaults.get('lead_time_days', component.lead_time_days)
-        component.min_stock = self.defaults.get('min_stock', component.min_stock)
-        
-        # 2. Sobrescreve com configurações específicas do SKU
-        sku_config = self.components_map.get(component.sku)
-        if sku_config:
-            component.supplier = sku_config.get('supplier', component.supplier)
-            component.lead_time_days = sku_config.get('lead_time_days', component.lead_time_days)
-            component.min_stock = sku_config.get('min_stock', component.min_stock)
-            component.unit_cost = sku_config.get('unit_cost', component.unit_cost)
+# ============================================================================
+# 4. GERENCIAMENTO DE NECESSIDADES DE COMPRA
+# ============================================================================
+
+class PurchaseNeedsManager:
+    """Gerencia as necessidades de compra identificadas."""
+    
+    def __init__(self):
+        self.needs: Dict[str, List[PurchaseNeed]] = {}  # supplier -> [needs]
+        self.lock = Lock()
+    
+    def add_need(self, need: PurchaseNeed):
+        """Adiciona uma necessidade de compra."""
+        with self.lock:
+            if need.supplier not in self.needs:
+                self.needs[need.supplier] = []
             
-        return component
+            # Verifica se já existe uma necessidade para o mesmo componente do mesmo fornecedor
+            existing = next((n for n in self.needs[need.supplier] if n.component_sku == need.component_sku), None)
+            if existing:
+                # Atualiza a quantidade se for maior
+                if need.quantity_needed > existing.quantity_needed:
+                    existing.quantity_needed = need.quantity_needed
+                    existing.reason = need.reason
+                    logger.info(f"Necessidade atualizada: {need.component_sku} - {need.quantity_needed} unidades")
+            else:
+                self.needs[need.supplier].append(need)
+                logger.info(f"Nova necessidade adicionada: {need.component_sku} - {need.quantity_needed} unidades")
+    
+    def clear_needs(self):
+        """Limpa todas as necessidades."""
+        with self.lock:
+            self.needs.clear()
+            logger.info("Todas as necessidades de compra foram limpas.")
+    
+    def get_needs_by_supplier(self, supplier: str) -> List[PurchaseNeed]:
+        """Retorna as necessidades de um fornecedor específico."""
+        with self.lock:
+            return self.needs.get(supplier, []).copy()
+    
+    def get_all_needs(self) -> Dict[str, List[PurchaseNeed]]:
+        """Retorna todas as necessidades organizadas por fornecedor."""
+        with self.lock:
+            return {supplier: needs.copy() for supplier, needs in self.needs.items()}
 
 # ============================================================================
-# 1. AUTENTICAÇÃO OAUTH 2.0
+# 5. ESTATÍSTICAS E MÉTRICAS
 # ============================================================================
 
-class BlingAuth:
-    """Gerencia o fluxo OAuth 2.0 e a persistência de tokens."""
+@dataclass
+class ProcessingStats:
+    """Estatísticas de processamento."""
+    success: int = 0
+    failed: int = 0
+    ops_created: int = 0
+    pos_created: int = 0
+    stock_checks: int = 0
+    elapsed_time_seconds: float = 0.0
+    
+    def reset(self):
+        """Reseta todas as estatísticas."""
+        self.success = 0
+        self.failed = 0
+        self.ops_created = 0
+        self.pos_created = 0
+        self.stock_checks = 0
+        self.elapsed_time_seconds = 0.0
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Converte para dicionário."""
+        return {
+            'success': self.success,
+            'failed': self.failed,
+            'ops_created': self.ops_created,
+            'pos_created': self.pos_created,
+            'stock_checks': self.stock_checks,
+            'elapsed_time_seconds': round(self.elapsed_time_seconds, 2)
+        }
+
+# ============================================================================
+# 6. CLIENTE BLING API
+# ============================================================================
+
+class BlingAPIClient:
+    """Cliente para comunicação com a API do Bling."""
     
     def __init__(self, config: Config):
         self.config = config
-        self.token_url = config.TOKEN_URL
-        self.access_token: Optional[str] = None
-        self.refresh_token: Optional[str] = None
-        self.expires_at: Optional[float] = None # Timestamp UNIX (float)
-        self.lock = Lock() # Re-adicionado para garantir thread safety na manipulação de tokens.
+        self.session = requests.Session()
+        self.session.timeout = config.REQUEST_TIMEOUT
         
-    def _save_tokens(self):
-        """Persiste os tokens e a data de expiração no arquivo tokens.json de forma atômica."""
-        with self.lock:
-            # A escrita é feita para um arquivo temporário e depois renomeada para garantir atomicidade.
-            data = {
-            'access_token': self.access_token,
-            'refresh_token': self.refresh_token,
-            'expires_at': self.expires_at if self.expires_at else None
+    def _get_headers(self, access_token: str) -> Dict[str, str]:
+        """Retorna os headers padrão para requisições autenticadas."""
+        return {
+            'Authorization': f'Bearer {access_token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         }
-        
-        temp_file = self.config.TOKENS_FILE.with_suffix('.tmp')
-        
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-            
-            # Renomeia o arquivo temporário para o arquivo final (operação atômica)
-            temp_file.rename(self.config.TOKENS_FILE)
-            logger.info("Tokens salvos com sucesso.")
-        except IOError as e:
-            logger.error(f"Erro ao salvar tokens: {e}")
-            error_logger.error(f"Erro ao salvar tokens: {e}")
-
-    def load_tokens(self) -> bool:
-        """Carrega os tokens do arquivo tokens.json."""
-        with self.lock:
-            if self.config.TOKENS_FILE.exists():
-                try:
-                    with open(self.config.TOKENS_FILE, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        self.access_token = data.get('access_token')
-                        self.refresh_token = data.get('refresh_token')
-                        expires_at_val = data.get('expires_at')
-                        
-                        if not self.refresh_token:
-                            logger.warning("Arquivo tokens.json incompleto (refresh_token ausente). Necessário reautenticar.")
-                            self.access_token = None
-                            self.expires_at = None
-                            return False
-                            
-                        if expires_at_val:
-                            # Garante que expires_at seja um float (timestamp UNIX)
-                            try:
-                                self.expires_at = float(expires_at_val)
-                            except (ValueError, TypeError):
-                                logger.error(f"Valor inválido para expires_at: {expires_at_val}. Tratando como expirado.")
-                                self.expires_at = 0.0
-                        
-                        if self.access_token:
-                            logger.info("Tokens carregados com sucesso.")
-                            return True
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.error(f"Erro ao carregar tokens: {e}")
-                    error_logger.error(f"Erro ao carregar tokens: {e}")
-        
-        logger.warning("Tokens não encontrados ou inválidos. Necessário autenticar.")
-        return False
-
-    def is_token_valid(self) -> bool:
-        """Verifica se o token de acesso é válido e não expirou (com margem de 5 minutos)."""
-
-        if not self.access_token or not self.expires_at:
-            return False
-        # Verifica se o token expira nos próximos 5 minutos (300 segundos)
-        return self.expires_at > time.time() + 300
-
-    def get_authorization_url(self) -> str:
-        """Retorna a URL para iniciar o fluxo de autorização OAuth."""
-        return (
-            f"https://www.bling.com.br/Api/v3/oauth/authorize?"
-            f"response_type=code&"
-            f"client_id={self.config.CLIENT_ID}&"
-            f"state=random_string_for_security&"
-            f"redirect_uri={self.config.REDIRECT_URI}"
-        )
-
-    def _get_basic_auth_header(self) -> Dict[str, str]:
-        """Gera o cabeçalho Basic Authentication para o token endpoint."""
-        auth_string = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
-        encoded_auth = base64.b64encode(auth_string.encode()).decode()
-        return {"Authorization": f"Basic {encoded_auth}"}
-
-    def exchange_code_for_token(self, code: str):
-        """Troca o código de autorização por tokens de acesso e refresh."""
-        logger.info("Trocando código de autorização por tokens...")
-        
-        payload = {
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': self.config.REDIRECT_URI # O Bling V3 exige o redirect_uri no payload
-        }
-        
-        try:
-            response = requests.post(
-                self.token_url,
-                data=payload,
-                headers=self._get_basic_auth_header(),
-                timeout=self.config.REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            self.access_token = data['access_token']
-            self.refresh_token = data['refresh_token']
-            # O Bling retorna expires_in em segundos (padrão 3600s = 1h)
-            expires_in = data.get('expires_in', 3600)
-            self.expires_at = time.time() + expires_in
-            self._save_tokens()
-            
-            logger.info("Autenticação OAuth concluída com sucesso!")
-            return True
-            
-        except RequestException as e:
-            msg = f"Erro ao trocar código por token: {e}"
-            logger.error(msg)
-            logger.error(msg)
-            error_logger.error(msg)
-            raise BlingAuthError(msg) from e
-
-    def refresh_access_token(self):
-        """Renova o token de acesso usando o refresh token."""
-        logger.info("Tentando renovar o token de acesso...")
-        
-        if not self.refresh_token:
-            raise BlingAuthError("Refresh token não disponível. Necessário reautenticar.")
-            
-        payload = {
-            'grant_type': 'refresh_token',
-            'refresh_token': self.refresh_token,
-            'redirect_uri': self.config.REDIRECT_URI # O Bling V3 exige o redirect_uri no payload
-        }
-        
-        try:
-            response = requests.post(
-                self.token_url,
-                data=payload,
-                headers=self._get_basic_auth_header(),
-                timeout=self.config.REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            self.access_token = data['access_token']
-            # O refresh token pode mudar, então atualizamos
-            self.refresh_token = data.get('refresh_token', self.refresh_token)
-            expires_in = data.get('expires_in', 3600)
-            self.expires_at = time.time() + expires_in
-            self._save_tokens()
-            
-            logger.info("Token de acesso renovado com sucesso!")
-            return True
-            
-        except RequestException as e:
-            msg = f"Erro ao renovar token: {e}. Necessário reautenticar."
-            logger.error(msg)
-            logger.error(msg)
-            error_logger.error(msg)
-            raise BlingAuthError(msg) from e
-
-# ============================================================================
-
-def get_bling_product_by_sku(sku):
-    token_data = load_tokens()
-
-    # Se o token estiver expirado → renova automaticamente
-    if not is_token_valid(token_data):
-        token_data = refresh_access_token()
-
-    access_token = token_data["access_token"]
-
-    url = f"https://www.bling.com.br/Api/v3/produtos?codigo={sku}"
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json"
-    }
-
-    response = requests.get(url, headers=headers)
-
-    try:
-        return response.json()
-    except Exception:
-        return {"error": "Falha ao interpretar resposta do Bling", "raw": response.text}
-
-# ============================================================================
-# 4. CLASSE BlingAPI COMPLETA
-# ============================================================================
-
-class BlingAPI:
-    """Cliente robusto para a API do Bling, com retry e renovação de token."""
     
-    def __init__(self, auth: BlingAuth, config: Config):
-        self.auth = auth
-        self.config = config
-        self.base_url = config.BLING_API_URL
-        self._stock_cache: Dict[int, Dict[str, Any]] = {} # {product_id: {'stock': int, 'expiry': datetime}
-        self._cache_ttl = timedelta(minutes=5)
-        
-    def _request_with_retry(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
-        """
-        Executa uma requisição HTTP com retry e backoff exponencial.
-        Trata erros 401 com renovação automática de token.
-        """
-        url = f"{self.base_url}/{endpoint}"
+    def _make_request(self, method: str, endpoint: str, access_token: str, **kwargs) -> requests.Response:
+        """Faz uma requisição HTTP com retry automático."""
+        url = f"{self.config.BLING_API_URL}/{endpoint.lstrip('/')}"
+        headers = self._get_headers(access_token)
         
         for attempt in range(self.config.MAX_RETRIES):
             try:
-                # 1. Verifica e renova o token se necessário
-                if not self.auth.access_token:
-                    if not self.auth.refresh_token:
-                        raise BlingAuthError("Aplicação não autorizada. Acesse /auth para configurar.")
-                    # Se tiver refresh token, tenta renovar antes de prosseguir
-                    self.auth.refresh_access_token()
+                response = self.session.request(method, url, headers=headers, **kwargs)
                 
-                # 2. Adiciona cabeçalhos de autorização
-                headers = kwargs.pop('headers', {})
-                headers['Authorization'] = f'Bearer {self.auth.access_token}'
-                headers['Accept'] = 'application/json'
-                kwargs['headers'] = headers
+                # Se a resposta for bem-sucedida, retorna
+                if response.status_code < 500:
+                    return response
+                    
+                # Para erros 5xx, tenta novamente
+                logger.warning(f"Erro {response.status_code} na tentativa {attempt + 1}/{self.config.MAX_RETRIES}: {url}")
                 
-                # 3. Executa a requisição
-                response = requests.request(
-                    method, 
-                    url, 
-                    timeout=self.config.REQUEST_TIMEOUT, 
-                    **kwargs
-                )
-                
-                # 4. Trata status codes
-                if response.status_code == 200 or response.status_code == 201:
-                    return response.json()
-                
-                # 5. Trata 401 (Não Autorizado) - Força a renovação e tenta novamente
-                if response.status_code == 401:
-                    logger.warning("Token expirado ou inválido (401). Tentando renovar...")
-                    self.auth.refresh_access_token()
-                    # Força a próxima iteração do loop com o novo token
-                    continue 
-                
-                # 6. Trata outros erros da API
-                response.raise_for_status()
-                
-            except BlingAuthError:
-                # Se a renovação falhar, o erro é fatal
-                raise
             except RequestException as e:
-                # Trata erros de conexão, timeout, etc.
-                if attempt < self.config.MAX_RETRIES - 1:
-                    delay = self.config.BASE_DELAY * (2 ** attempt)
-                    logger.warning(f"Tentativa {attempt + 1} falhou. Erro: {e}. Tentando novamente em {delay:.2f}s...")
-                    time.sleep(delay)
-                else:
-                    msg = f"Falha na requisição após {self.config.MAX_RETRIES} tentativas para {url}: {e}"
-                    error_logger.error(msg)
-                    raise BlingAPIError(msg) from e
-            except Exception as e:
-                msg = f"Erro inesperado na requisição para {url}: {e}"
-                error_logger.error(msg)
-                raise BlingAPIError(msg) from e
+                logger.warning(f"Erro de conexão na tentativa {attempt + 1}/{self.config.MAX_RETRIES}: {e}")
                 
-        # Se o loop terminar sem sucesso (o que não deve acontecer se o 401 for tratado)
-        raise BlingAPIError(f"Falha desconhecida na requisição para {url}")
-
-    def get_product_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
-        """Busca um produto pelo SKU."""
-        try:
-            response = self._request_with_retry(
-                'GET', 
-                'produtos', 
-                params={'codigo': sku}
-            )
-            # A API retorna uma lista, pegamos o primeiro
-            return response.get('data', [{}])[0].get('produto')
-        except BlingAPIError as e:
-            logger.error(f"Erro ao buscar produto SKU {sku}: {e}")
-            return None
-
-    def get_product_stock(self, product_id: int) -> int:
-        """Busca o estoque atual de um produto pelo ID, usando cache com TTL de 5 minutos."""
+            # Backoff exponencial
+            if attempt < self.config.MAX_RETRIES - 1:
+                delay = self.config.BASE_DELAY * (2 ** attempt)
+                time.sleep(delay)
         
-        # 1. Verifica o cache
-        if product_id in self._stock_cache:
-            cache_entry = self._stock_cache[product_id]
-            if datetime.now() < cache_entry['expiry']:
-                return cache_entry['stock']
-            # Cache expirado, remove
-            del self._stock_cache[product_id]
-            
-        # 2. Busca na API
-        try:
-            response = self._request_with_retry(
-                'GET', 
-                f'estoques/produtos/{product_id}'
-            )
-            # A API retorna o estoque em um formato específico
-            stock = int(response.get('data', {}).get('estoque', {}).get('estoqueAtual', 0))
-            
-            # 3. Atualiza o cache
-            self._stock_cache[product_id] = {
-                'stock': stock,
-                'expiry': datetime.now() + self._cache_ttl
-            }
-            
-            return stock
-        except BlingAPIError as e:
-            logger.error(f"Erro ao buscar estoque do produto ID {product_id}: {e}")
-            return 0
-
-    def get_all_kits_and_components(self, config_manager: ComponentConfigManager) -> List[Kit]:
-        """Busca todos os Kits e seus Componentes, aplicando configurações locais."""
-        logger.info("Buscando todos os Kits e Componentes no Bling...")
-        kits: List[Kit] = []
-        pagina = 1
-        MAX_PAGES = 100 # Limite de segurança para evitar loop infinito em caso de bug na API
-        
-        while pagina <= MAX_PAGES:
-            try:
-                response = self._request_with_retry(
-                    'GET', 
-                    'produtos', 
-                    params={'tipo': 'P', 'pagina': pagina}
-                )
-                
-                data = response.get('data', [])
-                if not data:
-                    break # Fim da paginação
-                
-                pagina += 1 # Incrementa a página para a próxima iteração
-                
-                for item in data:
-                    product = item.get('produto', {})
-                    if product.get('tipo') == 'P' and product.get('estrutura'):
-                        
-                        componentes: List[Component] = []
-                        for comp_item in product['estrutura'].get('componentes', []):
-                            comp_data = comp_item.get('produto', {})
-                            
-                            # 1. Cria o objeto Component
-                            component = Component(
-                                sku=comp_data.get('codigo', 'N/A'),
-                                name=comp_data.get('descricao', 'Sem nome'),
-                                qty=int(comp_item.get('quantidade', 0)),
-                                unit_cost=float(comp_data.get('precoCusto', 0.0))
-                            )
-                            
-                            # 2. Aplica configurações locais (fornecedor, min_stock, lead_time)
-                            component = config_manager.apply_config_to_component(component)
-                            
-                            # 3. Busca estoque atual (requer o ID do produto)
-                            product_id = comp_data.get('id')
-                            if product_id:
-                                component.current_stock = self.get_product_stock(product_id)
-                            
-                            componentes.append(component)
-                            
-                        kits.append(Kit(
-                            sku=product.get('codigo', 'N/A'),
-                            name=product.get('descricao', 'Sem nome'),
-                            components=componentes,
-                            price=float(product.get('preco', 0.0))
-                        ))
-                
-                pagina += 1
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES) # Delay entre batches
-                
-            except BlingAPIError as e:
-                logger.error(f"Erro na paginação de Kits: {e}")
-                break
-                
-        logger.info(f"Busca de Kits concluída. {len(kits)} Kits encontrados.")
-        return kits
-
-    def get_supplier_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Busca um fornecedor pelo nome."""
-        try:
-            response = self._request_with_retry(
-                'GET', 
-                'fornecedores', 
-                params={'pesquisa': name}
-            )
-            # A API retorna uma lista, tentamos encontrar uma correspondência exata
-            for item in response.get('data', []):
-                supplier = item.get('fornecedor', {})
-                if supplier.get('nome') == name:
-                    return supplier
-            return None
-        except BlingAPIError as e:
-            logger.error(f"Erro ao buscar fornecedor {name}: {e}")
-            return None
-
-    def create_production_order(self, kit_sku: str, quantity: int) -> Optional[int]:
-        """Cria uma Ordem de Produção (OP) no Bling."""
-        logger.info(f"Criando OP para Kit {kit_sku} (Qtd: {quantity})...")
-        
-        payload = {
-            "data": {
-                "produto": {
-                    "codigo": kit_sku
-                },
-                "quantidade": quantity
-            }
+        # Se chegou aqui, todas as tentativas falharam
+        raise BlingAPIError(f"Falha após {self.config.MAX_RETRIES} tentativas para {method} {url}")
+    
+    def get_products(self, access_token: str, page: int = 1, limit: int = 100, **filters) -> Dict[str, Any]:
+        """Busca produtos com paginação e filtros."""
+        params = {
+            'pagina': page,
+            'limite': limit,
+            **filters
         }
         
-        try:
-            response = self._request_with_retry(
-                'POST', 
-                'producao/ordens', 
-                json=payload
-            )
-            op_id = response.get('data', {}).get('id')
-            if op_id:
-                logger.info(f"OP criada com sucesso! ID: {op_id} para Kit {kit_sku} (Qtd: {quantity})")
-                return op_id
-            else:
-                raise BlingAPIError(f"Resposta da API não contém ID da OP: {response}")
-        except BlingAPIError as e:
-            logger.error(f"Falha ao criar OP para Kit {kit_sku}: {e}")
-            return None
-
-    def create_purchase_order(self, supplier_name: str, items: List[PurchaseNeed]) -> Optional[int]:
-        """Cria uma Ordem de Compra (PO) no Bling."""
-        logger.info(f"Criando PO para Fornecedor {supplier_name} com {len(items)} itens...")
+        response = self._make_request('GET', '/produtos', access_token, params=params)
         
-        supplier = self.get_supplier_by_name(supplier_name)
-        if not supplier:
-            logger.error(f"Fornecedor '{supplier_name}' não encontrado no Bling. PO não criada.")
-            return None
-            
-        supplier_id = supplier['id']
-        
-        payload = {
-            "data": {
-                "fornecedor": {
-                    "id": supplier_id
-                },
-                "itens": [
-                    {
-                        "produto": {
-                            "codigo": item.component_sku
-                        },
-                        "quantidade": item.quantity_needed,
-                        "observacoes": f"Motivo: {item.reason}"
-                    }
-                    for item in items
-                ]
-            }
-        }
-        
-        try:
-            response = self._request_with_retry(
-                'POST', 
-                'compras/pedidos', 
-                json=payload
-            )
-            po_id = response.get('data', {}).get('id')
-            if po_id:
-                logger.info(f"PO criada com sucesso! ID: {po_id} para {supplier_name} com {len(items)} itens.")
-                return po_id
-            else:
-                raise BlingAPIError(f"Resposta da API não contém ID da PO: {response}")
-        except BlingAPIError as e:
-            logger.error(f"Falha ao criar PO para {supplier_name}: {e}")
-            return None
-
-# ============================================================================
-# 5. SISTEMA DE ESTATÍSTICAS
-# ============================================================================
-
-class StatisticsManager:
-    """Gerencia e coleta estatísticas de execução da automação."""
+        if response.status_code == 200:
+            return response.json()
+        else:
+            raise BlingAPIError(f"Erro ao buscar produtos: {response.status_code} - {response.text}")
     
-    def __init__(self):
-        self.lock = Lock()
-
-        self.reset()
-        
-    def reset(self):
-        """Reseta todas as estatísticas."""
-        with self.lock:
-            self.success: int = 0
-            self.failed: int = 0
-            self.ops_created: int = 0
-            self.pos_created: int = 0
-            self.min_stock_checks: int = 0
-            self.start_time: Optional[datetime] = None
-            self.end_time: Optional[datetime] = None
+    def get_product_by_sku(self, access_token: str, sku: str) -> Optional[Dict[str, Any]]:
+        """Busca um produto específico pelo SKU."""
+        try:
+            response = self._make_request('GET', f'/produtos', access_token, params={'codigo': sku})
             
-    def start(self):
-        """Inicia a contagem de tempo."""
-        with self.lock:
-            self.start_time = datetime.now()
-            self.end_time = None
-            
-    def stop(self):
-        """Para a contagem de tempo."""
-        with self.lock:
-            self.end_time = datetime.now()
-            
-    def increment(self, counter: str, value: int = 1):
-        """Incrementa um contador específico."""
-        with self.lock:
-            if hasattr(self, counter):
-                setattr(self, counter, getattr(self, counter) + value)
-            
-    @property
-    def elapsed_time_seconds(self) -> float:
-        """Calcula o tempo decorrido em segundos."""
-        # Não precisa de lock aqui, pois é uma propriedade que só lê
-        # e é chamada dentro de to_dict, que já tem o lock.
-        if self.start_time:
-            end = self.end_time if self.end_time else datetime.now()
-            return (end - self.start_time).total_seconds()
-        return 0.0
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Retorna as estatísticas em formato de dicionário."""
-        with self.lock:
-            return {
-                'success': self.success,
-                'failed': self.failed,
-                'ops_created': self.ops_created,
-                'pos_created': self.pos_created,
-                'min_stock_checks': self.min_stock_checks,
-                'elapsed_time_seconds': round(self.elapsed_time_seconds, 2),
-                'total_processed': self.success + self.failed
-            }
-
-# ============================================================================
-# 6. GESTÃO DE COMPRAS (PO)
-# ============================================================================
-
-class NeedsManager:
-    """Gerencia as necessidades de compra e a criação de Ordens de Compra (POs)."""
-    
-    def __init__(self, api: BlingAPI, stats: StatisticsManager):
-        self.api = api
-        self.stats = stats
-        # needs: Dict[supplier_name, List[PurchaseNeed]]
-        self.needs: Dict[str, List[PurchaseNeed]] = {}
-        self.lock = Lock()
-
-    def reset(self):
-        """Limpa todas as necessidades de compra."""
-        with self.lock:
-            self.needs = {}
-
-    def add_need(self, component: Component, quantity: int, reason: str):
-        """Adiciona uma necessidade de compra."""
-        with self.lock:
-            if quantity <= 0:
-                return
-                
-            need = PurchaseNeed(
-                component_sku=component.sku,
-                component_name=component.name,
-                quantity_needed=quantity,
-                supplier=component.supplier,
-                lead_time_days=component.lead_time_days,
-                reason=reason
-            )
-            
-            if need.supplier not in self.needs:
-                self.needs[need.supplier] = []
-            self.needs[need.supplier].append(need)
-            logger.info(f"Necessidade adicionada: {need.component_name} ({need.quantity_needed} un.) para {need.supplier}")
-
-    def check_min_stock_needs(self, components: List[Component]):
-        """Verifica o estoque mínimo de uma lista de componentes e adiciona necessidades."""
-        logger.info("Verificação de Estoque Mínimo")
-        
-        for component in components:
-            self.stats.increment('min_stock_checks')
-            
-            if component.current_stock < component.min_stock:
-                quantity_needed = component.min_stock - component.current_stock
-                self.add_need(
-                    component, 
-                    quantity_needed, 
-                    f"Estoque atual ({component.current_stock}) abaixo do mínimo ({component.min_stock})"
-                )
-                logger.warning(f"ALERTA: {component.name} ({component.sku}) precisa de {quantity_needed} un.")
+            if response.status_code == 200:
+                data = response.json()
+                products = data.get('data', [])
+                return products[0] if products else None
             else:
-                logger.debug(f"Estoque OK: {component.name} ({component.sku}) - {component.current_stock}/{component.min_stock}")
-
-    def generate_purchase_orders(self) -> List[int]:
-        """Gera Ordens de Compra (POs) no Bling, agrupando por fornecedor."""
-        with self.lock:
-            logger.info("Geração de Ordens de Compra (POs)")
-            
-            if not self.needs:
-                logger.info("Nenhuma necessidade de compra pendente.")
-                return []
-            
-            po_ids: List[int] = []
-            needs_to_process = self.needs.copy()
-            self.needs = {} # Limpa as necessidades após copiar para processamento
-            
-            for supplier_name, items in needs_to_process.items():
-                po_id = self.api.create_purchase_order(supplier_name, items)
-                if po_id:
-                    po_ids.append(po_id)
-                    self.stats.increment('pos_created')
+                logger.error(f"Erro ao buscar produto {sku}: {response.status_code} - {response.text}")
+                return None
                 
-        logger.info(f"Geração de POs concluída. {len(po_ids)} PO(s) criada(s).")
-        return po_ids
+        except Exception as e:
+            logger.error(f"Erro ao buscar produto {sku}: {e}")
+            return None
+    
+    def get_stock(self, access_token: str, product_id: int) -> Optional[Dict[str, Any]]:
+        """Busca informações de estoque de um produto."""
+        try:
+            response = self._make_request('GET', f'/estoques/{product_id}', access_token)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                logger.error(f"Erro ao buscar estoque do produto {product_id}: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Erro ao buscar estoque do produto {product_id}: {e}")
+            return None
+    
+    def create_production_order(self, access_token: str, order_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Cria uma ordem de produção."""
+        try:
+            response = self._make_request('POST', '/ordens-producao', access_token, json=order_data)
+            
+            if response.status_code in [200, 201]:
+                return response.json()
+            else:
+                logger.error(f"Erro ao criar OP: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Erro ao criar OP: {e}")
+            return None
+    
+    def create_purchase_order(self, access_token: str, order_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Cria uma ordem de compra."""
+        try:
+            response = self._make_request('POST', '/pedidos-compras', access_token, json=order_data)
+            
+            if response.status_code in [200, 201]:
+                return response.json()
+            else:
+                logger.error(f"Erro ao criar PO: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Erro ao criar PO: {e}")
+            return None
 
 # ============================================================================
-# 7. ORQUESTRADOR DE AUTOMAÇÃO
+# 7. AUTENTICAÇÃO OAUTH
+# ============================================================================
+
+class BlingAuth:
+    """Gerencia a autenticação OAuth 2.0 com o Bling."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.client_id = config.CLIENT_ID
+        self.client_secret = config.CLIENT_SECRET
+        self.redirect_uri = config.REDIRECT_URI
+        self.auth_url_base = 'https://www.bling.com.br/Api/v3/oauth/authorize'
+        
+        # Estado da autenticação
+        self.access_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.expires_at: Optional[float] = None
+        
+    def get_authorization_url(self) -> str:
+        """Retorna a URL de autorização OAuth."""
+        return f"{self.auth_url_base}?client_id={self.client_id}&redirect_uri={self.redirect_uri}&response_type=code"
+    
+    def exchange_code_for_token(self, code: str) -> bool:
+        """Troca o código de autorização por tokens de acesso."""
+        try:
+            payload = {
+                'grant_type': 'authorization_code',
+                'code': code,
+                'client_id': self.client_id,
+                'client_secret': self.client_secret,
+                'redirect_uri': self.redirect_uri
+            }
+            
+            response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                
+                self.access_token = token_data.get('access_token')
+                self.refresh_token = token_data.get('refresh_token')
+                self.expires_at = time.time() + token_data.get('expires_in', 3600)
+                
+                # Salva os tokens
+                save_data = {
+                    'access_token': self.access_token,
+                    'refresh_token': self.refresh_token,
+                    'expires_at': self.expires_at
+                }
+                save_tokens(save_data)
+                
+                logger.info("Tokens obtidos e salvos com sucesso.")
+                return True
+            else:
+                logger.error(f"Erro ao trocar código por token: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Erro na troca de código por token: {e}")
+            error_logger.error(f"Erro na troca de código por token: {e}")
+            return False
+    
+    def load_tokens(self) -> bool:
+        """Carrega tokens salvos do arquivo."""
+        token_data = load_tokens()
+        if token_data and is_token_valid(token_data):
+            self.access_token = token_data.get('access_token')
+            self.refresh_token = token_data.get('refresh_token')
+            self.expires_at = token_data.get('expires_at')
+            logger.info("Tokens carregados com sucesso.")
+            return True
+        elif token_data and token_data.get('refresh_token'):
+            # Tenta renovar o token
+            return self.refresh_access_token()
+        else:
+            logger.warning("Nenhum token válido encontrado.")
+            return False
+    
+    def refresh_access_token(self) -> bool:
+        """Renova o token de acesso usando o refresh token."""
+        if not self.refresh_token:
+            logger.error("Refresh token não disponível.")
+            return False
+        
+        try:
+            payload = {
+                'grant_type': 'refresh_token',
+                'refresh_token': self.refresh_token,
+                'client_id': self.client_id,
+                'client_secret': self.client_secret
+            }
+            
+            response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.REQUEST_TIMEOUT)
+            
+            if response.status_code == 200:
+                token_data = response.json()
+                
+                self.access_token = token_data.get('access_token')
+                # O refresh token pode ou não ser renovado
+                if 'refresh_token' in token_data:
+                    self.refresh_token = token_data.get('refresh_token')
+                self.expires_at = time.time() + token_data.get('expires_in', 3600)
+                
+                # Salva os tokens atualizados
+                save_data = {
+                    'access_token': self.access_token,
+                    'refresh_token': self.refresh_token,
+                    'expires_at': self.expires_at
+                }
+                save_tokens(save_data)
+                
+                logger.info("Token renovado com sucesso.")
+                return True
+            else:
+                logger.error(f"Erro ao renovar token: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Erro na renovação do token: {e}")
+            error_logger.error(f"Erro na renovação do token: {e}")
+            return False
+    
+    def is_authenticated(self) -> bool:
+        """Verifica se está autenticado com token válido."""
+        if not self.access_token or not self.expires_at:
+            return False
+        
+        # Verifica se o token ainda é válido (com margem de 60 segundos)
+        return time.time() < (self.expires_at - 60)
+    
+    def get_valid_token(self) -> Optional[str]:
+        """Retorna um token válido, renovando se necessário."""
+        if self.is_authenticated():
+            return self.access_token
+        
+        # Tenta renovar o token
+        if self.refresh_access_token():
+            return self.access_token
+        
+        return None
+
+# ============================================================================
+# 8. ORQUESTRADOR PRINCIPAL
 # ============================================================================
 
 class AutomationOrchestrator:
-    """Orquestra o fluxo de automação: OPs, verificação de estoque e POs."""
+    """Orquestrador principal que coordena todas as operações."""
     
-    def __init__(self, api: BlingAPI, stats: StatisticsManager, needs_manager: NeedsManager, config_manager: ComponentConfigManager, auth: BlingAuth):
-        self.api = api
-        self.stats = stats
-        self.needs_manager = needs_manager
-        self.config_manager = config_manager
-        self.auth = auth
+    def __init__(self, config: Config):
+        self.config = config
+        self.auth = BlingAuth(config)
+        self.api_client = BlingAPIClient(config)
+        self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
+        self.needs_manager = PurchaseNeedsManager()
+        self.stats = ProcessingStats()
+        
+        # Estado
         self.kits: List[Kit] = []
-        self.failed_items: List[Dict[str, Any]] = []
         self.is_running: bool = False
-
+        self.lock = Lock()
+    
+    def load_data(self) -> bool:
+        """Carrega dados iniciais (kits, componentes, estoque)."""
+        logger.info("Iniciando carregamento de dados...")
         
-    def load_data(self):
-        """Carrega todos os kits e componentes do Bling."""
-        logger.info("Carregamento Inicial de Dados")
+        # Verifica autenticação
+        token = self.auth.get_valid_token()
+        if not token:
+            logger.error("Token de acesso não disponível. Execute a autenticação primeiro.")
+            return False
+        
         try:
-            self.kits = self.api.get_all_kits_and_components(self.config_manager)
-            self.run_purchase_check(force_po_creation=False) # Verifica estoque inicial
-            logger.info("Dados carregados e verificação inicial de estoque concluída.")
+            # Carrega produtos que são kits (produtos compostos)
+            self._load_kits(token)
+            
+            # Atualiza estoque dos componentes
+            self._update_component_stock(token)
+            
+            logger.info(f"Carregamento concluído: {len(self.kits)} kits carregados.")
             return True
-        except BlingAuthError:
-            logger.error("Falha na autenticação. Não foi possível carregar os dados.")
-            return False
-        except BlingAPIError as e:
-            logger.error(f"Falha ao carregar dados da API: {e}")
-            return False
-
-    def process_kits(self, kits_to_process: List[Kit], batch_size: int, check_stock: bool = True, quantity: int = 1) -> Dict[str, Any]:
-        """Processa uma lista de kits: cria OPs e verifica estoque de componentes. Implementa processamento em lotes."""
-        
-        if batch_size <= 0:
-            batch_size = 1
-        if self.is_running:
-            logger.warning("Processamento já em andamento. Ignorando nova requisição.")
-            return {"status": "warning", "message": "Processamento já em andamento."}
-        
-        self.is_running = True
-        self.stats.reset()
-        self.needs_manager.reset()
-        self.failed_items = []
-        self.stats.start()
             
-        logger.info(f"Iniciando Processamento de {len(kits_to_process)} Kits em Lotes de {batch_size}")
-        
-        try:
-            for i, kit in enumerate(kits_to_process):
-                op_id = self.api.create_production_order(kit.sku, quantity)
-                
-                if op_id:
-                    self.stats.increment('ops_created')
-                    self.stats.increment('success')
-                    
-                    if check_stock:
-                        # Verifica o estoque de todos os componentes do kit
-                        self.needs_manager.check_min_stock_needs(kit.components)
-                else:
-                    self.stats.increment('failed')
-                    self.failed_items.append({
-                        "sku": kit.sku,
-                        "name": kit.name,
-                        "reason": "Falha ao criar Ordem de Produção"
-                    })
-                
-                # Otimização de Rate Limiting: Pausa após cada item para respeitar o limite de requisições.
-                # O delay é distribuído pelo tamanho do lote para evitar sleeps longos e desnecessários.
-                if self.config.DELAY_BETWEEN_BATCHES > 0:
-                    delay_per_item = self.config.DELAY_BETWEEN_BATCHES / batch_size
-                    time.sleep(delay_per_item)
-                    
-            # Após processar todos os kits, gera as POs
-            self.needs_manager.generate_purchase_orders()
-            
-        except BlingAPIError as e:
-            msg = f"Erro de API durante o processamento de kits: {e}"
-            logger.error(msg)
-            error_logger.error(msg)
         except Exception as e:
-            msg = f"Erro inesperado durante o processamento de kits: {e}"
-            logger.error(msg)
-            error_logger.error(msg)
-        finally:
-            self.stats.stop()
-            self.is_running = False
-            
-        return {"status": "success", "stats": self.stats.to_dict()}
-
-    def run_purchase_check(self, force_po_creation: bool = True):
-        """Executa apenas a verificação de estoque e, opcionalmente, a criação de POs."""
-        if self.is_running:
-            logger.warning("Processamento já em andamento. Ignorando nova requisição.")
-            return {"status": "warning", "message": "Processamento já em andamento."}
+            logger.error(f"Erro no carregamento de dados: {e}")
+            error_logger.error(f"Erro no carregamento de dados: {e}")
+            return False
+    
+    def _load_kits(self, access_token: str):
+        """Carrega kits (produtos compostos) do Bling."""
+        logger.info("Carregando kits...")
         
-        self.is_running = True
-        self.needs_manager.reset()
-        self.stats.start()
+        page = 1
+        kits_loaded = 0
+        
+        while True:
+            try:
+                # Busca produtos com filtro para produtos compostos
+                response = self.api_client.get_products(
+                    access_token, 
+                    page=page, 
+                    limit=100,
+                    tipo='P'  # Tipo P = Produto (pode incluir compostos)
+                )
+                
+                products = response.get('data', [])
+                if not products:
+                    break
+                
+                for product in products:
+                    # Verifica se é um produto composto (tem estrutura)
+                    if self._is_kit_product(product):
+                        kit = self._create_kit_from_product(product)
+                        if kit:
+                            self.kits.append(kit)
+                            kits_loaded += 1
+                
+                page += 1
+                
+                # Delay entre páginas para não sobrecarregar a API
+                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
+                
+            except Exception as e:
+                logger.error(f"Erro ao carregar página {page} de kits: {e}")
+                break
+        
+        logger.info(f"{kits_loaded} kits carregados.")
+    
+    def _is_kit_product(self, product: Dict[str, Any]) -> bool:
+        """Verifica se um produto é um kit (produto composto)."""
+        # Implementação simplificada - pode ser refinada conforme a estrutura real da API
+        estrutura = product.get('estrutura', {})
+        componentes = estrutura.get('componentes', [])
+        return len(componentes) > 0
+    
+    def _create_kit_from_product(self, product: Dict[str, Any]) -> Optional[Kit]:
+        """Cria um objeto Kit a partir de um produto do Bling."""
+        try:
+            sku = product.get('codigo', '')
+            name = product.get('nome', '')
+            price = float(product.get('preco', 0))
             
-        logger.info("Iniciando Verificação de Estoque e Compras")
+            if not sku:
+                return None
+            
+            kit = Kit(sku=sku, name=name, price=price)
+            
+            # Processa componentes
+            estrutura = product.get('estrutura', {})
+            componentes = estrutura.get('componentes', [])
+            
+            for comp_data in componentes:
+                component = self._create_component_from_data(comp_data)
+                if component:
+                    kit.components.append(component)
+            
+            return kit
+            
+        except Exception as e:
+            logger.error(f"Erro ao criar kit do produto {product.get('codigo', 'N/A')}: {e}")
+            return None
+    
+    def _create_component_from_data(self, comp_data: Dict[str, Any]) -> Optional[Component]:
+        """Cria um objeto Component a partir dos dados do Bling."""
+        try:
+            sku = comp_data.get('codigo', '')
+            name = comp_data.get('nome', '')
+            qty = int(comp_data.get('quantidade', 1))
+            
+            if not sku:
+                return None
+            
+            # Busca configurações locais do componente
+            config = self.component_config.get_component_config(sku)
+            
+            component = Component(
+                sku=sku,
+                name=name,
+                qty=qty,
+                supplier=config.get('supplier', 'N/A'),
+                lead_time_days=config.get('lead_time_days', 0),
+                unit_cost=config.get('unit_cost', 0.0),
+                min_stock=config.get('min_stock', self.config.MIN_STOCK_THRESHOLD)
+            )
+            
+            return component
+            
+        except Exception as e:
+            logger.error(f"Erro ao criar componente: {e}")
+            return None
+    
+    def _update_component_stock(self, access_token: str):
+        """Atualiza o estoque atual de todos os componentes."""
+        logger.info("Atualizando estoque dos componentes...")
+        
+        # Coleta todos os SKUs únicos de componentes
+        component_skus = set()
+        for kit in self.kits:
+            for component in kit.components:
+                component_skus.add(component.sku)
+        
+        updated_count = 0
+        
+        for sku in component_skus:
+            try:
+                # Busca o produto pelo SKU
+                product = self.api_client.get_product_by_sku(access_token, sku)
+                
+                if product:
+                    # Busca informações de estoque
+                    product_id = product.get('id')
+                    if product_id:
+                        stock_info = self.api_client.get_stock(access_token, product_id)
+                        
+                        if stock_info:
+                            # Atualiza o estoque em todos os componentes com este SKU
+                            current_stock = stock_info.get('saldoVirtualTotal', 0)
+                            self._update_component_stock_by_sku(sku, current_stock)
+                            updated_count += 1
+                
+                # Delay entre consultas
+                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
+                
+            except Exception as e:
+                logger.error(f"Erro ao atualizar estoque do componente {sku}: {e}")
+        
+        logger.info(f"Estoque atualizado para {updated_count} componentes.")
+    
+    def _update_component_stock_by_sku(self, sku: str, current_stock: int):
+        """Atualiza o estoque atual de um componente específico em todos os kits."""
+        for kit in self.kits:
+            for component in kit.components:
+                if component.sku == sku:
+                    component.current_stock = current_stock
+    
+    def run_purchase_check(self, create_orders: bool = False) -> bool:
+        """Executa verificação de necessidades de compra e criação de ordens."""
+        if self.is_running:
+            logger.warning("Processamento já em andamento.")
+            return False
+        
+        with self.lock:
+            self.is_running = True
         
         try:
-            # 1. Coleta todos os componentes únicos de todos os kits
-            all_components: Dict[str, Component] = {}
+            start_time = time.time()
+            self.stats.reset()
+            
+            logger.info("Iniciando verificação de necessidades de compra...")
+            
+            # Verifica autenticação
+            token = self.auth.get_valid_token()
+            if not token:
+                logger.error("Token de acesso não disponível.")
+                return False
+            
+            # Limpa necessidades anteriores
+            self.needs_manager.clear_needs()
+            
+            # Verifica cada kit
             for kit in self.kits:
-                for component in kit.components:
-                    all_components[component.sku] = component
+                self._check_kit_needs(kit)
+                self.stats.stock_checks += 1
             
-            # 2. Verifica o estoque mínimo de todos os componentes
-            self.needs_manager.check_min_stock_needs(list(all_components.values()))
+            # Cria ordens se solicitado
+            if create_orders:
+                self._create_purchase_orders(token)
             
-            # 3. Gera as POs se forçado
-            if force_po_creation:
-                self.needs_manager.generate_purchase_orders()
-                
-        except BlingAPIError as e:
-            msg = f"Erro de API durante a verificação de estoque: {e}"
-            logger.error(msg)
-            error_logger.error(msg)
+            self.stats.elapsed_time_seconds = time.time() - start_time
+            
+            logger.info(f"Verificação concluída em {self.stats.elapsed_time_seconds:.2f}s")
+            return True
+            
         except Exception as e:
-            msg = f"Erro inesperado durante a verificação de estoque: {e}"
-            logger.error(msg)
-            error_logger.error(msg)
+            logger.error(f"Erro na verificação de necessidades: {e}")
+            error_logger.error(f"Erro na verificação de necessidades: {e}")
+            self.stats.failed += 1
+            return False
         finally:
-            self.stats.stop()
-            self.is_running = False
+            with self.lock:
+                self.is_running = False
+    
+    def _check_kit_needs(self, kit: Kit):
+        """Verifica as necessidades de compra de um kit específico."""
+        logger.debug(f"Verificando necessidades do kit {kit.sku}")
+        
+        for component in kit.components:
+            # Verifica se o estoque está abaixo do mínimo
+            if component.current_stock < component.min_stock:
+                quantity_needed = component.min_stock - component.current_stock
+                
+                need = PurchaseNeed(
+                    component_sku=component.sku,
+                    component_name=component.name,
+                    quantity_needed=quantity_needed,
+                    supplier=component.supplier,
+                    lead_time_days=component.lead_time_days,
+                    reason=f"Estoque baixo: {component.current_stock} < {component.min_stock}"
+                )
+                
+                self.needs_manager.add_need(need)
+    
+    def _create_purchase_orders(self, access_token: str):
+        """Cria ordens de compra baseadas nas necessidades identificadas."""
+        logger.info("Criando ordens de compra...")
+        
+        all_needs = self.needs_manager.get_all_needs()
+        
+        for supplier, needs in all_needs.items():
+            if not needs:
+                continue
             
-        logger.info("Verificação Concluída")
-        return {"status": "success", "stats": self.stats.to_dict()}
+            try:
+                # Cria uma PO por fornecedor
+                po_data = self._build_purchase_order_data(supplier, needs)
+                
+                result = self.api_client.create_purchase_order(access_token, po_data)
+                
+                if result:
+                    self.stats.pos_created += 1
+                    self.stats.success += 1
+                    logger.info(f"PO criada para fornecedor {supplier}")
+                else:
+                    self.stats.failed += 1
+                    logger.error(f"Falha ao criar PO para fornecedor {supplier}")
+                
+            except Exception as e:
+                self.stats.failed += 1
+                logger.error(f"Erro ao criar PO para fornecedor {supplier}: {e}")
+    
+    def _build_purchase_order_data(self, supplier: str, needs: List[PurchaseNeed]) -> Dict[str, Any]:
+        """Constrói os dados para criação de uma ordem de compra."""
+        # Estrutura básica de uma PO no Bling
+        # Esta estrutura pode precisar ser ajustada conforme a documentação da API
+        
+        items = []
+        for need in needs:
+            item = {
+                'codigo': need.component_sku,
+                'descricao': need.component_name,
+                'quantidade': need.quantity_needed,
+                'valor': 0.0  # Será preenchido manualmente ou via integração com catálogo
+            }
+            items.append(item)
+        
+        po_data = {
+            'fornecedor': {
+                'nome': supplier
+            },
+            'itens': items,
+            'observacoes': f"PO gerada automaticamente - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        }
+        
+        return po_data
+    
+    def process_kits(self, kits: List[Kit], batch_size: int = None, create_orders: bool = False, quantity: int = 1):
+        """Processa uma lista específica de kits."""
+        if self.is_running:
+            logger.warning("Processamento já em andamento.")
+            return
+        
+        if not kits:
+            logger.warning("Nenhum kit fornecido para processamento.")
+            return
+        
+        batch_size = batch_size or self.config.DEFAULT_BATCH_SIZE
+        
+        with self.lock:
+            self.is_running = True
+        
+        try:
+            start_time = time.time()
+            self.stats.reset()
+            
+            logger.info(f"Iniciando processamento de {len(kits)} kits...")
+            
+            # Verifica autenticação
+            token = self.auth.get_valid_token()
+            if not token:
+                logger.error("Token de acesso não disponível.")
+                return
+            
+            # Processa kits em lotes
+            for i in range(0, len(kits), batch_size):
+                batch = kits[i:i + batch_size]
+                
+                for kit in batch:
+                    try:
+                        if create_orders:
+                            # Cria ordem de produção para o kit
+                            self._create_production_order(token, kit, quantity)
+                        
+                        # Verifica necessidades dos componentes
+                        self._check_kit_needs(kit)
+                        
+                        self.stats.success += 1
+                        
+                    except Exception as e:
+                        self.stats.failed += 1
+                        logger.error(f"Erro ao processar kit {kit.sku}: {e}")
+                
+                # Delay entre lotes
+                if i + batch_size < len(kits):
+                    time.sleep(self.config.DELAY_BETWEEN_BATCHES)
+            
+            # Cria POs se necessário
+            if create_orders:
+                self._create_purchase_orders(token)
+            
+            self.stats.elapsed_time_seconds = time.time() - start_time
+            
+            logger.info(f"Processamento concluído em {self.stats.elapsed_time_seconds:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Erro no processamento de kits: {e}")
+            error_logger.error(f"Erro no processamento de kits: {e}")
+        finally:
+            with self.lock:
+                self.is_running = False
+    
+    def _create_production_order(self, access_token: str, kit: Kit, quantity: int):
+        """Cria uma ordem de produção para um kit."""
+        try:
+            op_data = {
+                'produto': {
+                    'codigo': kit.sku
+                },
+                'quantidade': quantity,
+                'observacoes': f"OP gerada automaticamente - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            }
+            
+            result = self.api_client.create_production_order(access_token, op_data)
+            
+            if result:
+                self.stats.ops_created += 1
+                logger.info(f"OP criada para kit {kit.sku}")
+            else:
+                logger.error(f"Falha ao criar OP para kit {kit.sku}")
+                
+        except Exception as e:
+            logger.error(f"Erro ao criar OP para kit {kit.sku}: {e}")
 
 # ============================================================================
-# INSTÂNCIAS GLOBAIS
+# 1. FUNÇÃO PARA BUSCAR PRODUTO POR SKU (PARA O DASHBOARD)
 # ============================================================================
 
-# 21. ESTRUTURA DE ARQUIVOS (Garantida pelo setup_logging e ComponentConfigManager)
-# 19# 1. CONFIGURAÇÕES (Instância)
+def get_bling_product_by_sku(sku):
+    """
+    Busca um produto no Bling pelo SKU e retorna os dados formatados.
+    Esta função é usada pela rota /api/produtos do dashboard.
+    """
+    
+    # Carrega tokens
+    token_data = load_tokens()
+    if not token_data or not is_token_valid(token_data):
+        # Tenta renovar
+        token_data = refresh_access_token()
+        if not token_data:
+            return {"error": "Token de acesso inválido. Faça a autenticação."}
+    
+    access_token = token_data["access_token"]
+    
+    # Faz a requisição para a API do Bling
+    url = f"https://www.bling.com.br/Api/v3/produtos"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    params = {"codigo": sku}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        else:
+            return {"error": f"Erro na API: {response.status_code}"}
+            
+    except Exception as e:
+        return {"error": f"Erro de conexão: {str(e)}"}
+
+# ============================================================================
+# 10. INSTÂNCIAS GLOBAIS
+# ============================================================================
+
+# Configuração
 config = Config()
-config.validate_credentials() # Chamada de validação adicionada
 
-# 2. AUTENTICAÇÃO (Instância)
-auth = BlingAuth(config)
+# Orquestrador principal
+orchestrator = AutomationOrchestrator(config)
 
-# 3. API (Instância)
-api = BlingAPI(auth, config) # Ordem corrigida (auth, config)
-
-# 4. CONFIGURAÇÃO DE COMPONENTES (Instância)
-config_manager = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
-
-# 5. SISTEMA DE ESTATÍSTICAS (Instância)
-stats_manager = StatisticsManager()
-
-# 6. GESTÃO DE COMPRAS (Instância)
-needs_manager = NeedsManager(api, stats_manager)
-
-# 7. ORQUESTRADOR DE AUTOMAÇÃO (Instância)
-orchestrator = AutomationOrchestrator(api, stats_manager, needs_manager, config_manager, auth)
-
-# ============================================================================
-# 14. DEPLOY E SERVIDOR (Estrutura da Classe WebServer)
+# Autenticação (referência para compatibilidade)
+auth = orchestrator.auth
 
 # PARTE 4 — TEMPLATE HTML DO FRONT-END (INTERFACE DO USUÁRIO)
 DASHBOARD_TEMPLATE = """
@@ -1168,7 +1186,9 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
     </div>
-    <script>\n        {% raw %}\n        
+    <script>
+        {% raw %}
+        
         document.getElementById('searchButton').addEventListener('click', buscarProduto);
         document.getElementById('skuInput').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
@@ -1252,7 +1272,10 @@ DASHBOARD_TEMPLATE = """
                 console.error('Erro ao buscar produto:', error);
                 exibirErro("Ocorreu um erro ao comunicar com a API.");
             }
-        }        {% endraw %}\n    </script>\n</body>
+        }        
+        {% endraw %}
+    </script>
+</body>
 </html>
 """
 
@@ -1298,7 +1321,7 @@ class WebServer:
         # 2. Rotas de Status e Estatísticas
         @self.app.route('/api/status')
         def api_status():
-            is_valid = self.orchestrator.auth.is_token_valid()
+            is_valid = self.orchestrator.auth.is_authenticated()
             return jsonify({
                 "authenticated": is_valid,
                 "auth_url": self.orchestrator.auth.get_authorization_url(),
@@ -1510,7 +1533,7 @@ SUCCESS_TEMPLATE = """
     <div class="container d-flex justify-content-center align-items-center" style="min-height: 100vh;">
         <div class="card shadow-lg p-5 text-center">
             <h1 class="text-success">✅ Sucesso!</h1>
-            <p class="lead">{{ message }</p>
+            <p class="lead">{{ message }}</p>
             <p>Você pode fechar esta janela e voltar ao dashboard.</p>
             <a href="/" class="btn btn-primary">Voltar ao Dashboard</a>
         </div>
@@ -1532,7 +1555,7 @@ ERROR_TEMPLATE = """
     <div class="container d-flex justify-content-center align-items-center" style="min-height: 100vh;">
         <div class="card shadow-lg p-5 text-center">
             <h1 class="text-danger">❌ Erro!</h1>
-            <p class="lead">{{ message }</p>
+            <p class="lead">{{ message }}</p>
             <p>Verifique o log para mais detalhes ou tente novamente.</p>
             <a href="/" class="btn btn-primary">Voltar ao Dashboard</a>
         </div>
@@ -1553,30 +1576,31 @@ DASHBOARD_TEMPLATE = """
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-
-        body {{ background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }}
-        .navbar {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }}
-        .navbar-brand {{ font-weight: 700; font-size: 1.5rem; }}
-        .status-badge {{ padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }}
-        .card {{ border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }}
-        .card:hover {{ transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }}
-        .card-title {{ font-weight: 600; color: #343a40; margin-bottom: 1rem; }}
-        .kpi-value {{ font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }}
-        .kpi-label {{ font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }}
-        .log-box {{ font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }}
-        .log-entry {{ padding: .25rem 0; border-bottom: 1px solid #333; }}
-        .log-entry:last-child {{ border-bottom: none; }}
-        .log-level-INFO {{ color: #4ec9b0; }}
-        .log-level-WARNING {{ color: #dcdcaa; }}
-        .log-level-ERROR {{ color: #f48771; }}
-        .log-level-DEBUG {{ color: #9cdcfe; }}
-        .nav-tabs .nav-link {{ color: #6c757d; font-weight: 500; }}
-        .nav-tabs .nav-link.active {{ background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }}
-        .table-danger td {{ background-color: #f8d7da !important; }}
-        .table-warning td {{ background-color: #fff3cd !important; }}
-        .btn-primary {{ background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }}
-        .btn-primary:hover {{ transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }}
-        .spinner-border-sm {{ width: 1rem; height: 1rem; border-width: .15em; }}
+        {% raw %}
+        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; box-shadow: 0 4px 6px rgba(0,0,0,.1); }
+        .navbar-brand { font-weight: 700; font-size: 1.5rem; }
+        .status-badge { padding: .5rem 1rem; border-radius: 20px; font-size: .9rem; font-weight: 600; }
+        .card { border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,.07); border: none; margin-bottom: 1.5rem; transition: transform 0.3s ease, box-shadow 0.3s ease; }
+        .card:hover { transform: translateY(-5px); box-shadow: 0 8px 15px rgba(0,0,0,.1); }
+        .card-title { font-weight: 600; color: #343a40; margin-bottom: 1rem; }
+        .kpi-value { font-size: 2.5rem; font-weight: 700; margin-bottom: .25rem; }
+        .kpi-label { font-size: .9rem; color: #6c757d; text-transform: uppercase; letter-spacing: .5px; }
+        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
+        .log-entry { padding: .25rem 0; border-bottom: 1px solid #333; }
+        .log-entry:last-child { border-bottom: none; }
+        .log-level-INFO { color: #4ec9b0; }
+        .log-level-WARNING { color: #dcdcaa; }
+        .log-level-ERROR { color: #f48771; }
+        .log-level-DEBUG { color: #9cdcfe; }
+        .nav-tabs .nav-link { color: #6c757d; font-weight: 500; }
+        .nav-tabs .nav-link.active { background-color: #fff; border-color: #dee2e6 #dee2e6 #fff; color: #667eea; font-weight: 600; }
+        .table-danger td { background-color: #f8d7da !important; }
+        .table-warning td { background-color: #fff3cd !important; }
+        .btn-primary { background: linear-gradient(45deg, #667eea, #764ba2); border: none; transition: all 0.3s ease; }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(102, 126, 234, 0.4); }
+        .spinner-border-sm { width: 1rem; height: 1rem; border-width: .15em; }
+        {% endraw %}
     </style>
 </head>
 <body>
@@ -1585,7 +1609,7 @@ DASHBOARD_TEMPLATE = """
             <a class="navbar-brand text-white" href="#">Bling Automação</a>
             <div class="d-flex">
                 <span id="status-badge" class="status-badge bg-secondary text-white me-2">Carregando...</span>
-                <a id="auth-link" href="{{{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar Bling</a>
+                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar Bling</a>
             </div>
         </div>
     </nav>
@@ -1704,7 +1728,7 @@ DASHBOARD_TEMPLATE = """
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-
+        {% raw %}
         
         const API_BASE = '/api';
         const WS_URL = `ws://${window.location.host}/ws/logs`;
@@ -1712,124 +1736,124 @@ DASHBOARD_TEMPLATE = """
         let processingChart;
 
         // a) Funções
-        function formatLog(log) {{
+        function formatLog(log) {
             const level = log.level;
             const levelClass = `log-level-${level}`;
             return `<div class="log-entry"><span class="${levelClass}">[${log.timestamp}] [${level}]</span> ${log.message}</div>`;
         }
 
-        function updateStatusBadge(isValid, expiresAt) {{
+        function updateStatusBadge(isValid, expiresAt) {
             const badge = document.getElementById('status-badge');
             const authLink = document.getElementById('auth-link');
             
-            if (isValid) {{
+            if (isValid) {
                 badge.className = 'status-badge bg-success text-white me-2';
                 badge.textContent = 'Token Válido';
                 authLink.className = 'btn btn-sm btn-outline-light d-none';
-            }} else {{
+            } else {
                 badge.className = 'status-badge bg-danger text-white me-2';
                 badge.textContent = 'Token Inválido';
                 authLink.className = 'btn btn-sm btn-outline-light';
-            }}
+            }
             
-            if (expiresAt) {{
+            if (expiresAt) {
                 const expiry = new Date(expiresAt);
                 const now = new Date();
                 const diffMinutes = Math.round((expiry - now) / 60000);
-                if (diffMinutes < 60 && diffMinutes > 0) {{
+                if (diffMinutes < 60 && diffMinutes > 0) {
                     badge.textContent += ` (Expira em ${diffMinutes} min)`;
                     badge.className = 'status-badge bg-warning text-dark me-2';
-                }}
-            }}
+                }
+            }
         }
 
-        function updateStatsKPIs(stats) {{
+        function updateStatsKPIs(stats) {
             document.getElementById('kpi-success').textContent = stats.success;
             document.getElementById('kpi-failed').textContent = stats.failed;
             document.getElementById('kpi-ops').textContent = stats.ops_created;
             document.getElementById('kpi-pos').textContent = stats.pos_created;
-            document.getElementById('kpi-checks').textContent = stats.min_stock_checks;
+            document.getElementById('kpi-checks').textContent = stats.stock_checks;
             document.getElementById('kpi-time').textContent = `${stats.elapsed_time_seconds}s`;
-        }}
+        }
 
-        function updateStatsChart(stats) {{
+        function updateStatsChart(stats) {
             const ctx = document.getElementById('processingChart').getContext('2d');
             const data = [stats.success, stats.failed, stats.ops_created, stats.pos_created];
             
-            if (!processingChart) {{
-                processingChart = new Chart(ctx, {{
+            if (!processingChart) {
+                processingChart = new Chart(ctx, {
                     type: 'bar',
-                    data: {{
+                    data: {
                         labels: ['Sucesso', 'Falhas', 'OPs Criadas', 'POs Criadas'],
-                        datasets: [{{
+                        datasets: [{
                             label: 'Contagem',
                             data: data,
                             backgroundColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
                             borderColor: ['#4ec9b0', '#f48771', '#667eea', '#764ba2'],
                             borderWidth: 1
-                        }}]
-                    }},
-                    options: {{
+                        }]
+                    },
+                    options: {
                         responsive: true,
-                        scales: {{
-                            y: {{ beginAtZero: true, ticks: {{ precision: 0 }} }}
-                        }},
-                        plugins: {{ legend: {{ display: false }} }}
-                    }}
+                        scales: {
+                            y: { beginAtZero: true, ticks: { precision: 0 } }
+                        },
+                        plugins: { legend: { display: false } }
+                    }
                 });
-            }} else {{
+            } else {
                 processingChart.data.datasets[0].data = data;
                 processingChart.update();
-            }}
-        }}
+            }
+        }
 
-        async function fetchStatus() {{
-            try {{
+        async function fetchStatus() {
+            try {
                 const response = await fetch(`${API_BASE}/status`);
                 const data = await response.json();
                 updateStatusBadge(data.authenticated, data.token_expires_at);
                 
                 const recheckButton = document.getElementById('recheck-button');
                 const recheckSpinner = document.getElementById('recheck-spinner');
-                if (data.is_running) {{
+                if (data.is_running) {
                     recheckButton.disabled = true;
                     recheckSpinner.classList.remove('d-none');
                     document.getElementById('recheck-status').textContent = 'Processamento em andamento...';
-                }} else {{
+                } else {
                     recheckButton.disabled = false;
                     recheckSpinner.classList.add('d-none');
                     document.getElementById('recheck-status').textContent = '';
-                }}
+                }
                 
-            }} catch (error) {{
+            } catch (error) {
                 console.error('Erro ao buscar status:', error);
-            }}
-        }}
+            }
+        }
 
-        async function fetchStats() {{
-            try {{
+        async function fetchStats() {
+            try {
                 const response = await fetch(`${API_BASE}/stats`);
                 const stats = await response.json();
                 updateStatsKPIs(stats);
                 updateStatsChart(stats);
-            }} catch (error) {{
+            } catch (error) {
                 console.error('Erro ao buscar estatísticas:', error);
-            }}
-        }}
+            }
+        }
 
-        async function fetchStock() {{
-            try {{
+        async function fetchStock() {
+            try {
                 const response = await fetch(`${API_BASE}/stock`);
                 const data = await response.json();
                 const tbody = document.getElementById('stock-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.stock.length === 0) {{
+                if (data.stock.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="7" class="text-center">Nenhum componente encontrado.</td></tr>';
                     return;
-                }}
+                }
                 
-                data.stock.forEach(item => {{
+                data.stock.forEach(item => {
                     const row = tbody.insertRow();
                     row.className = item.alert_level === 'danger' ? 'table-danger' : (item.alert_level === 'warning' ? 'table-warning' : '');
                     
@@ -1840,26 +1864,26 @@ DASHBOARD_TEMPLATE = """
                     row.insertCell().textContent = item.supplier;
                     row.insertCell().textContent = item.lead_time_days;
                     row.insertCell().innerHTML = item.alert_level === 'danger' ? '🚨 Baixo' : (item.alert_level === 'warning' ? '⚠️ Atenção' : '✅ OK');
-                }});
-            }} catch (error) {{
+                });
+            } catch (error) {
                 console.error('Erro ao buscar estoque:', error);
                 document.getElementById('stock-table-body').innerHTML = '<tr><td colspan="7" class="text-center text-danger">Erro ao carregar dados de estoque.</td></tr>';
-            }}
-        }}
+            }
+        }
 
-        async function fetchNeeds() {{
-            try {{
+        async function fetchNeeds() {
+            try {
                 const response = await fetch(`${API_BASE}/needs`);
                 const data = await response.json();
                 const tbody = document.getElementById('needs-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.needs.length === 0) {{
+                if (data.needs.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" class="text-center">Nenhuma necessidade de compra pendente.</td></tr>';
                     return;
-                }}
+                }
                 
-                data.needs.forEach(item => {{
+                data.needs.forEach(item => {
                     const row = tbody.insertRow();
                     row.insertCell().textContent = item.component_sku;
                     row.insertCell().textContent = item.component_name;
@@ -1867,26 +1891,26 @@ DASHBOARD_TEMPLATE = """
                     row.insertCell().textContent = item.supplier;
                     row.insertCell().textContent = item.lead_time_days;
                     row.insertCell().textContent = item.reason;
-                }});
-            }} catch (error) {{
+                });
+            } catch (error) {
                 console.error('Erro ao buscar necessidades:', error);
                 document.getElementById('needs-table-body').innerHTML = '<tr><td colspan="6" class="text-center text-danger">Erro ao carregar necessidades de compra.</td></tr>';
-            }}
-        }}
+            }
+        }
 
-        async function fetchKits() {{
-            try {{
+        async function fetchKits() {
+            try {
                 const response = await fetch(`${API_BASE}/kits`);
                 const data = await response.json();
                 const tbody = document.getElementById('kits-table-body');
                 tbody.innerHTML = '';
                 
-                if (data.kits.length === 0) {{
+                if (data.kits.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="4" class="text-center">Nenhum kit encontrado.</td></tr>';
                     return;
-                }}
+                }
                 
-                data.kits.forEach(kit => {{
+                data.kits.forEach(kit => {
                     const row = tbody.insertRow();
                     row.insertCell().textContent = kit.sku;
                     row.insertCell().textContent = kit.name;
@@ -1896,38 +1920,38 @@ DASHBOARD_TEMPLATE = """
                     componentsCell.innerHTML = kit.components.map(c => 
                         `${c.name} (${c.sku}) x${c.qty}`
                     ).join('<br>');
-                }});
-            }} catch (error) {{
+                });
+            } catch (error) {
                 console.error('Erro ao buscar kits:', error);
                 document.getElementById('kits-table-body').innerHTML = '<tr><td colspan="4" class="text-center text-danger">Erro ao carregar dados de kits.</td></tr>';
-            }}
-        }}
+            }
+        }
         
-        async function fetchProductDetails(sku) {{
+        async function fetchProductDetails(sku) {
             const resultsDiv = document.getElementById('product-search-results');
             resultsDiv.innerHTML = '<p class="text-info">Buscando produto...</p>';
             
-            try {{
+            try {
                 const response = await fetch(`${API_BASE}/produtos?sku=${sku}`);
                 const json = await response.json();
                 
-                if (response.ok) {{
-                    if (!json.data || json.data.length === 0) {{
+                if (response.ok) {
+                    if (!json.data || json.data.length === 0) {
                         resultsDiv.innerHTML = `<p class="text-danger">Erro: Produto não encontrado.</p>`;
                         return;
-                    }}
+                    }
                     const p = json.data[0];
                     renderProductDetails(p);
-                }} else {{
+                } else {
                     resultsDiv.innerHTML = `<p class="text-danger">Erro: ${json.error || 'Produto não encontrado.'}</p>`;
-                }}
-            }} catch (error) {{
+                }
+            } catch (error) {
                 console.error('Erro ao buscar detalhes do produto:', error);
                 resultsDiv.innerHTML = '<p class="text-danger">Erro de conexão ao buscar detalhes do produto.</p>';
-            }}
-        }}
+            }
+        }
         
-        function renderProductDetails(p) {{
+        function renderProductDetails(p) {
             const resultsDiv = document.getElementById('product-search-results');
             
             // 1. Criar os elementos de exibição (IDs fictícios para o exemplo, pois o HTML não foi fornecido)
@@ -1959,57 +1983,57 @@ DASHBOARD_TEMPLATE = """
             
             // 4. Ajustar descrição (ela é HTML) - Usar innerHTML
             const descricaoEl = document.getElementById('descricaoEl');
-            if (descricaoEl) {{
+            if (descricaoEl) {
                 descricaoEl.innerHTML = p.descricaoCurta;
-            }}
+            }
             
             // 3. Ajustar exibição da imagem - Já está no HTML, mas garantindo o src
             const imgProduto = document.getElementById('produtoImagem');
-            if (imgProduto) {{
+            if (imgProduto) {
                 imgProduto.src = p.imagemURL;
-            }}
-        }}
+            }
+        }
         
-        function connectWebSocket() {{
+        function connectWebSocket() {
             const logContent = document.getElementById('logs-content');
             logContent.innerHTML = '<p class="text-white-50">Tentando conectar ao WebSocket...</p>';
             
             logWebSocket = new WebSocket(WS_URL);
 
-            logWebSocket.onopen = () => {{
+            logWebSocket.onopen = () => {
                 console.log('WebSocket conectado.');
                 logContent.innerHTML = ''; // Limpa a mensagem de conexão
-            }};
+            };
 
-            logWebSocket.onmessage = (event) => {{
+            logWebSocket.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                if (data.logs) {{
-                    data.logs.forEach(log => {{
+                if (data.logs) {
+                    data.logs.forEach(log => {
                         logContent.innerHTML += formatLog(log);
-                    }});
+                    });
                     // Scroll para o final
                     logContent.scrollTop = logContent.scrollHeight;
-                }}
-            }};
+                }
+            };
 
-            logWebSocket.onclose = (event) => {{
+            logWebSocket.onclose = (event) => {
                 console.warn('WebSocket desconectado. Tentando reconectar em 5s...', event.reason);
-                logContent.innerHTML += formatLog({{
+                logContent.innerHTML += formatLog({
                     timestamp: new Date().toISOString().slice(0, 19),
                     level: 'WARNING',
                     message: 'Conexão WebSocket perdida. Tentando reconectar...'
-                }});
+                });
                 setTimeout(connectWebSocket, 5000); // Reconexão automática
-            }};
+            };
 
-                    logWebSocket.onerror = (err) => {{
+                    logWebSocket.onerror = (err) => {
                         console.error('WebSocket erro:', err);
                         // Não chama close() aqui. Deixa o onclose() tratar a reconexão
-                    }};
-        }}
+                    };
+        }
         
         // Handler do botão recheck
-        document.getElementById('recheck-button').addEventListener('click', async () => {{
+        document.getElementById('recheck-button').addEventListener('click', async () => {
             const button = document.getElementById('recheck-button');
             const spinner = document.getElementById('recheck-spinner');
             const statusText = document.getElementById('recheck-status');
@@ -2018,40 +2042,40 @@ DASHBOARD_TEMPLATE = """
             spinner.classList.remove('d-none');
             statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
             
-            try {{
-                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' }});
+            try {
+                const response = await fetch(`${API_BASE}/recheck`, { method: 'POST' });
                 const data = await response.json();
                 
-                if (response.ok) {{
+                if (response.ok) {
                     statusText.textContent = data.message;
-                }} else {{
+                } else {
                     statusText.textContent = `Erro: ${data.error || 'Falha na requisição.'}`;
                     button.disabled = false;
                     spinner.classList.add('d-none');
-                }}
+                }
                 
-            }} catch (error) {{
+            } catch (error) {
                 console.error('Erro ao chamar /api/recheck:', error);
                 statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
                 button.disabled = false;
                 spinner.classList.add('d-none');
-            }}
+            }
             // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-        }});
+        });
         
         // Handler do botão de busca de produto
-        document.getElementById('search-product-button').addEventListener('click', () => {{
+        document.getElementById('search-product-button').addEventListener('click', () => {
             const skuInput = document.getElementById('product-search-sku');
             const sku = skuInput.value.trim();
-            if (sku) {{
+            if (sku) {
                 fetchProductDetails(sku);
-            }} else {{
+            } else {
                 document.getElementById('product-search-results').innerHTML = '<p class="text-warning">Por favor, digite um SKU para buscar.</p>';
-            }}
-        }});
+            }
+        });
 
         // Handler do botão recheck
-        document.getElementById('recheck-button').addEventListener('click', async () => {{
+        document.getElementById('recheck-button').addEventListener('click', async () => {
             const button = document.getElementById('recheck-button');
             const spinner = document.getElementById('recheck-spinner');
             const statusText = document.getElementById('recheck-status');
@@ -2060,29 +2084,29 @@ DASHBOARD_TEMPLATE = """
             spinner.classList.remove('d-none');
             statusText.textContent = 'Iniciando verificação de estoque e geração de POs...';
             
-            try {{
-                const response = await fetch(`${API_BASE}/recheck`, {{ method: 'POST' }});
+            try {
+                const response = await fetch(`${API_BASE}/recheck`, { method: 'POST' });
                 const data = await response.json();
                 
-                if (response.ok) {{
+                if (response.ok) {
                     statusText.textContent = data.message;
-                }} else {{
+                } else {
                     statusText.textContent = `Erro: ${data.message || 'Falha na requisição.'}`;
                     button.disabled = false;
                     spinner.classList.add('d-none');
-                }}
+                }
                 
-            }} catch (error) {{
+            } catch (error) {
                 console.error('Erro ao chamar /api/recheck:', error);
                 statusText.textContent = 'Erro de conexão ao iniciar a verificação.';
                 button.disabled = false;
                 spinner.classList.add('d-none');
-            }}
+            }
             // O status final será atualizado pelo fetchStatus quando is_running voltar a ser false
-        }});
+        });
 
         // b) Intervalos
-        document.addEventListener('DOMContentLoaded', () => {{
+        document.addEventListener('DOMContentLoaded', () => {
             fetchStatus();
             fetchStats();
             fetchStock();
@@ -2100,7 +2124,8 @@ DASHBOARD_TEMPLATE = """
             setInterval(fetchStock, dataPollingInterval);
             setInterval(fetchNeeds, dataPollingInterval);
             setInterval(fetchKits, dataPollingInterval);
-        }});
+        });
+        {% endraw %}
     </script>
 </body>
 </html>
@@ -2149,31 +2174,30 @@ def run_cli():
     elif args.run:
         logger.info("Iniciando Processamento de Kits (CLI)")
         
-        if not auth.load_tokens():
-            logger.error("Não foi possível carregar tokens. Execute --serve e autentique primeiro.")
-            return
-            
+        # Carrega dados
         if not orchestrator.load_data():
-            logger.error("Não foi possível carregar dados do Bling. Verifique a conexão e o token.")
+            logger.error("Falha no carregamento de dados. Verifique a autenticação.")
             return
-            
-        # Processa todos os kits encontrados com quantidade 1 e batch_size padrão
-        orchestrator.process_kits(
-            orchestrator.kits, 
-            batch_size=config.DEFAULT_BATCH_SIZE, 
-            check_stock=True, 
-            quantity=1
-        )
         
+        # Executa verificação de necessidades e criação de ordens
+        success = orchestrator.run_purchase_check(create_orders=True)
+        
+        if success:
+            logger.info("Processamento concluído com sucesso.")
+            
+            # Exibe estatísticas
+            stats = orchestrator.stats.to_dict()
+            print("\n=== ESTATÍSTICAS ===")
+            for key, value in stats.items():
+                print(f"{key}: {value}")
+        else:
+            logger.error("Processamento falhou.")
     else:
         parser.print_help()
 
-if __name__ == '__main__':
-    # 21. ESTRUTURA DE ARQUIVOS (Criação de logs/ garantida pelo setup_logging)
-    # 13. JAVASCRIPT FALTANDO (Os intervalos e handlers estão no template)
-    # 12. CSS FALTANDO (O CSS está no template)
-    
-    # O código base já tinha a estrutura de logs em memória, agora está completa.
-    # O código base tinha rotas simples, agora estão completas e na classe WebServer.
-    
+# ============================================================================
+# 17. PONTO DE ENTRADA
+# ============================================================================
+
+if __name__ == "__main__":
     run_cli()
