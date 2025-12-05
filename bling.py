@@ -1170,7 +1170,7 @@ DASHBOARD_TEMPLATE = """
     </div>
 
     <script>
-        {% raw %}
+        
         document.getElementById('searchButton').addEventListener('click', buscarProduto);
         document.getElementById('skuInput').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
@@ -1255,7 +1255,7 @@ DASHBOARD_TEMPLATE = """
                 exibirErro("Ocorreu um erro ao comunicar com a API.");
             }
         }
-        {% endraw %}
+        
     </script>\n</body>
 </html>
 """
