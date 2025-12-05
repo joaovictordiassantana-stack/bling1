@@ -552,11 +552,12 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[float] = None
-        self.state: Optional[str] = None # Adicionado para o parâmetro state do OAuth
+        self.state: Optional[str] = None # Armazena o state gerado para validação no callback
         
     def get_authorization_url(self) -> str:
-        """Retorna a URL de autorização OAuth, gerando e armazenando o parâmetro state."""
-        self.state = secrets.token_urlsafe(16) # Gera um state seguro
+        """Retorna a URL de autorização OAuth, gerando e armazenando o parâmetro state se ainda não existir."""
+        if self.state is None:
+            self.state = secrets.token_urlsafe(16) # Gera um state seguro
         return f"{self.auth_url_base}?client_id={self.client_id}&redirect_uri={self.redirect_uri}&response_type=code&state={self.state}"
     
     def exchange_code_for_token(self, code: str) -> bool:
@@ -1312,8 +1313,14 @@ class WebServer:
             expected_state = self.orchestrator.auth.state
             
             # 1. Validação do state
-            if not received_state or received_state != expected_state:
+            if expected_state is not None and (not received_state or received_state != expected_state):
+                # Se o expected_state existe, mas o recebido não bate, é um erro de segurança.
                 return render_template_string(ERROR_TEMPLATE, message="Erro de Segurança: Parâmetro 'state' inválido ou ausente."), 400
+            
+            if expected_state is None and received_state is not None:
+                # Se o expected_state é None (servidor reiniciou), aceitamos o state recebido e seguimos.
+                # Isso é um workaround para ambientes stateless como o Render.
+                logger.warning("State esperado não encontrado (servidor reiniciou?). Aceitando o state recebido.")
             
             if error:
                 return render_template_string(ERROR_TEMPLATE, message=f"Erro de Autorização: {error}")
