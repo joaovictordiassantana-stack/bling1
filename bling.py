@@ -563,15 +563,23 @@ class BlingAuth:
     def exchange_code_for_token(self, code: str) -> bool:
         """Troca o código de autorização por tokens de acesso."""
         try:
+            # 1. Criar o cabeçalho Authorization corretamente
+            client = f"{self.client_id}:{self.client_secret}"
+            auth_header = base64.b64encode(client.encode()).decode()
+            
+            headers = {
+                "Authorization": f"Basic {auth_header}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            # 2. Enviar o body como form-data (não JSON)
             payload = {
                 'grant_type': 'authorization_code',
                 'code': code,
-                'client_id': self.client_id,
-                'client_secret': self.client_secret,
                 'redirect_uri': self.redirect_uri
             }
             
-            response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.REQUEST_TIMEOUT)
+            response = requests.post(self.config.TOKEN_URL, data=payload, headers=headers, timeout=self.config.REQUEST_TIMEOUT)
             
             if response.status_code == 200:
                 token_data = response.json()
