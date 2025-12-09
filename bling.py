@@ -26,8 +26,8 @@ from flask import Flask, request, render_template_string, jsonify, redirect, url
 from flask_sock import Sock
 
 # ============================================================================
-# 0. FUNÇÕES DE PERSISTÊNCIA DE TOKENS (RE-ADICIONADAS)
-# ============================================================================
+# 13. FUNÇÕES DE SUPORTE AO DASHBOARD
+# =============================================================================
 
 def load_tokens():
     if not os.path.exists("tokens.json"):
@@ -676,8 +676,8 @@ class BlingAuth:
         
         return None
 
-# ============================================================================
-# 8. ORQUESTRADOR PRINCIPAL
+# =# ============================================================================
+# 15. EXECUÇÃO PRINCIPAL
 # ============================================================================
 
 class AutomationOrchestrator:
@@ -838,41 +838,9 @@ class AutomationOrchestrator:
             return None
     
     def _update_component_stock(self, access_token: str):
-        """Atualiza o estoque atual de todos os componentes."""
-        logger.info("Atualizando estoque dos componentes...")
-        
-        # Coleta todos os SKUs únicos de componentes
-        component_skus = set()
-        for kit in self.kits:
-            for component in kit.components:
-                component_skus.add(component.sku)
-        
-        updated_count = 0
-        
-        for sku in component_skus:
-            try:
-                # Busca o produto pelo SKU
-                product = self.api_client.get_product_by_sku(access_token, sku)
-                
-                if product:
-                    # Busca informações de estoque
-                    product_id = product.get('id')
-                    if product_id:
-                        stock_info = self.api_client.get_stock(access_token, product_id)
-                        
-                        if stock_info:
-                            # Atualiza o estoque em todos os componentes com este SKU
-                            current_stock = stock_info.get('saldoVirtualTotal', 0)
-                            self._update_component_stock_by_sku(sku, current_stock)
-                            updated_count += 1
-                
-                # Delay entre consultas
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
-                
-            except Exception as e:
-                logger.error(f"Erro ao atualizar estoque do componente {sku}: {e}")
-        
-        logger.info(f"Estoque atualizado para {updated_count} componentes.")
+        """Atualiza o estoque atual de todos os componentes (Funcionalidade desativada)."""
+        logger.warning("Atualização de estoque de componentes desativada.")
+        pass
     
     def _update_component_stock_by_sku(self, sku: str, current_stock: int):
         """Atualiza o estoque atual de um componente específico em todos os kits."""
@@ -885,6 +853,10 @@ class AutomationOrchestrator:
         """Funcionalidade de verificação de necessidades de compra desativada."""
         logger.warning("A funcionalidade de verificação de necessidades de compra está desativada.")
         return False
+
+    def get_all_products(self) -> List[Dict[str, Any]]:
+        """Retorna a lista de todos os produtos carregados (não-variações)."""
+        return self.products
     
     def _check_kit_needs(self, kit: Kit):
         """Funcionalidade de verificação de necessidades de compra desativada."""
@@ -988,42 +960,7 @@ class AutomationOrchestrator:
 # 1. FUNÇÃO PARA BUSCAR PRODUTO POR SKU (PARA O DASHBOARD)
 # ============================================================================
 
-def get_bling_product_by_sku(sku):
-    """
-    Busca um produto no Bling pelo SKU e retorna os dados formatados.
-    Esta função é usada pela rota /api/produtos do dashboard.
-    """
-    
-    # Carrega tokens
-    token_data = load_tokens()
-    if not token_data or not is_token_valid(token_data):
-        # Tenta renovar
-        token_data = refresh_access_token()
-        if not token_data:
-            return {"error": "Token de acesso inválido. Faça a autenticação."}
-    
-    access_token = token_data["access_token"]
-    
-    # Faz a requisição para a API do Bling
-    url = f"https://www.bling.com.br/Api/v3/produtos"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    
-    params = {"codigo": sku}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=30)
-        
-        if response.status_code == 200:
-            data = response.json()
-            return data
-        else:
-            return {"error": f"Erro na API: {response.status_code}"}
-            
-    except Exception as e:
-        return {"error": f"Erro de conexão: {str(e)}"}
+def get_bling_prão: {str(e)}"}
 
 # ============================================================================
 # 10. INSTÂNCIAS GLOBAIS
@@ -1037,6 +974,24 @@ orchestrator = AutomationOrchestrator(config)
 
 # Autenticação (referência para compatibilidade)
 auth = orchestrator.auth
+
+# ============================================================================
+# 11. DECORADORES
+# ============================================================================
+
+def token_required(f):
+    """Decorador para verificar se o token de acesso está disponível."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not orchestrator.auth.is_authenticated():
+            return jsonify({
+                "status": "not_authenticated",
+                "message": "Authorize the application via OAuth"
+            }), 401
+        
+        # Passa o token para a função decorada, se necessário
+        return f(token=orchestrator.auth.access_token, *args, **kwargs)
+    return decorated
 
 # PARTE 4 — TEMPLATE HTML DO FRONT-END (INTERFACE DO USUÁRIO)
 DASHBOARD_TEMPLATE = """
@@ -1261,22 +1216,41 @@ class WebServer:
         def api_stats():
             return jsonify(self.orchestrator.stats.to_dict())
 
-        # 3. Rotas de Dados
-        @self.app.route("/api/products", methods=["GET"])
-        def api_products():
+        # 3. Rotas de Dado        @self.app.route("/api/all_products", methods=["GET"])
+        @token_required
+        def api_all_products(token):
             """Retorna a lista de todos os produtos (não-variações)."""
             # A lista self.orchestrator.products já está filtrada de variações
             return jsonify(self.orchestrator.products)
 
-        @self.app.route('/api/product/search')
-        def api_product_search():
+        @self.app.route('/api/products')
+        @token_required
+        def api_products(token):
             """Busca um produto por SKU ou nome na lista de produtos carregados."""
-            termo = request.args.get("q", "")
-            produto = buscar_produto_por_sku_ou_nome(self.orchestrator.products, termo)
-            return jsonify(produto if produto else {})
+            termo = request.args.get("sku") or request.args.get("nome") or request.args.get("term")
+            
+            if not termo:
+                return jsonify({"data": []})
 
-        @self.app.route('/api/kits')
-        def api_kits():
+            # Usa a lista de produtos já carregada e filtrada
+            achado = buscar_produto_por_sku_ou_nome(self.orchestrator.products, termo)
+
+            return jsonify({
+                "data": [] if not achado else [{
+                    "id": achado.get("id"),
+                    "sku": achado.get("codigo"),
+                    "nome": achado.get("nome"),
+                    "preco": achado.get("preco"),
+                    "precoCusto": achado.get("precoCusto"),
+                    "situacao": achado.get("situacao"),
+                    "formato": achado.get("formato"),
+                    "imagemURL": achado.get("imagemURL"),
+                    "estoque": achado.get("estoque"),
+                    "descricaoCurta": achado.get("descricaoCurta")
+                }]
+            })       @self.app.route('/api/kits')
+        @token_required
+        def api_kits(token):
             """Retorna a lista de kits com a estrutura simplificada de componentes."""
             kits_data = []
             for k in self.orchestrator.kits:
@@ -1296,33 +1270,10 @@ class WebServer:
             
             return jsonify(kits_data) # Retorna a lista diretamente, sem a chave "kits" extra.
 
-        @self.app.route('/api/stock')
-        def api_stock():
-            """Retorna a lista de estoque de todos os componentes de kits."""
-            all_components: Dict[str, Component] = {}
-            for kit in self.orchestrator.kits:
-                for component in kit.components:
-                    all_components[component.sku] = component
-            
-            stock_data = [
-                {
-                    "sku": c.sku,
-                    "name": c.name,
-                    "current_stock": c.current_stock,
-                    "min_stock": c.min_stock,
-                    "supplier": c.supplier,
-                    "lead_time_days": c.lead_time_days,
-                    "alert_level": "danger" if c.current_stock < c.min_stock else ("warning" if c.current_stock < c.min_stock * 1.5 else "ok")
-                } for c in all_components.values()
-            ]
-            return jsonify({"stock": stock_data})        @self.app.route('/api/needs')
-        def api_needs():
-            """Rota de necessidades de compra desativada."""
-            return jsonify({"status": "disabled"})
-
         # 4. Rotas de Ação
         @self.app.route('/api/recheck', methods=['POST'])
-        def api_recheck():
+        @token_required
+        def api_recheck(token):
             """Rota de rechecagem de estoque (mantida, mas sem NEEDS)."""
             if self.orchestrator.is_running:
                 return jsonify({"status": "warning", "message": "Processamento já em andamento."}), 409
@@ -1334,7 +1285,8 @@ class WebServer:
             return jsonify({"status": "ok", "message": "Verificação de estoque iniciada em background."})
 
         @self.app.route('/api/process_kits', methods=['POST'])
-        def api_process_kits():
+        @token_required
+        def api_process_kits(token):
             if self.orchestrator.is_running:
                 return jsonify({"status": "warning", "message": "Processamento já em andamento."}), 409
                 
@@ -1428,13 +1380,9 @@ def create_app() -> Flask:
     return app
 
 # Variável global para WSGI
-app = create_app()
-
-# ============================================================================
-# 18. TEMPLATES HTML (Mínimos para Auth)
-# ============================================================================
-
-SUCCESS_TEMPLATE = """
+app = create_app()# ============================================================================
+# 14. DEPLOY E SERVIDOR (Função factory e background task)
+# ============================================================================TE = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
@@ -2108,10 +2056,8 @@ def run_cli():
             logger.error("Processamento falhou.")
     else:
         parser.print_help()
-
 # ============================================================================
-# 17. PONTO DE ENTRADA
+# 12. WEB SERVER (FLASK)
 # ============================================================================
-
 if __name__ == "__main__":
     run_cli()
