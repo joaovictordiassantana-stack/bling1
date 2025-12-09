@@ -26,8 +26,8 @@ from flask import Flask, request, render_template_string, jsonify, redirect, url
 from flask_sock import Sock
 
 # ============================================================================
-# 13. FUNÇÕES DE SUPORTE AO DASHBOARD
-# =============================================================================
+# 0. FUNÇÕES DE PERSISTÊNCIA DE TOKENS (RE-ADICIONADAS)
+# ============================================================================
 
 def load_tokens():
     if not os.path.exists("tokens.json"):
@@ -93,49 +93,7 @@ def refresh_access_token():
 
 
 # ============================================================================
-# 95. FUNÇÕES DE UTILIDADE
-# ============================================================================
-
-def buscar_produto_por_sku_ou_nome(lista, termo):
-    """Busca um produto na lista por SKU exato, nome exato ou nome parcial."""
-    termo = termo.lower()
-
-    # 1. Busca SKU exato
-    for p in lista:
-        if p.get("codigo", "").lower() == termo:
-            return p
-
-    # 2. Busca por nome exato
-    for p in lista:
-        if p.get("nome", "").lower() == termo:
-            return p
-
-    # 3. Busca por nome parcial (contém)
-    for p in lista:
-        if termo in p.get("nome", "").lower():
-            return p
-
-    return None
-
-def filtrar_variacoes(lista):
-    """Remove produtos que parecem ser variações (tamanho, cor) com base em sufixos comuns."""
-    # Sufixos comuns de variação (Pequeno, Médio, Grande, Extra Grande, etc.)
-    sufixos = ["-P", "-M", "-G", "-GG", "-PP", "-XP", "-AZ", "-VM", "-PT"]
-    final = []
-
-    for p in lista:
-        codigo = p.get("codigo", "").upper()
-
-        # se contiver sufixo de variação, pula
-        if any(s in codigo for s in sufixos):
-            continue
-
-        final.append(p)
-
-    return final
-
-# ============================================================================
-# 96. EXCEÇÕES CUSTOMIZADAS
+# 16. EXCEÇÕES CUSTOMIZADAS
 # ============================================================================
 
 class BlingAuthError(Exception):
@@ -195,7 +153,6 @@ class Component:
     sku: str
     name: str
     qty: int # Quantidade necessária para o Kit
-    unit: str = '' # Unidade de medida
     supplier: str = 'N/A'
     lead_time_days: int = 0
     unit_cost: float = 0.0
@@ -213,6 +170,16 @@ class Kit:
     name: str
     components: List[Component] = field(default_factory=list)
     price: float = 0.0
+
+@dataclass
+class PurchaseNeed:
+    """Representa uma necessidade de compra de um componente."""
+    component_sku: str
+    component_name: str
+    quantity_needed: int
+    supplier: str
+    lead_time_days: int
+    reason: str
 
 # ============================================================================
 # 9. LOGS AVANÇADOS
@@ -364,7 +331,50 @@ class ComponentConfigManager:
         self._save_config(self.config)
         logger.info(f"Configuração do componente {sku} atualizada.")
 
+# ============================================================================
+# 4. GERENCIAMENTO DE NECESSIDADES DE COMPRA
+# ============================================================================
 
+class PurchaseNeedsManager:
+    """Gerencia as necessidades de compra identificadas."""
+    
+    def __init__(self):
+        self.needs: Dict[str, List[PurchaseNeed]] = {}  # supplier -> [needs]
+        self.lock = Lock()
+    
+    def add_need(self, need: PurchaseNeed):
+        """Adiciona uma necessidade de compra."""
+        with self.lock:
+            if need.supplier not in self.needs:
+                self.needs[need.supplier] = []
+            
+            # Verifica se já existe uma necessidade para o mesmo componente do mesmo fornecedor
+            existing = next((n for n in self.needs[need.supplier] if n.component_sku == need.component_sku), None)
+            if existing:
+                # Atualiza a quantidade se for maior
+                if need.quantity_needed > existing.quantity_needed:
+                    existing.quantity_needed = need.quantity_needed
+                    existing.reason = need.reason
+                    logger.info(f"Necessidade atualizada: {need.component_sku} - {need.quantity_needed} unidades")
+            else:
+                self.needs[need.supplier].append(need)
+                logger.info(f"Nova necessidade adicionada: {need.component_sku} - {need.quantity_needed} unidades")
+    
+    def clear_needs(self):
+        """Limpa todas as necessidades."""
+        with self.lock:
+            self.needs.clear()
+            logger.info("Todas as necessidades de compra foram limpas.")
+    
+    def get_needs_by_supplier(self, supplier: str) -> List[PurchaseNeed]:
+        """Retorna as necessidades de um fornecedor específico."""
+        with self.lock:
+            return self.needs.get(supplier, []).copy()
+    
+    def get_all_needs(self) -> Dict[str, List[PurchaseNeed]]:
+        """Retorna todas as necessidades organizadas por fornecedor."""
+        with self.lock:
+            return {supplier: needs.copy() for supplier, needs in self.needs.items()}
 
 # ============================================================================
 # 5. ESTATÍSTICAS E MÉTRICAS
@@ -676,8 +686,8 @@ class BlingAuth:
         
         return None
 
-# =# ============================================================================
-# 15. EXECUÇÃO PRINCIPAL
+# ============================================================================
+# 8. ORQUESTRADOR PRINCIPAL
 # ============================================================================
 
 class AutomationOrchestrator:
@@ -688,78 +698,67 @@ class AutomationOrchestrator:
         self.auth = BlingAuth(config)
         self.api_client = BlingAPIClient(config)
         self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
-        # self.needs_manager = PurchaseNeedsManager() # Removido: Funcionalidade de Needs desativada
+        self.needs_manager = PurchaseNeedsManager()
         self.stats = ProcessingStats()
         
         # Estado
         self.kits: List[Kit] = []
-        self.products: List[Dict[str, Any]] = [] # Novo atributo para armazenar todos os produtos não-variação
         self.is_running: bool = False
         self.lock = Lock()
-        
-        # Inicia o carregamento dos dados em uma thread separada
-        Thread(target=self.load_data_worker, daemon=True).start()
     
-    def load_data_worker(self):
-        """Worker que carrega os dados iniciais (kits, produtos e estoque) em loop."""
-        while True:
-            try:
-                token = self.auth.get_valid_token()
-                if token:
-                    self._load_products_and_kits(token)
-                    self._update_component_stock(token)
-                    logger.info("Dados iniciais carregados com sucesso.")
-                else:
-                    logger.warning("Não foi possível carregar dados: Token de acesso indisponível.")
-                
-                # Espera 1 hora antes de recarregar
-                time.sleep(3600)
-                
-            except Exception as e:
-                logger.error(f"Erro no worker de carregamento de dados: {e}")
-                time.sleep(60) # Espera 1 minuto em caso de erro
-                
     def load_data(self) -> bool:
-        """Função de carregamento de dados que será removida ou adaptada, mantida por compatibilidade."""
-        logger.warning("load_data() foi substituída por load_data_worker em uma thread separada.")
-        return True # Retorna True para não bloquear o startup.
+        """Carrega dados iniciais (kits, componentes, estoque)."""
+        logger.info("Iniciando carregamento de dados...")
+        
+        # Verifica autenticação
+        token = self.auth.get_valid_token()
+        if not token:
+            logger.error("Token de acesso não disponível. Execute a autenticação primeiro.")
+            return False
+        
+        try:
+            # Carrega produtos que são kits (produtos compostos)
+            self._load_kits(token)
+            
+            # Atualiza estoque dos componentes
+            self._update_component_stock(token)
+            
+            logger.info(f"Carregamento concluído: {len(self.kits)} kits carregados.")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro no carregamento de dados: {e}")
+            error_logger.error(f"Erro no carregamento de dados: {e}")
+            return False
     
-    def _load_products_and_kits(self, access_token: str):
-        """Carrega todos os produtos e kits do Bling, aplicando o filtro de variações."""
-        logger.info("Carregando produtos e kits do Bling...")
-        self.kits.clear()
-        self.products.clear()
-        kits_loaded = 0
-        products_loaded = 0
+    def _load_kits(self, access_token: str):
+        """Carrega kits (produtos compostos) do Bling."""
+        logger.info("Carregando kits...")
+        
         page = 1
+        kits_loaded = 0
         
         while True:
             try:
-                # Busca produtos da API
-                response_data = self.api_client.get_products(access_token, page=page, limit=100)
+                # Busca produtos com filtro para produtos compostos
+                response = self.api_client.get_products(
+                    access_token, 
+                    page=page, 
+                    limit=100,
+                    tipo='P'  # Tipo P = Produto (pode incluir compostos)
+                )
                 
-                products_raw = response_data.get('data', [])
-                
-                if not products_raw:
+                products = response.get('data', [])
+                if not products:
                     break
                 
-                # Extrai a lista de produtos
-                products_list = [p.get('produto', {}) for p in products_raw]
-                
-                # 1. Aplica o filtro de variações
-                products_filtered = filtrar_variacoes(products_list)
-                
-                for product in products_filtered:
-                    
+                for product in products:
+                    # Verifica se é um produto composto (tem estrutura)
                     if self._is_kit_product(product):
                         kit = self._create_kit_from_product(product)
                         if kit:
                             self.kits.append(kit)
                             kits_loaded += 1
-                    else:
-                        # Armazena produtos que não são kits (e já foram filtrados de variações)
-                        self.products.append(product)
-                        products_loaded += 1
                 
                 page += 1
                 
@@ -767,10 +766,10 @@ class AutomationOrchestrator:
                 time.sleep(self.config.DELAY_BETWEEN_BATCHES)
                 
             except Exception as e:
-                logger.error(f"Erro ao carregar página {page} de produtos/kits: {e}")
+                logger.error(f"Erro ao carregar página {page} de kits: {e}")
                 break
         
-        logger.info(f"{kits_loaded} kits e {products_loaded} produtos carregados.")
+        logger.info(f"{kits_loaded} kits carregados.")
     
     def _is_kit_product(self, product: Dict[str, Any]) -> bool:
         """Verifica se um produto é um kit (produto composto)."""
@@ -812,7 +811,6 @@ class AutomationOrchestrator:
             sku = comp_data.get('codigo', '')
             name = comp_data.get('nome', '')
             qty = int(comp_data.get('quantidade', 1))
-            unit = comp_data.get('unidade', '') # Adicionando a unidade
             
             if not sku:
                 return None
@@ -824,7 +822,6 @@ class AutomationOrchestrator:
                 sku=sku,
                 name=name,
                 qty=qty,
-                unit=unit, # Adicionando a unidade
                 supplier=config.get('supplier', 'N/A'),
                 lead_time_days=config.get('lead_time_days', 0),
                 unit_cost=config.get('unit_cost', 0.0),
@@ -838,9 +835,41 @@ class AutomationOrchestrator:
             return None
     
     def _update_component_stock(self, access_token: str):
-        """Atualiza o estoque atual de todos os componentes (Funcionalidade desativada)."""
-        logger.warning("Atualização de estoque de componentes desativada.")
-        pass
+        """Atualiza o estoque atual de todos os componentes."""
+        logger.info("Atualizando estoque dos componentes...")
+        
+        # Coleta todos os SKUs únicos de componentes
+        component_skus = set()
+        for kit in self.kits:
+            for component in kit.components:
+                component_skus.add(component.sku)
+        
+        updated_count = 0
+        
+        for sku in component_skus:
+            try:
+                # Busca o produto pelo SKU
+                product = self.api_client.get_product_by_sku(access_token, sku)
+                
+                if product:
+                    # Busca informações de estoque
+                    product_id = product.get('id')
+                    if product_id:
+                        stock_info = self.api_client.get_stock(access_token, product_id)
+                        
+                        if stock_info:
+                            # Atualiza o estoque em todos os componentes com este SKU
+                            current_stock = stock_info.get('saldoVirtualTotal', 0)
+                            self._update_component_stock_by_sku(sku, current_stock)
+                            updated_count += 1
+                
+                # Delay entre consultas
+                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
+                
+            except Exception as e:
+                logger.error(f"Erro ao atualizar estoque do componente {sku}: {e}")
+        
+        logger.info(f"Estoque atualizado para {updated_count} componentes.")
     
     def _update_component_stock_by_sku(self, sku: str, current_stock: int):
         """Atualiza o estoque atual de um componente específico em todos os kits."""
@@ -850,25 +879,124 @@ class AutomationOrchestrator:
                     component.current_stock = current_stock
     
     def run_purchase_check(self, create_orders: bool = False) -> bool:
-        """Funcionalidade de verificação de necessidades de compra desativada."""
-        logger.warning("A funcionalidade de verificação de necessidades de compra está desativada.")
-        return False
-
-    def get_all_products(self) -> List[Dict[str, Any]]:
-        """Retorna a lista de todos os produtos carregados (não-variações)."""
-        return self.products
+        """Executa verificação de necessidades de compra e criação de ordens."""
+        if self.is_running:
+            logger.warning("Processamento já em andamento.")
+            return False
+        
+        with self.lock:
+            self.is_running = True
+        
+        try:
+            start_time = time.time()
+            self.stats.reset()
+            
+            logger.info("Iniciando verificação de necessidades de compra...")
+            
+            # Verifica autenticação
+            token = self.auth.get_valid_token()
+            if not token:
+                logger.error("Token de acesso não disponível.")
+                return False
+            
+            # Limpa necessidades anteriores
+            self.needs_manager.clear_needs()
+            
+            # Verifica cada kit
+            for kit in self.kits:
+                self._check_kit_needs(kit)
+                self.stats.stock_checks += 1
+            
+            # Cria ordens se solicitado
+            if create_orders:
+                self._create_purchase_orders(token)
+            
+            self.stats.elapsed_time_seconds = time.time() - start_time
+            
+            logger.info(f"Verificação concluída em {self.stats.elapsed_time_seconds:.2f}s")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Erro na verificação de necessidades: {e}")
+            error_logger.error(f"Erro na verificação de necessidades: {e}")
+            self.stats.failed += 1
+            return False
+        finally:
+            with self.lock:
+                self.is_running = False
     
     def _check_kit_needs(self, kit: Kit):
-        """Funcionalidade de verificação de necessidades de compra desativada."""
-        pass
+        """Verifica as necessidades de compra de um kit específico."""
+        logger.debug(f"Verificando necessidades do kit {kit.sku}")
+        
+        for component in kit.components:
+            # Verifica se o estoque está abaixo do mínimo
+            if component.current_stock < component.min_stock:
+                quantity_needed = component.min_stock - component.current_stock
+                
+                need = PurchaseNeed(
+                    component_sku=component.sku,
+                    component_name=component.name,
+                    quantity_needed=quantity_needed,
+                    supplier=component.supplier,
+                    lead_time_days=component.lead_time_days,
+                    reason=f"Estoque baixo: {component.current_stock} < {component.min_stock}"
+                )
+                
+                self.needs_manager.add_need(need)
     
     def _create_purchase_orders(self, access_token: str):
-        """Funcionalidade de criação de ordens de compra desativada."""
-        pass
+        """Cria ordens de compra baseadas nas necessidades identificadas."""
+        logger.info("Criando ordens de compra...")
+        
+        all_needs = self.needs_manager.get_all_needs()
+        
+        for supplier, needs in all_needs.items():
+            if not needs:
+                continue
+            
+            try:
+                # Cria uma PO por fornecedor
+                po_data = self._build_purchase_order_data(supplier, needs)
+                
+                result = self.api_client.create_purchase_order(access_token, po_data)
+                
+                if result:
+                    self.stats.pos_created += 1
+                    self.stats.success += 1
+                    logger.info(f"PO criada para fornecedor {supplier}")
+                else:
+                    self.stats.failed += 1
+                    logger.error(f"Falha ao criar PO para fornecedor {supplier}")
+                
+            except Exception as e:
+                self.stats.failed += 1
+                logger.error(f"Erro ao criar PO para fornecedor {supplier}: {e}")
     
-    def _build_purchase_order_data(self, supplier: str, needs: List[Any]) -> Dict[str, Any]:
-        """Funcionalidade de construção de dados de ordem de compra desativada."""
-        return {}
+    def _build_purchase_order_data(self, supplier: str, needs: List[PurchaseNeed]) -> Dict[str, Any]:
+        """Constrói os dados para criação de uma ordem de compra."""
+        # Estrutura básica de uma PO no Bling
+        # Esta estrutura pode precisar ser ajustada conforme a documentação da API
+        
+        items = []
+        for need in needs:
+            item = {
+                'codigo': need.component_sku,
+                'descricao': need.component_name,
+                'quantidade': need.quantity_needed,
+                'valor': 0.0  # Será preenchido manualmente ou via integração com catálogo
+            }
+            items.append(item)
+        
+        po_data = {
+            'fornecedor': {
+                'nome': supplier
+            },
+            'itens': items,
+            'observacoes': f"PO gerada automaticamente - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        }
+        
+        return po_data
     
     def process_kits(self, kits: List[Kit], batch_size: int = None, create_orders: bool = False, quantity: int = 1):
         """Processa uma lista específica de kits."""
@@ -907,7 +1035,8 @@ class AutomationOrchestrator:
                             # Cria ordem de produção para o kit
                             self._create_production_order(token, kit, quantity)
                         
-                        # self._check_kit_needs(kit) # Removido: Funcionalidade de Needs desativada
+                        # Verifica necessidades dos componentes
+                        self._check_kit_needs(kit)
                         
                         self.stats.success += 1
                         
@@ -919,9 +1048,9 @@ class AutomationOrchestrator:
                 if i + batch_size < len(kits):
                     time.sleep(self.config.DELAY_BETWEEN_BATCHES)
             
-            # # Cria POs se necessário
-            # if create_orders:
-            #     self._create_purchase_orders(token) # Removido: Funcionalidade de Needs desativada
+            # Cria POs se necessário
+            if create_orders:
+                self._create_purchase_orders(token)
             
             self.stats.elapsed_time_seconds = time.time() - start_time
             
@@ -960,7 +1089,42 @@ class AutomationOrchestrator:
 # 1. FUNÇÃO PARA BUSCAR PRODUTO POR SKU (PARA O DASHBOARD)
 # ============================================================================
 
-def get_bling_prão: {str(e)}"}
+def get_bling_product_by_sku(sku):
+    """
+    Busca um produto no Bling pelo SKU e retorna os dados formatados.
+    Esta função é usada pela rota /api/produtos do dashboard.
+    """
+    
+    # Carrega tokens
+    token_data = load_tokens()
+    if not token_data or not is_token_valid(token_data):
+        # Tenta renovar
+        token_data = refresh_access_token()
+        if not token_data:
+            return {"error": "Token de acesso inválido. Faça a autenticação."}
+    
+    access_token = token_data["access_token"]
+    
+    # Faz a requisição para a API do Bling
+    url = f"https://www.bling.com.br/Api/v3/produtos"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    params = {"codigo": sku}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=30)
+        
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        else:
+            return {"error": f"Erro na API: {response.status_code}"}
+            
+    except Exception as e:
+        return {"error": f"Erro de conexão: {str(e)}"}
 
 # ============================================================================
 # 10. INSTÂNCIAS GLOBAIS
@@ -974,24 +1138,6 @@ orchestrator = AutomationOrchestrator(config)
 
 # Autenticação (referência para compatibilidade)
 auth = orchestrator.auth
-
-# ============================================================================
-# 11. DECORADORES
-# ============================================================================
-
-def token_required(f):
-    """Decorador para verificar se o token de acesso está disponível."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not orchestrator.auth.is_authenticated():
-            return jsonify({
-                "status": "not_authenticated",
-                "message": "Authorize the application via OAuth"
-            }), 401
-        
-        # Passa o token para a função decorada, se necessário
-        return f(token=orchestrator.auth.access_token, *args, **kwargs)
-    return decorated
 
 # PARTE 4 — TEMPLATE HTML DO FRONT-END (INTERFACE DO USUÁRIO)
 DASHBOARD_TEMPLATE = """
@@ -1097,15 +1243,17 @@ DASHBOARD_TEMPLATE = """
             showElement('loading');
 
             try {
-                // Usa a nova rota de busca que aceita SKU ou nome
-                const response = await fetch(`/api/product/search?q=${sku}`);
-                const p = await response.json();
+                const response = await fetch(`/api/produtos?sku=${sku}`);
+                const data = await response.json();
                 
+                // ✅ 1. Ajustar o fetch da API: Ler sempre json.data[0] e armazenar como const p.
+                const p = data.data?.[0]; 
+
                 hideElement('loading');
 
-                // Verifica se o produto existe (o endpoint retorna {} se não encontrar)
-                if (!p || Object.keys(p).length === 0) {
-                    exibirErro("Produto não encontrado. Verifique o SKU ou nome.");
+                // ✅ 5. Ajustar verificação se o produto existe
+                if (!p) {
+                    exibirErro("Produto não encontrado. Verifique o SKU.");
                     return;
                 }
 
@@ -1216,77 +1364,89 @@ class WebServer:
         def api_stats():
             return jsonify(self.orchestrator.stats.to_dict())
 
-        # 3. Rotas de Dado        @self.app.route("/api/all_products", methods=["GET"])
-        @token_required
-        def api_all_products(token):
-            """Retorna a lista de todos os produtos (não-variações)."""
-            # A lista self.orchestrator.products já está filtrada de variações
-            return jsonify(self.orchestrator.products)
+        # 3. Rotas de Dados
+        @self.app.route("/api/produtos", methods=["GET"])
+        def api_produtos():
+            sku = request.args.get("sku")
 
-        @self.app.route('/api/products')
-        @token_required
-        def api_products(token):
-            """Busca um produto por SKU ou nome na lista de produtos carregados."""
-            termo = request.args.get("sku") or request.args.get("nome") or request.args.get("term")
-            
-            if not termo:
-                return jsonify({"data": []})
+            if not sku:
+                return jsonify({"error": "SKU não informado"}), 400
 
-            # Usa a lista de produtos já carregada e filtrada
-            achado = buscar_produto_por_sku_ou_nome(self.orchestrator.products, termo)
+            print("Consulta de produto recebida:", sku, flush=True)
 
-            return jsonify({
-                "data": [] if not achado else [{
-                    "id": achado.get("id"),
-                    "sku": achado.get("codigo"),
-                    "nome": achado.get("nome"),
-                    "preco": achado.get("preco"),
-                    "precoCusto": achado.get("precoCusto"),
-                    "situacao": achado.get("situacao"),
-                    "formato": achado.get("formato"),
-                    "imagemURL": achado.get("imagemURL"),
-                    "estoque": achado.get("estoque"),
-                    "descricaoCurta": achado.get("descricaoCurta")
-                }]
-            })       @self.app.route('/api/kits')
-        @token_required
-        def api_kits(token):
-            """Retorna a lista de kits com a estrutura simplificada de componentes."""
-            kits_data = []
-            for k in self.orchestrator.kits:
-                kit = {
+            data = get_bling_product_by_sku(sku)
+
+            return jsonify(data), 200
+
+        @self.app.route('/api/kits')
+        def api_kits():
+            kits_data = [
+                {
                     "sku": k.sku,
-                    "nome": k.name,
-                    "componentes": []
-                }
-                for c in k.components:
-                    kit["componentes"].append({
-                        "sku": c.sku,
-                        "nome": c.name,
-                        "quantidade": c.qty,
-                        "unidade": c.unit
-                    })
-                kits_data.append(kit)
+                    "name": k.name,
+                    "price": k.price,
+                    "components": [
+                        {
+                            "sku": c.sku,
+                            "name": c.name,
+                            "qty": c.qty,
+                            "supplier": c.supplier,
+                            "lead_time_days": c.lead_time_days,
+                            "unit_cost": c.unit_cost
+                        } for c in k.components
+                    ]
+                } for k in self.orchestrator.kits
+            ]
+            return jsonify({"kits": kits_data})
+
+        @self.app.route('/api/stock')
+        def api_stock():
+            all_components: Dict[str, Component] = {}
+            for kit in self.orchestrator.kits:
+                for component in kit.components:
+                    all_components[component.sku] = component
             
-            return jsonify(kits_data) # Retorna a lista diretamente, sem a chave "kits" extra.
+            stock_data = [
+                {
+                    "sku": c.sku,
+                    "name": c.name,
+                    "current_stock": c.current_stock,
+                    "min_stock": c.min_stock,
+                    "supplier": c.supplier,
+                    "lead_time_days": c.lead_time_days,
+                    "alert_level": "danger" if c.current_stock < c.min_stock else ("warning" if c.current_stock < c.min_stock * 1.5 else "ok")
+                } for c in all_components.values()
+            ]
+            return jsonify({"stock": stock_data})
+
+        @self.app.route('/api/needs')
+        def api_needs():
+            needs_list = []
+            for supplier, needs in self.orchestrator.needs_manager.needs.items():
+                for need in needs:
+                    needs_list.append({
+                        "component_sku": need.component_sku,
+                        "component_name": need.component_name,
+                        "quantity_needed": need.quantity_needed,
+                        "supplier": need.supplier,
+                        "lead_time_days": need.lead_time_days,
+                        "reason": need.reason
+                    })
+            return jsonify({"needs": needs_list})
 
         # 4. Rotas de Ação
         @self.app.route('/api/recheck', methods=['POST'])
-        @token_required
-        def api_recheck(token):
-            """Rota de rechecagem de estoque (mantida, mas sem NEEDS)."""
+        def api_recheck():
             if self.orchestrator.is_running:
                 return jsonify({"status": "warning", "message": "Processamento já em andamento."}), 409
             
             # Executa a verificação em uma thread para não bloquear a requisição HTTP
-            # run_purchase_check agora apenas atualiza o estoque, pois a lógica de NEEDS foi removida.
-            Thread(target=self.orchestrator.run_purchase_check, args=(False,), daemon=True).start()
+            Thread(target=self.orchestrator.run_purchase_check, args=(True,), daemon=True).start()
             
-            return jsonify({"status": "ok", "message": "Verificação de estoque iniciada em background."})
+            return jsonify({"status": "ok", "message": "Verificação de estoque e POs iniciada em background."})
 
         @self.app.route('/api/process_kits', methods=['POST'])
-        @token_required
-        def api_process_kits(token):
+        def api_process_kits():
             if self.orchestrator.is_running:
                 return jsonify({"status": "warning", "message": "Processamento já em andamento."}), 409
                 
@@ -1380,9 +1540,13 @@ def create_app() -> Flask:
     return app
 
 # Variável global para WSGI
-app = create_app()# ============================================================================
-# 14. DEPLOY E SERVIDOR (Função factory e background task)
-# ============================================================================TE = """
+app = create_app()
+
+# ============================================================================
+# 18. TEMPLATES HTML (Mínimos para Auth)
+# ============================================================================
+
+SUCCESS_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
@@ -2056,8 +2220,10 @@ def run_cli():
             logger.error("Processamento falhou.")
     else:
         parser.print_help()
+
 # ============================================================================
-# 12. WEB SERVER (FLASK)
+# 17. PONTO DE ENTRADA
 # ============================================================================
+
 if __name__ == "__main__":
     run_cli()
