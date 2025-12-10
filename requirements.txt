@@ -3,5 +3,5 @@ flask
 python-dotenv
 colorama
 flask-sock
-gevent-websocket
+gevent
 gunicorn

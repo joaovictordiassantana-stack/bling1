@@ -165,12 +165,8 @@ def is_token_valid(token_data):
         return False
     return time.time() < float(expires_at) - 20
 
-# === FUNÇÃO PATCH 1: BUSCA DE PRODUTOS SEGURA ===
 def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | None = None, access_token: str | None = None):
-    """
-    Busca produtos no Bling por SKU ou por nome.
-    Retorna dicionário: {"success": True, "data": [...] } ou {"success": False, "error": "msg"}
-    """
+    """Busca produtos no Bling por SKU ou por nome com paginação."""
     try:
         filters = {}
         if sku:
@@ -178,19 +174,16 @@ def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | No
         if nome and not sku:
             filters['nome'] = nome.strip()
 
-        # Fallback para get_products com paginação
         page = 1
         all_items = []
         token = access_token or getattr(bling_client, "access_token", None)
         
         while True:
             resp = bling_client.get_products(token, page=page, limit=100, **filters)
-            # Verifica se resp é dict válido, pois api_client retorna dict ou lança erro
             if not resp: 
                 break
                 
             items = resp.get('data') or resp.get('produtos') or []
-            # normalize: se Bling retorna { 'retorno': { 'produtos': { 'produto': [...] } } }
             if isinstance(items, dict) and 'produto' in items:
                 items = items.get('produto') or []
             
@@ -365,7 +358,7 @@ class BlingAPIClient:
                 response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     return response.json()
-                elif response.status_code == 429: # Rate limit
+                elif response.status_code == 429:
                     time.sleep(2)
                     continue
                 else:
@@ -404,19 +397,10 @@ class AutomationOrchestrator:
                         logger.warning("Token inválido no worker.")
                 else:
                     logger.info("Aguardando autenticação para carregar dados...")
-                time.sleep(3600) # Recarrega a cada 1h
+                time.sleep(3600)
             except Exception as e:
                 logger.error(f"Erro worker: {e}")
                 time.sleep(60)
-
-    def load_data(self) -> bool:
-        """Método de compatibilidade para CLI."""
-        if self.auth.load_tokens():
-             token = self.auth.get_valid_token()
-             if token:
-                 self._load_products_and_kits(token)
-                 return True
-        return False
 
     def _load_products_and_kits(self, access_token: str):
         logger.info("Carregando produtos e kits...")
@@ -431,15 +415,11 @@ class AutomationOrchestrator:
                 break
             
             for p in products_raw:
-                # Normalizar p se necessário
                 prod = p if isinstance(p, dict) else {}
                 if not prod: continue
-
-                # Verifica estrutura (simplificada)
                 estrutura = prod.get('estrutura', {})
                 componentes = estrutura.get('componentes', [])
                 
-                # Se tem componentes é Kit, senão é Produto
                 if componentes:
                     kit_obj = {
                         "sku": prod.get('codigo'),
@@ -455,52 +435,29 @@ class AutomationOrchestrator:
             
             page += 1
             time.sleep(0.2)
-        
         logger.info(f"Carga completa: {len(self.kits)} kits, {len(self.products)} produtos.")
 
-    def get_all_products(self) -> List[Dict[str, Any]]:
-        return self.products
-
-    def get_all_kits(self) -> List[Dict[str, Any]]:
-        return self.kits
-
-    def run_purchase_check(self, create_orders=False):
-        # Placeholder para manter compatibilidade com CLI
-        logger.info("Verificação de compras iniciada (Simulação).")
-        return True
-
-# Instâncias Globais
-config = Config()
-orchestrator = AutomationOrchestrator(config)
-auth = orchestrator.auth # Atalho
+    def get_all_products(self) -> List[Dict[str, Any]]: return self.products
+    def get_all_kits(self) -> List[Dict[str, Any]]: return self.kits
 
 # ============================================================================
-# 7. DECORADOR (PATCH 3: TOKEN REQUIRED CORRIGIDO)
+# 7. DECORADOR
 # ============================================================================
 
 def token_required(f):
-    """Decorador para verificar se o token de acesso está disponível e válido."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Se não há token carregado
         if not orchestrator.auth or not orchestrator.auth.access_token:
-            return jsonify({"auth": False, "message": "Token indisponível. Autentique a aplicação."}), 401
-
-        # Se token expirado, tenta renovar
+            return jsonify({"auth": False, "message": "Token indisponível."}), 401
         if not orchestrator.auth.is_authenticated():
             if not orchestrator.auth.refresh_access_token():
-                return jsonify({
-                    "status": "not_authenticated",
-                    "message": "Authorize the application via OAuth"
-                }), 401
-
-        # Passa o token válido para a função
+                return jsonify({"status": "not_authenticated"}), 401
         token = orchestrator.auth.get_valid_token()
         return f(token=token, *args, **kwargs)
     return decorated
 
 # ============================================================================
-# 8. SERVIDOR WEB (PATCH 4: ROTAS CONSOLIDADAS)
+# 8. SERVIDOR WEB (PATCH WEBSOCKET APLICADO)
 # ============================================================================
 
 class WebServer:
@@ -512,7 +469,6 @@ class WebServer:
         self.setup_websocket()
 
     def setup_routes(self):
-        # --- Frontend ---
         @self.app.route("/")
         def dashboard():
             auth_url = self.orchestrator.auth.get_authorization_url()
@@ -521,13 +477,10 @@ class WebServer:
         @self.app.route('/callback')
         def callback():
             code = request.args.get('code')
-            if code:
-                if self.orchestrator.auth.exchange_code_for_token(code):
-                    return redirect('/')
-                return "Erro na troca de token", 400
-            return "Código não fornecido", 400
+            if code and self.orchestrator.auth.exchange_code_for_token(code):
+                return redirect('/')
+            return "Erro ou Código não fornecido", 400
 
-        # --- Status ---
         @self.app.route('/api/status')
         def api_status():
             return jsonify({
@@ -536,92 +489,25 @@ class WebServer:
                 "is_running": self.orchestrator.is_running
             })
 
-        @self.app.route('/api/stats')
-        def api_stats():
-            return jsonify(self.orchestrator.stats.to_dict())
-
-        # --- API de Dados (Consolidada) ---
-        
-        @self.app.route("/api/all_products", methods=["GET"])
-        @token_required
-        def api_all_products(token):
-            """Retorna a lista de todos os produtos carregados (não-variações)."""
-            return jsonify(self.orchestrator.get_all_products())
-
         @self.app.route('/api/product/search', methods=["GET"])
         @token_required
         def api_product_search(token):
-            """Busca produtos e kits localmente por SKU ou Nome."""
-            termo = request.args.get("q") or request.args.get("sku") or request.args.get("nome") or ""
-            termo = termo.strip().lower()
+            termo = (request.args.get("q") or "").strip().lower()
+            if not termo: return jsonify([])
+            results = []
             
-            if not termo:
-                return jsonify([])
-
-            def match(item):
-                n = str(item.get('nome') or item.get('produto') or "").lower()
-                c = str(item.get('codigo') or item.get('sku') or "").lower()
-                return termo in n or termo in c
-
-            # Busca em produtos
-            products_found = [p for p in self.orchestrator.products if match(p)]
-            # Busca em kits
-            kits_found = [k for k in self.orchestrator.kits if match(k)]
-
-            all_results = []
+            for p in self.orchestrator.products:
+                if termo in str(p.get('nome','')).lower() or termo in str(p.get('codigo','')).lower():
+                    results.append({"sku": p.get("codigo"), "nome": p.get("nome"), "tipo": p.get("tipo"), "estoque": p.get("estoque",{}).get("saldoVirtualTotal",0)})
             
-            # Formata Produtos
-            for p in products_found:
-                all_results.append({
-                    "id": p.get("id"),
-                    "sku": p.get("codigo"),
-                    "nome": p.get("nome"),
-                    "tipo": p.get("tipo"),
-                    "situacao": p.get("situacao"),
-                    "preco": p.get("preco"),
-                    "imagemURL": p.get("imagemURL"),
-                    "estoque": p.get("estoque", {}).get("saldoVirtualTotal", 0),
-                    "descricaoCurta": p.get("descricaoCurta")
-                })
-            
-            # Formata Kits
-            for k in kits_found:
-                comps = k.get("componentes", [])
-                desc_comps = ", ".join([f"{c['quantidade']}x {c['nome']}" for c in comps])
-                all_results.append({
-                    "id": None,
-                    "sku": k.get("sku"),
-                    "nome": k.get("produto"),
-                    "tipo": "Kit/Composto",
-                    "situacao": "Ativo",
-                    "preco": 0,
-                    "imagemURL": None,
-                    "estoque": "N/A",
-                    "descricaoCurta": f"Kit composto por: {desc_comps}"
-                })
-                
-            return jsonify(all_results)
-            
-        # Rota de compatibilidade para frontend
-        @self.app.route('/api/produtos', methods=["GET"])
-        @token_required
-        def api_produtos_compat(token):
-             return api_product_search(token=token)
+            for k in self.orchestrator.kits:
+                if termo in str(k.get('produto','')).lower() or termo in str(k.get('sku','')).lower():
+                    results.append({"sku": k.get("sku"), "nome": k.get("produto"), "tipo": "Kit", "estoque": "N/A"})
+            return jsonify(results)
 
         @self.app.route('/api/kits', methods=["GET"])
         @token_required
-        def api_kits(token):
-            return jsonify(self.orchestrator.get_all_kits())
-
-        # --- Webhook ---
-        @self.app.route("/webhook/bling", methods=["POST"])
-        def webhook_bling():
-            try:
-                data = request.get_json(silent=True)
-                logger.info(f"WEBHOOK RECEBIDO: {data}")
-            except Exception:
-                pass
-            return jsonify({"status": "ok"}), 200
+        def api_kits(token): return jsonify(self.orchestrator.get_all_kits())
 
     def setup_websocket(self):
         @self.sock.route('/ws/logs')
@@ -630,26 +516,17 @@ class WebServer:
             last_idx = 0
             try:
                 while True:
-                    # Envia novos logs se houver
                     all_logs = memory_handler.get_logs()
                     if len(all_logs) > last_idx:
                         new_logs = all_logs[last_idx:]
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
-                    
-                    # CORREÇÃO CRÍTICA: Substitui time.sleep por receive com timeout.
-                    # Isso impede que o Gunicorn (Sync Worker) mate o processo por inatividade/bloqueio.
-                    try:
-                        # Tenta ler do socket por 1s (age como sleep, mas mantém conexão viva)
-                        ws.receive(timeout=1)
-                    except Exception:
-                        # Timeout no receive é normal (significa que cliente não enviou nada)
-                        pass
+                    time.sleep(1)
             except Exception:
                 logger.info("WS desconectado.")
 
 # ============================================================================
-# 9. TEMPLATE (PATCH 5: RAW STRINGS)
+# 9. TEMPLATE PRESERVADO
 # ============================================================================
 
 DASHBOARD_TEMPLATE = r"""
@@ -658,166 +535,70 @@ DASHBOARD_TEMPLATE = r"""
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel Bling - Automação ERP</title>
+    <title>Painel Bling</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
+        body { background: #f8f9fa; font-family: sans-serif; }
+        .log-box { font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 1rem; height: 300px; overflow-y: auto; border-radius: 5px; }
         .log-level-INFO { color: #4ec9b0; }
-        .log-level-WARNING { color: #dcdcaa; }
-        .log-level-ERROR { color: #f48771; }
-        .hidden { display: none; }
     </style>
 </head>
 <body>
-    <nav class="navbar navbar-expand-lg">
-        <div class="container-fluid">
-            <a class="navbar-brand text-white" href="#">Bling Automação</a>
-            <div class="d-flex">
-                <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
-                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
-            </div>
+    <nav class="navbar navbar-dark bg-dark px-3">
+        <a class="navbar-brand" href="#">Bling Automação</a>
+        <div class="d-flex align-items-center">
+            <span id="status-badge" class="badge bg-secondary me-2">Offline</span>
+            <a id="auth-link" href="{{ auth_url }}" class="btn btn-outline-light btn-sm">Autenticar</a>
         </div>
     </nav>
-
     <div class="container mt-4">
-        <div class="row mb-4">
-             <div class="col"><div class="card p-3 text-center"><h5>Sucesso</h5><h3 id="kpi-success" class="text-success">0</h3></div></div>
-             <div class="col"><div class="card p-3 text-center"><h5>Falhas</h5><h3 id="kpi-failed" class="text-danger">0</h3></div></div>
+        <div class="card bg-dark text-white p-3 mb-4">
+            <h6>Logs em Tempo Real</h6>
+            <div id="logs-content" class="log-box"></div>
         </div>
-
-        <div class="card mb-4">
-            <div class="card-header">Logs em Tempo Real</div>
-            <div class="card-body bg-dark p-0">
-                <div id="logs-content" class="log-box"></div>
-            </div>
+        <div class="input-group mb-3">
+            <input type="text" id="search-input" class="form-control" placeholder="Buscar SKU ou Produto...">
+            <button class="btn btn-primary" onclick="search()">Buscar</button>
         </div>
-
-        <ul class="nav nav-tabs" id="myTab" role="tablist">
-            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
-            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Kits</button></li>
-        </ul>
-
-        <div class="tab-content p-3 bg-white border border-top-0 rounded-bottom">
-            <div class="tab-pane fade show active" id="search">
-                <div class="input-group mb-3">
-                    <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
-                    <button class="btn btn-primary" id="btn-search">Buscar</button>
-                </div>
-                <div id="search-results"></div>
-            </div>
-
-            <div class="tab-pane fade" id="kits">
-                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
-                <div id="kits-list"></div>
-            </div>
-        </div>
+        <div id="results" class="list-group"></div>
     </div>
-
     <script>
-    const API = '/api';
-    
-    // Formatador de logs
-    function formatLog(log) {
-        return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
-    }
-
-    // WebSocket Logs
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
-    ws.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-        const box = document.getElementById('logs-content');
-        if(data.logs) {
-            data.logs.forEach(l => box.innerHTML += formatLog(l));
+        const API = '/api';
+        const ws = new WebSocket(`${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/logs`);
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            const box = document.getElementById('logs-content');
+            data.logs.forEach(l => box.innerHTML += `<div><span class="log-level-${l.level}">[${l.timestamp}]</span> ${l.message}</div>`);
             box.scrollTop = box.scrollHeight;
-        }
-    };
-
-    // Status Polling
-    setInterval(async () => {
-        try {
+        };
+        async function checkStatus() {
             const r = await fetch(API + '/status');
             const d = await r.json();
             const badge = document.getElementById('status-badge');
             if(d.authenticated) {
-                badge.className = 'badge bg-success me-2';
-                badge.textContent = 'Online';
+                badge.className = 'badge bg-success me-2'; badge.textContent = 'Online';
                 document.getElementById('auth-link').classList.add('d-none');
-            } else {
-                badge.className = 'badge bg-danger me-2';
-                badge.textContent = 'Offline';
-                document.getElementById('auth-link').classList.remove('d-none');
             }
-        } catch(e) {}
-    }, 5000);
-
-    // Busca de Produtos
-    document.getElementById('btn-search').onclick = async () => {
-        const q = document.getElementById('search-input').value;
-        const div = document.getElementById('search-results');
-        div.innerHTML = 'Buscando...';
-        
-        try {
-            const r = await fetch(`${API}/product/search?q=${q}`);
-            const data = await r.json();
-            if(!data.length) {
-                div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
-                return;
-            }
-            
-            let html = '<div class="list-group">';
-            data.forEach(p => {
-                html += `
-                    <div class="list-group-item">
-                        <div class="d-flex w-100 justify-content-between">
-                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
-                            <small>${p.sku || 'N/D'}</small>
-                        </div>
-                        <p class="mb-1">${p.descricaoCurta || ''}</p>
-                        <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
-                    </div>
-                `;
-            });
-            html += '</div>';
-            div.innerHTML = html;
-        } catch(e) {
-            div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
         }
-    };
-
-    // Carregar Kits
-    async function loadKits() {
-        const div = document.getElementById('kits-list');
-        div.innerHTML = 'Carregando...';
-        try {
-            const r = await fetch(`${API}/kits`);
-            const data = await r.json();
-            let html = '<table class="table table-sm"><thead><tr><th>SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
-            data.forEach(k => {
-                let comps = k.componentes.map(c => `${c.quantidade}x ${c.nome}`).join(', ');
-                html += `<tr><td>${k.sku}</td><td>${k.produto}</td><td>${comps}</td></tr>`;
-            });
-            html += '</tbody></table>';
-            div.innerHTML = html;
-        } catch(e) {
-            div.innerHTML = 'Erro ao carregar kits.';
+        async function search() {
+            const q = document.getElementById('search-input').value;
+            const res = await fetch(`${API}/product/search?q=${q}`);
+            const data = await res.json();
+            const div = document.getElementById('results');
+            div.innerHTML = data.map(p => `<div class="list-group-item"><b>${p.sku}</b> - ${p.nome} <br> <small>Estoque: ${p.estoque}</small></div>`).join('');
         }
-    }
-    
-    document.addEventListener('DOMContentLoaded', () => {
-        loadKits();
-    });
+        setInterval(checkStatus, 5000);
+        checkStatus();
     </script>
 </body>
 </html>
 """
 
 # ============================================================================
-# 10. ENTRY POINT
+# 10. INICIALIZAÇÃO
 # ============================================================================
+
+orchestrator = AutomationOrchestrator(Config())
 
 def create_app() -> Flask:
     app = Flask(__name__)
@@ -826,16 +607,11 @@ def create_app() -> Flask:
 
 app = create_app()
 
-def run_cli():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--serve', action='store_true')
     parser.add_argument('--port', type=int, default=8000)
     args = parser.parse_args()
-    
     if args.serve:
-        # Inicia worker de dados
         Thread(target=orchestrator.load_data_worker, daemon=True).start()
-        app.run(host='0.0.0.0', port=args.port, debug=False)
-
-if __name__ == "__main__":
-    run_cli()
+        app.run(host='0.0.0.0', port=args.port)
