@@ -830,3 +830,20 @@ def run_cli():
 
 if __name__ == "__main__":
     run_cli()
+
+
+# --- PATCH: Gunicorn defaults for WebSocket stability (Render) ---
+import os as _os
+_os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 120 --keep-alive 5")
+# ---------------------------------------------------------------
+
+
+# --- PATCH: Explicit PORT binding (Render) ---
+APP_PORT = int(_os.getenv("PORT", "10000"))
+# ---------------------------------------------------------------
+
+
+# --- PATCH: API auth note ---
+# Ensure Authorization header is validated consistently for /api/kits and others.
+# If using tokens, return 401 ONLY when header missing/invalid; log reason.
+# ---------------------------------------------------------------
