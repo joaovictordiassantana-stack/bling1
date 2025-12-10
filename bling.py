@@ -628,16 +628,16 @@ class WebServer:
         def ws_logs(ws):
             logger.info("WS conectado.")
             last_idx = 0
-            while not ws.closed:
-                try:
+            try:
+                while True:
                     all_logs = memory_handler.get_logs()
                     if len(all_logs) > last_idx:
                         new_logs = all_logs[last_idx:]
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
                     time.sleep(1)
-                except Exception:
-                    break
+            except Exception:
+                logger.info("WS desconectado.")
 
 # ============================================================================
 # 9. TEMPLATE (PATCH 5: RAW STRINGS)
