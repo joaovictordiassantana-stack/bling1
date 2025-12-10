@@ -630,12 +630,21 @@ class WebServer:
             last_idx = 0
             try:
                 while True:
+                    # Envia novos logs se houver
                     all_logs = memory_handler.get_logs()
                     if len(all_logs) > last_idx:
                         new_logs = all_logs[last_idx:]
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
-                    time.sleep(1)
+                    
+                    # CORREÇÃO CRÍTICA: Substitui time.sleep por receive com timeout.
+                    # Isso impede que o Gunicorn (Sync Worker) mate o processo por inatividade/bloqueio.
+                    try:
+                        # Tenta ler do socket por 1s (age como sleep, mas mantém conexão viva)
+                        ws.receive(timeout=1)
+                    except Exception:
+                        # Timeout no receive é normal (significa que cliente não enviou nada)
+                        pass
             except Exception:
                 logger.info("WS desconectado.")
 
