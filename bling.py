@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from threading import Lock, Thread
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
+from functools import wraps
 
 import requests
 from requests.exceptions import RequestException
@@ -26,8 +27,8 @@ from flask import Flask, request, render_template_string, jsonify, redirect, url
 from flask_sock import Sock
 
 # ============================================================================
-# 0. FUNÇÕES DE PERSISTÊNCIA DE TOKENS (RE-ADICIONADAS)
-# ============================================================================
+# 13. FUNÇÕES DE SUPORTE AO DASHBOARD
+# =============================================================================
 
 def load_tokens():
     if not os.path.exists("tokens.json"):
@@ -93,7 +94,103 @@ def refresh_access_token():
 
 
 # ============================================================================
-# 16. EXCEÇÕES CUSTOMIZADAS
+# 95. FUNÇÕES DE UTILIDADE
+# ============================================================================
+
+def buscar_produtos_por_sku_ou_nome(lista: List[Dict[str, Any]], termo_raw: str) -> List[Dict[str, Any]]:
+    """
+    Busca produtos na lista por SKU exato, nome exato ou nome parcial.
+    Retorna uma lista de produtos ordenados por relevância:
+    - Score 0: Match exato (SKU ou nome)
+    - Score 1: Nome começa com o termo
+    - Score 2: Nome contém o termo
+    """
+    termo = termo_raw.strip().lower()
+    
+    if not termo:
+        return []
+    
+    results = []
+    seen_ids = set()  # Para evitar duplicatas
+
+    # 1) Match exato SKU (prioridade máxima)
+    for p in lista:
+        if p.get('codigo', '').strip().lower() == termo:
+            pid = p.get('id', p.get('codigo'))
+            if pid not in seen_ids:
+                results.append((0, p))
+                seen_ids.add(pid)
+
+    # 2) Match exato nome
+    for p in lista:
+        if p.get('nome', '').strip().lower() == termo:
+            pid = p.get('id', p.get('codigo'))
+            if pid not in seen_ids:
+                results.append((0, p))
+                seen_ids.add(pid)
+
+    # 3) Startswith nome (mais relevante)
+    for p in lista:
+        n = p.get('nome', '').strip().lower()
+        if n.startswith(termo):
+            pid = p.get('id', p.get('codigo'))
+            if pid not in seen_ids:
+                results.append((1, p))
+                seen_ids.add(pid)
+
+    # 4) Contains
+    for p in lista:
+        n = p.get('nome', '').strip().lower()
+        if termo in n:
+            pid = p.get('id', p.get('codigo'))
+            if pid not in seen_ids:
+                results.append((2, p))
+                seen_ids.add(pid)
+    
+    # Retorna apenas os dicts ordenados por score (menor = mais relevante)
+    results_sorted = [p for _, p in sorted(results, key=lambda x: x[0])]
+    return results_sorted
+
+def filtrar_variacoes(lista):
+    """
+    Remove produtos que parecem ser variações (tamanho, cor) com base em sufixos comuns.
+    Usa regex para detectar padrões de variação e deduplica por SKU base.
+    """
+    import re
+    
+    # Padrões de variação (tamanhos e cores)
+    VAR_SUFFIXES = re.compile(r'(\b(P|PP|M|G|GG|X(L)?|XL|XS)\b|-\b?(P|M|G|GG|PP)\b|-(vm|az|pt|br|brn|rd|bk)\b)$', re.I)
+    COLOR_WORDS = re.compile(r'\b(vermelho|azul|preto|branco|verde|amarelo|rosa|cinza|marrom)\b', re.I)
+    
+    final = []
+    seen_bases = set()
+    
+    for p in lista:
+        codigo = p.get('codigo', '').strip()
+        nome = p.get('nome', '').strip()
+        base = codigo
+        
+        # Remove sufixos tipo -P, -PT, " P", " M"
+        base = re.sub(r'[-\s](P|PP|M|G|GG|XL|XS|XP)$', '', base, flags=re.I)
+        # Remove trailing color codes (AZ, VM, PT,...)
+        base = re.sub(r'[-\s](AZ|VM|PT|BR|BK|RD)$', '', base, flags=re.I)
+        
+        base_upper = base.upper()
+        
+        # Se já vimos este SKU base, pula (deduplicação)
+        if base_upper in seen_bases:
+            continue
+        
+        # Marca como visto
+        seen_bases.add(base_upper)
+        
+        # Adiciona à lista final
+        final.append(p)
+    
+    return final
+
+# ============================================================================
+# 96. EXCEÇÕES CUSTOMIZADAS
 # ============================================================================
 
 class BlingAuthError(Exception):
@@ -132,7 +229,7 @@ class Config:
     
     # Automação
     CHECK_MIN_STOCK: bool = True
-    MIN_STOCK_THRESHOLD: int = 10 # Estoque mínimo padrão se não configurado
+    MIN_STOCK_THRESHOLD: int = 10
     DEFAULT_BATCH_SIZE: int = 10
     DELAY_BETWEEN_BATCHES: float = 0.5 # Delay entre chamadas de API em lote
     
@@ -153,14 +250,14 @@ class Component:
     sku: str
     name: str
     qty: int # Quantidade necessária para o Kit
+    unit: str = '' # Unidade de medida
     supplier: str = 'N/A'
     lead_time_days: int = 0
     unit_cost: float = 0.0
-    min_stock: int = Config.MIN_STOCK_THRESHOLD
+    min_stock: int = 0
     current_stock: int = 0
-    
+
     def __post_init__(self):
-        # Garante que min_stock seja pelo menos 0
         self.min_stock = max(0, self.min_stock)
 
 @dataclass
@@ -170,16 +267,6 @@ class Kit:
     name: str
     components: List[Component] = field(default_factory=list)
     price: float = 0.0
-
-@dataclass
-class PurchaseNeed:
-    """Representa uma necessidade de compra de um componente."""
-    component_sku: str
-    component_name: str
-    quantity_needed: int
-    supplier: str
-    lead_time_days: int
-    reason: str
 
 # ============================================================================
 # 9. LOGS AVANÇADOS
@@ -331,50 +418,7 @@ class ComponentConfigManager:
         self._save_config(self.config)
         logger.info(f"Configuração do componente {sku} atualizada.")
 
-# ============================================================================
-# 4. GERENCIAMENTO DE NECESSIDADES DE COMPRA
-# ============================================================================
 
-class PurchaseNeedsManager:
-    """Gerencia as necessidades de compra identificadas."""
-    
-    def __init__(self):
-        self.needs: Dict[str, List[PurchaseNeed]] = {}  # supplier -> [needs]
-        self.lock = Lock()
-    
-    def add_need(self, need: PurchaseNeed):
-        """Adiciona uma necessidade de compra."""
-        with self.lock:
-            if need.supplier not in self.needs:
-                self.needs[need.supplier] = []
-            
-            # Verifica se já existe uma necessidade para o mesmo componente do mesmo fornecedor
-            existing = next((n for n in self.needs[need.supplier] if n.component_sku == need.component_sku), None)
-            if existing:
-                # Atualiza a quantidade se for maior
-                if need.quantity_needed > existing.quantity_needed:
-                    existing.quantity_needed = need.quantity_needed
-                    existing.reason = need.reason
-                    logger.info(f"Necessidade atualizada: {need.component_sku} - {need.quantity_needed} unidades")
-            else:
-                self.needs[need.supplier].append(need)
-                logger.info(f"Nova necessidade adicionada: {need.component_sku} - {need.quantity_needed} unidades")
-    
-    def clear_needs(self):
-        """Limpa todas as necessidades."""
-        with self.lock:
-            self.needs.clear()
-            logger.info("Todas as necessidades de compra foram limpas.")
-    
-    def get_needs_by_supplier(self, supplier: str) -> List[PurchaseNeed]:
-        """Retorna as necessidades de um fornecedor específico."""
-        with self.lock:
-            return self.needs.get(supplier, []).copy()
-    
-    def get_all_needs(self) -> Dict[str, List[PurchaseNeed]]:
-        """Retorna todas as necessidades organizadas por fornecedor."""
-        with self.lock:
-            return {supplier: needs.copy() for supplier, needs in self.needs.items()}
 
 # ============================================================================
 # 5. ESTATÍSTICAS E MÉTRICAS
@@ -502,36 +546,6 @@ class BlingAPIClient:
                 
         except Exception as e:
             logger.error(f"Erro ao buscar estoque do produto {product_id}: {e}")
-            return None
-    
-    def create_production_order(self, access_token: str, order_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Cria uma ordem de produção."""
-        try:
-            response = self._make_request('POST', '/ordens-producao', access_token, json=order_data)
-            
-            if response.status_code in [200, 201]:
-                return response.json()
-            else:
-                logger.error(f"Erro ao criar OP: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Erro ao criar OP: {e}")
-            return None
-    
-    def create_purchase_order(self, access_token: str, order_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Cria uma ordem de compra."""
-        try:
-            response = self._make_request('POST', '/pedidos-compras', access_token, json=order_data)
-            
-            if response.status_code in [200, 201]:
-                return response.json()
-            else:
-                logger.error(f"Erro ao criar PO: {response.status_code} - {response.text}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Erro ao criar PO: {e}")
             return None
 
 # ============================================================================
@@ -686,8 +700,8 @@ class BlingAuth:
         
         return None
 
-# ============================================================================
-# 8. ORQUESTRADOR PRINCIPAL
+# =# ============================================================================
+# 15. EXECUÇÃO PRINCIPAL
 # ============================================================================
 
 class AutomationOrchestrator:
@@ -698,67 +712,77 @@ class AutomationOrchestrator:
         self.auth = BlingAuth(config)
         self.api_client = BlingAPIClient(config)
         self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
-        self.needs_manager = PurchaseNeedsManager()
+        # self.needs_manager = PurchaseNeedsManager() # Removido: Funcionalidade de Needs desativada
         self.stats = ProcessingStats()
         
         # Estado
         self.kits: List[Kit] = []
+        self.products: List[Dict[str, Any]] = [] # Novo atributo para armazenar todos os produtos não-variação
         self.is_running: bool = False
         self.lock = Lock()
+        
+        # Inicia o carregamento dos dados em uma thread separada
+        Thread(target=self.load_data_worker, daemon=True).start()
     
+    def load_data_worker(self):
+        """Worker que carrega os dados iniciais (kits, produtos e estoque) em loop."""
+        while True:
+            try:
+                token = self.auth.get_valid_token()
+                if token:
+                    self._load_products_and_kits(token)
+                    logger.info("Dados iniciais carregados com sucesso.")
+                else:
+                    logger.warning("Não foi possível carregar dados: Token de acesso indisponível.")
+                
+                # Espera 1 hora antes de recarregar
+                time.sleep(3600)
+                
+            except Exception as e:
+                logger.error(f"Erro no worker de carregamento de dados: {e}")
+                time.sleep(60) # Espera 1 minuto em caso de erro
+                
     def load_data(self) -> bool:
-        """Carrega dados iniciais (kits, componentes, estoque)."""
-        logger.info("Iniciando carregamento de dados...")
-        
-        # Verifica autenticação
-        token = self.auth.get_valid_token()
-        if not token:
-            logger.error("Token de acesso não disponível. Execute a autenticação primeiro.")
-            return False
-        
-        try:
-            # Carrega produtos que são kits (produtos compostos)
-            self._load_kits(token)
-            
-            # Atualiza estoque dos componentes
-            self._update_component_stock(token)
-            
-            logger.info(f"Carregamento concluído: {len(self.kits)} kits carregados.")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Erro no carregamento de dados: {e}")
-            error_logger.error(f"Erro no carregamento de dados: {e}")
-            return False
+        """Função de carregamento de dados que será removida ou adaptada, mantida por compatibilidade."""
+        logger.warning("load_data() foi substituída por load_data_worker em uma thread separada.")
+        return True # Retorna True para não bloquear o startup.
     
-    def _load_kits(self, access_token: str):
-        """Carrega kits (produtos compostos) do Bling."""
-        logger.info("Carregando kits...")
-        
-        page = 1
+    def _load_products_and_kits(self, access_token: str):
+        """Carrega todos os produtos e kits do Bling, aplicando o filtro de variações."""
+        logger.info("Carregando produtos e kits do Bling...")
+        self.kits.clear()
+        self.products.clear()
         kits_loaded = 0
+        products_loaded = 0
+        page = 1
         
         while True:
             try:
-                # Busca produtos com filtro para produtos compostos
-                response = self.api_client.get_products(
-                    access_token, 
-                    page=page, 
-                    limit=100,
-                    tipo='P'  # Tipo P = Produto (pode incluir compostos)
-                )
+                # Busca produtos da API
+                response_data = self.api_client.get_products(access_token, page=page, limit=100)
                 
-                products = response.get('data', [])
-                if not products:
+                products_raw = response_data.get('data', [])
+                
+                if not products_raw:
                     break
                 
-                for product in products:
-                    # Verifica se é um produto composto (tem estrutura)
+                # Extrai a lista de produtos
+                products_list = [p.get('produto', {}) for p in products_raw]
+                
+                # 1. Aplica o filtro de variações
+                products_filtered = filtrar_variacoes(products_list)
+                
+                for product in products_filtered:
+                    
                     if self._is_kit_product(product):
                         kit = self._create_kit_from_product(product)
                         if kit:
                             self.kits.append(kit)
                             kits_loaded += 1
+                    else:
+                        # Armazena produtos que não são kits (e já foram filtrados de variações)
+                        self.products.append(product)
+                        products_loaded += 1
                 
                 page += 1
                 
@@ -766,10 +790,10 @@ class AutomationOrchestrator:
                 time.sleep(self.config.DELAY_BETWEEN_BATCHES)
                 
             except Exception as e:
-                logger.error(f"Erro ao carregar página {page} de kits: {e}")
+                logger.error(f"Erro ao carregar página {page} de produtos/kits: {e}")
                 break
         
-        logger.info(f"{kits_loaded} kits carregados.")
+        logger.info(f"{kits_loaded} kits e {products_loaded} produtos carregados.")
     
     def _is_kit_product(self, product: Dict[str, Any]) -> bool:
         """Verifica se um produto é um kit (produto composto)."""
@@ -811,6 +835,7 @@ class AutomationOrchestrator:
             sku = comp_data.get('codigo', '')
             name = comp_data.get('nome', '')
             qty = int(comp_data.get('quantidade', 1))
+            unit = comp_data.get('unidade', '') # Adicionando a unidade
             
             if not sku:
                 return None
@@ -822,6 +847,7 @@ class AutomationOrchestrator:
                 sku=sku,
                 name=name,
                 qty=qty,
+                unit=unit, # Adicionando a unidade
                 supplier=config.get('supplier', 'N/A'),
                 lead_time_days=config.get('lead_time_days', 0),
                 unit_cost=config.get('unit_cost', 0.0),
@@ -835,41 +861,9 @@ class AutomationOrchestrator:
             return None
     
     def _update_component_stock(self, access_token: str):
-        """Atualiza o estoque atual de todos os componentes."""
-        logger.info("Atualizando estoque dos componentes...")
-        
-        # Coleta todos os SKUs únicos de componentes
-        component_skus = set()
-        for kit in self.kits:
-            for component in kit.components:
-                component_skus.add(component.sku)
-        
-        updated_count = 0
-        
-        for sku in component_skus:
-            try:
-                # Busca o produto pelo SKU
-                product = self.api_client.get_product_by_sku(access_token, sku)
-                
-                if product:
-                    # Busca informações de estoque
-                    product_id = product.get('id')
-                    if product_id:
-                        stock_info = self.api_client.get_stock(access_token, product_id)
-                        
-                        if stock_info:
-                            # Atualiza o estoque em todos os componentes com este SKU
-                            current_stock = stock_info.get('saldoVirtualTotal', 0)
-                            self._update_component_stock_by_sku(sku, current_stock)
-                            updated_count += 1
-                
-                # Delay entre consultas
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
-                
-            except Exception as e:
-                logger.error(f"Erro ao atualizar estoque do componente {sku}: {e}")
-        
-        logger.info(f"Estoque atualizado para {updated_count} componentes.")
+        """Atualiza o estoque atual de todos os componentes (Funcionalidade desativada)."""
+        logger.warning("Atualização de estoque de componentes desativada.")
+        pass
     
     def _update_component_stock_by_sku(self, sku: str, current_stock: int):
         """Atualiza o estoque atual de um componente específico em todos os kits."""
@@ -879,124 +873,36 @@ class AutomationOrchestrator:
                     component.current_stock = current_stock
     
     def run_purchase_check(self, create_orders: bool = False) -> bool:
-        """Executa verificação de necessidades de compra e criação de ordens."""
-        if self.is_running:
-            logger.warning("Processamento já em andamento.")
-            return False
-        
-        with self.lock:
-            self.is_running = True
-        
-        try:
-            start_time = time.time()
-            self.stats.reset()
-            
-            logger.info("Iniciando verificação de necessidades de compra...")
-            
-            # Verifica autenticação
-            token = self.auth.get_valid_token()
-            if not token:
-                logger.error("Token de acesso não disponível.")
-                return False
-            
-            # Limpa necessidades anteriores
-            self.needs_manager.clear_needs()
-            
-            # Verifica cada kit
-            for kit in self.kits:
-                self._check_kit_needs(kit)
-                self.stats.stock_checks += 1
-            
-            # Cria ordens se solicitado
-            if create_orders:
-                self._create_purchase_orders(token)
-            
-            self.stats.elapsed_time_seconds = time.time() - start_time
-            
-            logger.info(f"Verificação concluída em {self.stats.elapsed_time_seconds:.2f}s")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Erro na verificação de necessidades: {e}")
-            error_logger.error(f"Erro na verificação de necessidades: {e}")
-            self.stats.failed += 1
-            return False
-        finally:
-            with self.lock:
-                self.is_running = False
+        """Funcionalidade de verificação de necessidades de compra desativada."""
+        logger.warning("A funcionalidade de verificação de necessidades de compra está desativada.")
+        return False
+
+    def get_all_products(self) -> List[Dict[str, Any]]:
+        """Retorna a lista de todos os produtos carregados (não-variações)."""
+        return self.products
+
+    def get_all_kits(self) -> List[Kit]:
+        """Retorna a lista de todos os kits carregados."""
+        return self.kits
+
+    def get_kit_by_sku(self, sku: str) -> Optional[Kit]:
+        """Busca um kit pelo SKU."""
+        for kit in self.kits:
+            if kit.sku == sku:
+                return kit
+        return None
     
     def _check_kit_needs(self, kit: Kit):
-        """Verifica as necessidades de compra de um kit específico."""
-        logger.debug(f"Verificando necessidades do kit {kit.sku}")
-        
-        for component in kit.components:
-            # Verifica se o estoque está abaixo do mínimo
-            if component.current_stock < component.min_stock:
-                quantity_needed = component.min_stock - component.current_stock
-                
-                need = PurchaseNeed(
-                    component_sku=component.sku,
-                    component_name=component.name,
-                    quantity_needed=quantity_needed,
-                    supplier=component.supplier,
-                    lead_time_days=component.lead_time_days,
-                    reason=f"Estoque baixo: {component.current_stock} < {component.min_stock}"
-                )
-                
-                self.needs_manager.add_need(need)
+        """Funcionalidade de verificação de necessidades de compra desativada."""
+        pass
     
     def _create_purchase_orders(self, access_token: str):
-        """Cria ordens de compra baseadas nas necessidades identificadas."""
-        logger.info("Criando ordens de compra...")
-        
-        all_needs = self.needs_manager.get_all_needs()
-        
-        for supplier, needs in all_needs.items():
-            if not needs:
-                continue
-            
-            try:
-                # Cria uma PO por fornecedor
-                po_data = self._build_purchase_order_data(supplier, needs)
-                
-                result = self.api_client.create_purchase_order(access_token, po_data)
-                
-                if result:
-                    self.stats.pos_created += 1
-                    self.stats.success += 1
-                    logger.info(f"PO criada para fornecedor {supplier}")
-                else:
-                    self.stats.failed += 1
-                    logger.error(f"Falha ao criar PO para fornecedor {supplier}")
-                
-            except Exception as e:
-                self.stats.failed += 1
-                logger.error(f"Erro ao criar PO para fornecedor {supplier}: {e}")
+        """Funcionalidade de criação de ordens de compra desativada."""
+        pass
     
-    def _build_purchase_order_data(self, supplier: str, needs: List[PurchaseNeed]) -> Dict[str, Any]:
-        """Constrói os dados para criação de uma ordem de compra."""
-        # Estrutura básica de uma PO no Bling
-        # Esta estrutura pode precisar ser ajustada conforme a documentação da API
-        
-        items = []
-        for need in needs:
-            item = {
-                'codigo': need.component_sku,
-                'descricao': need.component_name,
-                'quantidade': need.quantity_needed,
-                'valor': 0.0  # Será preenchido manualmente ou via integração com catálogo
-            }
-            items.append(item)
-        
-        po_data = {
-            'fornecedor': {
-                'nome': supplier
-            },
-            'itens': items,
-            'observacoes': f"PO gerada automaticamente - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        }
-        
-        return po_data
+    def _build_purchase_order_data(self, supplier: str, needs: List[Any]) -> Dict[str, Any]:
+        """Funcionalidade de construção de dados de ordem de compra desativada."""
+        return {}
     
     def process_kits(self, kits: List[Kit], batch_size: int = None, create_orders: bool = False, quantity: int = 1):
         """Processa uma lista específica de kits."""
@@ -1035,8 +941,7 @@ class AutomationOrchestrator:
                             # Cria ordem de produção para o kit
                             self._create_production_order(token, kit, quantity)
                         
-                        # Verifica necessidades dos componentes
-                        self._check_kit_needs(kit)
+                        # self._check_kit_needs(kit) # Removido: Funcionalidade de Needs desativada
                         
                         self.stats.success += 1
                         
@@ -1048,9 +953,9 @@ class AutomationOrchestrator:
                 if i + batch_size < len(kits):
                     time.sleep(self.config.DELAY_BETWEEN_BATCHES)
             
-            # Cria POs se necessário
-            if create_orders:
-                self._create_purchase_orders(token)
+            # # Cria POs se necessário
+            # if create_orders:
+            #     self._create_purchase_orders(token) # Removido: Funcionalidade de Needs desativada
             
             self.stats.elapsed_time_seconds = time.time() - start_time
             
@@ -1085,46 +990,7 @@ class AutomationOrchestrator:
         except Exception as e:
             logger.error(f"Erro ao criar OP para kit {kit.sku}: {e}")
 
-# ============================================================================
-# 1. FUNÇÃO PARA BUSCAR PRODUTO POR SKU (PARA O DASHBOARD)
-# ============================================================================
 
-def get_bling_product_by_sku(sku):
-    """
-    Busca um produto no Bling pelo SKU e retorna os dados formatados.
-    Esta função é usada pela rota /api/produtos do dashboard.
-    """
-    
-    # Carrega tokens
-    token_data = load_tokens()
-    if not token_data or not is_token_valid(token_data):
-        # Tenta renovar
-        token_data = refresh_access_token()
-        if not token_data:
-            return {"error": "Token de acesso inválido. Faça a autenticação."}
-    
-    access_token = token_data["access_token"]
-    
-    # Faz a requisição para a API do Bling
-    url = f"https://www.bling.com.br/Api/v3/produtos"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    
-    params = {"codigo": sku}
-    
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=30)
-        
-        if response.status_code == 200:
-            data = response.json()
-            return data
-        else:
-            return {"error": f"Erro na API: {response.status_code}"}
-            
-    except Exception as e:
-        return {"error": f"Erro de conexão: {str(e)}"}
 
 # ============================================================================
 # 10. INSTÂNCIAS GLOBAIS
@@ -1138,6 +1004,24 @@ orchestrator = AutomationOrchestrator(config)
 
 # Autenticação (referência para compatibilidade)
 auth = orchestrator.auth
+
+# ============================================================================
+# 11. DECORADORES
+# ============================================================================
+
+def token_required(f):
+    """Decorador para verificar se o token de acesso está disponível."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not orchestrator.auth.is_authenticated():
+            return jsonify({
+                "status": "not_authenticated",
+                "message": "Authorize the application via OAuth"
+            }), 401
+        
+        # Passa o token para a função decorada, se necessário
+        return f(token=orchestrator.auth.access_token, *args, **kwargs)
+    return decorated
 
 # PARTE 4 — TEMPLATE HTML DO FRONT-END (INTERFACE DO USUÁRIO)
 DASHBOARD_TEMPLATE = """
@@ -1161,132 +1045,140 @@ DASHBOARD_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1 class="mb-4 text-center">Consulta de Produto Bling</h1>
-        
-        <div class="input-group mb-3">
-            <input type="text" class="form-control" id="skuInput" placeholder="Digite o SKU do produto" aria-label="SKU do produto">
-            <button class="btn btn-primary" type="button" id="searchButton">Buscar</button>
-        </div>
-
-        <div id="loading" class="alert alert-info hidden" role="alert">
-            Buscando produto...
-        </div>
-
-        <div id="errorAlert" class="alert alert-danger hidden" role="alert">
-            Produto não encontrado. Verifique o SKU.
-        </div>
-
-        <div id="productDetails" class="product-card hidden">
-            <div class="row">
-                <div class="col-md-4 text-center">
-                    <img id="imgProduto" src="/placeholder.png" alt="Imagem do Produto" class="product-image">
-                </div>
-                <div class="col-md-8">
-                    <h2 id="nome" class="mb-3"></h2>
-                    <div class="product-detail"><strong>Código:</strong> <span id="codigo"></span></div>
-                    <div class="product-detail"><strong>Tipo:</strong> <span id="tipo"></span></div>
-                    <div class="product-detail"><strong>Situação:</strong> <span id="situacao"></span></div>
-                    <div class="product-detail"><strong>Formato:</strong> <span id="formato"></span></div>
-                    <div class="product-detail"><strong>Preço:</strong> <span id="preco"></span></div>
-                    <div class="product-detail"><strong>Preço Custo:</strong> <span id="precoCusto"></span></div>
-                    <div class="product-detail"><strong>Estoque:</strong> <span id="estoque"></span></div>
-                </div>
-            </div>
-            <div id="descricao">
-                <h4>Descrição</h4>
-                <!-- A descrição será inserida aqui com innerHTML -->
-            </div>
-        </div>
-    </div>
-    <script>
-        {% raw %}
-        
-        document.getElementById('searchButton').addEventListener('click', buscarProduto);
-        document.getElementById('skuInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                buscarProduto();
+            <h1 class="mb-4 text-center">Bling Automação Dashboard</h1>
+        <script>
+            {% raw %}
+            
+            document.getElementById('search-product-button').addEventListener('click', buscarProdutos);
+            document.getElementById('product-search-sku').addEventListener('keypress', function(e) {
+                if (e.key === 'Enter') {
+                    buscarProdutos();
+                }
+            });
+    
+            function showElement(id) { document.getElementById(id).classList.remove('hidden'); }
+            function hideElement(id) { document.getElementById(id).classList.add('hidden'); }
+    
+            function exibirErro(mensagem) {
+                hideElement('product-details-container');
+                document.getElementById('search-results-list').innerHTML = `<div class="alert alert-danger" role="alert">${mensagem}</div>`;
             }
-        });
-
-        function showElement(id) { document.getElementById(id).classList.remove('hidden'); }
-        function hideElement(id) { document.getElementById(id).classList.add('hidden'); }
-
-        function exibirErro(mensagem) {
-            hideElement('productDetails');
-            showElement('errorAlert');
-            document.getElementById('errorAlert').innerText = mensagem;
-        }
-
-        function limparDetalhes() {
-            hideElement('productDetails');
-            hideElement('errorAlert');
-            document.getElementById('nome').innerText = '';
-            document.getElementById('codigo').innerText = '';
-            document.getElementById('tipo').innerText = '';
-            document.getElementById('situacao').innerText = '';
-            document.getElementById('formato').innerText = '';
-            document.getElementById('preco').innerText = '';
-            document.getElementById('precoCusto').innerText = '';
-            document.getElementById('estoque').innerText = '';
-            document.getElementById('descricao').innerHTML = '<h4>Descrição</h4>';
-            document.getElementById('imgProduto').src = '/placeholder.png';
-        }
-
-        async function buscarProduto() {
-            const sku = document.getElementById('skuInput').value.trim();
-            if (!sku) {
-                exibirErro("Por favor, digite um SKU.");
-                return;
+    
+            function limparDetalhes() {
+                document.getElementById('search-results-list').innerHTML = '';
+                hideElement('product-details-container');
             }
-
-            limparDetalhes();
-            showElement('loading');
-
-            try {
-                const response = await fetch(`/api/produtos?sku=${sku}`);
-                const data = await response.json();
-                
-                // ✅ 1. Ajustar o fetch da API: Ler sempre json.data[0] e armazenar como const p.
-                const p = data.data?.[0]; 
-
-                hideElement('loading');
-
-                // ✅ 5. Ajustar verificação se o produto existe
-                if (!p) {
-                    exibirErro("Produto não encontrado. Verifique o SKU.");
+    
+            async function buscarProdutos() {
+                const termo = document.getElementById('product-search-sku').value.trim();
+                if (!termo) {
+                    exibirErro("Por favor, digite um SKU ou nome.");
                     return;
                 }
-
-                // ✅ 2. Atualizar os campos que aparecem na interface (com fallback)
-                document.getElementById("nome").innerText = p.nome || "Sem nome";
-                document.getElementById("codigo").innerText = p.codigo || "N/D";
-                document.getElementById("tipo").innerText = p.tipo || "N/D";
-                document.getElementById("situacao").innerText = p.situacao || "N/D";
-                document.getElementById("formato").innerText = p.formato || "N/D";
-                
-                // Formatação de preço simples (pode ser melhorada com Intl.NumberFormat)
-                document.getElementById("preco").innerText = p.preco ? `R$ ${parseFloat(p.preco).toFixed(2).replace('.', ',')}` : "N/D";
-                document.getElementById("precoCusto").innerText = p.precoCusto ? `R$ ${parseFloat(p.precoCusto).toFixed(2).replace('.', ',')}` : "N/D";
-                
-                // ✅ Estoque em p.estoque.saldoVirtualTotal (com fallback)
-                document.getElementById("estoque").innerText = p.estoque?.saldoVirtualTotal ?? "0";
-
-                // ✅ 4. Ajustar descrição (ela é HTML) - Usar innerHTML
-                document.getElementById("descricao").innerHTML = `<h4>Descrição</h4>${p.descricaoCurta || "Sem descrição."}`;
-
-                // ✅ 3. Ajustar exibição da imagem - Usar p.imagemURL
-                document.getElementById("imgProduto").src = p.imagemURL || "/placeholder.png";
-
-                showElement('productDetails');
-
-            } catch (error) {
-                hideElement('loading');
-                console.error('Erro ao buscar produto:', error);
-                exibirErro("Ocorreu um erro ao comunicar com a API.");
+    
+                limparDetalhes();
+                document.getElementById('search-results-list').innerHTML = '<div class="alert alert-info" role="alert">Buscando produtos...</div>';
+    
+                try {
+                    const response = await fetch(`/api/product/search?q=${termo}`);
+                    const results = await response.json();
+                    
+                    document.getElementById('search-results-list').innerHTML = ''; // Limpa o "Buscando..."
+    
+                    if (!results || results.length === 0) {
+                        exibirErro("Nenhum produto encontrado com o termo fornecido.");
+                        return;
+                    }
+    
+                    // Exibe a lista de resultados
+                    results.forEach(p => {
+                        const item = document.createElement('a');
+                        item.href = "#";
+                        item.className = "list-group-item list-group-item-action";
+                        item.innerHTML = `<strong>${p.nome || 'Sem Nome'}</strong> <span class="badge bg-secondary">${p.sku || 'N/D'}</span> <span class="badge bg-info">${p.formato || 'Produto'}</span>`;
+                        item.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            exibirDetalhesProduto(p);
+                        });
+                        document.getElementById('search-results-list').appendChild(item);
+                    });
+    
+                    // Exibe o primeiro resultado automaticamente
+                    exibirDetalhesProduto(results[0]);
+    
+                } catch (error) {
+                    console.error('Erro ao buscar produtos:', error);
+                    exibirErro("Ocorreu um erro ao comunicar com a API.");
+                }
             }
-        }        
-        {% endraw %}
-    </script>
+            
+            function exibirDetalhesProduto(p) {
+                const container = document.getElementById('product-details-container');
+                container.innerHTML = ''; // Limpa o conteúdo anterior
+                
+                // Cria a estrutura de detalhes (a mesma que estava no template original)
+                const detailsHTML = `
+                    <div id="productDetails" class="product-card">
+                        <div class="row">
+                            <div class="col-md-4 text-center">
+                                <img id="imgProduto" src="${p.imagemURL || '/placeholder.png'}" alt="Imagem do Produto" class="product-image">
+                            </div>
+                            <div class="col-md-8">
+                                <h2 id="nome" class="mb-3">${p.nome || "Sem nome"}</h2>
+                                <div class="product-detail"><strong>Código:</strong> <span id="codigo">${p.sku || "N/D"}</span></div>
+                                <div class="product-detail"><strong>Tipo:</strong> <span id="tipo">${p.tipo || "N/D"}</span></div>
+                                <div class="product-detail"><strong>Situação:</strong> <span id="situacao">${p.situacao || "N/D"}</span></div>
+                                <div class="product-detail"><strong>Formato:</strong> <span id="formato">${p.formato || "N/D"}</span></div>
+                                <div class="product-detail"><strong>Preço:</strong> <span id="preco">${p.preco ? \`R$ \${parseFloat(p.preco).toFixed(2).replace('.', ',')}\` : "N/D"}</span></div>
+                                <div class="product-detail"><strong>Preço Custo:</strong> <span id="precoCusto">${p.formato !== 'Kit' ? (p.precoCusto ? \`R$ \${parseFloat(p.precoCusto).toFixed(2).replace('.', ',')}\` : "N/D") : "N/A (Kit)"}</span></div>
+                                <div class="product-detail"><strong>Estoque:</strong> <span id="estoque">${p.formato !== 'Kit' ? (p.estoque?.saldoVirtualTotal ?? "0") : "N/A (Kit)"}</span></div>
+                            </div>
+                        </div>
+                        <div id="estrutura" class="mt-4 ${p.formato !== 'Kit' ? 'hidden' : ''}">
+                            <h4>Estrutura do Kit</h4>
+                            <table class="table table-sm table-bordered">
+                                <thead>
+                                    <tr>
+                                        <th>SKU</th>
+                                        <th>Nome</th>
+                                        <th>Qtd.</th>
+                                        <th>Un.</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="estrutura-body">
+                                    ${p.estrutura && p.estrutura.length > 0 ? p.estrutura.map(comp => `
+                                        <tr>
+                                            <td>${comp.sku}</td>
+                                            <td>${comp.nome}</td>
+                                            <td>${comp.quantidade}</td>
+                                            <td>${comp.unidade}</td>
+                                        </tr>
+                                    `).join('') : `
+                                        <tr><td colspan="4">Nenhum componente listado.</td></tr>
+                                    `}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div id="descricao">
+                            <h4>Descrição</h4>
+                            ${p.descricaoCurta || "Sem descrição."}
+                        </div>
+                    </div>
+                `;
+                
+                container.innerHTML = detailsHTML;
+                showElement('product-details-container');
+            }
+            
+            // Função de busca de imagem (para ser usada no frontend)
+            async function getProductImage(productId) {
+                // Como a rota de busca já traz a imagemURL, esta função não é mais necessária
+                // Mas se fosse, seria implementada aqui.
+                return null;
+            }
+            
+            {% endraw %}
+        </script>
 </body>
 </html>
 """
@@ -1364,118 +1256,119 @@ class WebServer:
         def api_stats():
             return jsonify(self.orchestrator.stats.to_dict())
 
+        # 3. Rotas de Dado        @self.app.route("/api/all_products", methods=["GET"])
+        @token_required
+        def api_all_products(token):
+            """Retorna a lista de todos os produtos (não-variações)."""
+            # A lista self.orchestrator.products já está filtrada de variações
+            return jsonify(self.orchestrator.products)
+
         # 3. Rotas de Dados
-        @self.app.route("/api/produtos", methods=["GET"])
-        def api_produtos():
-            sku = request.args.get("sku")
+        @self.app.route("/api/all_products", methods=["GET"])
+        @token_required
+        def api_all_products(token):
+            """Retorna a lista de todos os produtos carregados (não-variações)."""
+            # A lista self.orchestrator.products já está filtrada de variações
+            return jsonify(self.orchestrator.products)
 
-            if not sku:
-                return jsonify({"error": "SKU não informado"}), 400
+        @self.app.route('/api/product/search', methods=["GET"])
+        @token_required
+        def api_product_search(token):
+            """Busca produtos por SKU ou nome na lista de produtos carregados e retorna uma lista."""
+            termo = request.args.get("q")
+            
+            if not termo:
+                return jsonify([])
 
-            print("Consulta de produto recebida:", sku, flush=True)
+            # 1. Busca na lista de produtos (não-kits e não-variações)
+            products_found = buscar_produtos_por_sku_ou_nome(self.orchestrator.products, termo)
+            
+            # 2. Busca na lista de kits
+            kits_found_raw = buscar_produtos_por_sku_ou_nome(self.orchestrator.kits, termo)
+            
+            # Processa os kits encontrados para incluir a estrutura
+            kits_found = []
+            for kit_raw in kits_found_raw:
+                kit_achado = self.orchestrator.get_kit_by_sku(kit_raw.get("codigo"))
+                if kit_achado:
+                    kit_data = {
+                        "id": kit_raw.get("id"),
+                        "sku": kit_achado.sku,
+                        "nome": kit_achado.name,
+                        "tipo": "Kit/Composto",
+                        "situacao": "Ativo", # Assumindo ativo para kits carregados
+                        "formato": "Kit",
+                        "preco": kit_achado.price,
+                        "estrutura": [{'sku': c.sku, 'nome': c.name, 'quantidade': c.qty, 'unidade': c.unit} for c in kit_achado.components]
+                    }
+                    kits_found.append(kit_data)
+            
+            # Combina os resultados e formata os produtos simples
+            all_results = []
+            
+            # Adiciona produtos simples formatados
+            for achado in products_found:
+                all_results.append({
+                    "id": achado.get("id"),
+                    "sku": achado.get("codigo"),
+                    "nome": achado.get("nome"),
+                    "tipo": achado.get("tipo"),
+                    "situacao": achado.get("situacao"),
+                    "formato": achado.get("formato"),
+                    "preco": achado.get("preco"),
+                    "precoCusto": achado.get("precoCusto"),
+                    "imagemURL": achado.get("imagemURL"),
+                    "estoque": achado.get("estoque"),
+                    "descricaoCurta": achado.get("descricaoCurta")
+                })
+                
+            # Adiciona kits processados
+            all_results.extend(kits_found)
+            
+            # TODO: Adicionar busca de imagem para produtos simples e kits
+            # A busca de imagem será feita no frontend para cada item da lista.
+            
+            return jsonify(all_results)
 
-            data = get_bling_product_by_sku(sku)
-
-            return jsonify(data), 200
-
-        @self.app.route('/api/kits')
-        def api_kits():
-            kits_data = [
-                {
+        @self.app.route('/api/kits', methods=["GET"])
+        @token_required
+        def api_kits(token):
+            """Retorna a lista de kits com a estrutura simplificada de componentes."""
+            kits_data = []
+            for k in self.orchestrator.kits:
+                kit = {
                     "sku": k.sku,
-                    "name": k.name,
-                    "price": k.price,
-                    "components": [
+                    "nome": k.name,
+                    "preco": k.price,
+                    "componentes": [
                         {
                             "sku": c.sku,
-                            "name": c.name,
-                            "qty": c.qty,
-                            "supplier": c.supplier,
-                            "lead_time_days": c.lead_time_days,
-                            "unit_cost": c.unit_cost
+                            "nome": c.name,
+                            "quantidade": c.qty,
+                            "unidade": c.unit
                         } for c in k.components
                     ]
-                } for k in self.orchestrator.kits
-            ]
-            return jsonify({"kits": kits_data})
-
-        @self.app.route('/api/stock')
-        def api_stock():
-            all_components: Dict[str, Component] = {}
-            for kit in self.orchestrator.kits:
-                for component in kit.components:
-                    all_components[component.sku] = component
+                }
+                kits_data.append(kit)
             
-            stock_data = [
-                {
-                    "sku": c.sku,
-                    "name": c.name,
-                    "current_stock": c.current_stock,
-                    "min_stock": c.min_stock,
-                    "supplier": c.supplier,
-                    "lead_time_days": c.lead_time_days,
-                    "alert_level": "danger" if c.current_stock < c.min_stock else ("warning" if c.current_stock < c.min_stock * 1.5 else "ok")
-                } for c in all_components.values()
-            ]
-            return jsonify({"stock": stock_data})
+            return jsonify(kits_data) # Retorna a lista diretamente, sem a chave "kits" extra.
 
-        @self.app.route('/api/needs')
-        def api_needs():
-            needs_list = []
-            for supplier, needs in self.orchestrator.needs_manager.needs.items():
-                for need in needs:
-                    needs_list.append({
-                        "component_sku": need.component_sku,
-                        "component_name": need.component_name,
-                        "quantity_needed": need.quantity_needed,
-                        "supplier": need.supplier,
-                        "lead_time_days": need.lead_time_days,
-                        "reason": need.reason
-                    })
-            return jsonify({"needs": needs_list})
-
-        # 4. Rotas de Ação
-        @self.app.route('/api/recheck', methods=['POST'])
-        def api_recheck():
-            if self.orchestrator.is_running:
-                return jsonify({"status": "warning", "message": "Processamento já em andamento."}), 409
-            
-            # Executa a verificação em uma thread para não bloquear a requisição HTTP
-            Thread(target=self.orchestrator.run_purchase_check, args=(True,), daemon=True).start()
-            
-            return jsonify({"status": "ok", "message": "Verificação de estoque e POs iniciada em background."})
-
-        @self.app.route('/api/process_kits', methods=['POST'])
-        def api_process_kits():
-            if self.orchestrator.is_running:
-                return jsonify({"status": "warning", "message": "Processamento já em andamento."}), 409
-                
-            data = request.get_json(silent=True) or {}
-            sku_list = data.get('skus', [])
-            quantity = data.get('quantity', 1)
-            batch_size = data.get('batch_size', self.orchestrator.config.DEFAULT_BATCH_SIZE)
-            
-            kits_to_process = [k for k in self.orchestrator.kits if k.sku in sku_list]
-            
-            if not kits_to_process:
-                return jsonify({"status": "error", "message": "Nenhum kit encontrado com os SKUs fornecidos."}), 404
-            
-            # Executa o processamento em uma thread
-            Thread(target=self.orchestrator.process_kits, args=(kits_to_process, batch_size, True, quantity), daemon=True).start()
-            
-            return jsonify({"status": "ok", "message": f"Processamento de {len(kits_to_process)} kits iniciado em background."})
-
-        # 5. Webhook
-        @self.app.route("/webhook/bling", methods=["POST"])
-        def webhook_bling():
-            try:
-                data = request.get_json(silent=True)
-            except Exception:
-                data = None
-
-            print("WEBHOOK RECEBIDO:", data, flush=True)
-
-            return jsonify({"status": "ok"}), 200
+            # 4. Webhook
+            @self.app.route("/webhook/bling", methods=["POST"])
+            def webhook_bling():
+                """
+                Webhook do Bling. Apenas loga o payload e retorna 200 OK.
+                Toda a lógica de processamento de estoque/compra foi removida.
+                """
+                try:
+                    data = request.get_json(silent=True)
+                except Exception:
+                    data = None
+    
+                logger.info(f"WEBHOOK RECEBIDO: {data}")
+    
+                # Retorna 200 OK imediatamente, conforme instruído.
+                return jsonify({"status": "ok", "message": "Webhook recebido e logado."}), 200
 
     # 10. WEBSOCKET PARA LOGS
     def setup_websocket(self):
@@ -1543,7 +1436,7 @@ def create_app() -> Flask:
 app = create_app()
 
 # ============================================================================
-# 18. TEMPLATES HTML (Mínimos para Auth)
+# 14. TEMPLATES HTML
 # ============================================================================
 
 SUCCESS_TEMPLATE = """
@@ -1738,14 +1631,24 @@ DASHBOARD_TEMPLATE = """
                     
                     <!-- Busca Detalhada -->
                     <div class="tab-pane fade" id="search" role="tabpanel">
-                        <h5 class="card-title">Buscar Produto por SKU</h5>
-                        <div class="input-group mb-3">
-                            <input type="text" class="form-control" id="product-search-sku" placeholder="Digite o SKU do produto (ex: KIT-001)">
-                            <button class="btn btn-primary" type="button" id="search-product-button">Buscar</button>
-                        </div>
-                        <div id="product-search-results" class="mt-4">
-                            <p class="text-muted">Use o campo acima para buscar um produto e ver seus detalhes e componentes.</p>
-                        </div>
+                            <h5 class="card-title">Buscar Produto por SKU ou Nome</h5>
+                            <div class="input-group mb-3">
+                                <input type="text" class="form-control" id="product-search-sku" placeholder="Digite o SKU ou Nome do produto (ex: KIT-001 ou Camiseta)">
+                                <button class="btn btn-primary" type="button" id="search-product-button">Buscar</button>
+                            </div>
+                            <div id="product-search-results" class="mt-4">
+                                <p class="text-muted">Use o campo acima para buscar um produto e ver seus detalhes e componentes.</p>
+                                
+                                <!-- Novo container para a lista de resultados -->
+                                <div id="search-results-list" class="list-group mt-3">
+                                    <!-- Resultados da busca serão inseridos aqui -->
+                                </div>
+                                
+                                <!-- Container para os detalhes do produto selecionado -->
+                                <div id="product-details-container" class="mt-4 hidden">
+                                    <!-- Detalhes do produto selecionado serão inseridos aqui -->
+                                </div>
+                            </div>
                     </div>
                 </div>
             </div>
@@ -2220,10 +2123,8 @@ def run_cli():
             logger.error("Processamento falhou.")
     else:
         parser.print_help()
-
 # ============================================================================
-# 17. PONTO DE ENTRADA
+# 12. WEB SERVER (FLASK)
 # ============================================================================
-
 if __name__ == "__main__":
     run_cli()
