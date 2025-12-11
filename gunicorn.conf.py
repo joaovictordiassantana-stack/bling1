@@ -9,8 +9,8 @@ worker_class = "gevent"
 workers = 1
 
 # 🟢 Evitar crash por timeout
-timeout = 300
-graceful_timeout = 300
+timeout = 120
+graceful_timeout = 120
 
 # 🟢 Manter conexões WebSocket vivas por mais tempo (antes era só 5 segundos)
 keepalive = 120

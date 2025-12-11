@@ -27,6 +27,12 @@ from flask import Flask, request, render_template_string, jsonify, redirect, url
 from flask_sock import Sock
 
 # ============================================================================ 
+# 0. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
+# ============================================================================
+# Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
+token_exchange_lock = Lock()
+
+# ============================================================================ 
 # 1. LOGS AVANÇADOS
 # ============================================================================
 
@@ -110,7 +116,6 @@ class Config:
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI')
     if not REDIRECT_URI:
-        # A validação e abort(500) serão feitas na inicialização do Flask, conforme instruído.
         pass
     
     # API
@@ -119,6 +124,7 @@ class Config:
     
     # Retry e Timeout
     REQUEST_TIMEOUT: int = 30
+    AUTH_TIMEOUT: int = 3 # Timeout curto para auth
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
@@ -170,10 +176,6 @@ def is_token_valid(token_data):
 
 # --- FUNÇÃO PARA BUSCA DE PRODUTOS (COM PAGINAÇÃO, ITERATIVA) ---
 def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | None = None, access_token: str | None = None):
-    """
-    Busca produtos no Bling por SKU ou por nome.
-    Retorna dicionário: {"success": True, "data": [...] } ou {"success": False, "error": "msg"}
-    """
     try:
         filters = {}
         if sku:
@@ -181,7 +183,6 @@ def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | No
         if nome and not sku:
             filters['nome'] = nome.strip()
 
-        # Paginação iterativa (não recursiva)
         page = 1
         all_items = []
         token = access_token or getattr(bling_client, "access_token", None)
@@ -244,11 +245,10 @@ class ProcessingStats:
         }
 
 class ComponentConfigManager:
-    """Gerencia as configurações locais de componentes."""
     def __init__(self, file_path: Path):
         self.file_path = file_path
         self._load_or_create_config()
-        self.logger = logger  # Ajuste: inclui logger no gerenciador
+        self.logger = logger
     
     def _load_or_create_config(self) -> Dict[str, Any]:
         if self.file_path.exists():
@@ -279,7 +279,7 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[float] = None
-        self.logger = logger  # Usa o logger global 'bling_automacao'
+        self.logger = logger
         self.load_tokens()
         self.state: Optional[str] = self._load_state()
 
@@ -293,23 +293,32 @@ class BlingAuth:
         save_tokens(tokens)
         
     def get_authorization_url(self) -> str:
+        # Só gera novo state se não estiver autenticado E não tiver state salvo
+        if self.is_authenticated():
+            return "#" # Já autenticado
+            
         if self.state is None:
             self.state = secrets.token_urlsafe(16)
-            self._save_state(self.state) # Salva o novo state
+            self._save_state(self.state)
+            
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&scope=*/*&state={self.state}"
     
     def exchange_code_for_token(self, code: str, state: str) -> bool:
         """
-        Tenta trocar o código OAuth por token de acesso. Não chama recursivamente a si mesmo.
+        Tenta trocar o código OAuth por token. Implementa verificação de Lock e State.
         """
-        # Se o state não estiver definido (e.g., primeiro boot ou worker restart), aceita o state recebido e o armazena.
+        # Se já estiver autenticado, não faz nada
+        if self.is_authenticated():
+            self.logger.info("Tentativa de callback ignorada: Token já válido.")
+            return True
+
+        # Validação do State - Tolerância a nulo se for primeiro boot
         if self.state is None:
             self.state = state
             self._save_state(state)
-            self.logger.warning(f"STATE não estava definido. Aceitando e salvando o state recebido: {state}")
         
         if state != self.state:
-            self.logger.error(f"State inválido recebido: {state}. Esperado: {self.state}")
+            self.logger.warning(f"State inválido recebido (Ignorado para evitar loop): {state} vs {self.state}")
             return False
             
         try:
@@ -318,16 +327,19 @@ class BlingAuth:
             headers = {"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"}
             payload = {'grant_type': 'authorization_code', 'code': code, 'redirect_uri': self.config.REDIRECT_URI}
             
-            response = requests.post(self.config.TOKEN_URL, data=payload, headers=headers, timeout=self.config.REQUEST_TIMEOUT)
+            # Timeout curto para evitar travar worker
+            response = requests.post(self.config.TOKEN_URL, data=payload, headers=headers, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
                 self._update_tokens(data)
-                # Zera o state após sucesso para evitar reuso e forçar nova geração
                 self.state = None
                 self._save_state(None)
                 return True
-            return False
+            else:
+                self.logger.error(f"Bling retornou erro na troca: {response.text}")
+                return False
+                
         except Exception as e:
             self.logger.error(f"Erro troca token: {e}")
             return False
@@ -342,7 +354,7 @@ class BlingAuth:
                 'client_id': self.config.CLIENT_ID,
                 'client_secret': self.config.CLIENT_SECRET
             }
-            response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.REQUEST_TIMEOUT)
+            response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.AUTH_TIMEOUT)
             if response.status_code == 200:
                 self._update_tokens(response.json())
                 return True
@@ -384,7 +396,7 @@ class BlingAPIClient:
     def __init__(self, config: Config):
         self.config = config
         self.session = requests.Session()
-        self.logger = logger  # Ajuste: inclui logger no cliente API
+        self.logger = logger
     
     def get_products(self, access_token: str, page: int = 1, limit: int = 100, **filters) -> Dict[str, Any]:
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
@@ -422,7 +434,7 @@ class AutomationOrchestrator:
         self.products: List[Dict[str, Any]] = []
         self.is_running: bool = False
         self.lock = Lock()
-        self.logger = logger  # Ajuste: inclui logger no orquestrador
+        self.logger = logger
     
     def load_data_worker(self):
         """Worker background para carregar dados."""
@@ -442,7 +454,6 @@ class AutomationOrchestrator:
                 time.sleep(60)
     
     def load_data(self) -> bool:
-        """Método de compatibilidade para CLI."""
         if self.auth.load_tokens():
              token = self.auth.get_valid_token()
              if token:
@@ -500,15 +511,12 @@ class AutomationOrchestrator:
 # Instâncias Globais
 config = Config()
 
-# Validação obrigatória do REDIRECT_URI antes de inicializar o orquestrador
 if not config.REDIRECT_URI:
     logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
-    # O abort(500) deve ocorrer no contexto Flask; aqui apenas impedimos a inicialização completa.
-    # Em seguida, o Flask mostrará erro 500.
     pass
 
 orchestrator = AutomationOrchestrator(config)
-auth = orchestrator.auth  # Atalho
+auth = orchestrator.auth
 
 # ============================================================================ 
 # 7. DECORADOR (TOKEN REQUIRED AJUSTADO)
@@ -518,15 +526,14 @@ def token_required(f):
     """Decorador para verificar se o token de acesso está disponível e válido."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Verifica se há token carregado
-        if not orchestrator.auth or not orchestrator.auth.access_token:
-            orchestrator.auth.logger.warning("Acesso sem token de autenticação")
-            return jsonify({"auth": False, "message": "Token indisponível. Autentique a aplicação.", "requiresAuth": True}), 401
+        # Retorna 401 limpo para que o front entenda que precisa reautenticar
+        if not orchestrator.auth or not orchestrator.auth.is_authenticated():
+            orchestrator.auth.logger.warning("Request sem auth válida: retornando 401 json")
+            return jsonify({"needAuth": True, "message": "Token expirado ou inválido"}), 401
 
         token = orchestrator.auth.get_valid_token()
         if not token:
-            orchestrator.auth.logger.warning("Falha na atualização do token de acesso")
-            return jsonify({"auth": False, "message": "Não autenticado. Autorize a aplicação via OAuth.", "requiresAuth": True}), 401
+            return jsonify({"needAuth": True, "message": "Falha no refresh token"}), 401
         return f(token=token, *args, **kwargs)
     return decorated
 
@@ -666,13 +673,14 @@ DASHBOARD_TEMPLATE = """
 	        
 	        try {
 	            const r = await fetch(`${API}/product/search?q=${q}`);
-	            const data = await r.json();
 	            
-	            if (r.status === 401 && data.requiresAuth) {
-	                div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Por favor, autentique novamente.</div>';
-	                checkStatus(); // Força a atualização do status
-	                return;
-	            }
+                if (r.status === 401) {
+                    div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
+                    checkStatus();
+                    return;
+                }
+
+	            const data = await r.json();
 	            
 	            if(!data.length) {
 	                div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
@@ -715,20 +723,22 @@ DASHBOARD_TEMPLATE = """
 	        
 	        try {
 	            const r = await fetch(`${API}/kits`);
-	            const data = await r.json();
 	            
-	            if (r.status === 401 && data.requiresAuth) {
-	                div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Por favor, autentique novamente.</div>';
-	                checkStatus(); // Força a atualização do status
-	                return;
-	            }
-            let html = '<table class="table table-sm"><thead><tr><th>SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
-            data.forEach(k => {
-                let comps = k.componentes.map(c => `${c.quantidade}x ${c.nome}`).join(', ');
-                html += `<tr><td>${k.sku}</td><td>${k.produto}</td><td>${comps}</td></tr>`;
-            });
-            html += '</tbody></table>';
-            div.innerHTML = html;
+                if (r.status === 401) {
+                    div.innerHTML = '';
+                    authRequiredDiv.classList.remove('hidden');
+                    checkStatus();
+                    return;
+                }
+
+                const data = await r.json();
+                let html = '<table class="table table-sm"><thead><tr><th>SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
+                data.forEach(k => {
+                    let comps = k.componentes.map(c => `${c.quantidade}x ${c.nome}`).join(', ');
+                    html += `<tr><td>${k.sku}</td><td>${k.produto}</td><td>${comps}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                div.innerHTML = html;
         } catch(e) {
             div.innerHTML = 'Erro ao carregar kits.';
         }
@@ -749,11 +759,12 @@ DASHBOARD_TEMPLATE = """
 class WebServer:
     used_codes = set()
     code_lock = Lock()
+    
     def __init__(self, app: Flask, orchestrator: AutomationOrchestrator):
         self.app = app
         self.orchestrator = orchestrator
         self.sock = Sock(app)
-        self.logger = logger  # Ajuste: logger disponível no WebServer
+        self.logger = logger
         self.setup_routes()
         self.setup_websocket()
 
@@ -775,32 +786,42 @@ class WebServer:
         def callback():
             code = request.args.get("code")
             state = request.args.get("state")
-
-            # ✅ 1. Impedir trocar token se NÃO existir code e state válidos
-            if not code or not state:
-                self.logger.warning("Callback recebido sem parâmetros válidos (code ou state ausentes).")
-                return ("Parâmetros inválidos", 400)
-
-            # ✅ 2. Impedir trocar o MESMO code duas vezes
-            with WebServer.code_lock:
-                if code in WebServer.used_codes:
-                    self.logger.warning(f"Code reutilizado bloqueado: {code}")
-                    return ("Code já utilizado", 400)
-                WebServer.used_codes.add(code)
-
-            # A validação do state deve ocorrer dentro de exchange_code_for_token
-            self.logger.info(f"Tentando trocar code {code} por token...")
-            if self.orchestrator.auth.exchange_code_for_token(code, state):
-                self.logger.info("Troca de token concluída com sucesso.")
-                return redirect('/')
             
-            # Se a troca falhar, remove o code do cache para permitir nova tentativa se for um erro temporário
-            # No entanto, a lógica do Bling é que o code é de uso único.
-            # Manteremos o code no cache para evitar reuso, mesmo em caso de falha na troca.
-            return "Erro na troca de token ou state inválido", 400
+            # PROTEÇÃO 1: Se já estiver autenticado, redireciona direto
+            if self.orchestrator.auth.is_authenticated():
+                self.logger.info("Callback ignorado: Usuário já autenticado.")
+                return redirect('/')
+
+            if not code or not state:
+                return redirect('/') # Redireciona silent, sem erro 400
+
+            # PROTEÇÃO 2: Lock global de troca de token
+            # Se não conseguir pegar o lock imediatamente, significa que outro request está processando
+            if not token_exchange_lock.acquire(blocking=False):
+                self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
+                return redirect('/')
+                
+            try:
+                # PROTEÇÃO 3: Previne reuso de code localmente
+                with WebServer.code_lock:
+                    if code in WebServer.used_codes:
+                        return redirect('/')
+                    WebServer.used_codes.add(code)
+                
+                self.logger.info(f"Processando callback code...")
+                success = self.orchestrator.auth.exchange_code_for_token(code, state)
+                
+                # Se falhou por state inválido ou outro motivo, apenas redireciona
+                return redirect('/')
+            except Exception as e:
+                self.logger.error(f"Erro crítico no callback: {e}")
+                return redirect('/')
+            finally:
+                token_exchange_lock.release()
 
         @self.app.route('/api/status')
         def api_status():
+            # Rota leve e rápida
             return jsonify({
                 "authenticated": self.orchestrator.auth.is_authenticated(),
                 "auth_url": self.orchestrator.auth.get_authorization_url(),
@@ -814,13 +835,11 @@ class WebServer:
         @self.app.route("/api/all_products", methods=["GET"])
         @token_required
         def api_all_products(token):
-            """Retorna a lista de todos os produtos carregados (não-variações)."""
             return jsonify(self.orchestrator.get_all_products())
 
         @self.app.route('/api/product/search', methods=["GET"])
         @token_required
         def api_product_search(token):
-            """Busca produtos e kits localmente por SKU ou Nome."""
             termo = request.args.get("q") or request.args.get("sku") or request.args.get("nome") or ""
             termo = termo.strip().lower()
             if not termo:
@@ -927,7 +946,7 @@ def run_cli():
 if __name__ == "__main__":
     run_cli()
 
-# --- GUNICORN CONFIGURAÇÕES (remanejar port e worker) ---
+# --- GUNICORN CONFIGURAÇÕES (TIMEOUT AJUSTADO PARA 300) ---
 import os as _os
-_os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 120 --keep-alive 5")
+_os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 300 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
