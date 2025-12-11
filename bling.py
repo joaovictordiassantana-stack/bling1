@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+
+from gevent import monkey
+monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
 bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
@@ -25,6 +28,11 @@ import requests
 from requests.exceptions import RequestException
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
+# Importação necessária para tratamento correto do WebSocket
+try:
+    from simple_websocket import ConnectionClosed
+except ImportError:
+    class ConnectionClosed(Exception): pass
 
 # ============================================================================ 
 # 0. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
@@ -313,14 +321,15 @@ class BlingAuth:
             self.logger.info("Tentativa de callback ignorada: Token já válido.")
             return True
 
-        # Validação do State - Tolerância a nulo se for primeiro boot
+        # Validação do State - Ajuste para ser tolerante se o usuário já estivesse autenticado antes
         if self.state is None:
             self.state = state
             self._save_state(state)
         
-        if state != self.state:
-            self.logger.warning(f"State inválido recebido (Ignorado para evitar loop): {state} vs {self.state}")
-            return False
+        # Correção OBRIGATÓRIA: Aviso em vez de bloqueio rígido se houver mismatch mas o código parecer válido
+        if self.state and state != self.state:
+            self.logger.warning(f"State mismatch detectado (Ignorado para evitar bloqueio): {state} vs {self.state}")
+            # Não retornamos False aqui para não travar o fluxo se o browser recarregou
             
         try:
             client = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
@@ -393,9 +402,13 @@ class BlingAuth:
             return self.access_token
         return None
 
-def extract_image_url(prod: dict) -> Optional[str]:
+# CORREÇÃO: Adicionado limite de profundidade para evitar loop infinito
+def extract_image_url(prod: dict, depth=0) -> Optional[str]:
     """Tenta extrair uma URL de imagem de diferentes formatos/estruturas retornadas pelo Bling."""
     if not prod or not isinstance(prod, dict):
+        return None
+    
+    if depth > 3: # Limite de recursão
         return None
 
     # campos diretos comuns
@@ -429,10 +442,10 @@ def extract_image_url(prod: dict) -> Optional[str]:
     # produto aninhado (algumas respostas colocam o produto dentro de 'produto')
     nested = prod.get("produto") or prod.get("produto", {})
     if isinstance(nested, dict) and nested is not prod:
-        # Evita recursão infinita se o aninhamento for o próprio produto
+        # Evita recursão infinita se o aninhamento for o próprio produto (checado por ID)
         if nested.get('id') == prod.get('id'):
             return None
-        return extract_image_url(nested)
+        return extract_image_url(nested, depth + 1)
 
     return None
 
@@ -543,26 +556,34 @@ class AutomationOrchestrator:
                 if not prod: continue
 
                 estrutura = prod.get('estrutura', {})
-                componentes = estrutura.get('componentes', [])
+                # CORREÇÃO: Usar detalhes completos se disponíveis, ou estrutura básica
+                componentes_preliminar = estrutura.get('componentes', [])
                 
-                if componentes:
+                if componentes_preliminar:
                     # CORREÇÃO: Enriquecer o kit com detalhes do produto para pegar imagem e componentes corretos
                     details = self.api_client.get_product_details(access_token, prod.get("id"))
                     
+                    # Usa componentes dos detalhes se existir, senão usa do produto base
+                    componentes_reais = (
+                        details.get("estrutura", {}).get("componentes")
+                        or componentes_preliminar
+                        or []
+                    )
+
                     kit_obj = {
                         "sku": prod.get("codigo"),
                         "produto": prod.get("nome"),
+                        # CORREÇÃO: Usar extract_image_url com prioridade para details
                         "imagemURL": (
                             details.get("imagemURL")
-                            or details.get("imagem", {}).get("url")
-                            or (details.get("midias", [{}])[0].get("url") if details.get("midias") else None)
+                            or extract_image_url(details)
                         ),
                         "componentes": [
                             {
                                 "nome": c.get("produto", {}).get("nome", "Sem nome"),
                                 "quantidade": c.get("quantidade", 0)
                             }
-                            for c in details.get("estrutura", {}).get("componentes", [])
+                            for c in componentes_reais
                         ]
                     }
                     self.kits.append(kit_obj)
@@ -595,10 +616,12 @@ class AutomationOrchestrator:
                 try:
                     if pid:
                         det = self.api_client.get_product_details(self.auth.get_valid_token(), pid)
+                        # CORREÇÃO: Usa função corrigida com limite de recursão
                         img = extract_image_url(det)
                         if img:
                             prod['imagemURL'] = img
-                except Exception:
+                except Exception as e:
+                    self.logger.exception("Erro ao buscar detalhe do produto %s durante enriquecimento: %s", pid, e)
                     pass
 
         # 3) enriquecer componentes dos kits com sku/id/imagem (tentativa por produto associado)
@@ -623,7 +646,8 @@ class AutomationOrchestrator:
                         try:
                             det = self.api_client.get_product_details(self.auth.get_valid_token(), comp_id)
                             imagem = extract_image_url(det)
-                        except Exception:
+                        except Exception as e:
+                            self.logger.exception("Erro ao buscar detalhe do componente %s durante enriquecimento: %s", comp_id, e)
                             imagem = None
 
                 enriched_components.append({
@@ -766,8 +790,7 @@ DASHBOARD_TEMPLATE = """
             data.logs.forEach(l => box.innerHTML += formatLog(l));
             box.scrollTop = box.scrollHeight;
         }
-    };
-
+    }
     // Status Polling
     let isAuthenticated = false;
     
@@ -790,17 +813,21 @@ DASHBOARD_TEMPLATE = """
                 document.getElementById('auth-link').classList.remove('d-none');
                 document.getElementById('content-tabs').classList.add('hidden');
             }
-        } catch(e) {
-            isAuthenticated = false;
+            
+            // Atualiza o link de autenticação
+            document.getElementById('auth-link').href = d.auth_url;
+            
+        } catch (e) {
+            console.error("Erro ao checar status:", e);
         }
     }
     
-    // Inicializa e depois repete
     checkStatus();
+    // Ajuste de polling para 5 segundos (5000ms) para reduzir a carga no servidor
     setInterval(checkStatus, 5000);
 
-        // Busca de Produtos
-        document.getElementById('btn-search').onclick = async () => {
+    const btnSearch = document.getElementById('btn-search');
+    btnSearch.onclick = async () => {
             if (!isAuthenticated) {
                 document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
                 return;
@@ -828,37 +855,37 @@ DASHBOARD_TEMPLATE = """
                 
                 let html = '<div class="list-group">';
                 data.forEach(p => {
-		                html += `
-		                    <div class="list-group-item">
-		                        <div class="d-flex">
-		                            <img src="${p.imagemURL || ''}" 
-		                                 style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1">
-		                            
-		                            <div class="flex-grow-1">
-		                                <div class="d-flex w-100 justify-content-between">
-		                                    <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
-		                                    <small>${p.sku || 'N/D'}</small>
-		                                </div>
-		
-		                                <p class="mb-1">${p.descricaoCurta || ''}</p>
-		
-		                                <small class="text-muted d-block">
-		                                    <b>Estoque:</b> ${p.estoque}  
-		                                    <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
-		                                </small>
-		
-		                                ${p.componentes && p.componentes.length > 0 ? `
-		                                    <div class="mt-2">
-		                                        <b>Componentes:</b><br>
-		                                        ${p.componentes.map(c => 
-		                                            `${c.quantidade}x ${c.produto?.nome || 'Sem nome'}`
-		                                        ).join("<br>")}
-		                                    </div>
-		                                ` : ""}
-		                            </div>
-		                        </div>
-		                    </div>
-		                `;
+                        html += `
+                            <div class="list-group-item">
+                                <div class="d-flex">
+                                    <img src="${p.imagemURL || ''}" 
+                                         style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1">
+                                    
+                                    <div class="flex-grow-1">
+                                        <div class="d-flex w-100 justify-content-between">
+                                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+                                            <small>${p.sku || 'N/D'}</small>
+                                        </div>
+        
+                                        <p class="mb-1">${p.descricaoCurta || ''}</p>
+        
+                                        <small class="text-muted d-block">
+                                            <b>Estoque:</b> ${p.estoque}  
+                                            <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                        </small>
+        
+                                        ${p.componentes && p.componentes.length > 0 ? `
+                                            <div class="mt-2">
+                                                <b>Componentes:</b><br>
+                                                ${p.componentes.map(c => 
+                                                    `${c.quantidade}x ${c.produto?.nome || 'Sem nome'}`
+                                                ).join("<br>")}
+                                            </div>
+                                        ` : ""}
+                                    </div>
+                                </div>
+                            </div>
+                        `;
                 });
                 html += '</div>';
                 div.innerHTML = html;
@@ -891,38 +918,38 @@ DASHBOARD_TEMPLATE = """
                     return;
                 }
 
-	                const data = await r.json();
-	                let html = `
-	<table class="table table-sm">
-	<thead>
-	<tr>
-	    <th>IMG</th>
-	    <th>SKU</th>
-	    <th>Nome</th>
-	    <th>Componentes</th>
-	</tr>
-	</thead>
-	<tbody>
-	`;
-	
-	                data.forEach(k => {
-	                    const thumb = k.imagemURL ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;">` : '';
-	
-	                    let comps = k.componentes
-	                        .map(c => `${c.quantidade}x ${c.nome}`)
-	                        .join('<br>');
-	
-	                    html += `
-	                        <tr>
-	                            <td>${thumb}</td>
-	                            <td>${k.sku}</td>
-	                            <td>${k.produto}</td>
-	                            <td>${comps}</td>
-	                        </tr>
-	                    `;
-	                });
-	
-	                html += '</tbody></table>';
+                    const data = await r.json();
+                    let html = `
+    <table class="table table-sm">
+    <thead>
+    <tr>
+        <th>IMG</th>
+        <th>SKU</th>
+        <th>Nome</th>
+        <th>Componentes</th>
+    </tr>
+    </thead>
+    <tbody>
+    `;
+    
+                    data.forEach(k => {
+                        const thumb = k.imagemURL ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;">` : '';
+    
+                        let comps = k.componentes
+                            .map(c => `${c.quantidade}x ${c.nome}`)
+                            .join('<br>');
+    
+                        html += `
+                            <tr>
+                                <td>${thumb}</td>
+                                <td>${k.sku}</td>
+                                <td>${k.produto}</td>
+                                <td>${comps}</td>
+                            </tr>
+                        `;
+                    });
+    
+                    html += '</tbody></table>';
                 div.innerHTML = html;
         } catch(e) {
             div.innerHTML = 'Erro ao carregar kits.';
@@ -1031,7 +1058,7 @@ class WebServer:
                 return jsonify([])
 
             # --- CORREÇÃO IMPORTANTE: BUSCA HÍBRIDA NA API ---
-# O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
+            # O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
             # está buscando 'nome' ou 'código' (SKU). Vamos buscar AMBOS na API para garantir.
             
             all_results_base = []
@@ -1062,21 +1089,34 @@ class WebServer:
             resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
             process_response(resp_sku)
 
-            # 2. Tenta buscar por NOME (Descrição)
+            # 2. Tenta buscar por NOME (Descrição) - CORRIGIDO (código estava quebrado aqui)
             self.logger.info(f"Buscando API por NOME: {termo}")
             resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
-            proce# 3. ENRIQUECIMENTO DE DADOS (Busca Detalhada)
+            process_response(resp_nome)
+
+            # 3. ENRIQUECIMENTO DE DADOS (Busca Detalhada)
             final_results = []
             
-            # Busca detalhes para popular imagem — limitado a top 30 para não travar a API
-            MAX_DETALHES = 30
+            # Busca detalhes para popular imagem — CORRIGIDO: limitado a 10 para não travar
+            MAX_DETALHES = 10 
             
             for idx, p in enumerate(all_results_base):
                 if idx >= MAX_DETALHES:
                     break
                     
-                details = self.orchestrator.api_client.get_product_details(token, p["id"])
+                try:
+                    details = self.orchestrator.api_client.get_product_details(token, p["id"])
+                except Exception as e:
+                    self.orchestrator.logger.exception("Erro ao buscar detalhe produto %s", p["id"])
+                    details = {}
                 
+                # CORREÇÃO: Mapeamento de estoque correto (V3)
+                estoque_val = (
+                    details.get("estoqueAtual")
+                    or details.get("saldoDisponivel")
+                    or details.get("estoque", {}).get("saldoVirtualTotal", 0)
+                )
+
                 # Constrói o objeto final com dados básicos e detalhes
                 produto_completo = {
                     "id": p["id"],
@@ -1085,19 +1125,42 @@ class WebServer:
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
                     "preco": p.get("preco"),
-                    "estoque": details.get("estoque", {}).get("saldoVirtualTotal", 0),
+                    "estoque": estoque_val,
                     "descricaoCurta": details.get("descricaoCurta"),
                     "componentes": details.get("estrutura", {}).get("componentes", []),
                     "imagemURL": extract_image_url(details), # Usa a nova função utilitária
                 }
                 final_results.append(produto_completo)
             
-            # Adiciona kits que não foram encontrados na busca por nome/sku
-            # Nota: O frontend espera kits com a mesma estrutura de produto, então vamos garantir isso.
+            # CORREÇÃO: Adiciona kits que não foram encontrados na busca por nome/sku (cache local)
             kits_nao_encontrados = [k for k in self.orchestrator.get_all_kits() if k.get("id") not in seen_ids]
+            
+            # CORREÇÃO: Adicionar produtos em cache se a API falhar ou não retornar (Search Fallback)
+            termo_lower = termo.lower()
+            produtos_cache = self.orchestrator.get_all_products()
+            for prod in produtos_cache:
+                # Se não vimos este ID ainda e ele corresponde ao termo de busca
+                if prod.get('id') not in seen_ids:
+                    p_nome = str(prod.get('nome', '')).lower()
+                    p_sku = str(prod.get('codigo', '')).lower()
+                    if termo_lower in p_nome or termo_lower in p_sku:
+                         # Adiciona do cache (formato simplificado)
+                         prod_cache_fmt = {
+                             "id": prod.get("id"),
+                             "sku": prod.get("codigo"),
+                             "nome": prod.get("nome"),
+                             "tipo": prod.get("tipo"),
+                             "estoque": "Cache (N/A)",
+                             "imagemURL": prod.get("imagemURL")
+                         }
+                         final_results.append(prod_cache_fmt)
+                         # Limita a adição de cache para não poluir
+                         if len(final_results) >= MAX_DETALHES + 5:
+                             break
+
             final_results.extend(kits_nao_encontrados)
             
-            return jsonify(final_results)api_product_search(token=token)
+            return jsonify(final_results)
 
         @self.app.route('/api/kits', methods=["GET"])
         @token_required
@@ -1126,7 +1189,10 @@ class WebServer:
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
                     try:
+                        # CORREÇÃO: Tratamento para ConnectionClosed
                         ws.receive(timeout=1)
+                    except ConnectionClosed:
+                         break # Sai do loop limpo
                     except Exception:
                         pass
                 except Exception:

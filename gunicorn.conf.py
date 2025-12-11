@@ -1,16 +1,19 @@
-# 🔥 Aplicar monkey patch ANTES de qualquer outra importação
+# 🔥 Aplicar o monkey patch do gevent ANTES de qualquer outra importação
 from gevent import monkey
 monkey.patch_all()
 
-# 🟢 Classe de worker ideal para WebSockets + Flask
+# 🟩 Tipo de worker ideal para WebSockets + requisições externas lentas
 worker_class = "gevent"
 
-# 🟢 Apenas 1 worker para evitar problemas de memória/estado em Render
+# 🟩 Apenas 1 worker — obrigatório no Render (mantém o estado, tokens, WS)
 workers = 1
 
-# 🟢 Evitar crash por timeout
+# 🟩 Evitar "WORKER TIMEOUT" em requisições pesadas (e Bling é lento)
 timeout = 120
 graceful_timeout = 120
 
-# 🟢 Manter conexões WebSocket vivas por mais tempo (antes era só 5 segundos)
+# 🟩 Manter as conexões vivas mais tempo (especialmente WebSockets)
 keepalive = 120
+
+# 🟩 Opcional: deixa logs mais limpos e úteis
+loglevel = "info"
