@@ -611,7 +611,7 @@ DASHBOARD_TEMPLATE = """
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Kits</button></li>
         </ul>
 
-	        <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
+            <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
             <div class="tab-pane fade show active" id="search">
                 <div class="input-group mb-3">
                     <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
@@ -620,13 +620,13 @@ DASHBOARD_TEMPLATE = """
                 <div id="search-results"></div>
             </div>
 
-	        <div class="tab-pane fade" id="kits">
-	                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
-	                <div id="kits-list"></div>
-	            </div>
-	            <div id="auth-required-kits" class="alert alert-warning hidden">
-	                É necessário autenticar com o Bling para visualizar os Kits.
-	            </div>
+            <div class="tab-pane fade" id="kits">
+                    <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
+                    <div id="kits-list"></div>
+                </div>
+                <div id="auth-required-kits" class="alert alert-warning hidden">
+                    É necessário autenticar com o Bling para visualizar os Kits.
+                </div>
         </div>
     </div>
 
@@ -682,70 +682,70 @@ DASHBOARD_TEMPLATE = """
     checkStatus();
     setInterval(checkStatus, 5000);
 
-	    // Busca de Produtos
-	    document.getElementById('btn-search').onclick = async () => {
-	        if (!isAuthenticated) {
-	            document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
-	            return;
-	        }
-	        
-	        const q = document.getElementById('search-input').value;
-	        const div = document.getElementById('search-results');
-	        div.innerHTML = 'Buscando...';
-	        
-	        try {
-	            const r = await fetch(`${API}/product/search?q=${q}`);
-	            
+        // Busca de Produtos
+        document.getElementById('btn-search').onclick = async () => {
+            if (!isAuthenticated) {
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
+                return;
+            }
+            
+            const q = document.getElementById('search-input').value;
+            const div = document.getElementById('search-results');
+            div.innerHTML = 'Buscando...';
+            
+            try {
+                const r = await fetch(`${API}/product/search?q=${q}`);
+                
                 if (r.status === 401) {
                     div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
                     checkStatus();
                     return;
                 }
 
-	            const data = await r.json();
-	            
-	            if(!data.length) {
-	                div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
-	                return;
-	            }
-	            
-	            let html = '<div class="list-group">';
-	            data.forEach(p => {
-	                html += `
-	                    <div class="list-group-item">
-	                        <div class="d-flex w-100 justify-content-between">
-	                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
-	                            <small>${p.sku || 'N/D'}</small>
-	                        </div>
-	                        <p class="mb-1">${p.descricaoCurta || ''}</p>
-	                        <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
-	                    </div>
-	                `;
-	            });
-	            html += '</div>';
-	            div.innerHTML = html;
-	        } catch(e) {
-	            div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
-	        }
-	    };
+                const data = await r.json();
+                
+                if(!data.length) {
+                    div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
+                    return;
+                }
+                
+                let html = '<div class="list-group">';
+                data.forEach(p => {
+                    html += `
+                        <div class="list-group-item">
+                            <div class="d-flex w-100 justify-content-between">
+                                <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+                                <small>${p.sku || 'N/D'}</small>
+                            </div>
+                            <p class="mb-1">${p.descricaoCurta || ''}</p>
+                            <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
+                        </div>
+                    `;
+                });
+                html += '</div>';
+                div.innerHTML = html;
+            } catch(e) {
+                div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
+            }
+        };
 
-	    // Carregar Kits
-	    async function loadKits() {
-	        const div = document.getElementById('kits-list');
-	        const authRequiredDiv = document.getElementById('auth-required-kits');
-	        
-	        if (!isAuthenticated) {
-	            div.innerHTML = '';
-	            authRequiredDiv.classList.remove('hidden');
-	            return;
-	        }
-	        
-	        authRequiredDiv.classList.add('hidden');
-	        div.innerHTML = 'Carregando...';
-	        
-	        try {
-	            const r = await fetch(`${API}/kits`);
-	            
+        // Carregar Kits
+        async function loadKits() {
+            const div = document.getElementById('kits-list');
+            const authRequiredDiv = document.getElementById('auth-required-kits');
+            
+            if (!isAuthenticated) {
+                div.innerHTML = '';
+                authRequiredDiv.classList.remove('hidden');
+                return;
+            }
+            
+            authRequiredDiv.classList.add('hidden');
+            div.innerHTML = 'Carregando...';
+            
+            try {
+                const r = await fetch(`${API}/kits`);
+                
                 if (r.status === 401) {
                     div.innerHTML = '';
                     authRequiredDiv.classList.remove('hidden');
@@ -868,64 +868,64 @@ class WebServer:
                 return jsonify([])
 
             # --- CORREÇÃO IMPORTANTE: BUSCA HÍBRIDA NA API ---
-            # O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
+# O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
             # está buscando 'nome' ou 'código' (SKU). Vamos buscar AMBOS na API para garantir.
             
-	            all_results_base = []
-	            seen_ids = set()
-	
-	            def process_response(resp_data):
-	                """Processa resposta da API e adiciona à lista de resultados básicos"""
-	                items = resp_data.get('data') or []
-	                for p in items:
-	                    p_id = p.get('id')
-	                    # Evita duplicatas se encontrar o mesmo produto por nome e código
-	                    if p_id and p_id in seen_ids:
-	                        continue
-	                    if p_id: seen_ids.add(p_id)
-	                    
-	                    # Armazena apenas os dados básicos da busca inicial
-	                    all_results_base.append({
-	                        "id": p.get("id"),
-	                        "sku": p.get("codigo"),
-	                        "nome": p.get("nome"),
-	                        "tipo": p.get("tipo"),
-	                        "situacao": p.get("situacao"),
-	                        "preco": p.get("preco"),
-	                    })
-	
-	            # 1. Tenta buscar por CÓDIGO (SKU)
-	            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
-	            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
-	            process_response(resp_sku)
-	
-	            # 2. Tenta buscar por NOME (Descrição)
-	            self.logger.info(f"Buscando API por NOME: {termo}")
-	            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
-	            process_response(resp_nome)
-	            
-	            # 3. ENRIQUECIMENTO DE DADOS (Busca Detalhada)
-	            final_results = []
-	            for p in all_results_base:
-	                details = self.orchestrator.api_client.get_product_details(token, p["id"])
-	                
-	                # Constrói o objeto final com dados básicos e detalhes
-	                produto_completo = {
-	                    "id": p["id"],
-	                    "sku": p.get("sku"),
-	                    "nome": p.get("nome"),
-	                    "preco": p.get("preco"),
-	                    # Dados enriquecidos do GET /produtos/{id}
-	                    "estoque": details.get("estoque", {}).get("saldoVirtualTotal", 0),
-	                    "imagemURL": details.get("imagemURL"),
-	                    "componentes": details.get("estrutura", {}).get("componentes", []),
-	                    "descricaoCurta": details.get("descricaoCurta"),
-	                    "tipo": p.get("tipo"), # Mantém o tipo do produto
-	                }
-	                
-	                final_results.append(produto_completo)
-	
-	            return jsonify(final_results)
+            all_results_base = []
+            seen_ids = set()
+
+            def process_response(resp_data):
+                """Processa resposta da API e adiciona à lista de resultados básicos"""
+                items = resp_data.get('data') or []
+                for p in items:
+                    p_id = p.get('id')
+                    # Evita duplicatas se encontrar o mesmo produto por nome e código
+                    if p_id and p_id in seen_ids:
+                        continue
+                    if p_id: seen_ids.add(p_id)
+                    
+                    # Armazena apenas os dados básicos da busca inicial
+                    all_results_base.append({
+                        "id": p.get("id"),
+                        "sku": p.get("codigo"),
+                        "nome": p.get("nome"),
+                        "tipo": p.get("tipo"),
+                        "situacao": p.get("situacao"),
+                        "preco": p.get("preco"),
+                    })
+
+            # 1. Tenta buscar por CÓDIGO (SKU)
+            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
+            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
+            process_response(resp_sku)
+
+            # 2. Tenta buscar por NOME (Descrição)
+            self.logger.info(f"Buscando API por NOME: {termo}")
+            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
+            process_response(resp_nome)
+            
+            # 3. ENRIQUECIMENTO DE DADOS (Busca Detalhada)
+            final_results = []
+            for p in all_results_base:
+                details = self.orchestrator.api_client.get_product_details(token, p["id"])
+                
+                # Constrói o objeto final com dados básicos e detalhes
+                produto_completo = {
+                    "id": p["id"],
+                    "sku": p.get("sku"),
+                    "nome": p.get("nome"),
+                    "preco": p.get("preco"),
+                    # Dados enriquecidos do GET /produtos/{id}
+                    "estoque": details.get("estoque", {}).get("saldoVirtualTotal", 0),
+                    "imagemURL": details.get("imagemURL"),
+                    "componentes": details.get("estrutura", {}).get("componentes", []),
+                    "descricaoCurta": details.get("descricaoCurta"),
+                    "tipo": p.get("tipo"), # Mantém o tipo do produto
+                }
+                
+                final_results.append(produto_completo)
+
+            return jsonify(final_results)
 
         @self.app.route('/api/produtos', methods=["GET"])
         @token_required
