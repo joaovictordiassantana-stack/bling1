@@ -276,21 +276,38 @@ class ComponentConfigManager:
 class BlingAuth:
     def __init__(self, config: Config):
         self.config = config
-        self.state: Optional[str] = None
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[float] = None
         self.logger = logger  # Usa o logger global 'bling_automacao'
+        self._load_tokens()
+        self.state: Optional[str] = self._load_state()
+
+    def _load_state(self) -> Optional[str]:
+        tokens = load_tokens_safe(self.config.TOKENS_FILE)
+        return tokens.get("state")
+
+    def _save_state(self, state: str):
+        tokens = load_tokens_safe(self.config.TOKENS_FILE)
+        tokens["state"] = state
+        save_tokens(tokens)
         
     def get_authorization_url(self) -> str:
         if self.state is None:
             self.state = secrets.token_urlsafe(16)
+            self._save_state(self.state) # Salva o novo state
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&scope=*/*&state={self.state}"
     
     def exchange_code_for_token(self, code: str, state: str) -> bool:
         """
         Tenta trocar o código OAuth por token de acesso. Não chama recursivamente a si mesmo.
         """
+        # Se o state não estiver definido (e.g., primeiro boot ou worker restart), aceita o state recebido e o armazena.
+        if self.state is None:
+            self.state = state
+            self._save_state(state)
+            self.logger.warning(f"STATE não estava definido. Aceitando e salvando o state recebido: {state}")
+        
         if state != self.state:
             self.logger.error(f"State inválido recebido: {state}. Esperado: {self.state}")
             return False
@@ -306,6 +323,9 @@ class BlingAuth:
             if response.status_code == 200:
                 data = response.json()
                 self._update_tokens(data)
+                # Zera o state após sucesso para evitar reuso e forçar nova geração
+                self.state = None
+                self._save_state(None)
                 return True
             return False
         except Exception as e:
@@ -501,12 +521,12 @@ def token_required(f):
         # Verifica se há token carregado
         if not orchestrator.auth or not orchestrator.auth.access_token:
             orchestrator.auth.logger.warning("Acesso sem token de autenticação")
-            return jsonify({"auth": False, "message": "Token indisponível. Autentique a aplicação."}), 401
+            return jsonify({"auth": False, "message": "Token indisponível. Autentique a aplicação.", "requiresAuth": True}), 401
 
         token = orchestrator.auth.get_valid_token()
         if not token:
             orchestrator.auth.logger.warning("Falha na atualização do token de acesso")
-            return jsonify({"auth": False, "message": "Não autenticado. Autorize a aplicação via OAuth."}), 401
+            return jsonify({"auth": False, "message": "Não autenticado. Autorize a aplicação via OAuth.", "requiresAuth": True}), 401
         return f(token=token, *args, **kwargs)
     return decorated
 
@@ -562,7 +582,7 @@ DASHBOARD_TEMPLATE = """
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Kits</button></li>
         </ul>
 
-        <div class="tab-content p-3 bg-white border border-top-0 rounded-bottom">
+	        <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
             <div class="tab-pane fade show active" id="search">
                 <div class="input-group mb-3">
                     <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
@@ -571,10 +591,13 @@ DASHBOARD_TEMPLATE = """
                 <div id="search-results"></div>
             </div>
 
-            <div class="tab-pane fade" id="kits">
-                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
-                <div id="kits-list"></div>
-            </div>
+	        <div class="tab-pane fade" id="kits">
+	                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
+	                <div id="kits-list"></div>
+	            </div>
+	            <div id="auth-required-kits" class="alert alert-warning hidden">
+	                É necessário autenticar com o Bling para visualizar os Kits.
+	            </div>
         </div>
     </div>
 
@@ -600,64 +623,105 @@ DASHBOARD_TEMPLATE = """
     };
 
     // Status Polling
-    setInterval(async () => {
+    let isAuthenticated = false;
+    
+    async function checkStatus() {
         try {
             const r = await fetch(API + '/status');
             const d = await r.json();
             const badge = document.getElementById('status-badge');
-            if(d.authenticated) {
+            
+            isAuthenticated = d.authenticated;
+            
+            if(isAuthenticated) {
                 badge.className = 'badge bg-success me-2';
                 badge.textContent = 'Online';
                 document.getElementById('auth-link').classList.add('d-none');
+                document.getElementById('content-tabs').classList.remove('hidden');
             } else {
                 badge.className = 'badge bg-danger me-2';
                 badge.textContent = 'Offline';
                 document.getElementById('auth-link').classList.remove('d-none');
+                document.getElementById('content-tabs').classList.add('hidden');
             }
-        } catch(e) {}
-    }, 5000);
-
-    // Busca de Produtos
-    document.getElementById('btn-search').onclick = async () => {
-        const q = document.getElementById('search-input').value;
-        const div = document.getElementById('search-results');
-        div.innerHTML = 'Buscando...';
-        
-        try {
-            const r = await fetch(`${API}/product/search?q=${q}`);
-            const data = await r.json();
-            if(!data.length) {
-                div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
-                return;
-            }
-            
-            let html = '<div class="list-group">';
-            data.forEach(p => {
-                html += `
-                    <div class="list-group-item">
-                        <div class="d-flex w-100 justify-content-between">
-                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
-                            <small>${p.sku || 'N/D'}</small>
-                        </div>
-                        <p class="mb-1">${p.descricaoCurta || ''}</p>
-                        <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
-                    </div>
-                `;
-            });
-            html += '</div>';
-            div.innerHTML = html;
         } catch(e) {
-            div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
+            isAuthenticated = false;
         }
-    };
+    }
+    
+    // Inicializa e depois repete
+    checkStatus();
+    setInterval(checkStatus, 5000);
 
-    // Carregar Kits
-    async function loadKits() {
-        const div = document.getElementById('kits-list');
-        div.innerHTML = 'Carregando...';
-        try {
-            const r = await fetch(`${API}/kits`);
-            const data = await r.json();
+	    // Busca de Produtos
+	    document.getElementById('btn-search').onclick = async () => {
+	        if (!isAuthenticated) {
+	            document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
+	            return;
+	        }
+	        
+	        const q = document.getElementById('search-input').value;
+	        const div = document.getElementById('search-results');
+	        div.innerHTML = 'Buscando...';
+	        
+	        try {
+	            const r = await fetch(`${API}/product/search?q=${q}`);
+	            const data = await r.json();
+	            
+	            if (r.status === 401 && data.requiresAuth) {
+	                div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Por favor, autentique novamente.</div>';
+	                checkStatus(); // Força a atualização do status
+	                return;
+	            }
+	            
+	            if(!data.length) {
+	                div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
+	                return;
+	            }
+	            
+	            let html = '<div class="list-group">';
+	            data.forEach(p => {
+	                html += `
+	                    <div class="list-group-item">
+	                        <div class="d-flex w-100 justify-content-between">
+	                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+	                            <small>${p.sku || 'N/D'}</small>
+	                        </div>
+	                        <p class="mb-1">${p.descricaoCurta || ''}</p>
+	                        <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
+	                    </div>
+	                `;
+	            });
+	            html += '</div>';
+	            div.innerHTML = html;
+	        } catch(e) {
+	            div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
+	        }
+	    };
+
+	    // Carregar Kits
+	    async function loadKits() {
+	        const div = document.getElementById('kits-list');
+	        const authRequiredDiv = document.getElementById('auth-required-kits');
+	        
+	        if (!isAuthenticated) {
+	            div.innerHTML = '';
+	            authRequiredDiv.classList.remove('hidden');
+	            return;
+	        }
+	        
+	        authRequiredDiv.classList.add('hidden');
+	        div.innerHTML = 'Carregando...';
+	        
+	        try {
+	            const r = await fetch(`${API}/kits`);
+	            const data = await r.json();
+	            
+	            if (r.status === 401 && data.requiresAuth) {
+	                div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Por favor, autentique novamente.</div>';
+	                checkStatus(); // Força a atualização do status
+	                return;
+	            }
             let html = '<table class="table table-sm"><thead><tr><th>SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
             data.forEach(k => {
                 let comps = k.componentes.map(c => `${c.quantidade}x ${c.nome}`).join(', ');
