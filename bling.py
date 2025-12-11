@@ -287,10 +287,14 @@ class BlingAuth:
             self.state = secrets.token_urlsafe(16)
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&state={self.state}"
     
-    def exchange_code_for_token(self, code: str) -> bool:
+    def exchange_code_for_token(self, code: str, state: str) -> bool:
         """
         Tenta trocar o código OAuth por token de acesso. Não chama recursivamente a si mesmo.
         """
+        if state != self.state:
+            self.logger.error(f"State inválido recebido: {state}. Esperado: {self.state}")
+            return False
+            
         try:
             client = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
             auth_header = base64.b64encode(client.encode()).decode()
@@ -516,7 +520,7 @@ DASHBOARD_TEMPLATE = """
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel Bling - Automação ERP</title>
+    <title>Painel Bling - Sw Moveis</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
@@ -679,6 +683,8 @@ DASHBOARD_TEMPLATE = """
 # ============================================================================
 
 class WebServer:
+    used_codes = set()
+    code_lock = Lock()
     def __init__(self, app: Flask, orchestrator: AutomationOrchestrator):
         self.app = app
         self.orchestrator = orchestrator
@@ -703,14 +709,31 @@ class WebServer:
 
         @self.app.route('/callback')
         def callback():
-            code = request.args.get('code')
-            if code:
-                self.logger.info(f"Tentando trocar code {code} por token...")
-                if self.orchestrator.auth.exchange_code_for_token(code):
-                    self.logger.info("Troca de token concluída com sucesso.")
-                    return redirect('/')
-                return "Erro na troca de token", 400
-            return "Código não fornecido", 400
+            code = request.args.get("code")
+            state = request.args.get("state")
+
+            # ✅ 1. Impedir trocar token se NÃO existir code e state válidos
+            if not code or not state:
+                self.logger.warning("Callback recebido sem parâmetros válidos (code ou state ausentes).")
+                return ("Parâmetros inválidos", 400)
+
+            # ✅ 2. Impedir trocar o MESMO code duas vezes
+            with WebServer.code_lock:
+                if code in WebServer.used_codes:
+                    self.logger.warning(f"Code reutilizado bloqueado: {code}")
+                    return ("Code já utilizado", 400)
+                WebServer.used_codes.add(code)
+
+            # A validação do state deve ocorrer dentro de exchange_code_for_token
+            self.logger.info(f"Tentando trocar code {code} por token...")
+          if self.orchestrator.auth.exchange_code_for_token(code, state)::
+                self.logger.info("Troca de token concluída com sucesso.")
+                return redirect('/')
+            
+            # Se a troca falhar, remove o code do cache para permitir nova tentativa se for um erro temporário
+            # No entanto, a lógica do Bling é que o code é de uso único.
+            # Manteremos o code no cache para evitar reuso, mesmo em caso de falha na troca.
+            return "Erro na troca de token ou state inválido", 400
 
         @self.app.route('/api/status')
         def api_status():
@@ -844,4 +867,3 @@ if __name__ == "__main__":
 import os as _os
 _os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 120 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
-
