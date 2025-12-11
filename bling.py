@@ -168,42 +168,34 @@ def is_token_valid(token_data):
     if not expires_at: return False
     return time.time() < float(expires_at) - 20
 
-# --- CORREÇÃO 1: Função de extração de imagem melhorada ---
-def extract_image_url(prod: dict, depth=0) -> Optional[str]:
-    """Extrai URL da imagem procurando em midia, imagens e campos diretos com mais precisão."""
-    if not prod or not isinstance(prod, dict):
-        return None
+# --- CORREÇÃO 1: Função de extração de imagem mais focada na estrutura Bling V3 ---
+def extract_image_url(prod: dict) -> Optional[str]:
+    """Extrai URL da imagem, focando nas estruturas Bling V3 mais comuns e confiáveis."""
+    if not isinstance(prod, dict): return None
     
-    # Proteção contra loop
-    if depth > 3: return None
-
-    # 1. Prioridade para campos de thumbnail ou URL direta
-    for key in ["urlThumbnail", "imagemURL", "url", "link", "caminho"]:
+    # Prioridade 1: Campos diretos de thumbnail ou url
+    for key in ["urlThumbnail", "imagemURL", "url", "link"]:
         val = prod.get(key)
-        if val and isinstance(val, str) and val.startswith("http"):
+        if isinstance(val, str) and val.startswith("http"):
             return val
 
-    # 2. Busca em listas de mídia (Padrão V3 e V2)
-    for list_key in ["midia", "midias", "imagens", "fotos", "anexos"]:
-        items = prod.get(list_key, [])
-        if isinstance(items, list):
-            for item in items:
-                # Se for string direta
-                if isinstance(item, str) and item.startswith("http"):
-                    return item
-                # Se for objeto (ex: {url: "...", tipo: "foto"})
-                if isinstance(item, dict):
-                    ret = extract_image_url(item, depth + 1)
-                    if ret: return ret
-        elif isinstance(items, dict):
-             ret = extract_image_url(items, depth + 1)
-             if ret: return ret
-
-    # 3. Tenta descer um nível se houver 'data' ou 'produto' aninhado
-    for nested in ["data", "produto", "storage"]:
-        if nested in prod and isinstance(prod[nested], dict):
-             if prod[nested].get('id') != prod.get('id'): # Evita recursão no mesmo ID
-                 return extract_image_url(prod[nested], depth + 1)
+    # Prioridade 2: Lista de mídia (midia é a mais comum no V3)
+    midia_list = prod.get("midia") or prod.get("midias")
+    if isinstance(midia_list, list) and midia_list:
+        first_item = midia_list[0]
+        if isinstance(first_item, dict):
+            # Tenta a chave 'url' dentro do primeiro objeto
+            if first_item.get("url") and isinstance(first_item["url"], str) and first_item["url"].startswith("http"):
+                return first_item["url"]
+        elif isinstance(first_item, str) and first_item.startswith("http"):
+            return first_item
+            
+    # Prioridade 3: Desce um nível (caso os dados de produto estejam aninhados)
+    for nested_key in ["data", "produto"]:
+        nested_data = prod.get(nested_key)
+        if isinstance(nested_data, dict):
+            ret = extract_image_url(nested_data) # Recursão rasa
+            if ret: return ret
 
     return None
 
@@ -465,7 +457,7 @@ class AutomationOrchestrator:
                  return True
         return False
     
-    # --- CORREÇÃO 2: Lógica para carregar TODOS os produtos na lista de Kits ---
+    # --- CORREÇÃO 2: Lógica para carregar TODOS os produtos e detalhar KITS ---
     def _load_products_and_kits(self, access_token: str):
         self.logger.info("Iniciando carga completa de produtos para a lista...")
         self.kits.clear()
@@ -495,11 +487,21 @@ class AutomationOrchestrator:
         
         self.logger.info(f"Processando {len(todos_produtos)} itens para exibição...")
 
-        # PASSO 3: Processar TODOS os produtos
+        # PASSO 2: Processar, detalhar KITS e formatar a lista
         for p in todos_produtos:
             p_id = p.get("id")
             
-            # Dados básicos
+            # Checa se é um kit. Se sim, chama detalhes para obter a estrutura completa.
+            if p.get("tipo") == "K":
+                try:
+                    details = self.api_client.get_product_details(access_token, p_id)
+                    if details:
+                        p.update(details) # Atualiza o objeto p com os detalhes completos
+                        time.sleep(0.1) # Pequena pausa para rate limit
+                except Exception as e:
+                    self.logger.warning(f"Falha ao buscar detalhes do Kit {p_id}: {e}")
+
+            # Agora, extrai a estrutura (seja da lista original ou dos detalhes)
             estrutura = p.get("estrutura", {})
             componentes = estrutura.get("componentes", [])
             
@@ -515,7 +517,8 @@ class AutomationOrchestrator:
                     
                     # Nome do componente
                     produto_filho = produto_map.get(filho_id)
-                    nome_final = produto_filho.get("nome") if produto_filho else filho_ref.get("nome", "Componente")
+                    # Usa o nome do cache (produto_map) ou do payload, se o cache falhar
+                    nome_final = produto_filho.get("nome") if produto_filho else filho_ref.get("nome", "Componente Desconhecido")
                     
                     comps_formatados.append({
                         "nome": nome_final,
@@ -523,7 +526,7 @@ class AutomationOrchestrator:
                         "sku": produto_filho.get("codigo") if produto_filho else ""
                     })
 
-            # ADICIONA TUDO À LISTA PRINCIPAL
+            # ADICIONA TUDO À LISTA PRINCIPAL (KITS)
             item_formatado = {
                 "id": p_id,
                 "sku": p.get("codigo"),
@@ -639,6 +642,7 @@ DASHBOARD_TEMPLATE = """
 
             <div class="tab-pane fade" id="kits">
                     <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
+                    <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
                     <div id="kits-list"></div>
                 </div>
                 <div id="auth-required-kits" class="alert alert-warning hidden">
@@ -770,7 +774,7 @@ DASHBOARD_TEMPLATE = """
             }
             
             authRequiredDiv.classList.add('hidden');
-            div.innerHTML = 'Carregando...';
+            div.innerHTML = '<div class="alert alert-info">Carregando dados... Pode demorar, pois estamos buscando detalhes de Kits.</div>';
             
             try {
                 const r = await fetch(`${API}/kits`);
@@ -797,18 +801,25 @@ DASHBOARD_TEMPLATE = """
                 `;
                 
                 data.forEach(k => {
-                    // Trata imagem quebrada escondendo a tag
+                    // Trata imagem quebrada escondendo a tag (mantido)
                     const imgHtml = k.imagemURL 
                         ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
                         : '<span class="text-muted">-</span>';
 
                     let comps = '';
                     if (k.componentes && k.componentes.length > 0) {
-                        comps = k.componentes
-                            .map(c => `<small>• ${c.quantidade}x ${c.nome}</small>`)
-                            .join('<br>');
+                        // Verifica se o componente tem nome (necessário se o produto for muito novo ou incompleto no cache)
+                        const componentes_validos = k.componentes.filter(c => c.nome && c.nome !== 'Componente Desconhecido');
+                        
+                        if (componentes_validos.length > 0) {
+                            comps = componentes_validos
+                                .map(c => `<small>• ${c.quantidade}x ${c.nome} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .join('<br>');
+                        } else {
+                            comps = '<span class="text-info" style="font-size:0.8em">Kit sem componentes detalhados na API.</span>';
+                        }
                     } else {
-                        comps = '<span class="text-muted" style="font-size:0.8em">Produto Simples</span>';
+                        comps = '<span class="text-muted" style="font-size:0.8em">Produto Simples (sem componentes)</span>';
                     }
 
                     html += `
@@ -823,7 +834,7 @@ DASHBOARD_TEMPLATE = """
                 html += '</tbody></table>';
                 div.innerHTML = html;
         } catch(e) {
-            div.innerHTML = 'Erro ao carregar lista.';
+            div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
         }
     }
     
@@ -930,10 +941,7 @@ class WebServer:
                         "preco": p.get("preco"),
                     })
 
-            self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
-            process_response({}) # Falta processar resp_sku, corrigido abaixo
-            
-            # Reimplementando a busca para garantir funcionamento correto
+            # Busca por SKU e Nome para produtos não detalhados
             resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
             process_response(resp_sku)
             
@@ -946,6 +954,7 @@ class WebServer:
             for idx, p in enumerate(all_results_base):
                 if idx >= MAX_DETALHES: break
                 try:
+                    # Busca detalhes completos para os primeiros resultados
                     details = self.orchestrator.api_client.get_product_details(token, p["id"])
                 except Exception:
                     details = {}
@@ -966,8 +975,7 @@ class WebServer:
                 }
                 final_results.append(produto_completo)
             
-            kits_nao_encontrados = [k for k in self.orchestrator.get_all_kits() if k.get("id") not in seen_ids]
-            
+            # Adiciona produtos do cache que a busca direta pode ter ignorado
             termo_lower = termo.lower()
             produtos_cache = self.orchestrator.get_all_products()
             for prod in produtos_cache:
@@ -985,16 +993,17 @@ class WebServer:
                          }
                          final_results.append(prod_cache_fmt)
                          if len(final_results) >= MAX_DETALHES + 5: break
-
-            final_results.extend(kits_nao_encontrados)
+            
             return jsonify(final_results)
 
-        @self.app.route('/api/kits', methods=["GET"])
+        @app.route('/api/kits', methods=["GET"])
         @token_required
         def api_kits(token):
-            return jsonify(self.orchestrator.get_all_kits())
+            # Força o recarregamento dos dados com a nova lógica de detalhamento de kits
+            orchestrator.load_data() 
+            return jsonify(orchestrator.get_all_kits())
 
-        @self.app.route("/webhook/bling", methods=["POST"])
+        @app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
             try:
                 data = request.get_json(silent=True)
