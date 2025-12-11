@@ -457,7 +457,7 @@ class AutomationOrchestrator:
                  return True
         return False
     
-    # --- CORREÇÃO 2: Lógica para carregar TODOS os produtos e detalhar KITS ---
+    # --- Lógica para carregar TODOS os produtos e detalhar KITS ---
     def _load_products_and_kits(self, access_token: str):
         self.logger.info("Iniciando carga completa de produtos para a lista...")
         self.kits.clear()
@@ -762,7 +762,7 @@ DASHBOARD_TEMPLATE = """
             }
         };
 
-        // CORREÇÃO 3: Lógica de exibição no JavaScript
+        // Lógica de exibição de Kits/Produtos no JavaScript
         async function loadKits() {
             const div = document.getElementById('kits-list');
             const authRequiredDiv = document.getElementById('auth-required-kits');
@@ -996,14 +996,16 @@ class WebServer:
             
             return jsonify(final_results)
 
-        @app.route('/api/kits', methods=["GET"])
+        # LINHA CORRIGIDA: De @app.route para @self.app.route
+        @self.app.route('/api/kits', methods=["GET"])
         @token_required
         def api_kits(token):
             # Força o recarregamento dos dados com a nova lógica de detalhamento de kits
             orchestrator.load_data() 
             return jsonify(orchestrator.get_all_kits())
 
-        @app.route("/webhook/bling", methods=["POST"])
+        # LINHA CORRIGIDA: De @app.route para @self.app.route
+        @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
             try:
                 data = request.get_json(silent=True)
@@ -1057,6 +1059,7 @@ def run_cli():
 if __name__ == "__main__":
     run_cli()
 
+# --- GUNICORN CONFIGURAÇÕES (TIMEOUT AJUSTADO PARA 300) ---
 import os as _os
 _os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 300 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
