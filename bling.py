@@ -635,7 +635,12 @@ class WebServer:
                         new_logs = all_logs[last_idx:]
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
-                    time.sleep(1)
+
+                    # Non-blocking wait to avoid Gunicorn timeout
+                    try:
+                        ws.receive(timeout=1)
+                    except Exception:
+                        pass
                 except Exception:
                     break
 
