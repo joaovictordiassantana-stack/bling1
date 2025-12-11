@@ -285,7 +285,7 @@ class BlingAuth:
     def get_authorization_url(self) -> str:
         if self.state is None:
             self.state = secrets.token_urlsafe(16)
-        return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&state={self.state}"
+        return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&scope=*/*&state={self.state}"
     
     def exchange_code_for_token(self, code: str, state: str) -> bool:
         """
@@ -299,7 +299,7 @@ class BlingAuth:
             client = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
             auth_header = base64.b64encode(client.encode()).decode()
             headers = {"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"}
-            payload = {'grant_type': 'authorization_code', 'code': code, 'redirect_uri': self.config.REDIRECT_URI}
+            payload = {'grant_type': 'authorization_code', 'code': code, 'redirect_uri': self.config.REDIRECT_URI, 'scope': '*/*'}
             
             response = requests.post(self.config.TOKEN_URL, data=payload, headers=headers, timeout=self.config.REQUEST_TIMEOUT)
             
@@ -320,7 +320,8 @@ class BlingAuth:
                 'grant_type': 'refresh_token',
                 'refresh_token': self.refresh_token,
                 'client_id': self.config.CLIENT_ID,
-                'client_secret': self.config.CLIENT_SECRET
+                'client_secret': self.config.CLIENT_SECRET,
+                'scope': '*/*'
             }
             response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.REQUEST_TIMEOUT)
             if response.status_code == 200:
@@ -867,3 +868,4 @@ if __name__ == "__main__":
 import os as _os
 _os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 120 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
+
