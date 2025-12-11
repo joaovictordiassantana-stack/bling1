@@ -280,7 +280,7 @@ class BlingAuth:
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[float] = None
         self.logger = logger  # Usa o logger global 'bling_automacao'
-        self._load_tokens()
+        self.load_tokens()
         self.state: Optional[str] = self._load_state()
 
     def _load_state(self) -> Optional[str]:
