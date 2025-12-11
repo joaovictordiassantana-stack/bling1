@@ -726,7 +726,7 @@ class WebServer:
 
             # A validação do state deve ocorrer dentro de exchange_code_for_token
             self.logger.info(f"Tentando trocar code {code} por token...")
-          if self.orchestrator.auth.exchange_code_for_token(code, state)::
+            if self.orchestrator.auth.exchange_code_for_token(code, state):
                 self.logger.info("Troca de token concluída com sucesso.")
                 return redirect('/')
             
