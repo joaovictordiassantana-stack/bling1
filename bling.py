@@ -628,7 +628,7 @@ class WebServer:
         def ws_logs(ws):
             logger.info("WS conectado.")
             last_idx = 0
-            while not ws.closed:
+            while True:
                 try:
                     all_logs = memory_handler.get_logs()
                     if len(all_logs) > last_idx:
