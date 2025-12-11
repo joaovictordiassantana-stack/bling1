@@ -711,16 +711,37 @@ DASHBOARD_TEMPLATE = """
                 
                 let html = '<div class="list-group">';
                 data.forEach(p => {
-                    html += `
-                        <div class="list-group-item">
-                            <div class="d-flex w-100 justify-content-between">
-                                <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
-                                <small>${p.sku || 'N/D'}</small>
-                            </div>
-                            <p class="mb-1">${p.descricaoCurta || ''}</p>
-                            <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
-                        </div>
-                    `;
+		                html += `
+		                    <div class="list-group-item">
+		                        <div class="d-flex">
+		                            <img src="${p.imagemURL || ''}" 
+		                                 style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1">
+		                            
+		                            <div class="flex-grow-1">
+		                                <div class="d-flex w-100 justify-content-between">
+		                                    <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+		                                    <small>${p.sku || 'N/D'}</small>
+		                                </div>
+		
+		                                <p class="mb-1">${p.descricaoCurta || ''}</p>
+		
+		                                <small class="text-muted d-block">
+		                                    <b>Estoque:</b> ${p.estoque}  
+		                                    <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+		                                </small>
+		
+		                                ${p.componentes && p.componentes.length > 0 ? `
+		                                    <div class="mt-2">
+		                                        <b>Componentes:</b><br>
+		                                        ${p.componentes.map(c => 
+		                                            `${c.quantidade}x ${c.produto?.nome || 'Sem nome'}`
+		                                        ).join("<br>")}
+		                                    </div>
+		                                ` : ""}
+		                            </div>
+		                        </div>
+		                    </div>
+		                `;
                 });
                 html += '</div>';
                 div.innerHTML = html;
@@ -753,13 +774,38 @@ DASHBOARD_TEMPLATE = """
                     return;
                 }
 
-                const data = await r.json();
-                let html = '<table class="table table-sm"><thead><tr><th>SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
-                data.forEach(k => {
-                    let comps = k.componentes.map(c => `${c.quantidade}x ${c.nome}`).join(', ');
-                    html += `<tr><td>${k.sku}</td><td>${k.produto}</td><td>${comps}</td></tr>`;
-                });
-                html += '</tbody></table>';
+	                const data = await r.json();
+	                let html = `
+	<table class="table table-sm">
+	<thead>
+	<tr>
+	    <th>IMG</th>
+	    <th>SKU</th>
+	    <th>Nome</th>
+	    <th>Componentes</th>
+	</tr>
+	</thead>
+	<tbody>
+	`;
+	
+	                data.forEach(k => {
+	                    const thumb = k.imagemURL ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;">` : '';
+	
+	                    let comps = k.componentes
+	                        .map(c => `${c.quantidade}x ${c.nome}`)
+	                        .join('<br>');
+	
+	                    html += `
+	                        <tr>
+	                            <td>${thumb}</td>
+	                            <td>${k.sku}</td>
+	                            <td>${k.produto}</td>
+	                            <td>${comps}</td>
+	                        </tr>
+	                    `;
+	                });
+	
+	                html += '</tbody></table>';
                 div.innerHTML = html;
         } catch(e) {
             div.innerHTML = 'Erro ao carregar kits.';
