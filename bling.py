@@ -174,12 +174,13 @@ def is_token_valid(token_data):
         return False
     return time.time() < float(expires_at) - 20
 
-# --- FUNÇÃO PARA BUSCA DE PRODUTOS (COM PAGINAÇÃO, ITERATIVA) ---
+# --- FUNÇÃO PARA BUSCA DE PRODUTOS (CORRIGIDO PARA V3) ---
 def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | None = None, access_token: str | None = None):
     try:
         filters = {}
         if sku:
-            filters['sku'] = sku.strip()
+            # CORREÇÃO: API v3 usa 'codigo' e não 'sku'
+            filters['codigo'] = sku.strip()
         if nome and not sku:
             filters['nome'] = nome.strip()
 
@@ -400,6 +401,7 @@ class BlingAPIClient:
     
     def get_products(self, access_token: str, page: int = 1, limit: int = 100, **filters) -> Dict[str, Any]:
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        # Filters serão passados aqui: e.g. codigo='COI-B' ou nome='...'
         params = {'pagina': page, 'limite': limit, **filters}
         url = f"{self.config.BLING_API_URL}/produtos"
         
@@ -841,47 +843,51 @@ class WebServer:
         @token_required
         def api_product_search(token):
             termo = request.args.get("q") or request.args.get("sku") or request.args.get("nome") or ""
-            termo = termo.strip().lower()
+            termo = termo.strip() # Remove espaços
             if not termo:
                 return jsonify([])
 
-            def match(item):
-                n = str(item.get('nome') or item.get('produto') or "").lower()
-                c = str(item.get('codigo') or item.get('sku') or "").lower()
-                return termo in n or termo in c
-
-            products_found = [p for p in self.orchestrator.products if match(p)]
-            kits_found = [k for k in self.orchestrator.kits if match(k)]
+            # --- CORREÇÃO IMPORTANTE: BUSCA HÍBRIDA NA API ---
+            # O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
+            # está buscando 'nome' ou 'código' (SKU). Vamos buscar AMBOS na API para garantir.
+            
             all_results = []
-            
-            for p in products_found:
-                all_results.append({
-                    "id": p.get("id"),
-                    "sku": p.get("codigo"),
-                    "nome": p.get("nome"),
-                    "tipo": p.get("tipo"),
-                    "situacao": p.get("situacao"),
-                    "preco": p.get("preco"),
-                    "imagemURL": p.get("imagemURL"),
-                    "estoque": p.get("estoque", {}).get("saldoVirtualTotal", 0),
-                    "descricaoCurta": p.get("descricaoCurta")
-                })
-            
-            for k in kits_found:
-                comps = k.get("componentes", [])
-                desc_comps = ", ".join([f"{c['quantidade']}x {c['nome']}" for c in comps])
-                all_results.append({
-                    "id": None,
-                    "sku": k.get("sku"),
-                    "nome": k.get("produto"),
-                    "tipo": "Kit/Composto",
-                    "situacao": "Ativo",
-                    "preco": 0,
-                    "imagemURL": None,
-                    "estoque": "N/A",
-                    "descricaoCurta": f"Kit composto por: {desc_comps}"
-                })
-                
+            seen_ids = set()
+
+            def process_response(resp_data):
+                """Processa resposta da API e adiciona à lista de resultados"""
+                items = resp_data.get('data') or []
+                for p in items:
+                    p_id = p.get('id')
+                    # Evita duplicatas se encontrar o mesmo produto por nome e código
+                    if p_id and p_id in seen_ids:
+                        continue
+                    if p_id: seen_ids.add(p_id)
+                    
+                    all_results.append({
+                        "id": p.get("id"),
+                        "sku": p.get("codigo"),
+                        "nome": p.get("nome"),
+                        "tipo": p.get("tipo"),
+                        "situacao": p.get("situacao"),
+                        "preco": p.get("preco"),
+                        "imagemURL": p.get("imagemURL"),
+                        "estoque": p.get("estoque", {}).get("saldoVirtualTotal", 0) if isinstance(p.get("estoque"), dict) else 0,
+                        "descricaoCurta": p.get("descricaoCurta")
+                    })
+
+            # 1. Tenta buscar por CÓDIGO (SKU)
+            # Isso resolve o caso "COI-B" se for um SKU
+            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
+            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
+            process_response(resp_sku)
+
+            # 2. Tenta buscar por NOME (Descrição)
+            # Isso resolve o caso "COI-B" se for parte do nome
+            self.logger.info(f"Buscando API por NOME: {termo}")
+            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
+            process_response(resp_nome)
+
             return jsonify(all_results)
 
         @self.app.route('/api/produtos', methods=["GET"])
