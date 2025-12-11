@@ -507,6 +507,174 @@ def token_required(f):
     return decorated
 
 # ============================================================================ 
+# 9. TEMPLATE HTML DO DASHBOARD
+# ============================================================================
+
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel Bling - Automação ERP</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <style>
+        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
+        .log-level-INFO { color: #4ec9b0; }
+        .log-level-WARNING { color: #dcdcaa; }
+        .log-level-ERROR { color: #f48771; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg">
+        <div class="container-fluid">
+            <a class="navbar-brand text-white" href="#">Bling Automação</a>
+            <div class="d-flex">
+                <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
+                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div class="row mb-4">
+             <div class="col"><div class="card p-3 text-center"><h5>Sucesso</h5><h3 id="kpi-success" class="text-success">0</h3></div></div>
+             <div class="col"><div class="card p-3 text-center"><h5>Falhas</h5><h3 id="kpi-failed" class="text-danger">0</h3></div></div>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header">Logs em Tempo Real</div>
+            <div class="card-body bg-dark p-0">
+                <div id="logs-content" class="log-box"></div>
+            </div>
+        </div>
+
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Kits</button></li>
+        </ul>
+
+        <div class="tab-content p-3 bg-white border border-top-0 rounded-bottom">
+            <div class="tab-pane fade show active" id="search">
+                <div class="input-group mb-3">
+                    <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
+                    <button class="btn btn-primary" id="btn-search">Buscar</button>
+                </div>
+                <div id="search-results"></div>
+            </div>
+
+            <div class="tab-pane fade" id="kits">
+                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
+                <div id="kits-list"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    const API = '/api';
+    
+    // Formatador de logs
+    function formatLog(log) {
+        return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
+    }
+
+    // WebSocket Logs
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+    ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        const box = document.getElementById('logs-content');
+        if(data.logs) {
+            data.logs.forEach(l => box.innerHTML += formatLog(l));
+            box.scrollTop = box.scrollHeight;
+        }
+    };
+
+    // Status Polling
+    setInterval(async () => {
+        try {
+            const r = await fetch(API + '/status');
+            const d = await r.json();
+            const badge = document.getElementById('status-badge');
+            if(d.authenticated) {
+                badge.className = 'badge bg-success me-2';
+                badge.textContent = 'Online';
+                document.getElementById('auth-link').classList.add('d-none');
+            } else {
+                badge.className = 'badge bg-danger me-2';
+                badge.textContent = 'Offline';
+                document.getElementById('auth-link').classList.remove('d-none');
+            }
+        } catch(e) {}
+    }, 5000);
+
+    // Busca de Produtos
+    document.getElementById('btn-search').onclick = async () => {
+        const q = document.getElementById('search-input').value;
+        const div = document.getElementById('search-results');
+        div.innerHTML = 'Buscando...';
+        
+        try {
+            const r = await fetch(`${API}/product/search?q=${q}`);
+            const data = await r.json();
+            if(!data.length) {
+                div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
+                return;
+            }
+            
+            let html = '<div class="list-group">';
+            data.forEach(p => {
+                html += `
+                    <div class="list-group-item">
+                        <div class="d-flex w-100 justify-content-between">
+                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+                            <small>${p.sku || 'N/D'}</small>
+                        </div>
+                        <p class="mb-1">${p.descricaoCurta || ''}</p>
+                        <small class="text-muted">Tipo: ${p.tipo} | Estoque: ${p.estoque}</small>
+                    </div>
+                `;
+            });
+            html += '</div>';
+            div.innerHTML = html;
+        } catch(e) {
+            div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
+        }
+    };
+
+    // Carregar Kits
+    async function loadKits() {
+        const div = document.getElementById('kits-list');
+        div.innerHTML = 'Carregando...';
+        try {
+            const r = await fetch(`${API}/kits`);
+            const data = await r.json();
+            let html = '<table class="table table-sm"><thead><tr><th>SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
+            data.forEach(k => {
+                let comps = k.componentes.map(c => `${c.quantidade}x ${c.nome}`).join(', ');
+                html += `<tr><td>${k.sku}</td><td>${k.produto}</td><td>${comps}</td></tr>`;
+            });
+            html += '</tbody></table>';
+            div.innerHTML = html;
+        } catch(e) {
+            div.innerHTML = 'Erro ao carregar kits.';
+        }
+    }
+    
+    document.addEventListener('DOMContentLoaded', () => {
+        loadKits();
+    });
+    </script>
+</body>
+</html>
+"""
+
+# ============================================================================ 
 # 8. SERVIDOR WEB (ROTAS CONSOLIDADAS)
 # ============================================================================
 
@@ -687,3 +855,4 @@ if __name__ == "__main__":
 import os as _os
 _os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 120 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
+
