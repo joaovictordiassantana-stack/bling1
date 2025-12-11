@@ -404,48 +404,39 @@ class BlingAuth:
 
 # CORREÇÃO: Adicionado limite de profundidade para evitar loop infinito
 def extract_image_url(prod: dict, depth=0) -> Optional[str]:
-    """Tenta extrair uma URL de imagem de diferentes formatos/estruturas retornadas pelo Bling."""
+    """Extrai URL da imagem procurando em midia, imagens e campos diretos."""
     if not prod or not isinstance(prod, dict):
         return None
     
-    if depth > 3: # Limite de recursão
-        return None
+    # Proteção contra loop
+    if depth > 3: return None
 
-    # campos diretos comuns
-    for key in ("imagemURL", "imagem", "image", "foto", "thumbnail", "thumbnail_url"):
-        url = prod.get(key)
-        if url and isinstance(url, str):
-            return url
+    # 1. Tenta campos diretos comuns
+    for key in ["imagemURL", "url", "urlThumbnail", "link", "caminho"]:
+        val = prod.get(key)
+        if val and isinstance(val, str) and val.startswith("http"):
+            return val
 
-    # listas possíveis
-    for list_key in ("midias", "imagens", "fotos", "arquivos"):
-        items = prod.get(list_key) or []
-        # às vezes vem dict com chave interna
-        if isinstance(items, dict):
-            # exemplo: {'midia': [ ... ]}
-            for sub in ("midia", "imagens", "produto"):
-                items = items.get(sub) or items
+    # 2. Tenta encontrar dentro de listas de mídia (padrão Bling V3)
+    # Ex: midia: [{ url: "..." }] ou imagens: [{ link: "..." }]
+    for list_key in ["midia", "midias", "imagens", "fotos", "anexos"]:
+        items = prod.get(list_key, [])
         if isinstance(items, list):
-            for m in items:
-                if not isinstance(m, dict):
-                    continue
-                # campos possíveis dentro da midia
-                for k in ("url", "link", "arquivo", "caminho", "path"):
-                    val = m.get(k)
-                    if val:
-                        # se 'arquivo' for dict
-                        if isinstance(val, dict):
-                            return val.get("caminho") or val.get("url")
-                        if isinstance(val, str):
-                            return val
+            for item in items:
+                # Se for string direta
+                if isinstance(item, str) and item.startswith("http"):
+                    return item
+                # Se for objeto, recursão rasa
+                if isinstance(item, dict):
+                    ret = extract_image_url(item, depth + 1)
+                    if ret: return ret
 
-    # produto aninhado (algumas respostas colocam o produto dentro de 'produto')
-    nested = prod.get("produto") or prod.get("produto", {})
-    if isinstance(nested, dict) and nested is not prod:
-        # Evita recursão infinita se o aninhamento for o próprio produto (checado por ID)
-        if nested.get('id') == prod.get('id'):
-            return None
-        return extract_image_url(nested, depth + 1)
+    # 3. Tenta descer um nível se houver 'data' ou 'produto' aninhado
+    for nested in ["data", "produto"]:
+        if nested in prod and isinstance(prod[nested], dict):
+             # Evita recursão no mesmo ID
+             if prod[nested].get('id') != prod.get('id'):
+                 return extract_image_url(prod[nested], depth + 1)
 
     return None
 
@@ -540,126 +531,107 @@ class AutomationOrchestrator:
         return False
     
     def _load_products_and_kits(self, access_token: str):
-        self.logger.info("Carregando produtos e kits...")
+        self.logger.info("Iniciando carga otimizada de produtos e kits...")
         self.kits.clear()
         self.products.clear()
+        
+        todos_produtos = []
         page = 1
         
+        # PASSO 1: Baixar TUDO primeiro (Paginação)
         while True:
-            resp = self.api_client.get_products(access_token, page=page)
-            products_raw = resp.get('data', [])
-            if not products_raw:
-                break
-            
-            for p in products_raw:
-                prod = p if isinstance(p, dict) else {}
-                if not prod: continue
-
-                estrutura = prod.get('estrutura', {})
-                # CORREÇÃO: Usar detalhes completos se disponíveis, ou estrutura básica
-                componentes_preliminar = estrutura.get('componentes', [])
+            try:
+                # Busca produtos incluindo estrutura se possível
+                resp = self.api_client.get_products(access_token, page=page, limit=100)
+                items = resp.get('data', [])
                 
-                if componentes_preliminar:
-                    # CORREÇÃO: Enriquecer o kit com detalhes do produto para pegar imagem e componentes corretos
-                    details = self.api_client.get_product_details(access_token, prod.get("id"))
+                if not items:
+                    break
+                
+                todos_produtos.extend(items)
+                
+                # Se vier menos que o limite, acabou
+                if len(items) < 100:
+                    break
                     
-                    # Usa componentes dos detalhes se existir, senão usa do produto base
-                    componentes_reais = (
-                        details.get("estrutura", {}).get("componentes")
-                        or componentes_preliminar
-                        or []
-                    )
+                page += 1
+                time.sleep(0.2) # Respeita rate limit
+            except Exception as e:
+                self.logger.error(f"Erro ao carregar página {page}: {e}")
+                break
+        
+        # PASSO 2: Criar Mapa para busca rápida (ID -> Produto)
+        # Isso permite achar o nome do componente instantaneamente
+        produto_map = {str(p.get("id")): p for p in todos_produtos}
+        
+        self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando Kits...")
 
-                    kit_obj = {
-                        "sku": prod.get("codigo"),
-                        "produto": prod.get("nome"),
-                        # CORREÇÃO: Usar extract_image_url com prioridade para details
-                        "imagemURL": (
-                            details.get("imagemURL")
-                            or extract_image_url(details)
-                        ),
-                        "componentes": [
-                            {
-                                "nome": c.get("produto", {}).get("nome", "Sem nome"),
-                                "quantidade": c.get("quantidade", 0)
-                            }
-                            for c in componentes_reais
-                        ]
-                    }
-                    self.kits.append(kit_obj)
-                else:
-                    self.products.append(prod)
+        # PASSO 3: Separar Kits e preencher nomes dos componentes
+        for p in todos_produtos:
+            p_id = p.get("id")
             
-            page += 1
-            time.sleep(0.2)
-        
-        self.logger.info(f"Carga completa: {len(self.kits)} kits, {len(self.products)} produtos.")
+            # Tenta pegar estrutura (alguns endpoints retornam direto, outros precisam de details)
+            # Se for crucial ter a estrutura e ela não vier na listagem, teríamos que buscar details individualmente.
+            # Assumindo que 'estrutura' vem na lista ou que vamos usar o que tem:
+            estrutura = p.get("estrutura", {})
+            componentes = estrutura.get("componentes", [])
+            
+            # Define se é kit: tem componentes OU tipo é 'K'
+            eh_kit = len(componentes) > 0 or p.get("tipo") == "K" or p.get("formato") == "K"
 
-        # --- SEGUNDA PASSAGEM: ENRIQUECIMENTO DE DADOS (IMAGEM E COMPONENTES) ---
-        self.logger.info("Iniciando enriquecimento de dados (Imagens e Componentes de Kits)...")
+            # Busca imagem robusta
+            img_url = extract_image_url(p)
+            
+            # Se for KIT, processa componentes
+            if eh_kit:
+                comps_formatados = []
+                
+                # Se a lista de componentes estiver vazia mas for tipo K, 
+                # tentamos uma chamada única de detalhe (fallback)
+                if not componentes and p_id:
+                     try:
+                         # Só chama API se realmente faltar info
+                         det = self.api_client.get_product_details(access_token, p_id)
+                         componentes = det.get("estrutura", {}).get("componentes", [])
+                         # Atualiza imagem se achou no detalhe
+                         if not img_url: img_url = extract_image_url(det)
+                     except:
+                         pass
 
-        # 1) criar lookup por codigo e por id
-        produto_por_codigo = {}
-        produto_por_id = {}
-        for prod in self.products:
-            codigo = prod.get('codigo')
-            pid = prod.get('id')
-            if codigo:
-                produto_por_codigo[codigo] = prod
-            if pid:
-                produto_por_id[pid] = prod
+                for c in componentes:
+                    # O componente refere-se a um produto filho
+                    filho_ref = c.get("produto", {})
+                    filho_id = str(filho_ref.get("id"))
+                    
+                    # Tenta achar o nome no nosso MAPA (muito mais rápido)
+                    produto_filho = produto_map.get(filho_id)
+                    
+                    nome_final = "Item não carregado"
+                    if produto_filho:
+                        nome_final = produto_filho.get("nome")
+                    elif filho_ref.get("nome"):
+                        nome_final = filho_ref.get("nome")
+                    
+                    comps_formatados.append({
+                        "nome": nome_final,
+                        "quantidade": c.get("quantidade", 0),
+                        "sku": produto_filho.get("codigo") if produto_filho else ""
+                    })
 
-        # 2) buscar detalhes para popular imagem (opcionalmente só se imagem não existir)
-        for prod in self.products:
-            if not prod.get('imagemURL'):
-                pid = prod.get('id')
-                try:
-                    if pid:
-                        det = self.api_client.get_product_details(self.auth.get_valid_token(), pid)
-                        # CORREÇÃO: Usa função corrigida com limite de recursão
-                        img = extract_image_url(det)
-                        if img:
-                            prod['imagemURL'] = img
-                except Exception as e:
-                    self.logger.exception("Erro ao buscar detalhe do produto %s durante enriquecimento: %s", pid, e)
-                    pass
-
-        # 3) enriquecer componentes dos kits com sku/id/imagem (tentativa por produto associado)
-        for kit in self.kits:
-            enriched_components = []
-            for comp in kit.get('componentes', []):
-                # tenta achar código/id dentro da estrutura original (ajuste se a estrutura do Bling usar outro campo)
-                prod_ref = comp.get('produto') or {}
-                comp_codigo = prod_ref.get('codigo') or prod_ref.get('sku') or None
-                comp_id = prod_ref.get('id') or None
-
-                imagem = None
-                found_sku = comp_codigo
-                # lookup por codigo/id
-                if comp_codigo and comp_codigo in produto_por_codigo:
-                    imagem = produto_por_codigo[comp_codigo].get('imagemURL')
-                elif comp_id and comp_id in produto_por_id:
-                    imagem = produto_por_id[comp_id].get('imagemURL')
-                else:
-                    # ultima tentativa: buscar detalhes via API se tivermos id
-                    if comp_id:
-                        try:
-                            det = self.api_client.get_product_details(self.auth.get_valid_token(), comp_id)
-                            imagem = extract_image_url(det)
-                        except Exception as e:
-                            self.logger.exception("Erro ao buscar detalhe do componente %s durante enriquecimento: %s", comp_id, e)
-                            imagem = None
-
-                enriched_components.append({
-                    "nome": comp.get('produto', {}).get('nome') or comp.get('nome'),
-                    "quantidade": comp.get('quantidade', 0),
-                    "sku": found_sku,
-                    "produto_id": comp_id,
-                    "imagemURL": imagem
+                self.kits.append({
+                    "id": p_id,
+                    "sku": p.get("codigo"),
+                    "produto": p.get("nome"),
+                    "imagemURL": img_url,
+                    "componentes": comps_formatados
                 })
-            kit['componentes'] = enriched_components
-        
-        self.logger.info("Enriquecimento de dados concluído.")
+            else:
+                # É produto normal
+                # Injeta a imagem extraída para garantir que o front receba
+                p['imagemURL'] = img_url
+                self.products.append(p)
+
+        self.logger.info(f"Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
 
     def get_all_products(self) -> List[Dict[str, Any]]:
         return self.products
