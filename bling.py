@@ -108,7 +108,11 @@ class Config:
     # Bling OAuth
     CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', 'YOUR_CLIENT_ID')
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
-    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', 'https://bling1.onrender.com/callback')
+    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI')
+    if not REDIRECT_URI:
+        # A validação e abort(500) serão feitas na inicialização do Flask, conforme instruído.
+        # Aqui, apenas garantimos que o valor seja None se não estiver setado.
+        pass
     
     # API
     BLING_API_URL: str = 'https://www.bling.com.br/Api/v3'
@@ -471,6 +475,22 @@ class AutomationOrchestrator:
 
 # Instâncias Globais
 config = Config()
+
+# Validação obrigatória do REDIRECT_URI antes de inicializar o orquestrador
+if not config.REDIRECT_URI:
+    logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+    # A instrução do usuário pede para abortar, mas o abort(500) só funciona dentro de um contexto Flask.
+    # Vamos garantir que o erro seja logado e a aplicação não inicie corretamente.
+    # Para simular o abort(500) em um contexto não-Flask, vamos usar sys.exit(1)
+    # ou, melhor, garantir que o Flask chame abort(500) na inicialização.
+    # Como a instrução é para a IA, e não para o código, vamos apenas garantir o log e a variável None.
+    # A instrução original pedia:
+    # if not BLING_REDIRECT_URI:
+    #     log("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+    #     abort(500)
+    # Vamos adicionar a lógica de abortar na inicialização do Flask.
+    pass
+
 orchestrator = AutomationOrchestrator(config)
 auth = orchestrator.auth # Atalho
 
@@ -486,16 +506,14 @@ def token_required(f):
         if not orchestrator.auth or not orchestrator.auth.access_token:
             return jsonify({"auth": False, "message": "Token indisponível. Autentique a aplicação."}), 401
 
-        # Se token expirado, tenta renovar
-        if not orchestrator.auth.is_authenticated():
-            if not orchestrator.auth.refresh_access_token():
-                return jsonify({
-                    "status": "not_authenticated",
-                    "message": "Authorize the application via OAuth"
-                }), 401
-
-        # Passa o token válido para a função
+        # Passa o token válido para a função (tenta refresh se necessário)
         token = orchestrator.auth.get_valid_token()
+        
+        if not token:
+            return jsonify({
+                "status": "not_authenticated",
+                "message": "Authorize the application via OAuth"
+            }), 401
         return f(token=token, *args, **kwargs)
     return decorated
 
@@ -512,6 +530,15 @@ class WebServer:
         self.setup_websocket()
 
     def setup_routes(self):
+        # Validação de configuração obrigatória
+        if not self.orchestrator.config.REDIRECT_URI:
+            @self.app.route('/', defaults={'path': ''})
+            @self.app.route('/<path:path>')
+            def fatal_error_config(path):
+                from flask import abort
+                self.orchestrator.auth.logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+                abort(500)
+
         # --- Frontend ---
         @self.app.route("/")
         def dashboard():
@@ -522,7 +549,9 @@ class WebServer:
         def callback():
             code = request.args.get('code')
             if code:
+                self.orchestrator.auth.logger.info(f"Tentando trocar code {code} por token...")
                 if self.orchestrator.auth.exchange_code_for_token(code):
+                    self.orchestrator.auth.logger.info("Troca de token concluída com sucesso.")
                     return redirect('/')
                 return "Erro na troca de token", 400
             return "Código não fornecido", 400
