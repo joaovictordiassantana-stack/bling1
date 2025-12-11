@@ -282,6 +282,7 @@ class BlingAuth:
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.expires_at: Optional[float] = None
+        self.logger = logger  # Usa o logger global 'bling_automacao'
         
     def get_authorization_url(self) -> str:
         if self.state is None:
@@ -536,7 +537,7 @@ class WebServer:
             @self.app.route('/<path:path>')
             def fatal_error_config(path):
                 from flask import abort
-                logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+                self.orchestrator.auth.logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
                 abort(500)
 
         # --- Frontend ---
@@ -549,9 +550,9 @@ class WebServer:
         def callback():
             code = request.args.get('code')
             if code:
-                logger.info(f"Tentando trocar code {code} por token...")
+                self.orchestrator.auth.logger.info(f"Tentando trocar code {code} por token...")
                 if self.orchestrator.auth.exchange_code_for_token(code):
-                    logger.info("Troca de token concluída com sucesso.")
+                    self.orchestrator.auth.logger.info("Troca de token concluída com sucesso.")
                     return redirect('/')
                 return "Erro na troca de token", 400
             return "Código não fornecido", 400
