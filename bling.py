@@ -108,7 +108,7 @@ class Config:
     # Bling OAuth
     CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', 'YOUR_CLIENT_ID')
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
-    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', 'http://localhost:8000/callback')
+    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', 'https://bling1.onrender.com/callback')
     
     # API
     BLING_API_URL: str = 'https://www.bling.com.br/Api/v3'
