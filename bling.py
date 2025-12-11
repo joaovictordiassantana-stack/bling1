@@ -420,6 +420,26 @@ class BlingAPIClient:
             time.sleep(1)
         return {}
 
+    def get_product_details(self, access_token: str, product_id: int) -> Dict[str, Any]:
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        url = f"{self.config.BLING_API_URL}/produtos/{product_id}"
+        
+        for attempt in range(self.config.MAX_RETRIES):
+            try:
+                response = self.session.get(url, headers=headers, timeout=self.config.REQUEST_TIMEOUT)
+                if response.status_code == 200:
+                    # O Bling V3 retorna o objeto do produto dentro de 'data'
+                    return response.json().get("data", {})
+                elif response.status_code == 429:  # Rate limit
+                    time.sleep(2)
+                    continue
+                else:
+                    self.logger.warning(f"Erro API Detalhes Produto {product_id}: {response.status_code} - {response.text}")
+            except Exception as e:
+                self.logger.warning(f"Erro conexao API Detalhes Produto {product_id}: {e}")
+            time.sleep(1)
+        return {}
+
 # ============================================================================ 
 # 6. ORQUESTRADOR
 # ============================================================================
@@ -851,44 +871,61 @@ class WebServer:
             # O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
             # está buscando 'nome' ou 'código' (SKU). Vamos buscar AMBOS na API para garantir.
             
-            all_results = []
-            seen_ids = set()
-
-            def process_response(resp_data):
-                """Processa resposta da API e adiciona à lista de resultados"""
-                items = resp_data.get('data') or []
-                for p in items:
-                    p_id = p.get('id')
-                    # Evita duplicatas se encontrar o mesmo produto por nome e código
-                    if p_id and p_id in seen_ids:
-                        continue
-                    if p_id: seen_ids.add(p_id)
-                    
-                    all_results.append({
-                        "id": p.get("id"),
-                        "sku": p.get("codigo"),
-                        "nome": p.get("nome"),
-                        "tipo": p.get("tipo"),
-                        "situacao": p.get("situacao"),
-                        "preco": p.get("preco"),
-                        "imagemURL": p.get("imagemURL"),
-                        "estoque": p.get("estoque", {}).get("saldoVirtualTotal", 0) if isinstance(p.get("estoque"), dict) else 0,
-                        "descricaoCurta": p.get("descricaoCurta")
-                    })
-
-            # 1. Tenta buscar por CÓDIGO (SKU)
-            # Isso resolve o caso "COI-B" se for um SKU
-            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
-            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
-            process_response(resp_sku)
-
-            # 2. Tenta buscar por NOME (Descrição)
-            # Isso resolve o caso "COI-B" se for parte do nome
-            self.logger.info(f"Buscando API por NOME: {termo}")
-            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
-            process_response(resp_nome)
-
-            return jsonify(all_results)
+	            all_results_base = []
+	            seen_ids = set()
+	
+	            def process_response(resp_data):
+	                """Processa resposta da API e adiciona à lista de resultados básicos"""
+	                items = resp_data.get('data') or []
+	                for p in items:
+	                    p_id = p.get('id')
+	                    # Evita duplicatas se encontrar o mesmo produto por nome e código
+	                    if p_id and p_id in seen_ids:
+	                        continue
+	                    if p_id: seen_ids.add(p_id)
+	                    
+	                    # Armazena apenas os dados básicos da busca inicial
+	                    all_results_base.append({
+	                        "id": p.get("id"),
+	                        "sku": p.get("codigo"),
+	                        "nome": p.get("nome"),
+	                        "tipo": p.get("tipo"),
+	                        "situacao": p.get("situacao"),
+	                        "preco": p.get("preco"),
+	                    })
+	
+	            # 1. Tenta buscar por CÓDIGO (SKU)
+	            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
+	            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
+	            process_response(resp_sku)
+	
+	            # 2. Tenta buscar por NOME (Descrição)
+	            self.logger.info(f"Buscando API por NOME: {termo}")
+	            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
+	            process_response(resp_nome)
+	            
+	            # 3. ENRIQUECIMENTO DE DADOS (Busca Detalhada)
+	            final_results = []
+	            for p in all_results_base:
+	                details = self.orchestrator.api_client.get_product_details(token, p["id"])
+	                
+	                # Constrói o objeto final com dados básicos e detalhes
+	                produto_completo = {
+	                    "id": p["id"],
+	                    "sku": p.get("sku"),
+	                    "nome": p.get("nome"),
+	                    "preco": p.get("preco"),
+	                    # Dados enriquecidos do GET /produtos/{id}
+	                    "estoque": details.get("estoque", {}).get("saldoVirtualTotal", 0),
+	                    "imagemURL": details.get("imagemURL"),
+	                    "componentes": details.get("estrutura", {}).get("componentes", []),
+	                    "descricaoCurta": details.get("descricaoCurta"),
+	                    "tipo": p.get("tipo"), # Mantém o tipo do produto
+	                }
+	                
+	                final_results.append(produto_completo)
+	
+	            return jsonify(final_results)
 
         @self.app.route('/api/produtos', methods=["GET"])
         @token_required
