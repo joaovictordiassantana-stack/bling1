@@ -16,6 +16,8 @@ import logging.handlers
 import base64
 import secrets
 import argparse
+import hmac # NOVO: Necessário para a validação HMAC
+import hashlib # NOVO: Necessário para a validação HMAC
 
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -271,7 +273,7 @@ class SalesManager:
         
         with self.lock:
             for order in orders:
-                # CORREÇÃO: Adiciona checagem de tipo para evitar 'AttributeError: 'str' object has no attribute 'get''
+                # CORREÇÃO CRÍTICA (AttributeError): Adiciona checagem de tipo
                 if not isinstance(order, dict):
                     logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
                     continue
@@ -454,11 +456,13 @@ class BlingAuth:
         return False
     
     def is_authenticated(self) -> bool:
+        # Usa margem de 60 segundos
         return bool(self.access_token and self.expires_at and time.time() < (self.expires_at - 60))
     
     def get_valid_token(self) -> Optional[str]:
         if self.is_authenticated():
             return self.access_token
+        # Tenta renovar se não for válido
         if self.refresh_access_token():
             return self.access_token
         return None
@@ -563,6 +567,8 @@ class BlingAPIClient:
                     continue
                 else:
                     self.logger.warning(f"Erro API Pedidos de Venda: {response.status_code} - {response.text}")
+                    # Adiciona log de erro com resposta completa
+                    error_logger.error(f"FALHA NA BUSCA DE PEDIDOS: {response.status_code} - {response.text}") 
             except Exception as e:
                 self.logger.warning(f"Erro conexao API Pedidos de Venda: {e}")
             time.sleep(1)
@@ -627,10 +633,9 @@ class AutomationOrchestrator:
                 self.check_and_refresh_token()
                 
                 # 2. Carrega dados estáticos do Bling (kits, produtos simples)
-                # Esta operação pode ser longa e bloqueadora
                 self.load_bling_products() 
                 
-                # 3. NOVO: Busca Pedidos de Venda e Atualiza as Estatísticas (Recálculo total)
+                # 3. FIX: Garante que o recálculo dos KPIs é acionado
                 self.process_sales_orders() 
 
             except Exception as e:
@@ -651,17 +656,13 @@ class AutomationOrchestrator:
             self.logger.warning("Token indisponível para buscar pedidos de venda.")
             return
 
-        self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs...")
-        
-        # CORREÇÃO: Status ajustado para cobrir ABERTOS (2, 3, 9) e FECHADOS (12)
-        # 2: Em Andamento; 3: Em Aberto; 9: Pendente; 12: Atendido/Faturado
-        status_ids = [2, 3, 9, 12] 
+        # NOVO LOG: Informa que o filtro de situação foi removido para debug
+        self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (SEM FILTRO DE SITUAÇÃO)...")
         
         # O período de busca deve cobrir o semanal (7 dias) + uma margem de segurança (9 dias)
-        # Isso garante que a contagem semanal seja precisa, mesmo que o sistema tenha ficado desligado.
         params = {
-            'situacao[id]': ','.join(map(str, status_ids)),
-            # Buscando pedidos dos últimos 9 dias (para cobrir a semana + margem de erro)
+            # FIX CRÍTICO: Removido 'situacao[id]' para debuggar a falha silenciosa. 
+            # A API deve retornar dados, e o SalesManager filtra pela data.
             'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
             # Usaremos a paginação completa para garantir que todos os pedidos sejam carregados
             'pagina': 1,
@@ -690,7 +691,15 @@ class AutomationOrchestrator:
                 break
                 
         if all_orders:
-            # NOVO: Recalcula todos os KPIs com base em todos os pedidos encontrados no período
+            self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
+            
+            # LOG DETALHADO DOS 3 PRIMEIROS PEDIDOS (para debug dos KPIs zerados)
+            for order in all_orders[:3]: 
+                data_emissao_str = order.get('data', {}).get('dataEmissao')
+                total_val = order.get('total')
+                self.logger.info(f"  - Pedido ID: {order.get('id')}, DataEmissao: {data_emissao_str}, Total: R$ {total_val}")
+                
+            # Recalcula todos os KPIs com base em todos os pedidos encontrados no período
             self.sales_manager.recalculate_from_orders(all_orders)
         
             self.logger.info(f"Busca e Recálculo de KPIs concluído. Total de pedidos analisados: {len(all_orders)}.")
@@ -698,7 +707,7 @@ class AutomationOrchestrator:
             self.sales_manager.historic_count = 0 # Limpa se não encontrar nada
             self.sales_manager.daily_count = 0
             self.sales_manager.weekly_count = 0
-            self.logger.warning("Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
+            self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
 
 
     def _load_products_and_kits(self, access_token: str):
@@ -1409,11 +1418,46 @@ class WebServer:
 
         @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
+            """Processa webhooks do Bling e atualiza KPIs em tempo real com validação HMAC."""
+            
+            # 1. Recupera o payload bruto e o header de assinatura
+            payload = request.get_data()
+            signature_header = request.headers.get('X-Bling-Signature-256', '')
+
+            # 2. Válida o HMAC usando o CLIENT_SECRET
             try:
+                expected_signature = 'sha256=' + hmac.new(
+                    self.orchestrator.config.CLIENT_SECRET.encode(), # Usa CLIENT_SECRET da Config
+                    payload,
+                    hashlib.sha256
+                ).hexdigest()
+
+                if not hmac.compare_digest(signature_header, expected_signature):
+                    self.logger.warning(f"❌ Assinatura inválida no Webhook. Header: {signature_header}")
+                    return jsonify({"error": "Invalid signature"}), 401
+                    
+                self.logger.info("✅ Assinatura HMAC do Webhook validada com sucesso.")
+
+                # 3. Processa o JSON após a validação
                 data = request.get_json(silent=True)
-                logger.info(f"WEBHOOK RECEBIDO: {data}")
-            except Exception:
-                pass
+                if not data:
+                    return jsonify({"status": "ok"}), 200 # OK se não houver dados
+                
+                event_type = data.get('event', '')
+                
+                # CRUCIAL 4: Verifica Token e Aciona o recálculo
+                if not self.orchestrator.auth.is_authenticated():
+                    self.logger.warning("⚠️ Webhook recebido, mas token Bling não é válido. Ignorando recálculo.")
+                    return jsonify({"status": "ok", "note": "awaiting_auth"}), 200
+
+                if 'order' in event_type: 
+                    self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
+                    # Usa uma Thread para não bloquear a resposta do webhook enquanto o recálculo roda
+                    Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
+
+            except Exception as e:
+                self.logger.exception(f"Erro no webhook: {e}")
+                
             return jsonify({"status": "ok"}), 200
 
     def setup_websocket(self):
