@@ -3,8 +3,10 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.0)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
+- CORREÇÃO CRÍTICA: Lógica de parseamento de data em Pedidos de Venda para multi-payloads (API/Webhook).
+- Correção: Persistência dos KPIs para ambientes Multi-Worker (Gunicorn/Render).
 """
 
 import os
@@ -16,8 +18,8 @@ import logging.handlers
 import base64
 import secrets
 import argparse
-import hmac # NOVO: Necessário para a validação HMAC
-import hashlib # NOVO: Necessário para a validação HMAC
+import hmac
+import hashlib
 
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -147,13 +149,15 @@ class Config:
     # Arquivos
     TOKENS_FILE: Path = Path('tokens.json')
     COMPONENT_CONFIG_FILE: Path = Path('component_config.json')
+    SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
 
 # ============================================================================ 
 # 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
 # ============================================================================
 
-def load_tokens_safe(path="tokens.json"):
-    if not os.path.exists(path):
+def load_tokens_safe(path: Path | str = "tokens.json"):
+    if isinstance(path, str): path = Path(path)
+    if not path.exists():
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump({}, f)
@@ -165,16 +169,47 @@ def load_tokens_safe(path="tokens.json"):
             data = json.load(f) or {}
             return data
     except Exception as e:
-        logger.error(f"Erro lendo tokens.json: {e}")
+        logger.error(f"Erro lendo {path.name}: {e}")
         return {}
 
-def save_tokens(data):
+def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
+    if isinstance(path, str): path = Path(path)
     try:
-        with open("tokens.json", "w", encoding="utf-8") as file:
+        with open(path, "w", encoding="utf-8") as file:
             json.dump(data, file, indent=4, ensure_ascii=False)
         logger.info("Tokens salvos com sucesso.")
     except Exception as e:
         logger.error(f"Erro ao salvar tokens: {e}")
+
+def load_stats_safe(path: Path):
+    """Carrega as estatísticas de vendas de forma segura."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Converte a string ISO de volta para datetime
+            if data and 'last_recalculated' in data:
+                 data['last_recalculated'] = datetime.fromisoformat(data['last_recalculated'])
+            return data
+    except Exception as e:
+        logger.error(f"Erro lendo {path.name}: {e}")
+        return None
+
+def save_stats(data: Dict[str, Any], path: Path):
+    """Salva as estatísticas de vendas, convertendo datetime para string ISO."""
+    try:
+        # Cria uma cópia para evitar modificar o objeto original antes do dump
+        data_to_save = data.copy()
+        if 'last_recalculated' in data_to_save and isinstance(data_to_save['last_recalculated'], datetime):
+            data_to_save['last_recalculated'] = data_to_save['last_recalculated'].isoformat()
+
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(data_to_save, file, indent=4, ensure_ascii=False)
+        logger.info("Estatísticas de KPIs salvas com sucesso.")
+    except Exception as e:
+        logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
+
 
 def is_token_valid(token_data):
     if not token_data:
@@ -233,10 +268,10 @@ class BlingAPIError(Exception): pass
 class SalesManager:
     """
     Gerencia contadores de Pedidos de Venda Diárias, Semanais e o Histórico.
-    O cálculo é feito por recálculo completo baseado na data do pedido, ideal para
-    sistemas que não rodam 24/7.
+    Implementa persistência em arquivo para garantir consistência entre workers.
     """
     
+    config: Config
     lock: Lock = field(default_factory=Lock)
     
     # Contadores (serão redefinidos a cada recalculate)
@@ -247,9 +282,41 @@ class SalesManager:
     # Data da última atualização dos dados
     last_recalculated: datetime = field(default_factory=datetime.now)
 
+    def __post_init__(self):
+        # Carrega o estado persistido na inicialização
+        self._load_stats()
+
+
+    # NOVO: Carregamento do estado persistente
+    def _load_stats(self):
+        data = load_stats_safe(self.config.SALES_STATS_FILE)
+        if data:
+            with self.lock:
+                self.daily_count = data.get('daily', 0)
+                self.weekly_count = data.get('weekly', 0)
+                self.historic_count = data.get('historic', 0)
+                # Usa a data carregada ou a data de inicialização se o carregamento falhar
+                self.last_recalculated = data.get('last_recalculated', datetime.now())
+            logger.info(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
+        else:
+             logger.info("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
+
+    # NOVO: Método para obter o estado a ser salvo
+    def _get_state_for_save(self) -> Dict[str, Any]:
+         return {
+            "daily": self.daily_count,
+            "weekly": self.weekly_count,
+            "historic": self.historic_count,
+            "last_recalculated": self.last_recalculated,
+         }
+
+
     def get_stats(self) -> Dict[str, Any]:
         """Retorna todas as estatísticas em formato JSON para a API."""
         with self.lock:
+            # Garante que o worker que está lendo a API tem o estado mais recente
+            self._load_stats() # Tenta carregar do arquivo novamente
+            
             # Retorna o timestamp em formato ISO para o front
             return {
                 "daily": self.daily_count,
@@ -259,6 +326,7 @@ class SalesManager:
                 "last_update": self.last_recalculated.isoformat() 
             }
 
+    # MÉTODO CORRIGIDO (v4.0): Lida com múltiplos formatos de data/hora
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
         """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
         now = datetime.now()
@@ -271,49 +339,74 @@ class SalesManager:
         weekly = 0
         historic = 0
         
+        # O cálculo é feito fora do lock, apenas a atualização do estado é protegida.
+        for order in orders:
+            # CORREÇÃO CRÍTICA: Adiciona checagem de tipo
+            if not isinstance(order, dict):
+                logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
+                continue
+            
+            # FIX CRÍTICO: A data pode vir em DOIS formatos diferentes:
+            # 1. De /pedidos/vendas API: {'data': {'dataEmissao': '2025-12-12', 'horaEmissao': '14:30:00'}}
+            # 2. De Webhook/Logs: Pode ser string direta na chave 'data'
+                            
+            data_emissao_str = None
+                            
+            # Tenta Formato 1: Estrutura aninhada (API v3 padrão)
+            data_obj = order.get('data')
+            if isinstance(data_obj, dict):
+                data_emissao_str = data_obj.get('dataEmissao')
+                hora_emissao = data_obj.get('horaEmissao')
+            # Tenta Formato 2: String direta na chave 'data' (alguns webhooks)
+            elif isinstance(data_obj, str):
+                data_emissao_str = data_obj
+                hora_emissao = None
+                            
+            if not data_emissao_str:
+                # DEBUG: Loga se a data não foi encontrada
+                logger.debug(f"Pedido {order.get('id')} sem dataEmissao. Estrutura: {order.keys()}")
+                continue
+                            
+            try:
+                # Constrói a data/hora para comparação
+                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+                                    
+                # Se temos hora_emissao e ela é válida, adiciona ao datetime
+                if hora_emissao and isinstance(hora_emissao, str):
+                    try:
+                        parts = hora_emissao.split(':')
+                        if len(parts) == 3:
+                            h, m, s = map(int, parts)
+                            order_date = order_date.replace(hour=h, minute=m, second=s)
+                    except (ValueError, AttributeError):
+                        pass  # Se não conseguir parsear a hora, usa apenas data
+            except Exception as e:
+                # WARNING: Loga erro de parseamento
+                logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
+                continue
+
+            historic += 1  # Contagem de pedidos (dentro do intervalo buscado)
+                            
+            # O cálculo é feito sobre a data do pedido, garantindo precisão 24/7
+            if order_date >= last_week:
+                weekly += 1
+                            
+            if order_date >= yesterday:
+                daily += 1 
+
+        # ATUALIZAÇÃO SÓ DEPOIS DO CÁLCULO, DENTRO DO LOCK
         with self.lock:
-            for order in orders:
-                # CORREÇÃO CRÍTICA (AttributeError): Adiciona checagem de tipo
-                if not isinstance(order, dict):
-                    logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
-                    continue
-
-                # API V3: data de emissão vem em 'data' no objeto do pedido
-                data_emissao_str = order.get('data', {}).get('dataEmissao')
-                
-                if not data_emissao_str:
-                    continue
-                
-                try:
-                    # Constrói a data/hora para comparação
-                    order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-                    
-                    # Tenta incluir a hora do pedido, se disponível (para precisão de 24h)
-                    hora_emissao = order.get('data', {}).get('horaEmissao')
-                    if hora_emissao and len(hora_emissao.split(':')) == 3:
-                        h, m, s = map(int, hora_emissao.split(':'))
-                        order_date = order_date.replace(hour=h, minute=m, second=s)
-
-                except Exception:
-                    # Se falhar o parsing da hora, usa apenas a data
-                    order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d').replace(hour=0, minute=0, second=0)
-
-
-                historic += 1 # Contagem de pedidos (dentro do intervalo buscado)
-                
-                # O cálculo é feito sobre a data do pedido, garantindo precisão 24/7
-                if order_date >= last_week:
-                    weekly += 1
-                
-                if order_date >= yesterday:
-                    daily += 1 
-
             # Atualiza todos os contadores de uma vez
             self.daily_count = daily
             self.weekly_count = weekly
             self.historic_count = historic
             self.last_recalculated = now # Atualiza o tempo de processamento
-            logger.info(f"Estatísticas recalculadas com {len(orders)} pedidos: Diário={daily}, Semanal={weekly}, Histórico={historic}")
+            
+            # PERSISTE O ESTADO ATUAL
+            save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+            
+            logger.info(f"✅ Estatísticas recalculadas com {len(orders)} pedidos analisados: "
+                       f"Diário={daily}, Semanal={weekly}, Histórico={historic}")
 
 
 class ComponentConfigManager:
@@ -648,6 +741,7 @@ class AutomationOrchestrator:
             self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
             time.sleep(600) # 10 minutos (600 segundos)
 
+    # MÉTODO CORRIGIDO (v4.0): Inclui debug logs e lógica de recálculo
     def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
@@ -656,15 +750,11 @@ class AutomationOrchestrator:
             self.logger.warning("Token indisponível para buscar pedidos de venda.")
             return
 
-        # NOVO LOG: Informa que o filtro de situação foi removido para debug
         self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (SEM FILTRO DE SITUAÇÃO)...")
         
         # O período de busca deve cobrir o semanal (7 dias) + uma margem de segurança (9 dias)
         params = {
-            # FIX CRÍTICO: Removido 'situacao[id]' para debuggar a falha silenciosa. 
-            # A API deve retornar dados, e o SalesManager filtra pela data.
             'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
-            # Usaremos a paginação completa para garantir que todos os pedidos sejam carregados
             'pagina': 1,
             'limite': 50,
         }
@@ -694,19 +784,42 @@ class AutomationOrchestrator:
             self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
             
             # LOG DETALHADO DOS 3 PRIMEIROS PEDIDOS (para debug dos KPIs zerados)
-            for order in all_orders[:3]: 
-                data_emissao_str = order.get('data', {}).get('dataEmissao')
-                total_val = order.get('total')
-                self.logger.info(f"  - Pedido ID: {order.get('id')}, DataEmissao: {data_emissao_str}, Total: R$ {total_val}")
+            for idx, order in enumerate(all_orders[:3]):
+                # Extrai a data da mesma forma que recalculate_from_orders faz
+                data_obj = order.get('data')
                 
+                if isinstance(data_obj, dict):
+                    data_str = data_obj.get('dataEmissao', 'N/A')
+                    hora_str = data_obj.get('horaEmissao', 'N/A')
+                elif isinstance(data_obj, str):
+                    data_str = data_obj
+                    hora_str = "N/A"
+                else:
+                    data_str = "ERRO: tipo inesperado"
+                    hora_str = "N/A"
+                
+                total_val = order.get('total', 0)
+                self.logger.info(f"  [{idx+1}] ID: {order.get('id')}, "
+                               f"Data: {data_str}, Hora: {hora_str}, "
+                               f"Total: R$ {total_val}")
+            
             # Recalcula todos os KPIs com base em todos os pedidos encontrados no período
+            self.logger.info(f"🔄 Iniciando recalculate_from_orders com {len(all_orders)} pedidos...")
             self.sales_manager.recalculate_from_orders(all_orders)
         
-            self.logger.info(f"Busca e Recálculo de KPIs concluído. Total de pedidos analisados: {len(all_orders)}.")
+            self.logger.info(f"✅ Busca e Recálculo de KPIs concluído. "
+                           f"Resultados: Diário={self.sales_manager.daily_count}, "
+                           f"Semanal={self.sales_manager.weekly_count}, "
+                           f"Histórico={self.sales_manager.historic_count}")
         else:
-            self.sales_manager.historic_count = 0 # Limpa se não encontrar nada
-            self.sales_manager.daily_count = 0
-            self.sales_manager.weekly_count = 0
+            # FIX: Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
+            with self.sales_manager.lock:
+                self.sales_manager.historic_count = 0 
+                self.sales_manager.daily_count = 0
+                self.sales_manager.weekly_count = 0
+                self.sales_manager.last_recalculated = datetime.now()
+                save_stats(self.sales_manager._get_state_for_save(), self.config.SALES_STATS_FILE)
+            
             self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
 
 
@@ -835,7 +948,7 @@ if not config.REDIRECT_URI:
     pass
 
 # Instancia o SalesManager
-sales_manager = SalesManager() 
+sales_manager = SalesManager(config) 
 # Passa o SalesManager para o Orchestrator
 orchestrator = AutomationOrchestrator(config, sales_manager) 
 auth = orchestrator.auth
@@ -1285,11 +1398,11 @@ class WebServer:
                 "is_running": self.orchestrator.is_running
             })
 
-        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA RECALCULADO)
+        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA RECALCULADO E PERSISTIDO)
         @self.app.route("/api/sales/stats")
         def api_sales_stats():
             """Retorna os contadores Diário, Semanal e Histórico."""
-            # O sales_manager recalcula o Daily/Weekly baseado em 24h/7d na última execução do worker
+            # O sales_manager agora garante que o estado é lido do arquivo antes de retornar
             return jsonify(sales_manager.get_stats())
 
         @self.app.route("/api/all_products", methods=["GET"])
@@ -1453,6 +1566,7 @@ class WebServer:
                 if 'order' in event_type: 
                     self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
                     # Usa uma Thread para não bloquear a resposta do webhook enquanto o recálculo roda
+                    # A persistência em arquivo garante que o estado seja compartilhado entre processos
                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
 
             except Exception as e:
