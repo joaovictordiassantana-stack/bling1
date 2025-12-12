@@ -3,12 +3,13 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.5)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.6)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
 - CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
 - FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
 - FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
 - ALTERAÇÃO (v4.6): Bloco 'Pedidos Históricos' (Produtos/Vendas) alterado de 9 para 30 dias.
+- FIX SINTAXE (v4.6): Corrige 'SyntaxError: unterminated string literal' na função extract_image_url.
 """
 
 import os
@@ -135,6 +136,8 @@ class Config:
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI')
     if not REDIRECT_URI:
+        # NOTE: A aplicação vai falhar na inicialização se esta variável for crítica e não estiver definida,
+        # mas a falha será tratada no WebServer.setup_routes.
         pass
     
     # API
@@ -587,7 +590,29 @@ def extract_image_url(prod: dict, depth=0) -> Optional[str]:
             return val
 
     # 2. Tenta encontrar dentro de listas de mídia (padrão Bling V3)
-    for list_key in ["midia", "mid...
+    # A linha abaixo estava incompleta e causou o erro de SyntaxError na versão anterior.
+    for list_key in ["midia", "imagens"]: 
+        media_list = prod.get(list_key)
+        # O Bling V3 costuma aninhar imagens em um dicionário 'imagem' dentro de uma lista de 'midia'.
+        if isinstance(media_list, list):
+            for item in media_list:
+                if isinstance(item, dict) and 'imagem' in item and isinstance(item['imagem'], dict):
+                    url = item['imagem'].get('url')
+                    if url and isinstance(url, str) and url.startswith("http"):
+                        return url
+                elif isinstance(item, dict):
+                    # Tenta a URL diretamente no item (caso não esteja aninhado)
+                    url = item.get('url')
+                    if url and isinstance(url, str) and url.startswith("http"):
+                        return url
+    
+    # 3. Tenta campos aninhados (recursão, se for um produto complexo)
+    if 'produto' in prod and isinstance(prod['produto'], dict):
+        result = extract_image_url(prod['produto'], depth + 1)
+        if result:
+            return result
+            
+    return None
 
 # ============================================================================ 
 # 6. CLIENTE BLING API (REQUESTS)
@@ -765,7 +790,7 @@ class AutomationOrchestrator:
                 self.logger.warning("Token indisponível para buscar pedidos de venda.")
                 return
             
-            # >>> ALTERAÇÃO AQUI (9 para 30 dias) <<<
+            # >>> ALTERAÇÃO PARA 30 DIAS <<<
             self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
             params = { 
                 'dataEmissaoInicial': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
@@ -1245,7 +1270,7 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.5)
+# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
 # ============================================================================
 
 class WebServer:
@@ -1485,6 +1510,8 @@ class WebServer:
 
 def create_app() -> Flask:
     app = Flask(__name__)
+    # A instância do orchestrator deve ser global para ser acessível pelo Gunicorn/Flask
+    global orchestrator
     WebServer(app, orchestrator)
     return app
 
