@@ -556,7 +556,7 @@ class BlingAPIClient:
 
 
 # ============================================================================ 
-# 6. ORQUESTRADOR (ATUALIZADO COM LÓGICA DE VENDAS)
+# 6. ORQUESTRADOR (ATUALIZADO COM LÓGICA DE VENDAS E CACHE DE PRODUTOS)
 # ============================================================================
 
 class AutomationOrchestrator:
@@ -613,6 +613,7 @@ class AutomationOrchestrator:
                 self.check_and_refresh_token()
                 
                 # 2. Carrega dados estáticos do Bling (kits, produtos simples)
+                # Esta operação pode ser longa e bloqueadora
                 self.load_bling_products() 
                 
                 # 3. NOVO: Busca Pedidos de Venda e Atualiza as Estatísticas
@@ -635,6 +636,8 @@ class AutomationOrchestrator:
             self.logger.warning("Token indisponível para buscar pedidos de venda.")
             return
 
+        self.logger.info("Iniciando busca de pedidos de venda para atualização dos KPIs...")
+        
         # Status: 12 (Atendido/Faturado) e 2 (Em Andamento/Produção)
         status_ids = [12, 2] 
         
@@ -662,15 +665,19 @@ class AutomationOrchestrator:
                 
                 # O SalesManager só adiciona se o ID for maior que o último processado
                 is_new_sale = self.sales_manager.last_order_id < order_id
-                self.sales_manager.add_product_sales(product_count, order_id)
                 
                 if product_count > 0 and is_new_sale:
+                    # Chamar add_product_sales APENAS se for uma nova venda para evitar atualizações de last_order_id
+                    # para vendas sem produtos. O método gerencia a adição e o last_order_id.
+                    self.sales_manager.add_product_sales(product_count, order_id)
                     total_sales_count += product_count
             
             if total_sales_count > 0:
                  self.logger.info(f"Contabilizadas {total_sales_count} unidades de produtos em novos pedidos de venda.")
+            else:
+                 self.logger.info("Busca de pedidos de venda concluída. Nenhum novo pedido contabilizado.")
         else:
-            self.logger.warning("Nenhum pedido de venda encontrado com os filtros.")
+            self.logger.warning("Busca de pedidos de venda concluída. Nenhuma resposta da API.")
 
 
     def _load_products_and_kits(self, access_token: str):
@@ -760,15 +767,23 @@ class AutomationOrchestrator:
                 self.kits.append({
                     "id": p_id,
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"),
+                    "produto": p.get("nome"), # Chave 'produto'
                     "imagemURL": img_url,
                     "componentes": comps_formatados
                 })
             else:
                 # É produto normal
-                # Injeta a imagem extraída para garantir que o front receba
-                p['imagemURL'] = img_url
-                self.products.append(p)
+                # CORREÇÃO: Padroniza o nome para 'produto' para o front-end
+                self.products.append({
+                    "id": p.get("id"),
+                    "sku": p.get("codigo"),
+                    "produto": p.get("nome"), # Chave 'produto'
+                    "imagemURL": img_url,
+                    "tipo": p.get("tipo"),
+                    "situacao": p.get("situacao"),
+                    "preco": p.get("preco"),
+                    "estoque": p.get("estoqueAtual", 0)
+                })
 
         self.logger.info(f"Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
 
@@ -1036,7 +1051,7 @@ DASHBOARD_TEMPLATE = """
                                     
                                     <div class="flex-grow-1">
                                         <div class="d-flex w-100 justify-content-between">
-                                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+                                            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
                                             <small>${p.sku || 'N/D'}</small>
                                         </div>
         
@@ -1067,7 +1082,7 @@ DASHBOARD_TEMPLATE = """
             }
         };
 
-        // Carregar Kits
+        // Carregar Kits e Produtos Simples (Todos Produtos)
         async function loadKits() {
             const div = document.getElementById('kits-list');
             const authRequiredDiv = document.getElementById('auth-required-kits');
@@ -1079,10 +1094,12 @@ DASHBOARD_TEMPLATE = """
             }
             
             authRequiredDiv.classList.add('hidden');
-            div.innerHTML = '<div class="alert alert-info">Carregando dados... Pode demorar, pois estamos buscando detalhes de Kits.</div>';
+            // MENSAGEM AJUSTADA: avisa que pode demorar
+            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
             
             try {
-                const r = await fetch(`${API}/kits`);
+                // CORREÇÃO: Endpoint agora retorna KITS + PRODUTOS SIMPLES
+                const r = await fetch(`${API}/kits`); 
                 
                 if (r.status === 401) {
                     div.innerHTML = '';
@@ -1099,7 +1116,7 @@ DASHBOARD_TEMPLATE = """
                     <th>IMG</th>
                     <th>SKU</th>
                     <th>Nome</th>
-                    <th>Componentes</th>
+                    <th>Componentes / Tipo</th>
                 </tr>
                 </thead>
                 <tbody>
@@ -1112,29 +1129,28 @@ DASHBOARD_TEMPLATE = """
                         : '<span class="text-muted">-</span>';
 
                     let comps = '';
+                    // Se o item tem componentes, é um KIT
                     if (k.componentes && k.componentes.length > 0) {
                         const componentes_validos = k.componentes;
                         
                         if (componentes_validos.length > 0) {
-                            comps = componentes_validos
+                            comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
                                 .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                                 .join('<br>');
                         } else {
-                            comps = '<span class="text-info" style="font-size:0.8em">Kit sem componentes detalhados na API.</span>';
+                            comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
                         }
                     } else {
-                        if (k.produto && k.produto.toLowerCase().includes('kit')) {
-                             comps = '<span class="text-info" style="font-size:0.8em">Provável Kit, mas sem componentes listados.</span>';
-                        } else {
-                             comps = '<span class="text-muted" style="font-size:0.8em">Produto Simples</span>';
-                        }
+                        // Produto Simples
+                        comps = `<span class="text-muted" style="font-size:0.8em">Produto Simples (Estoque: ${k.estoque || 'N/D'})</span>`;
                     }
 
+                    // CORREÇÃO: Agora usa k.produto (chave unificada)
                     html += `
                         <tr>
                             <td style="width:60px">${imgHtml}</td>
                             <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-                            <td>${k.produto}</td>
+                            <td>${k.produto || 'N/D'}</td>
                             <td>${comps}</td>
                         </tr>
                     `;
@@ -1315,6 +1331,7 @@ class WebServer:
                     "id": p["id"],
                     "sku": p.get("sku"),
                     "nome": p.get("nome"),
+                    "produto": p.get("nome"), # Chave unificada para o front-end
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
                     "preco": p.get("preco"),
@@ -1337,10 +1354,12 @@ class WebServer:
             
             return jsonify(final_results)
 
+        # CORREÇÃO: Rota /api/kits alterada para retornar Kits E Produtos Simples do cache.
         @self.app.route('/api/kits', methods=["GET"])
         @token_required
         def api_kits(token):
-            return jsonify(self.orchestrator.get_all_kits())
+            """Retorna todos os produtos (kits e simples) carregados em cache."""
+            return jsonify(self.orchestrator.get_all_kits() + self.orchestrator.get_all_products())
 
         @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
