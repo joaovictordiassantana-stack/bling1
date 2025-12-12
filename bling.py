@@ -3,10 +3,12 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.0)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.3)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
-- CORREÇÃO CRÍTICA: Lógica de parseamento de data em Pedidos de Venda para multi-payloads (API/Webhook).
-- Correção: Persistência dos KPIs para ambientes Multi-Worker (Gunicorn/Render).
+- MELHORIA DASHBOARD: Mensagem clara na dashboard quando falta autenticação para KPIs (v4.3).
+- CORREÇÃO CRÍTICA: Sincronização de Recálculo de Vendas para Webhooks Concorrentes (v4.2).
+- FIX DE LOG: Reduz nível de log de verificação de KPI para evitar spam (v4.1).
+- Correção: Persistência dos KPIs para ambientes Multi-Worker (Gunicorn/Render) (v4.0).
 """
 
 import os
@@ -88,8 +90,9 @@ def setup_logging():
     global memory_handler
     memory_handler = InMemoryLogHandler()
     
+    # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO) 
     
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=1024*1024*5, backupCount=5, encoding='utf-8'
@@ -210,13 +213,13 @@ def save_stats(data: Dict[str, Any], path: Path):
     except Exception as e:
         logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
 
-
 def is_token_valid(token_data):
     if not token_data:
         return False
     expires_at = token_data.get("expires_at")
     if not expires_at:
         return False
+    # Checa se o tempo atual é menor que o tempo de expiração menos uma margem de segurança de 20 segundos
     return time.time() < float(expires_at) - 20
 
 # --- FUNÇÃO PARA BUSCA DE PRODUTOS (CORRIGIDO PARA V3) ---
@@ -267,7 +270,7 @@ class BlingAPIError(Exception): pass
 @dataclass
 class SalesManager:
     """
-    Gerencia contadores de Pedidos de Venda Diárias, Semanais e o Histórico.
+    Gerencia contadores de Pedidos de Venda Diárias, Semanaais e o Histórico.
     Implementa persistência em arquivo para garantir consistência entre workers.
     """
     
@@ -287,7 +290,7 @@ class SalesManager:
         self._load_stats()
 
 
-    # NOVO: Carregamento do estado persistente
+    # NOVO: Carregamento do estado persistente (FIX DE LOG)
     def _load_stats(self):
         data = load_stats_safe(self.config.SALES_STATS_FILE)
         if data:
@@ -299,7 +302,9 @@ class SalesManager:
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
             logger.info(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
         else:
-             logger.info("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
+             # FIX CRÍTICO: Mudar de INFO para DEBUG para evitar spam na interface em cada poll de status
+             logger.debug("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
+
 
     # NOVO: Método para obter o estado a ser salvo
     def _get_state_for_save(self) -> Dict[str, Any]:
@@ -686,6 +691,7 @@ class AutomationOrchestrator:
         self.products: List[Dict[str, Any]] = []
         self.is_running: bool = False
         self.lock = Lock()
+        self.recalculation_lock = Lock() # NOVO: Lock para sincronizar o recálculo de vendas
         self.logger = logger
     
     # Renomeado e refatorado para ser o método de cache do worker
@@ -741,86 +747,97 @@ class AutomationOrchestrator:
             self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
             time.sleep(600) # 10 minutos (600 segundos)
 
-    # MÉTODO CORRIGIDO (v4.0): Inclui debug logs e lógica de recálculo
+    # MÉTODO CORRIGIDO (v4.2): Adiciona debounce lock
     def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
-        token = self.auth.get_valid_token()
-        if not token:
-            self.logger.warning("Token indisponível para buscar pedidos de venda.")
+        # NOVO: Previne execuções concorrentes (debounce)
+        if not self.recalculation_lock.acquire(blocking=False):
+            self.logger.warning("Recálculo de KPIs já em andamento. Ignorando nova solicitação.")
             return
 
-        self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (SEM FILTRO DE SITUAÇÃO)...")
-        
-        # O período de busca deve cobrir o semanal (7 dias) + uma margem de segurança (9 dias)
-        params = {
-            'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
-            'pagina': 1,
-            'limite': 50,
-        }
-        
-        all_orders = []
-        page = 1
-        
-        while True:
-            current_params = params.copy()
-            current_params['pagina'] = page
+        try:
+            token = self.auth.get_valid_token()
+            if not token:
+                self.logger.warning("Token indisponível para buscar pedidos de venda.")
+                return
+
+            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (SEM FILTRO DE SITUAÇÃO)...")
             
-            response_data = self.api_client.get_sales_orders(token, **current_params)
+            # O período de busca deve cobrir o semanal (7 dias) + uma margem de segurança (9 dias)
+            params = {
+                'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
+                'pagina': 1,
+                'limite': 50,
+            }
             
-            if response_data and 'data' in response_data:
-                items = response_data['data']
-                all_orders.extend(items)
-                
-                if len(items) < 50:
-                    break
-                
-                page += 1
-                time.sleep(0.5) # Pequeno delay entre páginas
-            else:
-                break
-                
-        if all_orders:
-            self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
+            all_orders = []
+            page = 1
             
-            # LOG DETALHADO DOS 3 PRIMEIROS PEDIDOS (para debug dos KPIs zerados)
-            for idx, order in enumerate(all_orders[:3]):
-                # Extrai a data da mesma forma que recalculate_from_orders faz
-                data_obj = order.get('data')
+            while True:
+                current_params = params.copy()
+                current_params['pagina'] = page
                 
-                if isinstance(data_obj, dict):
-                    data_str = data_obj.get('dataEmissao', 'N/A')
-                    hora_str = data_obj.get('horaEmissao', 'N/A')
-                elif isinstance(data_obj, str):
-                    data_str = data_obj
-                    hora_str = "N/A"
+                response_data = self.api_client.get_sales_orders(token, **current_params)
+                
+                if response_data and 'data' in response_data:
+                    items = response_data['data']
+                    all_orders.extend(items)
+                    
+                    if len(items) < 50:
+                        break
+                    
+                    page += 1
+                    time.sleep(0.5) # Pequeno delay entre páginas
                 else:
-                    data_str = "ERRO: tipo inesperado"
-                    hora_str = "N/A"
+                    break
+                    
+            if all_orders:
+                self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
                 
-                total_val = order.get('total', 0)
-                self.logger.info(f"  [{idx+1}] ID: {order.get('id')}, "
-                               f"Data: {data_str}, Hora: {hora_str}, "
-                               f"Total: R$ {total_val}")
+                # LOG DETALHADO DOS 3 PRIMEIROS PEDIDOS (para debug dos KPIs zerados)
+                for idx, order in enumerate(all_orders[:3]):
+                    # Extrai a data da mesma forma que recalculate_from_orders faz
+                    data_obj = order.get('data')
+                    
+                    if isinstance(data_obj, dict):
+                        data_str = data_obj.get('dataEmissao', 'N/A')
+                        hora_str = data_obj.get('horaEmissao', 'N/A')
+                    elif isinstance(data_obj, str):
+                        data_str = data_obj
+                        hora_str = "N/A"
+                    else:
+                        data_str = "ERRO: tipo inesperado"
+                        hora_str = "N/A"
+                    
+                    total_val = order.get('total', 0)
+                    self.logger.info(f"  [{idx+1}] ID: {order.get('id')}, "
+                                   f"Data: {data_str}, Hora: {hora_str}, "
+                                   f"Total: R$ {total_val}")
+                
+                # Recalcula todos os KPIs com base em todos os pedidos encontrados no período
+                self.logger.info(f"🔄 Iniciando recalculate_from_orders com {len(all_orders)} pedidos...")
+                self.sales_manager.recalculate_from_orders(all_orders)
             
-            # Recalcula todos os KPIs com base em todos os pedidos encontrados no período
-            self.logger.info(f"🔄 Iniciando recalculate_from_orders com {len(all_orders)} pedidos...")
-            self.sales_manager.recalculate_from_orders(all_orders)
-        
-            self.logger.info(f"✅ Busca e Recálculo de KPIs concluído. "
-                           f"Resultados: Diário={self.sales_manager.daily_count}, "
-                           f"Semanal={self.sales_manager.weekly_count}, "
-                           f"Histórico={self.sales_manager.historic_count}")
-        else:
-            # FIX: Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
-            with self.sales_manager.lock:
-                self.sales_manager.historic_count = 0 
-                self.sales_manager.daily_count = 0
-                self.sales_manager.weekly_count = 0
-                self.sales_manager.last_recalculated = datetime.now()
-                save_stats(self.sales_manager._get_state_for_save(), self.config.SALES_STATS_FILE)
-            
-            self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
+                self.logger.info(f"✅ Busca e Recálculo de KPIs concluído. "
+                               f"Resultados: Diário={self.sales_manager.daily_count}, "
+                               f"Semanal={self.sales_manager.weekly_count}, "
+                               f"Histórico={self.sales_manager.historic_count}")
+            else:
+                # FIX: Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
+                with self.sales_manager.lock:
+                    self.sales_manager.historic_count = 0 
+                    self.sales_manager.daily_count = 0
+                    self.sales_manager.weekly_count = 0
+                    self.sales_manager.last_recalculated = datetime.now()
+                    save_stats(self.sales_manager._get_state_for_save(), self.config.SALES_STATS_FILE)
+                
+                self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
+        except Exception as e:
+            self.logger.exception(f"Erro no processamento de pedidos de venda: {e}")
+        finally:
+            # Garante que o lock é liberado, mesmo em caso de erro.
+            self.recalculation_lock.release() 
 
 
     def _load_products_and_kits(self, access_token: str):
@@ -1132,24 +1149,32 @@ DASHBOARD_TEMPLATE = """
             document.getElementById('auth-link').href = dStatus.auth_url;
 
             // 2. Update Sales Stats (KPIs)
-            const rSalesStats = await fetch(API + '/sales/stats');
+            if (isAuthenticated) {
+                const rSalesStats = await fetch(API + '/sales/stats');
             
-            if (rSalesStats.ok) {
-                const dSalesStats = await rSalesStats.json();
-            
-                document.getElementById('kpi-daily').textContent = dSalesStats.daily;
-                document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
-                document.getElementById('kpi-historic').textContent = dSalesStats.historic;
-    
-                // Atualiza o tempo do último recálculo
-                document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+                if (rSalesStats.ok) {
+                    const dSalesStats = await rSalesStats.json();
+                
+                    document.getElementById('kpi-daily').textContent = dSalesStats.daily;
+                    document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
+                    document.getElementById('kpi-historic').textContent = dSalesStats.historic;
+        
+                    // Atualiza o tempo do último recálculo
+                    document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
+                } else {
+                    // Se o status for OK (mas a API falhou por outro motivo)
+                    document.getElementById('kpi-daily').textContent = 0;
+                    document.getElementById('kpi-weekly').textContent = 0;
+                    document.getElementById('kpi-historic').textContent = 0;
+                    document.getElementById('last-recalculated').textContent = 'ERRO API';
+                }
             } else {
-                // Limpa os dados em caso de falha (provavelmente por falta de autenticação)
-                document.getElementById('kpi-daily').textContent = 0;
-                document.getElementById('kpi-weekly').textContent = 0;
-                document.getElementById('kpi-historic').textContent = 0;
-                document.getElementById('last-recalculated').textContent = 'N/D';
+                 // Limpa os dados porque a autenticação falhou
+                 document.getElementById('kpi-daily').textContent = 0;
+                 document.getElementById('kpi-weekly').textContent = 0;
+                 document.getElementById('kpi-historic').textContent = 0;
+                 document.getElementById('last-recalculated').textContent = 'N/D - AUTENTIQUE';
             }
 
 
@@ -1567,6 +1592,7 @@ class WebServer:
                     self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
                     # Usa uma Thread para não bloquear a resposta do webhook enquanto o recálculo roda
                     # A persistência em arquivo garante que o estado seja compartilhado entre processos
+                    # Chamada ao método protegido pelo novo lock.
                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
 
             except Exception as e:
