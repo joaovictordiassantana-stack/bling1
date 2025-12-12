@@ -939,24 +939,23 @@ class AutomationOrchestrator:
 # 7. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.5)
 # ============================================================================
 
-# O template utiliza Bootstrap 5.3 para o design 'premium'
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bling Automação Premium</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <title>Painel Bling - Sw Moveis</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-        body {
-            background-color: #f8f9fa;
-        }
-        .navbar {
-            background-color: #343a40 !important; /* Cor escura para a navbar */
-            border-bottom: 3px solid #0d6efd;
-        }
-        /* Custom CSS para os KPIs e esconder elementos até autenticação/debug */
+        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
+        .log-level-INFO { color: #4ec9b0; }
+        .log-level-WARNING { color: #dcdcaa; }
+        .log-level-ERROR { color: #f48771; }
+        .log-level-DEBUG { color: #569cd6; } /* Adicionado para debug */
         .hidden { display: none; }
         .kpi-card { border-left: 5px solid; transition: background-color 0.5s ease; }
         .kpi-daily { border-left-color: #0d6efd; }
@@ -974,248 +973,211 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
     </nav>
+
     <div class="container mt-4">
         <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
         <div class="row mb-4">
-            <div class="col-md-4">
-                <div class="card p-3 text-center kpi-card kpi-daily">
-                    <h5>Pedidos Diários (Últimas 24h)</h5>
-                    <h3 id="kpi-daily" class="text-primary">0</h3>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card p-3 text-center kpi-card kpi-weekly">
-                    <h5>Pedidos Semanais (Últimos 7 dias)</h5>
-                    <h3 id="kpi-weekly" class="text-warning">0</h3>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card p-3 text-center kpi-card kpi-historic">
-                    <h5>Pedidos Históricos (Últimos 30 dias)</h5>
-                    <h3 id="kpi-historic" class="text-success">0</h3>
-                </div>
-            </div>
-            <small class="text-muted mt-2"> Último Recálculo de KPIs: <span id="last-recalculated">N/D</span> </small>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-daily">
+                     <h5>Pedidos Diários (Últimas 24h)</h5>
+                     <h3 id="kpi-daily" class="text-primary">0</h3>
+                 </div>
+             </div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-weekly">
+                     <h5>Pedidos Semanais (Últimos 7 dias)</h5>
+                     <h3 id="kpi-weekly" class="text-warning">0</h3>
+                 </div>
+             </div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-historic">
+                     <h5>Pedidos Históricos (Últimos 9 dias)</h5>
+                     <h3 id="kpi-historic" class="text-success">0</h3>
+                 </div>
+             </div>
+             <small class="text-muted mt-2">
+                Último Recálculo de KPIs: <span id="last-recalculated">N/D</span>
+            </small>
         </div>
-        
-        <div id="content-tabs" class="hidden">
-            <ul class="nav nav-tabs" id="mainTab" role="tablist">
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link active" id="products-tab" data-bs-toggle="tab" data-bs-target="#products-pane" type="button" role="tab">🔍 Buscar Produtos</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits-pane" type="button" role="tab" onclick="loadKits()">📦 Kits/Estruturas</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="config-tab" data-bs-toggle="tab" data-bs-target="#config-pane" type="button" role="tab">⚙️ Configurações</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs-pane" type="button" role="tab" onclick="connectLogs()">📝 Logs</button>
-                </li>
-            </ul>
 
-            <div class="tab-content pt-3" id="mainTabContent">
-                <div class="tab-pane fade show active" id="products-pane" role="tabpanel" tabindex="0">
-                    <div class="input-group mb-3">
-                        <input type="text" class="form-control" placeholder="Buscar por SKU ou Nome do Produto/Kit..." id="search-input" onkeyup="if(event.key === 'Enter') performSearch()">
-                        <button class="btn btn-primary" type="button" onclick="performSearch()">Buscar</button>
-                    </div>
-                    <div id="search-results">
-                        <div class="alert alert-info">Digite o SKU ou Nome e clique em Buscar.</div>
-                    </div>
-                </div>
-
-                <div class="tab-pane fade" id="kits-pane" role="tabpanel" tabindex="0">
-                    <p class="text-muted">Lista de Kits/Produtos com Estrutura (Sincronizado automaticamente). Componentes são buscados em tempo real ao expandir.</p>
-                    <div id="kits-content">
-                        <div class="alert alert-info">Carregando Kits...</div>
-                    </div>
-                </div>
-
-                <div class="tab-pane fade" id="config-pane" role="tabpanel" tabindex="0">
-                    <h4>Configurações Gerais (Em desenvolvimento)</h4>
-                    <p class="text-muted">Aguardando a implementação de persistência de configurações editáveis.</p>
-                </div>
-
-                <div class="tab-pane fade" id="logs-pane" role="tabpanel" tabindex="0">
-                    <div class="card">
-                        <div class="card-header d-flex justify-content-between">
-                            Logs em Tempo Real
-                            <span class="badge bg-secondary" id="ws-status">Desconectado</span>
-                        </div>
-                        <div class="card-body" style="height: 400px; overflow-y: scroll; background-color: #212529; color: #f8f9fa;">
-                            <pre id="logs-content" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8rem;"></pre>
-                        </div>
-                    </div>
-                </div>
+        <div class="card mb-4">
+            <div class="card-header">Logs em Tempo Real</div>
+            <div class="card-body bg-dark p-0">
+                <div id="logs-content" class="log-box"></div>
             </div>
+        </div>
+
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Todos Produtos</button></li>
+        </ul>
+
+            <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
+            <div class="tab-pane fade show active" id="search">
+                <div class="input-group mb-3">
+                    <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
+                    <button class="btn btn-primary" id="btn-search">Buscar</button>
+                </div>
+                <div id="search-results"></div>
+            </div>
+
+            <div class="tab-pane fade" id="kits">
+                    <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
+                    <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
+                    <div id="kits-list"></div>
+                </div>
+                <div id="auth-required-kits" class="alert alert-warning hidden">
+                    É necessário autenticar com o Bling para visualizar os Produtos.
+                </div>
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
-
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        const API = '/api';
-        
-        // Função utilitária para formatar a data/hora
-        function formatDateTime(isoString) {
-            if (!isoString) return 'N/D';
-            try {
-                const date = new Date(isoString);
-                // Formato Brasileiro: DD/MM/AAAA HH:MM:SS
-                return date.toLocaleDateString('pt-BR', {
-                    year: 'numeric', month: '2-digit', day: '2-digit',
-                    hour: '2-digit', minute: '2-digit', second: '2-digit',
-                    hour12: false
-                });
-            } catch {
-                return isoString;
-            }
+    const API = '/api';
+    
+    function formatLog(log) {
+        return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
+    }
+    
+    // Função para formatar o tempo da última venda (hora/minuto)
+    function formatDateTime(isoString) {
+        if (!isoString || isoString === 'N/D') return 'N/D';
+        try {
+             const date = new Date(isoString);
+             const now = new Date();
+             const isToday = date.toDateString() === now.toDateString();
+             
+             if (isToday) {
+                 return date.toLocaleTimeString('pt-BR'); 
+             } else {
+                 return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); 
+             }
+        } catch (e) {
+            return 'N/D';
         }
-        
-        // Log Formatting (Para Logs via WebSocket)
-        function formatLog(log) {
-            const levelClass = log.level === 'ERROR' ? 'text-danger' : 
-                               log.level === 'WARNING' ? 'text-warning' : 
-                               log.level === 'INFO' ? 'text-info' : 
-                               'text-secondary';
-            return `<div class="${levelClass}">[${log.timestamp.split('T')[1].split('.')[0]}] ${log.message}</div>`;
+    }
+
+    // WebSocket Logs
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+    ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        const box = document.getElementById('logs-content');
+        if(data.logs) {
+            data.logs.forEach(l => box.innerHTML += formatLog(l));
+            box.scrollTop = box.scrollHeight;
         }
-
-        // WebSocket de Logs
-        function connectLogs() {
-            const wsStatus = document.getElementById('ws-status');
-            const box = document.getElementById('logs-content');
-
-            // Se o WebSocket já estiver aberto ou tentando, não faz nada
-            if (wsStatus.textContent !== 'Desconectado') return;
+    }
+    
+    let isAuthenticated = false;
+    
+    // Função para atualizar os KPIs (chamada via polling E via WebSocket)
+    function updateKpis(dSalesStats) {
+        document.getElementById('kpi-daily').textContent = dSalesStats.daily;
+        document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
+        document.getElementById('kpi-historic').textContent = dSalesStats.historic;
+        document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+    }
+    
+    async function checkStatus() {
+        try {
+            // 1. Check Auth Status
+            const rStatus = await fetch(API + '/status');
+            const dStatus = await rStatus.json();
+            const badge = document.getElementById('status-badge');
             
-            wsStatus.textContent = 'Conectando...';
-
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+            isAuthenticated = dStatus.authenticated;
             
-            ws.onopen = () => {
-                wsStatus.textContent = 'Conectado';
-                wsStatus.className = 'badge bg-success';
-                // Puxa os logs iniciais
-                fetch(API + '/logs')
-                    .then(r => r.json())
-                    .then(data => {
-                        box.innerHTML = ''; // Limpa antes de carregar o histórico
-                        data.logs.forEach(l => box.innerHTML += formatLog(l));
-                        box.scrollTop = box.scrollHeight;
-                    })
+            if(isAuthenticated) {
+                badge.className = 'badge bg-success me-2';
+                badge.textContent = 'Online';
+                document.getElementById('auth-link').classList.add('d-none');
+                document.getElementById('content-tabs').classList.remove('hidden');
+            } else {
+                badge.className = 'badge bg-danger me-2';
+                badge.textContent = 'Offline';
+                document.getElementById('auth-link').classList.remove('d-none');
+                document.getElementById('content-tabs').classList.add('hidden');
             }
+            document.getElementById('auth-link').href = dStatus.auth_url;
+
+            // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
+            if (isAuthenticated) {
+                const rSalesStats = await fetch(API + '/sales/stats');
             
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                if(data.logs) {
-                    data.logs.forEach(l => box.innerHTML += formatLog(l));
-                    box.scrollTop = box.scrollHeight;
-                }
-            }
-
-            ws.onerror = ws.onclose = () => {
-                wsStatus.textContent = 'Desconectado';
-                wsStatus.className = 'badge bg-danger';
-                // Tenta reconectar a cada 5 segundos se a aba de logs estiver ativa
-                if(document.getElementById('logs-tab').classList.contains('active')) {
-                    setTimeout(connectLogs, 5000);
-                }
-            }
-        }
-        
-        let isAuthenticated = false;
-
-        // Função para atualizar os KPIs (chamada via polling E via WebSocket)
-        function updateKpis(dSalesStats) {
-            document.getElementById('kpi-daily').textContent = dSalesStats.daily;
-            document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
-            document.getElementById('kpi-historic').textContent = dSalesStats.historic;
-            document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
-        }
-
-        // WebSocket de KPIs (para real-time)
-        function connectKpiWs() {
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            // NOTA: Conecta-se ao WS de logs, mas o backend envia os KPIs via callback
-            const ws = new WebSocket(`${proto}://${window.location.host}/ws/kpis`);
-            
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                if (data.kpi_update) {
-                    updateKpis(data.kpi_update);
-                }
-            }
-
-            ws.onerror = ws.onclose = () => {
-                // Tenta reconectar em 5 segundos
-                setTimeout(connectKpiWs, 5000);
-            }
-        }
-
-        async function checkStatus() {
-            try {
-                // 1. Check Auth Status
-                const rStatus = await fetch(API + '/status');
-                const dStatus = await rStatus.json();
-                
-                const badge = document.getElementById('status-badge');
-                isAuthenticated = dStatus.authenticated;
-                
-                if(isAuthenticated) {
-                    badge.className = 'badge bg-success me-2';
-                    badge.textContent = 'Online';
-                    document.getElementById('auth-link').classList.add('d-none');
-                    document.getElementById('content-tabs').classList.remove('hidden');
+                if (rSalesStats.ok) {
+                    const dSalesStats = await rSalesStats.json();
+                    updateKpis(dSalesStats); // Usa a função de atualização
                 } else {
-                    badge.className = 'badge bg-danger me-2';
-                    badge.textContent = 'Offline';
-                    document.getElementById('auth-link').classList.remove('d-none');
-                    document.getElementById('content-tabs').classList.add('hidden');
+                    document.getElementById('kpi-daily').textContent = 0;
+                    document.getElementById('kpi-weekly').textContent = 0;
+                    document.getElementById('kpi-historic').textContent = 0;
+                    document.getElementById('last-recalculated').textContent = 'ERRO API';
                 }
-                
-                document.getElementById('auth-link').href = dStatus.auth_url;
-                
-                // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
-                if (isAuthenticated) {
-                    const rSalesStats = await fetch(API + '/sales/stats');
-                    if (rSalesStats.ok) {
-                        const dSalesStats = await rSalesStats.json();
-                        updateKpis(dSalesStats); // Usa a função de atualização
-                    } else {
-                        document.getElementById('kpi-daily').textContent = 0;
-                        document.getElementById('kpi-weekly').textContent = 0;
-                        document.getElementById('kpi-historic').textContent = 0;
-                        document.getElementById('last-recalculated').textContent = 'Erro';
-                    }
-                }
-                
-            } catch(e) {
-                console.error("Erro ao verificar status:", e);
-                // Falha silenciosa
-            } finally {
-                // Polling a cada 30 segundos (principalmente para atualizar os KPIs caso o WS falhe)
-                setTimeout(checkStatus, 30000); 
+            } else {
+                 document.getElementById('kpi-daily').textContent = 0;
+                 document.getElementById('kpi-weekly').textContent = 0;
+                 document.getElementById('kpi-historic').textContent = 0;
+                 document.getElementById('last-recalculated').textContent = 'N/D - AUTENTIQUE';
             }
-        }
 
-        // Função de busca de produtos
-        const performSearch = async () => {
-            if (!isAuthenticated) { 
-                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar para realizar buscas.</div>';
+
+        } catch (e) {
+            console.error("Erro ao checar status ou stats:", e);
+        }
+    }
+    
+    checkStatus();
+    setInterval(checkStatus, 5000);
+    
+    // NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+    const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+    
+    wsKpi.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        
+        if (data.type === 'kpi_update') {
+            const stats = data.data;
+            console.log("📊 KPI atualizado em tempo real:", stats);
+            
+            // Atualiza a dashboard imediatamente usando a função comum
+            updateKpis(stats);
+            
+            // Animação de atualização (opcional, mas visual)
+            const cards = document.querySelectorAll('.kpi-card');
+            cards.forEach(card => {
+                card.style.backgroundColor = '#e8f5e9';
+                setTimeout(() => {
+                    card.style.backgroundColor = '';
+                }, 500);
+            });
+        }
+    };
+    
+    wsKpi.onerror = (e) => {
+        console.error("Erro WebSocket KPI:", e);
+    };
+    
+    wsKpi.onclose = () => {
+        console.log("WebSocket KPI desconectado. Reconectando em 5s...");
+        setTimeout(() => {
+            // Tenta reconectar (recarregar a página é a forma mais simples)
+            location.reload();
+        }, 5000);
+    };
+
+
+    const btnSearch = document.getElementById('btn-search');
+    btnSearch.onclick = async () => {
+            if (!isAuthenticated) {
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
                 return;
             }
             
             const q = document.getElementById('search-input').value;
             const div = document.getElementById('search-results');
-            
-            if (q.length < 3) {
-                div.innerHTML = '<div class="alert alert-warning">Digite ao menos 3 caracteres para buscar.</div>';
-                return;
-            }
-
             div.innerHTML = 'Buscando...';
             
             try {
@@ -1226,7 +1188,7 @@ DASHBOARD_TEMPLATE = """
                     checkStatus();
                     return;
                 }
-                
+
                 const data = await r.json();
                 
                 if(!data.length) {
@@ -1236,117 +1198,123 @@ DASHBOARD_TEMPLATE = """
                 
                 let html = '<div class="list-group">';
                 data.forEach(p => {
-                    // Determina se é Kit para usar o Collapse
-                    const isKit = p.componentes && p.componentes.length > 0;
-                    const collapseId = `collapse-${p.id}`;
-
-                    html += `
-                    <div class="list-group-item">
-                        <div class="d-flex align-items-center ${isKit ? 'cursor-pointer' : ''}" ${isKit ? `data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}"` : ''}>
-                            <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
-                            <div class="flex-grow-1">
-                                <div class="d-flex w-100 justify-content-between">
-                                    <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                    <small class="text-secondary">${p.sku || 'N/D'}</small>
+                        html += `
+                            <div class="list-group-item">
+                                <div class="d-flex">
+                                    <img src="${p.imagemURL || ''}" 
+                                         style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1"
+                                         onerror="this.style.display='none'">
+                                    
+                                    <div class="flex-grow-1">
+                                        <div class="d-flex w-100 justify-content-between">
+                                            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                            <small>${p.sku || 'N/D'}</small>
+                                        </div>
+        
+                                        <p class="mb-1">${p.descricaoCurta || ''}</p>
+        
+                                        <small class="text-muted d-block">
+                                            <b>Estoque:</b> ${p.estoque}  
+                                            <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                        </small>
+        
+                                        ${p.componentes && p.componentes.length > 0 ? `
+                                            <div class="mt-2">
+                                                <b>Componentes:</b><br>
+                                                ${p.componentes.map(c => 
+                                                    `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
+                                                ).join("<br>")}
+                                            </div>
+                                        ` : ""}
+                                    </div>
                                 </div>
-                                <p class="mb-1 text-muted">${p.descricaoCurta || ''}</p>
-                                <small class="text-muted d-block">
-                                    <b>Estoque:</b> ${p.estoque} 
-                                    <b style="margin-left:10px;">Tipo:</b> ${p.tipo} 
-                                    <b style="margin-left:10px;">Situação:</b> ${p.situacao}
-                                </small>
                             </div>
-                            ${isKit ? '<i class="ms-3 fas fa-chevron-down text-primary"></i>' : ''}
-                        </div>
-                        
-                        ${isKit ? `
-                        <div class="collapse mt-2" id="${collapseId}">
-                            <div class="card card-body bg-light">
-                                <b>Componentes:</b><br> 
-                                ${p.componentes.map(c => `<small class="d-block">${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`).join("")}
-                            </div>
-                        </div>
-                        ` : ""}
-                    </div>
-                    `;
+                        `;
                 });
                 html += '</div>';
                 div.innerHTML = html;
-
             } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro ao buscar: ${e}</div>`;
+                div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
             }
         };
 
-        // Função de carregamento da lista de Kits
-        const loadKits = async () => {
-            const div = document.getElementById('kits-content');
-            if (!isAuthenticated) { 
-                div.innerHTML = '<div class="alert alert-warning">É necessário autenticar para carregar kits.</div>';
+        // Carregar Kits e Produtos Simples (Todos Produtos)
+        async function loadKits() {
+            const div = document.getElementById('kits-list');
+            const authRequiredDiv = document.getElementById('auth-required-kits');
+            
+            if (!isAuthenticated) {
+                div.innerHTML = '';
+                authRequiredDiv.classList.remove('hidden');
                 return;
             }
             
-            div.innerHTML = '<div class="alert alert-info">Buscando kits no Bling (pode demorar)...</div>';
-
+            authRequiredDiv.classList.add('hidden');
+            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
+            
             try {
-                const r = await fetch(`${API}/product/kits`);
+                const r = await fetch(`${API}/kits`); 
                 
                 if (r.status === 401) {
-                    div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
+                    div.innerHTML = '';
+                    authRequiredDiv.classList.remove('hidden');
                     checkStatus();
                     return;
                 }
-                
+
                 const data = await r.json();
+                let html = `
+                <table class="table table-sm">
+                <thead>
+                <tr>
+                    <th>IMG</th>
+                    <th>SKU</th>
+                    <th>Nome</th>
+                    <th>Componentes / Tipo</th>
+                </tr>
+                </thead>
+                <tbody>
+                `;
                 
-                if(!data.length) {
-                    div.innerHTML = '<div class="alert alert-warning">Nenhum Kit/Estrutura encontrado.</div>';
-                    return;
-                }
-                
-                let html = '<div class="list-group">';
-                data.forEach(p => {
-                    const collapseId = `kit-collapse-${p.id}`;
-                    html += `
-                    <div class="list-group-item">
-                        <div class="d-flex align-items-center cursor-pointer" data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}">
-                            <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
-                            <div class="flex-grow-1">
-                                <div class="d-flex w-100 justify-content-between">
-                                    <h5 class="mb-1">${p.produto || 'Sem nome'}</h5>
-                                    <small class="text-secondary">${p.sku || 'N/D'}</small>
-                                </div>
-                                <small class="text-muted d-block">
-                                    <b>ID Bling:</b> ${p.id}
-                                </small>
-                            </div>
-                            <i class="ms-3 fas fa-chevron-down text-primary"></i>
-                        </div>
+                data.forEach(k => {
+                    const imgHtml = k.imagemURL 
+                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
+                        : '<span class="text-muted">-</span>';
+
+                    let comps = '';
+                    if (k.componentes && k.componentes.length > 0) {
+                        const componentes_validos = k.componentes;
                         
-                        <div class="collapse mt-2" id="${collapseId}">
-                            <div class="card card-body bg-light">
-                                <b>Componentes:</b><br> 
-                                ${p.componentes.map(c => `<small class="d-block">${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`).join("")}
-                            </div>
-                        </div>
-                    </div>
+                        if (componentes_validos.length > 0) {
+                            comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
+                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .join('<br>');
+                        } else {
+                            comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
+                        }
+                    } else {
+                        comps = `<span class="text-muted" style="font-size:0.8em">Produto Simples (Estoque: ${k.estoque || 'N/D'})</span>`;
+                    }
+
+                    html += `
+                        <tr>
+                            <td style="width:60px">${imgHtml}</td>
+                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                            <td>${k.produto || 'N/D'}</td>
+                            <td>${comps}</td>
+                        </tr>
                     `;
                 });
-                html += '</div>';
+                html += '</tbody></table>';
                 div.innerHTML = html;
-
-            } catch(e) {
-                div.innerHTML = '<div class="alert alert-danger">Erro ao carregar lista. Verifique os logs.</div>';
-            }
-        };
-
-
-        document.addEventListener('DOMContentLoaded', () => {
-            // Inicia o check de status/auth e polling
-            checkStatus();
-            // Inicia o WebSocket para atualizações de KPI em tempo real
-            connectKpiWs();
-        });
+        } catch(e) {
+            div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+        }
+    }
+    
+    document.addEventListener('DOMContentLoaded', () => {
+        loadKits();
+    });
     </script>
 </body>
 </html>
