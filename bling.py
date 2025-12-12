@@ -934,26 +934,29 @@ class AutomationOrchestrator:
 # ============================================================================ 
 # 8. TEMPLATE HTML (DASHBOARD)
 # ============================================================================
+# ============================================================================ 
+# 7. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.5)
+# ============================================================================
 
+# O template utiliza Bootstrap 5.3 para o design 'premium'
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bling Automação Dashboard</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
+    <title>Bling Automação Premium</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
     <style>
-        body { background-color: #f8f9fa; color: #343a40; }
-        .navbar { background-color: #343a40 !important; }
-        .nav-link { color: #f8f9fa !important; }
-        .nav-link.active { color: #0d6efd !important; background-color: #495057 !important; }
-        .card { border-radius: 12px; box-shadow: 0 4px 8px rgba(0,0,0,0.05); }
-        h2 { border-bottom: 2px solid #0d6efd; padding-bottom: 10px; margin-bottom: 20px; color: #0d6efd; }
-        .btn-outline-light { border-color: #f8f9fa; }
-        /* Esconde tabs se não autenticado (JS remove a class) - debug */
-        .hidden { display: none; } 
+        body {
+            background-color: #f8f9fa;
+        }
+        .navbar {
+            background-color: #343a40 !important; /* Cor escura para a navbar */
+            border-bottom: 3px solid #0d6efd;
+        }
+        /* Custom CSS para os KPIs e esconder elementos até autenticação/debug */
+        .hidden { display: none; }
         .kpi-card { border-left: 5px solid; transition: background-color 0.5s ease; }
         .kpi-daily { border-left-color: #0d6efd; }
         .kpi-weekly { border-left-color: #ffc107; }
@@ -987,100 +990,143 @@ DASHBOARD_TEMPLATE = """
             </div>
             <div class="col-md-4">
                 <div class="card p-3 text-center kpi-card kpi-historic">
-                    <h5>Pedidos Históricos (Últimos 30 dias)</h5>
+                    <h5>Pedidos Históricos (Últimos 9 dias)</h5>
                     <h3 id="kpi-historic" class="text-success">0</h3>
                 </div>
             </div>
-            <small class="text-muted mt-2">
-                Último Recálculo de KPIs: <span id="last-recalculated">N/D</span>
-            </small>
+            <small class="text-muted mt-2"> Último Recálculo de KPIs: <span id="last-recalculated">N/D</span> </small>
         </div>
-
+        
         <div id="content-tabs" class="hidden">
-            <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <ul class="nav nav-tabs" id="mainTab" role="tablist">
                 <li class="nav-item" role="presentation">
-                    <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search-pane" type="button" role="tab" aria-controls="search-pane" aria-selected="true">
-                        <i class="fas fa-search"></i> Busca de Produtos
-                    </button>
+                    <button class="nav-link active" id="products-tab" data-bs-toggle="tab" data-bs-target="#products-pane" type="button" role="tab">🔍 Buscar Produtos</button>
                 </li>
                 <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits-pane" type="button" role="tab" aria-controls="kits-pane" aria-selected="false">
-                        <i class="fas fa-box"></i> Kits e Componentes
-                    </button>
+                    <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits-pane" type="button" role="tab" onclick="loadKits()">📦 Kits/Estruturas</button>
                 </li>
                 <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs-pane" type="button" role="tab" aria-controls="logs-pane" aria-selected="false">
-                        <i class="fas fa-stream"></i> Logs (Live)
-                    </button>
+                    <button class="nav-link" id="config-tab" data-bs-toggle="tab" data-bs-target="#config-pane" type="button" role="tab">⚙️ Configurações</button>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs-pane" type="button" role="tab" onclick="connectLogs()">📝 Logs</button>
                 </li>
             </ul>
-            <div class="tab-content pt-3" id="myTabContent">
-                <div class="tab-pane fade show active" id="search-pane" role="tabpanel" aria-labelledby="search-tab">
+
+            <div class="tab-content pt-3" id="mainTabContent">
+                <div class="tab-pane fade show active" id="products-pane" role="tabpanel" tabindex="0">
                     <div class="input-group mb-3">
-                        <input type="text" class="form-control" placeholder="Buscar por SKU ou Nome do Produto/Kit" id="search-input">
-                        <button class="btn btn-primary" type="button" onclick="searchProduct()">Buscar</button>
+                        <input type="text" class="form-control" placeholder="Buscar por SKU ou Nome do Produto/Kit..." id="search-input" onkeyup="if(event.key === 'Enter') performSearch()">
+                        <button class="btn btn-primary" type="button" onclick="performSearch()">Buscar</button>
                     </div>
                     <div id="search-results">
-                        <div class="alert alert-info">Digite um termo para começar a buscar.</div>
+                        <div class="alert alert-info">Digite o SKU ou Nome e clique em Buscar.</div>
                     </div>
                 </div>
 
-                <div class="tab-pane fade" id="kits-pane" role="tabpanel" aria-labelledby="kits-tab">
-                    <div id="kits-list">
+                <div class="tab-pane fade" id="kits-pane" role="tabpanel" tabindex="0">
+                    <p class="text-muted">Lista de Kits/Produtos com Estrutura (Sincronizado automaticamente). Componentes são buscados em tempo real ao expandir.</p>
+                    <div id="kits-content">
                         <div class="alert alert-info">Carregando Kits...</div>
                     </div>
                 </div>
 
-                <div class="tab-pane fade" id="logs-pane" role="tabpanel" aria-labelledby="logs-tab">
-                    <div id="logs-content" style="height: 400px; overflow-y: scroll; background-color: #212529; color: #fff; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 0.85em;">
+                <div class="tab-pane fade" id="config-pane" role="tabpanel" tabindex="0">
+                    <h4>Configurações Gerais (Em desenvolvimento)</h4>
+                    <p class="text-muted">Aguardando a implementação de persistência de configurações editáveis.</p>
+                </div>
+
+                <div class="tab-pane fade" id="logs-pane" role="tabpanel" tabindex="0">
+                    <div class="card">
+                        <div class="card-header d-flex justify-content-between">
+                            Logs em Tempo Real
+                            <span class="badge bg-secondary" id="ws-status">Desconectado</span>
                         </div>
+                        <div class="card-body" style="height: 400px; overflow-y: scroll; background-color: #212529; color: #f8f9fa;">
+                            <pre id="logs-content" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8rem;"></pre>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+
     <script>
         const API = '/api';
-        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
         
-        ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            const box = document.getElementById('logs-content');
-            if(data.logs) {
-                data.logs.forEach(l => box.innerHTML += formatLog(l));
-                box.scrollTop = box.scrollHeight;
-            }
-        }
-
-        let isAuthenticated = false;
-
-        // Função auxiliar para formatar data/hora (para o KPI)
+        // Função utilitária para formatar a data/hora
         function formatDateTime(isoString) {
-            if (!isoString || isoString === 'N/D') return 'N/D';
+            if (!isoString) return 'N/D';
             try {
                 const date = new Date(isoString);
-                // Formato dd/mm/yyyy hh:mm:ss
+                // Formato Brasileiro: DD/MM/AAAA HH:MM:SS
                 return date.toLocaleDateString('pt-BR', {
                     year: 'numeric', month: '2-digit', day: '2-digit',
-                    hour: '2-digit', minute: '2-digit', second: '2-digit'
+                    hour: '2-digit', minute: '2-digit', second: '2-digit',
+                    hour12: false
                 });
             } catch {
-                return isoString; // Retorna o original se houver erro de parse
+                return isoString;
             }
         }
         
-        // Função auxiliar para formatar logs
+        // Log Formatting (Para Logs via WebSocket)
         function formatLog(log) {
-            let color = 'white';
-            if (log.level === 'WARNING') color = '#ffc107';
-            if (log.level === 'ERROR' || log.level === 'CRITICAL') color = '#dc3545';
-            if (log.level === 'INFO') color = '#198754';
+            const levelClass = log.level === 'ERROR' ? 'text-danger' : 
+                               log.level === 'WARNING' ? 'text-warning' : 
+                               log.level === 'INFO' ? 'text-info' : 
+                               'text-secondary';
+            return `<div class="${levelClass}">[${log.timestamp.split('T')[1].split('.')[0]}] ${log.message}</div>`;
+        }
+
+        // WebSocket de Logs
+        function connectLogs() {
+            const wsStatus = document.getElementById('ws-status');
+            const box = document.getElementById('logs-content');
+
+            // Se o WebSocket já estiver aberto ou tentando, não faz nada
+            if (wsStatus.textContent !== 'Desconectado') return;
             
-            return `<div style="color:${color}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
+            wsStatus.textContent = 'Conectando...';
+
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+            
+            ws.onopen = () => {
+                wsStatus.textContent = 'Conectado';
+                wsStatus.className = 'badge bg-success';
+                // Puxa os logs iniciais
+                fetch(API + '/logs')
+                    .then(r => r.json())
+                    .then(data => {
+                        box.innerHTML = ''; // Limpa antes de carregar o histórico
+                        data.logs.forEach(l => box.innerHTML += formatLog(l));
+                        box.scrollTop = box.scrollHeight;
+                    })
+            }
+            
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if(data.logs) {
+                    data.logs.forEach(l => box.innerHTML += formatLog(l));
+                    box.scrollTop = box.scrollHeight;
+                }
+            }
+
+            ws.onerror = ws.onclose = () => {
+                wsStatus.textContent = 'Desconectado';
+                wsStatus.className = 'badge bg-danger';
+                // Tenta reconectar a cada 5 segundos se a aba de logs estiver ativa
+                if(document.getElementById('logs-tab').classList.contains('active')) {
+                    setTimeout(connectLogs, 5000);
+                }
+            }
         }
         
+        let isAuthenticated = false;
+
         // Função para atualizar os KPIs (chamada via polling E via WebSocket)
         function updateKpis(dSalesStats) {
             document.getElementById('kpi-daily').textContent = dSalesStats.daily;
@@ -1088,13 +1134,23 @@ DASHBOARD_TEMPLATE = """
             document.getElementById('kpi-historic').textContent = dSalesStats.historic;
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
         }
-        
-        // WebSocket para KPIs (Notificação em Tempo Real)
-        const wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpis`);
-        wsKpi.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            if (data.daily !== undefined) {
-                updateKpis(data);
+
+        // WebSocket de KPIs (para real-time)
+        function connectKpiWs() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            // NOTA: Conecta-se ao WS de logs, mas o backend envia os KPIs via callback
+            const ws = new WebSocket(`${proto}://${window.location.host}/ws/kpis`);
+            
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if (data.kpi_update) {
+                    updateKpis(data.kpi_update);
+                }
+            }
+
+            ws.onerror = ws.onclose = () => {
+                // Tenta reconectar em 5 segundos
+                setTimeout(connectKpiWs, 5000);
             }
         }
 
@@ -1103,8 +1159,8 @@ DASHBOARD_TEMPLATE = """
                 // 1. Check Auth Status
                 const rStatus = await fetch(API + '/status');
                 const dStatus = await rStatus.json();
-                const badge = document.getElementById('status-badge');
                 
+                const badge = document.getElementById('status-badge');
                 isAuthenticated = dStatus.authenticated;
                 
                 if(isAuthenticated) {
@@ -1118,9 +1174,10 @@ DASHBOARD_TEMPLATE = """
                     document.getElementById('auth-link').classList.remove('d-none');
                     document.getElementById('content-tabs').classList.add('hidden');
                 }
+                
                 document.getElementById('auth-link').href = dStatus.auth_url;
-
-                // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback, mas o WS é principal)
+                
+                // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
                 if (isAuthenticated) {
                     const rSalesStats = await fetch(API + '/sales/stats');
                     if (rSalesStats.ok) {
@@ -1130,36 +1187,36 @@ DASHBOARD_TEMPLATE = """
                         document.getElementById('kpi-daily').textContent = 0;
                         document.getElementById('kpi-weekly').textContent = 0;
                         document.getElementById('kpi-historic').textContent = 0;
-                    }
-                    
-                    // 3. Carrega logs iniciais
-                    const rLogs = await fetch(API + '/logs');
-                    if (rLogs.ok) {
-                        const dLogs = await rLogs.json();
-                        const box = document.getElementById('logs-content');
-                        box.innerHTML = ''; // Limpa antes de carregar
-                        dLogs.logs.forEach(l => box.innerHTML += formatLog(l));
-                        box.scrollTop = box.scrollHeight;
+                        document.getElementById('last-recalculated').textContent = 'Erro';
                     }
                 }
                 
             } catch(e) {
-                console.error("Erro no checkStatus:", e);
-                const badge = document.getElementById('status-badge');
-                badge.className = 'badge bg-danger me-2';
-                badge.textContent = 'Erro';
+                console.error("Erro ao verificar status:", e);
+                // Falha silenciosa
+            } finally {
+                // Polling a cada 30 segundos (principalmente para atualizar os KPIs caso o WS falhe)
+                setTimeout(checkStatus, 30000); 
             }
         }
 
-        async function searchProduct() {
-            if (!isAuthenticated) {
-                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">Você precisa estar autenticado para realizar buscas.</div>';
+        // Função de busca de produtos
+        const performSearch = async () => {
+            if (!isAuthenticated) { 
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar para realizar buscas.</div>';
                 return;
             }
+            
             const q = document.getElementById('search-input').value;
             const div = document.getElementById('search-results');
-            div.innerHTML = 'Buscando...';
+            
+            if (q.length < 3) {
+                div.innerHTML = '<div class="alert alert-warning">Digite ao menos 3 caracteres para buscar.</div>';
+                return;
+            }
 
+            div.innerHTML = 'Buscando...';
+            
             try {
                 const r = await fetch(`${API}/product/search?q=${q}`);
                 
@@ -1175,100 +1232,124 @@ DASHBOARD_TEMPLATE = """
                     div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
                     return;
                 }
-
+                
                 let html = '<div class="list-group">';
                 data.forEach(p => {
+                    // Determina se é Kit para usar o Collapse
+                    const isKit = p.componentes && p.componentes.length > 0;
+                    const collapseId = `collapse-${p.id}`;
+
                     html += `
-                        <div class="list-group-item">
-                            <div class="d-flex">
-                                <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
-                                <div class="flex-grow-1">
-                                    <div class="d-flex w-100 justify-content-between">
-                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                        <small>${p.sku || 'N/D'}</small>
-                                    </div>
-                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
-                                    <small class="text-muted d-block">
-                                        <b>Estoque:</b> ${p.estoque} 
-                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo} 
-                                    </small>
-                                    ${p.componentes && p.componentes.length > 0 ? `
-                                        <div class="mt-2">
-                                            <b>Componentes:</b><br>
-                                            ${p.componentes.map(c => `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})` ).join("<br>")}
-                                        </div>
-                                    ` : ""}
+                    <div class="list-group-item">
+                        <div class="d-flex align-items-center ${isKit ? 'cursor-pointer' : ''}" ${isKit ? `data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}"` : ''}>
+                            <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
+                            <div class="flex-grow-1">
+                                <div class="d-flex w-100 justify-content-between">
+                                    <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                    <small class="text-secondary">${p.sku || 'N/D'}</small>
                                 </div>
+                                <p class="mb-1 text-muted">${p.descricaoCurta || ''}</p>
+                                <small class="text-muted d-block">
+                                    <b>Estoque:</b> ${p.estoque} 
+                                    <b style="margin-left:10px;">Tipo:</b> ${p.tipo} 
+                                    <b style="margin-left:10px;">Situação:</b> ${p.situacao}
+                                </small>
+                            </div>
+                            ${isKit ? '<i class="ms-3 fas fa-chevron-down text-primary"></i>' : ''}
+                        </div>
+                        
+                        ${isKit ? `
+                        <div class="collapse mt-2" id="${collapseId}">
+                            <div class="card card-body bg-light">
+                                <b>Componentes:</b><br> 
+                                ${p.componentes.map(c => `<small class="d-block">${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`).join("")}
                             </div>
                         </div>
+                        ` : ""}
+                    </div>
                     `;
                 });
                 html += '</div>';
                 div.innerHTML = html;
 
             } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
+                div.innerHTML = `<div class="alert alert-danger">Erro ao buscar: ${e}</div>`;
             }
-        }
-        
-        async function loadKits() {
-            if (!isAuthenticated) {
-                document.getElementById('kits-list').innerHTML = '<div class="alert alert-warning">Você precisa estar autenticado para ver a lista de Kits.</div>';
+        };
+
+        // Função de carregamento da lista de Kits
+        const loadKits = async () => {
+            const div = document.getElementById('kits-content');
+            if (!isAuthenticated) { 
+                div.innerHTML = '<div class="alert alert-warning">É necessário autenticar para carregar kits.</div>';
                 return;
             }
-            const div = document.getElementById('kits-list');
-            div.innerHTML = 'Carregando Kits em cache...';
+            
+            div.innerHTML = '<div class="alert alert-info">Buscando kits no Bling (pode demorar)...</div>';
+
             try {
                 const r = await fetch(`${API}/product/kits`);
+                
                 if (r.status === 401) {
                     div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
                     checkStatus();
                     return;
                 }
+                
                 const data = await r.json();
+                
                 if(!data.length) {
-                    div.innerHTML = '<div class="alert alert-info">Nenhum Kit em cache.</div>';
+                    div.innerHTML = '<div class="alert alert-warning">Nenhum Kit/Estrutura encontrado.</div>';
                     return;
                 }
+                
                 let html = '<div class="list-group">';
-                data.forEach(k => {
+                data.forEach(p => {
+                    const collapseId = `kit-collapse-${p.id}`;
                     html += `
-                        <div class="list-group-item">
-                            <div class="d-flex">
-                                <img src="${k.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
-                                <div class="flex-grow-1">
-                                    <div class="d-flex w-100 justify-content-between">
-                                        <h5 class="mb-1">${k.produto || 'Sem nome (Kit)'}</h5>
-                                        <small>SKU: ${k.sku || 'N/D'}</small>
-                                    </div>
-                                    <div class="mt-2">
-                                        <b>Componentes:</b><br>
-                                        ${k.componentes.map(c => `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})` ).join("<br>")}
-                                    </div>
+                    <div class="list-group-item">
+                        <div class="d-flex align-items-center cursor-pointer" data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}">
+                            <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
+                            <div class="flex-grow-1">
+                                <div class="d-flex w-100 justify-content-between">
+                                    <h5 class="mb-1">${p.produto || 'Sem nome'}</h5>
+                                    <small class="text-secondary">${p.sku || 'N/D'}</small>
                                 </div>
+                                <small class="text-muted d-block">
+                                    <b>ID Bling:</b> ${p.id}
+                                </small>
+                            </div>
+                            <i class="ms-3 fas fa-chevron-down text-primary"></i>
+                        </div>
+                        
+                        <div class="collapse mt-2" id="${collapseId}">
+                            <div class="card card-body bg-light">
+                                <b>Componentes:</b><br> 
+                                ${p.componentes.map(c => `<small class="d-block">${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`).join("")}
                             </div>
                         </div>
+                    </div>
                     `;
                 });
                 html += '</div>';
                 div.innerHTML = html;
 
             } catch(e) {
-                div.innerHTML = 'Falha ao carregar lista. Verifique os logs.';
+                div.innerHTML = '<div class="alert alert-danger">Erro ao carregar lista. Verifique os logs.</div>';
             }
-        }
+        };
+
 
         document.addEventListener('DOMContentLoaded', () => {
-            checkStatus(); // Roda a primeira checagem de status e carrega KPIs/Logs iniciais
-            // Associa a função loadKits ao evento de mostrar a aba de kits
-            document.getElementById('kits-tab').addEventListener('shown.bs.tab', loadKits);
+            // Inicia o check de status/auth e polling
+            checkStatus();
+            // Inicia o WebSocket para atualizações de KPI em tempo real
+            connectKpiWs();
         });
-        
     </script>
 </body>
 </html>
 """
-
 # ============================================================================ 
 # 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
 # ============================================================================
