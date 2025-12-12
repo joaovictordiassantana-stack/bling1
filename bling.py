@@ -351,7 +351,8 @@ class SalesManager:
         """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
         now = datetime.now()
         yesterday = now - timedelta(hours=24) 
-        last_week = now - timedelta(days=7)\n        last_month = now - timedelta(days=30)  # ✅ NOVO: Adiciona referência de 30 dias
+        last_week = now - timedelta(days=7)
+        last_month = now - timedelta(days=30)  # ✅ NOVO: Adiciona referência de 30 dias
         
         daily = 0
         weekly = 0
@@ -385,24 +386,7 @@ class SalesManager:
                         parts = hora_emissao.split(':')
                         if len(parts) == 3:
                             h, m, s = map(int, parts)
-                            order_date = order_date.replace(hour=h, minute=m, second=s)
-                    except (ValueError, AttributeError):
-                        pass
-            except Exception as e:
-                logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
-                continue
-
-            # ✅ CORRIGIDO: Só conta histórico se estiver nos últimos 30 dias
-            if order_date >= last_month:
-                historic += 1
-                            
-            if order_date >= last_week:
-                weekly += 1
-                            
-            if order_date >= yesterday:
-                daily += 1
-
-        # ATUALIZAÇÃO E PERSISTÊNCIA DENTRO DO LOCK
+                            order_date = order_date.replace(hour=h, minute=m, second=s)\n                    except (ValueError, AttributeError):\n                        pass\n            except Exception as e:\n                logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")\n                continue\n\n            # ✅ CORRIGIDO: Só conta histórico se estiver nos últimos 30 dias\n            if order_date >= last_month:\n                historic += 1\n                            \n            if order_date >= last_week:\n                weekly += 1\n                            \n            if order_date >= yesterday:\n                daily += 1\n\n        # ATUALIZAÇÃO E PERSISTÊNCIA DENTRO DO LOCK
         with self.lock:
             # Atualiza todos os contadores de uma vez
             self.daily_count = daily
