@@ -229,18 +229,18 @@ class BlingAPIError(Exception): pass
 # NOVO: Estatísticas de Vendas
 @dataclass
 class TimeStats:
-    """Estatísticas de vendas com controle de tempo."""
+    """Estatísticas de vendas com controle de tempo (Contagem de Pedidos)."""
     count: int = 0
     last_update: datetime = field(default_factory=datetime.now)
 
 @dataclass
 class SalesManager:
-    """Gerencia contadores de vendas Diárias, Semanais e o Histórico."""
+    """Gerencia contadores de vendas Diárias, Semanais e o Histórico (Pedidos de Venda)."""
     
     # Lock para garantir acesso seguro entre threads (worker e webserver)
     lock: Lock = field(default_factory=Lock)
     
-    # Contadores de Vendas de Produtos (unidades vendidas)
+    # Contadores de Pedidos de Venda
     daily: TimeStats = field(default_factory=TimeStats)
     weekly: TimeStats = field(default_factory=TimeStats)
     historic: TimeStats = field(default_factory=TimeStats) # Nunca reseta
@@ -267,21 +267,19 @@ class SalesManager:
         now = datetime.now()
         
         # Reset Diário (após 24 horas da última atualização)
-        # CORREÇÃO: Reseta se a data for diferente, ou se 24h passaram *desde o reset*
-        # Para um reset diário "à meia-noite", o check deve ser diferente, mas vamos manter o de 24h.
         if (now - self.daily.last_update).total_seconds() > (24 * 3600):
             self.daily.count = 0
             self.daily.last_update = now
-            logger.info("Contador Diário de Vendas Resetado.")
+            logger.info("Contador Diário de Pedidos Resetado.")
             
         # Reset Semanal (após 7 dias da última atualização)
         if (now - self.weekly.last_update).total_seconds() > (7 * 24 * 3600):
             self.weekly.count = 0
             self.weekly.last_update = now
-            logger.info("Contador Semanal de Vendas Resetado.")
+            logger.info("Contador Semanal de Pedidos Resetado.")
 
-    def add_product_sales(self, product_count: int, order_id: int):
-        """Adiciona a contagem de produtos vendidos (total de itens de linha)."""
+    def add_sales_order(self, order_id: int):
+        """Adiciona 1 à contagem de pedidos de venda."""
         with self.lock:
             # Evita reprocessar o mesmo pedido
             if order_id <= self.last_order_id:
@@ -289,9 +287,10 @@ class SalesManager:
 
             self._check_and_reset()
             
-            self.daily.count += product_count
-            self.weekly.count += product_count
-            self.historic.count += product_count
+            # Incrementa o contador de pedidos (não de unidades)
+            self.daily.count += 1
+            self.weekly.count += 1
+            self.historic.count += 1
             self.last_order_id = max(self.last_order_id, order_id)
             
             # Atualiza o timestamp
@@ -629,7 +628,7 @@ class AutomationOrchestrator:
             time.sleep(600) # 10 minutos (600 segundos)
 
     def process_sales_orders(self):
-        """Busca pedidos de venda faturados ou em produção e atualiza o sales_manager."""
+        """Busca pedidos de venda faturados/em andamento e atualiza o sales_manager (pedidos)."""
         
         token = self.auth.get_valid_token()
         if not token:
@@ -638,8 +637,9 @@ class AutomationOrchestrator:
 
         self.logger.info("Iniciando busca de pedidos de venda para atualização dos KPIs...")
         
-        # Status: 12 (Atendido/Faturado) e 2 (Em Andamento/Produção)
-        status_ids = [12, 2] 
+        # CORREÇÃO: Status ajustado para cobrir ABERTOS (2, 3, 9) e FECHADOS (12)
+        # 2: Em Andamento; 3: Em Aberto; 9: Pendente; 12: Atendido/Faturado
+        status_ids = [2, 3, 9, 12] 
         
         # Busca pedidos nos últimos 30 dias, ordenado por ID (para pegar os mais novos)
         params = {
@@ -654,26 +654,22 @@ class AutomationOrchestrator:
         response_data = self.api_client.get_sales_orders(token, **params)
         
         if response_data and 'data' in response_data:
-            total_sales_count = 0
+            total_orders_count = 0
             
             # Processa do pedido mais antigo para o mais novo (reverse)
             for order in reversed(response_data['data']): 
                 order_id = order['id']
                 
-                # Soma a quantidade de itens em todos os produtos do pedido
-                product_count = sum(item['quantidade'] for item in order.get('itens', []) if 'quantidade' in item)
-                
                 # O SalesManager só adiciona se o ID for maior que o último processado
                 is_new_sale = self.sales_manager.last_order_id < order_id
                 
-                if product_count > 0 and is_new_sale:
-                    # Chamar add_product_sales APENAS se for uma nova venda para evitar atualizações de last_order_id
-                    # para vendas sem produtos. O método gerencia a adição e o last_order_id.
-                    self.sales_manager.add_product_sales(product_count, order_id)
-                    total_sales_count += product_count
+                # CORREÇÃO: Adiciona 1 para cada NOVO pedido (não importa a quantidade de itens)
+                if is_new_sale:
+                    self.sales_manager.add_sales_order(order_id)
+                    total_orders_count += 1
             
-            if total_sales_count > 0:
-                 self.logger.info(f"Contabilizadas {total_sales_count} unidades de produtos em novos pedidos de venda.")
+            if total_orders_count > 0:
+                 self.logger.info(f"Contabilizados {total_orders_count} novos pedidos de venda (abertos e fechados).")
             else:
                  self.logger.info("Busca de pedidos de venda concluída. Nenhum novo pedido contabilizado.")
         else:
@@ -869,25 +865,25 @@ DASHBOARD_TEMPLATE = """
     </nav>
 
     <div class="container mt-4">
-        <h2>📊 Vendas de Produtos (Unidades)</h2>
+        <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
         <div class="row mb-4">
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-daily">
-                     <h5>Diário (Reseta 24h)</h5>
+                     <h5>Pedidos Diários (Reseta 24h)</h5>
                      <h3 id="kpi-daily" class="text-primary">0</h3>
                      <small class="text-muted">Última venda: <span id="last-daily">N/D</span></small>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-weekly">
-                     <h5>Semanal (Reseta 7 dias)</h5>
+                     <h5>Pedidos Semanais (Reseta 7 dias)</h5>
                      <h3 id="kpi-weekly" class="text-warning">0</h3>
                      <small class="text-muted">Última venda: <span id="last-weekly">N/D</span></small>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-historic">
-                     <h5>Histórico Total</h5>
+                     <h5>Pedidos Históricos</h5>
                      <h3 id="kpi-historic" class="text-success">0</h3>
                  </div>
              </div>
@@ -1001,7 +997,12 @@ DASHBOARD_TEMPLATE = """
                 document.getElementById('last-daily').textContent = formatLastUpdate(dSalesStats.last_update_daily);
                 document.getElementById('last-weekly').textContent = formatLastUpdate(dSalesStats.last_update_weekly);
             } else {
-                console.error("Falha ao buscar estatísticas de vendas.");
+                // Fallback para o endpoint antigo se o novo falhar, ou limpar
+                document.getElementById('kpi-daily').textContent = 0;
+                document.getElementById('kpi-weekly').textContent = 0;
+                document.getElementById('kpi-historic').textContent = 0;
+                document.getElementById('last-daily').textContent = 'N/D';
+                document.getElementById('last-weekly').textContent = 'N/D';
             }
 
 
@@ -1066,7 +1067,8 @@ DASHBOARD_TEMPLATE = """
                                             <div class="mt-2">
                                                 <b>Componentes:</b><br>
                                                 ${p.componentes.map(c => 
-                                                    `${c.quantidade}x ${c.nome || 'Sem nome'}`
+                                                    // CORREÇÃO: Usa 'nome' e 'sku' do componente (estrutura simplificada)
+                                                    `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
                                                 ).join("<br>")}
                                             </div>
                                         ` : ""}
@@ -1253,6 +1255,7 @@ class WebServer:
         @self.app.route("/api/sales/stats")
         def api_sales_stats():
             """Retorna os contadores Diário, Semanal e Histórico."""
+            # CORREÇÃO: O endpoint antigo /api/stats foi removido, usando o /api/sales/stats
             return jsonify(sales_manager.get_stats())
 
         @self.app.route("/api/all_products", methods=["GET"])
@@ -1338,7 +1341,15 @@ class WebServer:
                     "estoque": estoque_val,
                     "descricaoCurta": details.get("descricaoCurta"),
                     # Componentes são adicionados para kits
-                    "componentes": details.get("estrutura", {}).get("componentes", []),
+                    # Ajusta a estrutura para o front-end (componente.produto.nome -> componente.nome)
+                    "componentes": [
+                         {
+                            "nome": c.get("produto", {}).get("nome", "Sem nome"),
+                            "quantidade": c.get("quantidade", 0),
+                            "sku": c.get("produto", {}).get("codigo", "N/D")
+                         }
+                        for c in details.get("estrutura", {}).get("componentes", [])
+                    ],
                     "imagemURL": extract_image_url(details), # Usa a nova função utilitária
                 }
                 final_results.append(produto_completo)
@@ -1346,13 +1357,23 @@ class WebServer:
             # CORREÇÃO: Adiciona kits que não foram encontrados na busca por nome/sku (cache local)
             # A lista de kits é melhor mantida no cache
             kits_cache = self.orchestrator.get_all_kits()
+            termo_lower = termo.lower()
+            
             for kit in kits_cache:
-                # Se o ID não foi encontrado na busca da API, adiciona o kit do cache
-                if kit.get("id") not in seen_ids and (termo.lower() in str(kit.get("produto", "")).lower() or termo.lower() in str(kit.get("sku", "")).lower()):
+                # Se o ID não foi encontrado na busca da API, adiciona o kit do cache se for relevante
+                if kit.get("id") not in seen_ids and (termo_lower in str(kit.get("produto", "")).lower() or termo_lower in str(kit.get("sku", "")).lower()):
                     final_results.append(kit)
                     seen_ids.add(kit.get("id")) # Marca como visto
             
+            # Adicionar produtos simples do cache se a API não retornou e eles corresponderem
+            produtos_cache = self.orchestrator.get_all_products()
+            for prod in produtos_cache:
+                if prod.get("id") not in seen_ids and (termo_lower in str(prod.get("produto", "")).lower() or termo_lower in str(prod.get("sku", "")).lower()):
+                    final_results.append(prod)
+                    seen_ids.add(prod.get("id"))
+
             return jsonify(final_results)
+
 
         # CORREÇÃO: Rota /api/kits alterada para retornar Kits E Produtos Simples do cache.
         @self.app.route('/api/kits', methods=["GET"])
