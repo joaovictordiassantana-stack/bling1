@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 
 from gevent import monkey
-monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
+monkey.patch_all()   # torna as bibliotecas padrÃ£o cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.6)
+bling.py - Sistema completo de automaÃ§Ã£o Bling com design premium (CORRIGIDO v4.6)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
-- CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
-- FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
+- CORREÃ‡ÃƒO CRÃTICA (v4.4): ImplementaÃ§Ã£o de WebSocket para notificaÃ§Ã£o em TEMPO REAL de KPIs.
+- FIX SINCRONIZAÃ‡ÃƒO (v4.4): get_stats() agora forÃ§a a leitura do arquivo para sincronizaÃ§Ã£o multi-worker.
 - FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
-- FIX SPAM DE LOG (v4.6): Reduzido nível de log para INFO e removidos logs DEBUG repetitivos de /api/sales/stats.
-- FEATURE (v4.6): Histórico de pedidos expandido de 9 para 30 dias.
+- FIX SPAM DE LOG (v4.6): Reduzido nÃ­vel de log para INFO e removidos logs DEBUG repetitivos de /api/sales/stats.
+- FEATURE (v4.6): HistÃ³rico de pedidos expandido de 9 para 30 dias.
 """
 
 import os
@@ -35,27 +35,27 @@ import requests
 from requests.exceptions import RequestException
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
-# Importação necessária para tratamento correto do WebSocket
+# ImportaÃ§Ã£o necessÃ¡ria para tratamento correto do WebSocket
 try:
     from simple_websocket import ConnectionClosed
 except ImportError:
     class ConnectionClosed(Exception): pass
 
 # ============================================================================ 
-# 0. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
+# 0. VARIÃVEIS GLOBAIS DE CONTROLE (LOCK)
 # ============================================================================
-# Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
+# Lock global para impedir mÃºltiplas trocas de token simultÃ¢neas (Erro Worker Timeout)
 token_exchange_lock = Lock()
 
-# NOVO (v4.4): Variável global para notificar subscribers sobre mudanças de KPI
+# NOVO (v4.4): VariÃ¡vel global para notificar subscribers sobre mudanÃ§as de KPI
 kpi_update_callbacks = []
 kpi_update_lock = Lock()
 # ============================================================================ 
-# 1. LOGS AVANÇADOS
+# 1. LOGS AVANÃ‡ADOS
 # ============================================================================
 
 class InMemoryLogHandler(logging.Handler):
-    """Handler de log que armazena os registros em memória para o WebSocket."""
+    """Handler de log que armazena os registros em memÃ³ria para o WebSocket."""
     def __init__(self, max_logs=500):
         super().__init__()
         self.logs = []
@@ -84,7 +84,7 @@ class InMemoryLogHandler(logging.Handler):
             return self.logs[-limit:]
         return self.logs.copy()
 
-# Configuração global de diretórios e logs
+# ConfiguraÃ§Ã£o global de diretÃ³rios e logs
 LOGS_DIR = Path('logs')
 LOG_FILE = LOGS_DIR / 'automacao_bling.log'
 ERROR_LOG_FILE = LOGS_DIR / 'errors.log'
@@ -94,7 +94,7 @@ def setup_logging():
     global memory_handler
     memory_handler = InMemoryLogHandler()
     
-    # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
+    # Define o log principal para INFO (ou DEBUG se necessÃ¡rio, mas INFO Ã© o padrÃ£o)
     logger = logging.getLogger('bling_automacao')
     # FIX SPAM DE LOG (v4.6): Volta para INFO para reduzir spam de /api/sales/stats
     logger.setLevel(logging.INFO) 
@@ -125,11 +125,11 @@ def setup_logging():
 logger, error_logger = setup_logging()
 
 # ============================================================================ 
-# 2. CONFIGURAÇÕES
+# 2. CONFIGURAÃ‡Ã•ES
 # ============================================================================
 
 class Config:
-    """Configurações globais da aplicação."""
+    """ConfiguraÃ§Ãµes globais da aplicaÃ§Ã£o."""
     
     # Bling OAuth
     CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', 'YOUR_CLIENT_ID')
@@ -148,7 +148,7 @@ class Config:
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
-    # Automação
+    # AutomaÃ§Ã£o
     CHECK_MIN_STOCK: bool = True
     MIN_STOCK_THRESHOLD: int = 10
     DEFAULT_BATCH_SIZE: int = 10
@@ -157,10 +157,10 @@ class Config:
     # Arquivos
     TOKENS_FILE: Path = Path('tokens.json')
     COMPONENT_CONFIG_FILE: Path = Path('component_config.json')
-    SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
+    SALES_STATS_FILE: Path = Path('sales_stats.json') # PersistÃªncia de KPIs
 
 # ============================================================================ 
-# 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
+# 3. UTILITÃRIOS E AUTH (FUNÃ‡Ã•ES SEGURAS)
 # ============================================================================
 
 def load_tokens_safe(path: Path | str = "tokens.json"):
@@ -190,7 +190,7 @@ def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
         logger.error(f"Erro ao salvar tokens: {e}")
 
 def load_stats_safe(path: Path):
-    """Carrega as estatísticas de vendas de forma segura."""
+    """Carrega as estatÃ­sticas de vendas de forma segura."""
     if not path.exists():
         return None
     try:
@@ -205,18 +205,18 @@ def load_stats_safe(path: Path):
         return None
 
 def save_stats(data: Dict[str, Any], path: Path):
-    """Salva as estatísticas de vendas, convertendo datetime para string ISO."""
+    """Salva as estatÃ­sticas de vendas, convertendo datetime para string ISO."""
     try:
-        # Cria uma cópia para evitar modificar o objeto original antes do dump
+        # Cria uma cÃ³pia para evitar modificar o objeto original antes do dump
         data_to_save = data.copy()
         if 'last_recalculated' in data_to_save and isinstance(data_to_save['last_recalculated'], datetime):
             data_to_save['last_recalculated'] = data_to_save['last_recalculated'].isoformat()
 
         with open(path, "w", encoding="utf-8") as file:
             json.dump(data_to_save, file, indent=4, ensure_ascii=False)
-        logger.info("Estatísticas de KPIs salvas com sucesso.")
+        logger.info("EstatÃ­sticas de KPIs salvas com sucesso.")
     except Exception as e:
-        logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
+        logger.error(f"Erro ao salvar estatÃ­sticas de KPIs: {e}")
 
 def is_token_valid(token_data):
     if not token_data:
@@ -224,15 +224,15 @@ def is_token_valid(token_data):
     expires_at = token_data.get("expires_at")
     if not expires_at:
         return False
-    # Checa se o tempo atual é menor que o tempo de expiração menos uma margem de segurança de 20 segundos
+    # Checa se o tempo atual Ã© menor que o tempo de expiraÃ§Ã£o menos uma margem de seguranÃ§a de 20 segundos
     return time.time() < float(expires_at) - 20
 
-# --- FUNÇÃO PARA BUSCA DE PRODUTOS (CORRIGIDO PARA V3) ---
+# --- FUNÃ‡ÃƒO PARA BUSCA DE PRODUTOS (CORRIGIDO PARA V3) ---
 def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | None = None, access_token: str | None = None):
     try:
         filters = {}
         if sku:
-            # CORREÇÃO: API v3 usa 'codigo' e não 'sku'
+            # CORREÃ‡ÃƒO: API v3 usa 'codigo' e nÃ£o 'sku'
             filters['codigo'] = sku.strip()
         if nome and not sku:
             filters['nome'] = nome.strip()
@@ -265,36 +265,36 @@ def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | No
         return {"success": False, "error": str(e)}
 
 # ============================================================================ 
-# 4. CLASSES DE DADOS E EXCEÇÕES (ATUALIZADO PARA RECALCULO COMPLETO)
+# 4. CLASSES DE DADOS E EXCEÃ‡Ã•ES (ATUALIZADO PARA RECALCULO COMPLETO)
 # ============================================================================
 
 class BlingAuthError(Exception): pass
 class BlingAPIError(Exception): pass
 
-# NOVO: Estatísticas de Vendas (Simplificado para Recálculo)
+# NOVO: EstatÃ­sticas de Vendas (Simplificado para RecÃ¡lculo)
 @dataclass
 class SalesManager:
     """
-    Gerencia contadores de Pedidos de Venda Diárias, Semanaais e o Histórico.
-    Implementa persistência em arquivo para garantir consistência entre workers.
+    Gerencia contadores de Pedidos de Venda DiÃ¡rias, Semanaais e o HistÃ³rico.
+    Implementa persistÃªncia em arquivo para garantir consistÃªncia entre workers.
     """
     
     config: Config
     lock: Lock = field(default_factory=Lock)
     
-    # Contadores (serão redefinidos a cada recalculate)
+    # Contadores (serÃ£o redefinidos a cada recalculate)
     daily_count: int = 0
     weekly_count: int = 0
     historic_count: int = 0
     
-    # Data da última atualização dos dados
+    # Data da Ãºltima atualizaÃ§Ã£o dos dados
     last_recalculated: datetime = field(default_factory=datetime.now)
     
     # NOVO (v4.5): Flag para controlar o log de falha inicial (Evita spam no polling)
     _initial_load_failed: bool = True 
 
     def __post_init__(self):
-        # Carrega o estado persistido na inicialização
+        # Carrega o estado persistido na inicializaÃ§Ã£o
         self._load_stats()
 
 
@@ -306,22 +306,22 @@ class SalesManager:
                 self.daily_count = data.get('daily', 0)
                 self.weekly_count = data.get('weekly', 0)
                 self.historic_count = data.get('historic', 0)
-                # Usa a data carregada ou a data de inicialização se o carregamento falhar
+                # Usa a data carregada ou a data de inicializaÃ§Ã£o se o carregamento falhar
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
-            # FIX SPAM DE LOG (v4.6): Altera para INFO e só loga se não foi a falha inicial
+            # FIX SPAM DE LOG (v4.6): Altera para INFO e sÃ³ loga se nÃ£o foi a falha inicial
             if not self._initial_load_failed:  
-                logger.info(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
+                logger.info(f"KPIs carregados do arquivo. HistÃ³rico: {self.historic_count}.")
                 self._initial_load_failed = False 
             else:
                 self._initial_load_failed = False 
         else:
-             # FIX (v4.5): Só loga o erro de 'Nenhum KPI encontrado' uma vez
+             # FIX (v4.5): SÃ³ loga o erro de 'Nenhum KPI encontrado' uma vez
              if self._initial_load_failed:
                  logger.debug("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
-                # A flag permanece True até que um load seja bem-sucedido.
+                # A flag permanece True atÃ© que um load seja bem-sucedido.
 
 
-    # NOVO: Método para obter o estado a ser salvo
+    # NOVO: MÃ©todo para obter o estado a ser salvo
     def _get_state_for_save(self) -> Dict[str, Any]:
          return {
             "daily": self.daily_count,
@@ -332,8 +332,8 @@ class SalesManager:
 
 
     def get_stats(self) -> Dict[str, Any]:
-        """Retorna todas as estatísticas em formato JSON para a API."""
-        # CRÍTICO (v4.4): Sempre relê do arquivo para garantir sincronização entre workers
+        """Retorna todas as estatÃ­sticas em formato JSON para a API."""
+        # CRÃTICO (v4.4): Sempre relÃª do arquivo para garantir sincronizaÃ§Ã£o entre workers
         self._load_stats() 
         
         with self.lock:
@@ -342,13 +342,13 @@ class SalesManager:
                 "daily": self.daily_count,
                 "weekly": self.weekly_count,
                 "historic": self.historic_count,
-                # Retorna o timestamp de quando o worker processou por último
+                # Retorna o timestamp de quando o worker processou por Ãºltimo
                 "last_update": self.last_recalculated.isoformat() 
             }
 
-    # MÉTODO CORRIGIDO (v4.4): Adiciona notificação via WebSocket
+    # MÃ‰TODO CORRIGIDO (v4.4): Adiciona notificaÃ§Ã£o via WebSocket
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
-        """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
+        """Calcula KPIs baseando-se na data/hora de emissÃ£o dos pedidos."""
         now = datetime.now()
         yesterday = now - timedelta(hours=24) 
         last_week = now - timedelta(days=7)
@@ -357,7 +357,7 @@ class SalesManager:
         weekly = 0
         historic = 0
         
-        # O cálculo é feito fora do lock.
+        # O cÃ¡lculo Ã© feito fora do lock.
         for order in orders:
             if not isinstance(order, dict):
                 logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
@@ -400,7 +400,7 @@ class SalesManager:
             if order_date >= yesterday:
                 daily += 1 
 
-        # ATUALIZAÇÃO E PERSISTÊNCIA DENTRO DO LOCK
+        # ATUALIZAÃ‡ÃƒO E PERSISTÃŠNCIA DENTRO DO LOCK
         with self.lock:
             # Atualiza todos os contadores de uma vez
             self.daily_count = daily
@@ -411,7 +411,7 @@ class SalesManager:
             # PERSISTE O ESTADO ATUAL
             save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
             
-            # NOVO (v4.4): Notifica subscribers sobre a mudança
+            # NOVO (v4.4): Notifica subscribers sobre a mudanÃ§a
             stats_data = self._get_state_for_save()
             
             # Converte a data de volta para ISO string para o WS
@@ -425,8 +425,8 @@ class SalesManager:
                     except Exception as e:
                         logger.error(f"Erro ao notificar KPI subscriber: {e}")
             
-            logger.info(f"✅ Estatísticas recalculadas com {len(orders)} pedidos analisados: "
-                       f"Diário={daily}, Semanal={weekly}, Histórico={historic}")
+            logger.info(f"âœ… EstatÃ­sticas recalculadas com {len(orders)} pedidos analisados: "
+                       f"DiÃ¡rio={daily}, Semanal={weekly}, HistÃ³rico={historic}")
 
 
 class ComponentConfigManager:
@@ -478,9 +478,9 @@ class BlingAuth:
         save_tokens(tokens)
         
     def get_authorization_url(self) -> str:
-        # Só gera novo state se não estiver autenticado E não tiver state salvo
+        # SÃ³ gera novo state se nÃ£o estiver autenticado E nÃ£o tiver state salvo
         if self.is_authenticated():
-            return "#" # Já autenticado
+            return "#" # JÃ¡ autenticado
             
         if self.state is None:
             self.state = secrets.token_urlsafe(16)
@@ -490,10 +490,10 @@ class BlingAuth:
     
     def exchange_code_for_token(self, code: str, state: str) -> bool:
         """
-        Tenta trocar o código OAuth por token. Implementa verificação de Lock e State.
+        Tenta trocar o cÃ³digo OAuth por token. Implementa verificaÃ§Ã£o de Lock e State.
         """
         if self.is_authenticated():
-            self.logger.info("Tentativa de callback ignorada: Token já válido.")
+            self.logger.info("Tentativa de callback ignorada: Token jÃ¡ vÃ¡lido.")
             return True
 
         if self.state is None:
@@ -570,18 +570,18 @@ class BlingAuth:
     def get_valid_token(self) -> Optional[str]:
         if self.is_authenticated():
             return self.access_token
-        # Tenta renovar se não for válido
+        # Tenta renovar se nÃ£o for vÃ¡lido
         if self.refresh_access_token():
             return self.access_token
         return None
 
-# CORREÇÃO: Adicionado limite de profundidade para evitar loop infinito
+# CORREÃ‡ÃƒO: Adicionado limite de profundidade para evitar loop infinito
 def extract_image_url(prod: dict, depth=0) -> Optional[str]:
     """Extrai URL da imagem procurando em midia, imagens e campos diretos."""
     if not prod or not isinstance(prod, dict):
         return None
     
-    # Proteção contra loop
+    # ProteÃ§Ã£o contra loop
     if depth > 3: return None
 
     # 1. Tenta campos diretos comuns
@@ -590,7 +590,7 @@ def extract_image_url(prod: dict, depth=0) -> Optional[str]:
         if val and isinstance(val, str) and val.startswith("http"):
             return val
 
-    # 2. Tenta encontrar dentro de listas de mídia (padrão Bling V3)
+    # 2. Tenta encontrar dentro de listas de mÃ­dia (padrÃ£o Bling V3)
     for list_key in ["midia", "midias", "imagens", "fotos", "anexos"]:
         items = prod.get(list_key, [])
         if isinstance(items, list):
@@ -601,7 +601,7 @@ def extract_image_url(prod: dict, depth=0) -> Optional[str]:
                     ret = extract_image_url(item, depth + 1)
                     if ret: return ret
 
-    # 3. Tenta descer um nível se houver 'data' ou 'produto' aninhado
+    # 3. Tenta descer um nÃ­vel se houver 'data' ou 'produto' aninhado
     for nested in ["data", "produto"]:
         if nested in prod and isinstance(prod[nested], dict):
              if prod[nested].get('id') != prod.get('id'):
@@ -656,7 +656,7 @@ class BlingAPIClient:
         return {}
 
     def get_sales_orders(self, access_token: str, **params) -> Dict[str, Any]:
-        """Método dedicado para buscar pedidos de venda."""
+        """MÃ©todo dedicado para buscar pedidos de venda."""
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
         url = f"{self.config.BLING_API_URL}/pedidos/vendas"
         
@@ -700,30 +700,30 @@ class AutomationOrchestrator:
     def load_bling_products(self):
         """Worker background para carregar dados."""
         if not self.auth.is_authenticated():
-            self.logger.info("Aguardando autenticação para carregar dados...")
+            self.logger.info("Aguardando autenticaÃ§Ã£o para carregar dados...")
             return
             
         token = self.auth.get_valid_token()
         if not token:
-             self.logger.warning("Token inválido no worker.")
+             self.logger.warning("Token invÃ¡lido no worker.")
              return
              
         self._load_products_and_kits(token)
     
     def check_and_refresh_token(self):
-        """Verifica e renova o token, se necessário."""
+        """Verifica e renova o token, se necessÃ¡rio."""
         if not self.auth.is_authenticated():
             if self.auth.refresh_access_token():
                 self.logger.info("Token renovado com sucesso.")
             else:
-                self.logger.warning("Falha ao renovar token. Autenticação manual necessária.")
+                self.logger.warning("Falha ao renovar token. AutenticaÃ§Ã£o manual necessÃ¡ria.")
 
     def load_data_worker(self):
-        """Worker principal que busca dados, atualiza e executa a lógica."""
-        self.logger.info("Iniciando Worker de carregamento de dados e lógica.")
+        """Worker principal que busca dados, atualiza e executa a lÃ³gica."""
+        self.logger.info("Iniciando Worker de carregamento de dados e lÃ³gica.")
         
         if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
-            self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
+            self.logger.error("ConfiguraÃ§Ãµes BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker nÃ£o pode iniciar.")
             return
 
         while True:
@@ -732,7 +732,7 @@ class AutomationOrchestrator:
                 
                 self.load_bling_products() 
                 
-                # FIX: Garante que o recálculo dos KPIs é acionado
+                # FIX: Garante que o recÃ¡lculo dos KPIs Ã© acionado
                 self.process_sales_orders() 
 
             except Exception as e:
@@ -740,36 +740,39 @@ class AutomationOrchestrator:
                 time.sleep(60)
                 continue
             
-            self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
+            self.logger.info("Worker finalizado. PrÃ³xima execuÃ§Ã£o em 10 minutos.")
             time.sleep(600) # 10 minutos (600 segundos)
 
-    # MÉTODO CORRIGIDO (v4.2): Adiciona debounce lock
+    # MÃ‰TODO CORRIGIDO (v4.2): Adiciona debounce lock
     def process_sales_orders(self):
-        """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
+        """Busca pedidos de venda faturados/em andamento dos Ãºltimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
         if not self.recalculation_lock.acquire(blocking=False):
-            self.logger.warning("Recálculo de KPIs já em andamento. Ignorando nova solicitação.")
+            self.logger.warning("RecÃ¡lculo de KPIs jÃ¡ em andamento. Ignorando nova solicitaÃ§Ã£o.")
             return
-
+        
         try:
             token = self.auth.get_valid_token()
             if not token:
-                self.logger.warning("Token indisponível para buscar pedidos de venda.")
+                self.logger.warning("Token indisponÃ­vel para buscar pedidos de venda.")
                 return
-
-            # FEATURE (v4.6): Expande o período de busca de 9 para 30 dias
-            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
-            
+                
+            # FEATURE (v4.6): Expande o perÃ­odo de busca de 9 para 30 dias
+            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Ãšltimos 30 dias)...")
+            now = datetime.now()
             params = {
-                'dataEmissaoInicial': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
+                'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+                'dataEmissaoFinal': now.strftime('%Y-%m-%d'),  # CRÃTICO: Adiciona data final
                 'pagina': 1,
-                'limite': 50,
+                'limite': 100,  # Aumenta limite para reduzir chamadas
             }
-            
+            # ADICIONAR apÃ³s definir params:
+            self.logger.info(f"ðŸ” ParÃ¢metros da busca: {params}")
+
             all_orders = []
             page = 1
-            
-            while True:
+            MAX_PAGES = 100  # ProteÃ§Ã£o contra loop infinito (100 pÃ¡ginas * 100 itens = 10.000 pedidos max)
+            while page <= MAX_PAGES:
                 current_params = params.copy()
                 current_params['pagina'] = page
                 
@@ -777,42 +780,112 @@ class AutomationOrchestrator:
                 
                 if response_data and 'data' in response_data:
                     items = response_data['data']
+                    
+                    if not items:  # Lista vazia = fim dos resultados
+                        break
+                        
                     all_orders.extend(items)
                     
-                    if len(items) < 50:
+                    # Log de progresso a cada 5 pÃ¡ginas
+                    if page % 5 == 0:
+                        self.logger.info(f"ðŸ“„ PÃ¡gina {page}: {len(items)} pedidos carregados (Total: {len(all_orders)})")
+                        
+                    # Se retornou menos que o limite, Ã© a Ãºltima pÃ¡gina
+                    if len(items) < current_params['limite']:
                         break
-                    
+                        
                     page += 1
-                    time.sleep(0.5) 
+                    time.sleep(0.3)  # Reduz delay entre pÃ¡ginas
                 else:
+                    self.logger.warning(f"âš ï¸ Resposta vazia na pÃ¡gina {page}")
                     break
-                    
+            
+            if page > MAX_PAGES:
+                self.logger.error(f"ðŸš¨ LIMITE DE PÃGINAS ATINGIDO! PossÃ­vel problema com filtro de data. Total carregado: {len(all_orders)}")
+
             if all_orders:
-                self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
+                # NOVO: Valida se os pedidos estÃ£o no perÃ­odo esperado
+                now = datetime.now()
+                thirty_days_ago = now - timedelta(days=30)
+                
+                orders_outside_range = 0
+                oldest_order = None
+                newest_order = None
+                
+                for order in all_orders:
+                    data_obj = order.get('data')
+                    if isinstance(data_obj, dict):
+                        data_str = data_obj.get('dataEmissao')
+                    elif isinstance(data_obj, str):
+                        data_str = data_obj
+                    else:
+                        continue
+                        
+                    try:
+                        order_date = datetime.strptime(data_str, '%Y-%m-%d')
+                        
+                        if not oldest_order or order_date < oldest_order:
+                            oldest_order = order_date
+                        if not newest_order or order_date > newest_order:
+                            newest_order = order_date
+                            
+                        if order_date < thirty_days_ago:
+                            orders_outside_range += 1
+                    except:
+                        pass
+                        
+                # Log de validaÃ§Ã£o
+                if oldest_order and newest_order:
+                    self.logger.info(f"ðŸ“… PerÃ­odo dos pedidos: {oldest_order.strftime('%Y-%m-%d')} atÃ© {newest_order.strftime('%Y-%m-%d')}")
+                    
+                if orders_outside_range > 0:
+                    self.logger.warning(f"âš ï¸ ALERTA: {orders_outside_range} pedidos fora do perÃ­odo de 30 dias! "
+                                      f"A API pode estar ignorando o filtro de data.")
+                
+                self.logger.info(f"ðŸ“Š Total de pedidos encontrados: {len(all_orders)}")
+                
+                # Se encontrou pedidos fora do range, filtra localmente como fallback
+                if orders_outside_range > 0:
+                    self.logger.warning(f"ðŸ”§ Aplicando filtro local para remover {orders_outside_range} pedidos antigos...")
+                    
+                    filtered_orders = []
+                    for order in all_orders:
+                        data_obj = order.get('data')
+                        if isinstance(data_obj, dict):
+                            data_str = data_obj.get('dataEmissao')
+                        elif isinstance(data_obj, str):
+                            data_str = data_obj
+                        else:
+                            continue
+                            
+                        try:
+                            order_date = datetime.strptime(data_str, '%Y-%m-%d')
+                            if order_date >= thirty_days_ago:
+                                filtered_orders.append(order)
+                        except:
+                            filtered_orders.append(order)  # MantÃ©m pedidos sem data vÃ¡lida
+                            
+                    self.logger.info(f"âœ… Filtro local aplicado: {len(all_orders)} -> {len(filtered_orders)} pedidos")
+                    all_orders = filtered_orders
                 
                 for idx, order in enumerate(all_orders[:3]):
                     data_obj = order.get('data')
-                    
                     if isinstance(data_obj, dict):
                         data_str = data_obj.get('dataEmissao', 'N/A')
                         hora_str = data_obj.get('horaEmissao', 'N/A')
                     elif isinstance(data_obj, str):
                         data_str = data_obj
-                        hora_str = "N/A"
+                        hora_str = 'N/A'
                     else:
-                        data_str = "ERRO: tipo inesperado"
-                        hora_str = "N/A"
+                        data_str = 'N/A'
+                        hora_str = 'N/A'
+                    self.logger.debug(f"Amostra pedido {idx+1}: Data EmissÃ£o={data_str} {hora_str}")
                     
-                    total_val = order.get('total', 0)
-                    self.logger.info(f"  [{idx+1}] ID: {order.get('id')}, "
-                                   f"Data: {data_str}, Hora: {hora_str}, "
-                                   f"Total: R$ {total_val}")
-                
-                self.logger.info(f"🔄 Iniciando recalculate_from_orders com {len(all_orders)} pedidos...")
+                # Notifica o SalesManager para recalcular os KPIs
                 self.sales_manager.recalculate_from_orders(all_orders)
             
             else:
-                # Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
+                # Se nÃ£o encontrar NADA, ainda atualiza o timestamp e zera os contadores
                 with self.sales_manager.lock:
                     self.sales_manager.historic_count = 0 
                     self.sales_manager.daily_count = 0
@@ -820,7 +893,7 @@ class AutomationOrchestrator:
                     self.sales_manager.last_recalculated = datetime.now()
                     save_stats(self.sales_manager._get_state_for_save(), self.config.SALES_STATS_FILE)
                 
-                self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
+                self.logger.warning("âš ï¸ Busca de pedidos de venda concluÃ­da. Nenhuma resposta ou pedido encontrado no perÃ­odo.")
         except Exception as e:
             self.logger.exception(f"Erro no processamento de pedidos de venda: {e}")
         finally:
@@ -835,7 +908,7 @@ class AutomationOrchestrator:
         todos_produtos = []
         page = 1
         
-        # PASSO 1: Baixar TUDO primeiro (Paginação)
+        # PASSO 1: Baixar TUDO primeiro (PaginaÃ§Ã£o)
         while True:
             try:
                 resp = self.api_client.get_products(access_token, page=page, limit=100)
@@ -852,10 +925,10 @@ class AutomationOrchestrator:
                 page += 1
                 time.sleep(0.2) 
             except Exception as e:
-                self.logger.error(f"Erro ao carregar página {page}: {e}")
+                self.logger.error(f"Erro ao carregar pÃ¡gina {page}: {e}")
                 break
         
-        # PASSO 2: Criar Mapa para busca rápida (ID -> Produto)
+        # PASSO 2: Criar Mapa para busca rÃ¡pida (ID -> Produto)
         produto_map = {str(p.get("id")): p for p in todos_produtos}
         
         self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando Kits...")
@@ -888,7 +961,7 @@ class AutomationOrchestrator:
                     
                     produto_filho = produto_map.get(filho_id)
                     
-                    nome_final = "Item não carregado"
+                    nome_final = "Item nÃ£o carregado"
                     if produto_filho:
                         nome_final = produto_filho.get("nome")
                     elif filho_ref.get("nome"):
@@ -928,14 +1001,14 @@ class AutomationOrchestrator:
         return self.kits
 
     def run_purchase_check(self, create_orders=False):
-        self.logger.info("Verificação de compras iniciada (Simulação).")
+        self.logger.info("VerificaÃ§Ã£o de compras iniciada (SimulaÃ§Ã£o).")
         return True
 
-# Instâncias Globais
+# InstÃ¢ncias Globais
 config = Config()
 
 if not config.REDIRECT_URI:
-    logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+    logger.error("ERRO FATAL: BLING_REDIRECT_URI nÃ£o configurada no Render")
     pass
 
 sales_manager = SalesManager(config) 
@@ -947,12 +1020,12 @@ auth = orchestrator.auth
 # ============================================================================
 
 def token_required(f):
-    """Decorador para verificar se o token de acesso está disponível e válido."""
+    """Decorador para verificar se o token de acesso estÃ¡ disponÃ­vel e vÃ¡lido."""
     @wraps(f)
     def decorated(*args, **kwargs):
         if not orchestrator.auth or not orchestrator.auth.is_authenticated():
-            orchestrator.auth.logger.warning("Request sem auth válida: retornando 401 json")
-            return jsonify({"needAuth": True, "message": "Token expirado ou inválido"}), 401
+            orchestrator.auth.logger.warning("Request sem auth vÃ¡lida: retornando 401 json")
+            return jsonify({"needAuth": True, "message": "Token expirado ou invÃ¡lido"}), 401
 
         token = orchestrator.auth.get_valid_token()
         if not token:
@@ -991,7 +1064,7 @@ DASHBOARD_TEMPLATE = """
 <body>
     <nav class="navbar navbar-expand-lg">
         <div class="container-fluid">
-            <a class="navbar-brand text-white" href="#">Bling Automação</a>
+            <a class="navbar-brand text-white" href="#">Bling AutomaÃ§Ã£o</a>
             <div class="d-flex">
                 <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
@@ -1000,28 +1073,28 @@ DASHBOARD_TEMPLATE = """
     </nav>
 
     <div class="container mt-4">
-        <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
+        <h2>ðŸ“Š Pedidos de Venda (Abertos e Fechados)</h2>
         <div class="row mb-4">
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-daily">
-                     <h5>Pedidos Diários (Últimas 24h)</h5>
+                     <h5>Pedidos DiÃ¡rios (Ãšltimas 24h)</h5>
                      <h3 id="kpi-daily" class="text-primary">0</h3>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-weekly">
-                     <h5>Pedidos Semanais (Últimos 7 dias)</h5>
+                     <h5>Pedidos Semanais (Ãšltimos 7 dias)</h5>
                      <h3 id="kpi-weekly" class="text-warning">0</h3>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-historic">
-                     <h5>Pedidos Históricos (Últimos 30 dias)</h5>
+                     <h5>Pedidos HistÃ³ricos (Ãšltimos 30 dias)</h5>
                      <h3 id="kpi-historic" class="text-success">0</h3>
                  </div>
              </div>
              <small class="text-muted mt-2">
-                Último Recálculo de KPIs: <span id="last-recalculated">N/D</span>
+                Ãšltimo RecÃ¡lculo de KPIs: <span id="last-recalculated">N/D</span>
             </small>
         </div>
 
@@ -1052,7 +1125,7 @@ DASHBOARD_TEMPLATE = """
                     <div id="kits-list"></div>
                 </div>
                 <div id="auth-required-kits" class="alert alert-warning hidden">
-                    É necessário autenticar com o Bling para visualizar os Produtos.
+                    Ã‰ necessÃ¡rio autenticar com o Bling para visualizar os Produtos.
                 </div>
         </div>
     </div>
@@ -1065,7 +1138,7 @@ DASHBOARD_TEMPLATE = """
         return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
     }
     
-    // Função para formatar o tempo da última venda (hora/minuto)
+    // FunÃ§Ã£o para formatar o tempo da Ãºltima venda (hora/minuto)
     function formatDateTime(isoString) {
         if (!isoString || isoString === 'N/D') return 'N/D';
         try {
@@ -1097,7 +1170,7 @@ DASHBOARD_TEMPLATE = """
     
     let isAuthenticated = false;
     
-    // Função para atualizar os KPIs (chamada via polling E via WebSocket)
+    // FunÃ§Ã£o para atualizar os KPIs (chamada via polling E via WebSocket)
     function updateKpis(dSalesStats) {
         document.getElementById('kpi-daily').textContent = dSalesStats.daily;
         document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
@@ -1133,7 +1206,7 @@ DASHBOARD_TEMPLATE = """
             
                 if (rSalesStats.ok) {
                     const dSalesStats = await rSalesStats.json();
-                    updateKpis(dSalesStats); // Usa a função de atualização
+                    updateKpis(dSalesStats); // Usa a funÃ§Ã£o de atualizaÃ§Ã£o
                 } else {
                     document.getElementById('kpi-daily').textContent = 0;
                     document.getElementById('kpi-weekly').textContent = 0;
@@ -1156,7 +1229,7 @@ DASHBOARD_TEMPLATE = """
     checkStatus();
     setInterval(checkStatus, 5000);
     
-    // NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+    // NOVO (v4.4): WebSocket para notificaÃ§Ãµes de KPI em tempo real
     const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
     
@@ -1165,12 +1238,12 @@ DASHBOARD_TEMPLATE = """
         
         if (data.type === 'kpi_update') {
             const stats = data.data;
-            console.log("📊 KPI atualizado em tempo real:", stats);
+            console.log("ðŸ“Š KPI atualizado em tempo real:", stats);
             
-            // Atualiza a dashboard imediatamente usando a função comum
+            // Atualiza a dashboard imediatamente usando a funÃ§Ã£o comum
             updateKpis(stats);
             
-            // Animação de atualização (opcional, mas visual)
+            // AnimaÃ§Ã£o de atualizaÃ§Ã£o (opcional, mas visual)
             const cards = document.querySelectorAll('.kpi-card');
             cards.forEach(card => {
                 card.style.backgroundColor = '#e8f5e9';
@@ -1188,7 +1261,7 @@ DASHBOARD_TEMPLATE = """
     wsKpi.onclose = () => {
         console.log("WebSocket KPI desconectado. Reconectando em 5s...");
         setTimeout(() => {
-            // Tenta reconectar (recarregar a página é a forma mais simples)
+            // Tenta reconectar (recarregar a pÃ¡gina Ã© a forma mais simples)
             location.reload();
         }, 5000);
     };
@@ -1197,7 +1270,7 @@ DASHBOARD_TEMPLATE = """
     const btnSearch = document.getElementById('btn-search');
     btnSearch.onclick = async () => {
             if (!isAuthenticated) {
-                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">Ã‰ necessÃ¡rio autenticar com o Bling para realizar buscas.</div>';
                 return;
             }
             
@@ -1209,7 +1282,7 @@ DASHBOARD_TEMPLATE = """
                 const r = await fetch(`${API}/product/search?q=${q}`);
                 
                 if (r.status === 401) {
-                    div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
+                    div.innerHTML = '<div class="alert alert-warning">SessÃ£o expirada. Autentique novamente.</div>';
                     checkStatus();
                     return;
                 }
@@ -1275,7 +1348,7 @@ DASHBOARD_TEMPLATE = """
             }
             
             authRequiredDiv.classList.add('hidden');
-            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
+            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalizaÃ§Ã£o do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
             
             try {
                 const r = await fetch(`${API}/kits`); 
@@ -1312,7 +1385,7 @@ DASHBOARD_TEMPLATE = """
                         
                         if (componentes_validos.length > 0) {
                             comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
-                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .map(c => `<small>â€¢ ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                                 .join('<br>');
                         } else {
                             comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
@@ -1369,7 +1442,7 @@ class WebServer:
             @self.app.route('/<path:path>')
             def fatal_error_config(path):
                 from flask import abort
-                self.logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+                self.logger.error("ERRO FATAL: BLING_REDIRECT_URI nÃ£o configurada no Render")
                 abort(500)
         
         @self.app.route("/")
@@ -1383,14 +1456,14 @@ class WebServer:
             state = request.args.get("state")
             
             if self.orchestrator.auth.is_authenticated():
-                self.logger.info("Callback ignorado: Usuário já autenticado.")
+                self.logger.info("Callback ignorado: UsuÃ¡rio jÃ¡ autenticado.")
                 return redirect('/')
 
             if not code or not state:
                 return redirect('/') 
 
             if not token_exchange_lock.acquire(blocking=False):
-                self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
+                self.logger.warning("ConcorrÃªncia detectada no callback. Redirecionando para home.")
                 return redirect('/')
                 
             try:
@@ -1404,7 +1477,7 @@ class WebServer:
                 
                 return redirect('/')
             except Exception as e:
-                self.logger.error(f"Erro crítico no callback: {e}")
+                self.logger.error(f"Erro crÃ­tico no callback: {e}")
                 return redirect('/')
             finally:
                 token_exchange_lock.release()
@@ -1417,10 +1490,10 @@ class WebServer:
                 "is_running": self.orchestrator.is_running
             })
 
-        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
+        # ENDPOINT DE ESTATÃSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
         @self.app.route("/api/sales/stats")
         def api_sales_stats():
-            """Retorna os contadores Diário, Semanal e Histórico."""
+            """Retorna os contadores DiÃ¡rio, Semanal e HistÃ³rico."""
             stats = sales_manager.get_stats()
             
             # FIX SPAM DE LOG (v4.6): Removido o log DEBUG que causava spam no console
@@ -1444,7 +1517,7 @@ class WebServer:
             seen_ids = set()
 
             def process_response(resp_data):
-                """Processa resposta da API e adiciona à lista de resultados básicos"""
+                """Processa resposta da API e adiciona Ã  lista de resultados bÃ¡sicos"""
                 items = resp_data.get('data') or []
                 for p in items:
                     p_id = p.get('id')
@@ -1461,7 +1534,7 @@ class WebServer:
                         "preco": p.get("preco"),
                     })
 
-            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
+            self.logger.info(f"Buscando API por CÃ“DIGO: {termo}")
             resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
             process_response(resp_sku)
 
@@ -1546,10 +1619,10 @@ class WebServer:
                 ).hexdigest()
 
                 if not hmac.compare_digest(signature_header, expected_signature):
-                    self.logger.warning(f"❌ Assinatura inválida no Webhook. Header: {signature_header}")
+                    self.logger.warning(f"âŒ Assinatura invÃ¡lida no Webhook. Header: {signature_header}")
                     return jsonify({"error": "Invalid signature"}), 401
                     
-                self.logger.info("✅ Assinatura HMAC do Webhook validada com sucesso.")
+                self.logger.info("âœ… Assinatura HMAC do Webhook validada com sucesso.")
 
                 data = request.get_json(silent=True)
                 if not data:
@@ -1558,11 +1631,11 @@ class WebServer:
                 event_type = data.get('event', '')
                 
                 if not self.orchestrator.auth.is_authenticated():
-                    self.logger.warning("⚠️ Webhook recebido, mas token Bling não é válido. Ignorando recálculo.")
+                    self.logger.warning("âš ï¸ Webhook recebido, mas token Bling nÃ£o Ã© vÃ¡lido. Ignorando recÃ¡lculo.")
                     return jsonify({"status": "ok", "note": "awaiting_auth"}), 200
 
                 if 'order' in event_type: 
-                    self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
+                    self.logger.info(f"RecÃ¡lculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
 
             except Exception as e:
@@ -1593,17 +1666,17 @@ class WebServer:
                 except Exception:
                     break
 
-        # NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+        # NOVO (v4.4): WebSocket para notificaÃ§Ãµes de KPI em tempo real
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
-            logger.info("📡 WebSocket KPI conectado.")
+            logger.info("ðŸ“¡ WebSocket KPI conectado.")
             
             def notify_kpi(stats):
                 """Callback para notificar via WebSocket quando KPI muda."""
                 try:
-                    # stats já está no formato JSON-ready {'daily': 2, 'weekly': 13, 'historic': 2287, 'last_update': '2025-12-12T14:40:00.000000'}
+                    # stats jÃ¡ estÃ¡ no formato JSON-ready {'daily': 2, 'weekly': 13, 'historic': 2287, 'last_update': '2025-12-12T14:40:00.000000'}
                     ws.send(json.dumps({"type": "kpi_update", "data": stats}))
-                    logger.debug(f"📤 KPI update enviado via WebSocket: {stats}")
+                    logger.debug(f"ðŸ“¤ KPI update enviado via WebSocket: {stats}")
                 except ConnectionClosed:
                     pass
                 except Exception as e:
@@ -1614,7 +1687,7 @@ class WebServer:
                 kpi_update_callbacks.append(notify_kpi)
             
             try:
-                # O loop só precisa manter a conexão viva
+                # O loop sÃ³ precisa manter a conexÃ£o viva
                 while True:
                     try:
                         ws.receive(timeout=5)  # Keepalive
@@ -1653,7 +1726,7 @@ def run_cli():
 if __name__ == "__main__":
     run_cli()
 
-# --- GUNICORN CONFIGURAÇÕES (TIMEOUT AJUSTADO PARA 300) ---
+# --- GUNICORN CONFIGURAÃ‡Ã•ES (TIMEOUT AJUSTADO PARA 300) ---
 import os as _os
 _os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 300 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
