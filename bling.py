@@ -3,12 +3,11 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.4)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.5)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
 - CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
 - FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
-- MELHORIA DASHBOARD: Mensagem clara na dashboard quando falta autenticação para KPIs (v4.3).
-- CORREÇÃO CRÍTICA: Sincronização de Recálculo de Vendas para Webhooks Concorrentes (v4.2).
+- FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
 """
 
 import os
@@ -288,6 +287,9 @@ class SalesManager:
     
     # Data da última atualização dos dados
     last_recalculated: datetime = field(default_factory=datetime.now)
+    
+    # NOVO (v4.5): Flag para controlar o log de falha inicial (Evita spam no polling)
+    _initial_load_failed: bool = True 
 
     def __post_init__(self):
         # Carrega o estado persistido na inicialização
@@ -305,8 +307,13 @@ class SalesManager:
                 # Usa a data carregada ou a data de inicialização se o carregamento falhar
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
             logger.debug(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
+            # Se carregou com sucesso, reseta a flag
+            self._initial_load_failed = False 
         else:
-             logger.debug("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
+             # FIX (v4.5): Só loga o erro de 'Nenhum KPI encontrado' uma vez
+             if self._initial_load_failed:
+                 logger.debug("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
+                # A flag permanece True até que um load seja bem-sucedido.
 
 
     # NOVO: Método para obter o estado a ser salvo
@@ -1333,7 +1340,7 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.4)
+# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.5)
 # ============================================================================
 
 class WebServer:
