@@ -1044,7 +1044,7 @@ def token_required(f):
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel Bling - Sw Moveis</title>
+    <title>Painel Bling - Sw Móveis</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
@@ -1284,42 +1284,45 @@ def token_required(f):
                 }
                 
                 let html = '<div class="list-group">';
+
                 data.forEach(p => {
-                        html += `
-                            <div class="list-group-item">
-                                <div class="d-flex">
-                                    <img src="${p.imagemURL || ''}" 
-                                         style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1"
-                                         onerror="this.style.display='none'">
-                                    
-                                    <div class="flex-grow-1">
-                                        <div class="d-flex w-100 justify-content-between">
-                                            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                            <small>${p.sku || 'N/D'}</small>
-                                        </div>
-        
-                                        <p class="mb-1">${p.descricaoCurta || ''}</p>
-        
-                                        <small class="text-muted d-block">
-                                            <b>Estoque:</b> ${p.estoque}  
-                                            <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
-                                        </small>
-        
-                                        ${p.componentes && p.componentes.length > 0 ? `
-                                            <div class="mt-2">
-                                                <b>Componentes:</b><br>
-                                                ${p.componentes.map(c => 
-                                                    `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
-                                                ).join("<br>")}
-                                            </div>
-                                        ` : ""}
+                    html += `
+                        <div class="list-group-item">
+                            <div class="d-flex">
+                                <img src="${p.imagemURL || ''}" 
+                                     style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1"
+                                     onerror="this.style.display='none'">
+                                
+                                <div class="flex-grow-1">
+                                    <div class="d-flex w-100 justify-content-between">
+                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                        <small>${p.sku || 'N/D'}</small>
                                     </div>
+
+                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
+
+                                    <small class="text-muted d-block">
+                                        <b>Estoque:</b> ${p.estoque}  
+                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                    </small>
+
+                                    ${p.componentes && p.componentes.length > 0 ? `
+                                        <div class="mt-2">
+                                            <b>Componentes:</b><br>
+                                            ${p.componentes.map(c => 
+                                                `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
+                                            ).join("<br>")}
+                                        </div>
+                                    ` : ""}
                                 </div>
                             </div>
-                        `;
+                        </div>
+                    `;
                 });
+
                 html += '</div>';
                 div.innerHTML = html;
+
             } catch(e) {
                 div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
             }
@@ -1361,7 +1364,7 @@ def token_required(f):
                 </thead>
                 <tbody>
                 `;
-                
+
                 data.forEach(k => {
                     const imgHtml = k.imagemURL 
                         ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
@@ -1391,12 +1394,14 @@ def token_required(f):
                         </tr>
                     `;
                 });
+
                 html += '</tbody></table>';
                 div.innerHTML = html;
-        } catch(e) {
-            div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+
+            } catch(e) {
+                div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+            }
         }
-    }
     
     document.addEventListener('DOMContentLoaded', () => {
         loadKits();
