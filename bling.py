@@ -1037,7 +1037,8 @@ def token_required(f):
 # 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.6)
 # ============================================================================
 
-DASHBOARD_TEMPLATE = """
+# -*- coding: utf-8 -*-
+
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
@@ -1053,7 +1054,7 @@ DASHBOARD_TEMPLATE = """
         .log-level-INFO { color: #4ec9b0; }
         .log-level-WARNING { color: #dcdcaa; }
         .log-level-ERROR { color: #f48771; }
-        .log-level-DEBUG { color: #569cd6; } /* Adicionado para debug */
+        .log-level-DEBUG { color: #569cd6; }
         .hidden { display: none; }
         .kpi-card { border-left: 5px solid; transition: background-color 0.5s ease; }
         .kpi-daily { border-left-color: #0d6efd; }
@@ -1064,7 +1065,7 @@ DASHBOARD_TEMPLATE = """
 <body>
     <nav class="navbar navbar-expand-lg">
         <div class="container-fluid">
-            <a class="navbar-brand text-white" href="#">Bling AutomaÃ§Ã£o</a>
+            <a class="navbar-brand text-white" href="#">Bling Automação</a>
             <div class="d-flex">
                 <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
@@ -1073,28 +1074,28 @@ DASHBOARD_TEMPLATE = """
     </nav>
 
     <div class="container mt-4">
-        <h2>ðŸ“Š Pedidos de Venda (Abertos e Fechados)</h2>
+        <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
         <div class="row mb-4">
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-daily">
-                     <h5>Pedidos DiÃ¡rios (Ãšltimas 24h)</h5>
+                     <h5>Pedidos Diários (Últimas 24h)</h5>
                      <h3 id="kpi-daily" class="text-primary">0</h3>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-weekly">
-                     <h5>Pedidos Semanais (Ãšltimos 7 dias)</h5>
+                     <h5>Pedidos Semanais (Últimos 7 dias)</h5>
                      <h3 id="kpi-weekly" class="text-warning">0</h3>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-historic">
-                     <h5>Pedidos HistÃ³ricos (Ãšltimos 30 dias)</h5>
+                     <h5>Pedidos Históricos (Últimos 30 dias)</h5>
                      <h3 id="kpi-historic" class="text-success">0</h3>
                  </div>
              </div>
              <small class="text-muted mt-2">
-                Ãšltimo RecÃ¡lculo de KPIs: <span id="last-recalculated">N/D</span>
+                Último Recalculo de KPIs: <span id="last-recalculated">N/D</span>
             </small>
         </div>
 
@@ -1110,7 +1111,7 @@ DASHBOARD_TEMPLATE = """
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Todos Produtos</button></li>
         </ul>
 
-            <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
+        <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
             <div class="tab-pane fade show active" id="search">
                 <div class="input-group mb-3">
                     <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
@@ -1120,13 +1121,14 @@ DASHBOARD_TEMPLATE = """
             </div>
 
             <div class="tab-pane fade" id="kits">
-                    <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
-                    <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
-                    <div id="kits-list"></div>
-                </div>
-                <div id="auth-required-kits" class="alert alert-warning hidden">
-                    Ã‰ necessÃ¡rio autenticar com o Bling para visualizar os Produtos.
-                </div>
+                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
+                <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
+                <div id="kits-list"></div>
+            </div>
+
+            <div id="auth-required-kits" class="alert alert-warning hidden">
+                É necessário autenticar com o Bling para visualizar os Produtos.
+            </div>
         </div>
     </div>
 
@@ -1138,7 +1140,6 @@ DASHBOARD_TEMPLATE = """
         return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
     }
     
-    // FunÃ§Ã£o para formatar o tempo da Ãºltima venda (hora/minuto)
     function formatDateTime(isoString) {
         if (!isoString || isoString === 'N/D') return 'N/D';
         try {
@@ -1156,7 +1157,6 @@ DASHBOARD_TEMPLATE = """
         }
     }
 
-    // WebSocket Logs
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
     ws.onmessage = (e) => {
@@ -1170,7 +1170,6 @@ DASHBOARD_TEMPLATE = """
     
     let isAuthenticated = false;
     
-    // FunÃ§Ã£o para atualizar os KPIs (chamada via polling E via WebSocket)
     function updateKpis(dSalesStats) {
         document.getElementById('kpi-daily').textContent = dSalesStats.daily;
         document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
@@ -1180,7 +1179,6 @@ DASHBOARD_TEMPLATE = """
     
     async function checkStatus() {
         try {
-            // 1. Check Auth Status
             const rStatus = await fetch(API + '/status');
             const dStatus = await rStatus.json();
             const badge = document.getElementById('status-badge');
@@ -1200,13 +1198,12 @@ DASHBOARD_TEMPLATE = """
             }
             document.getElementById('auth-link').href = dStatus.auth_url;
 
-            // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
             if (isAuthenticated) {
                 const rSalesStats = await fetch(API + '/sales/stats');
             
                 if (rSalesStats.ok) {
                     const dSalesStats = await rSalesStats.json();
-                    updateKpis(dSalesStats); // Usa a funÃ§Ã£o de atualizaÃ§Ã£o
+                    updateKpis(dSalesStats);
                 } else {
                     document.getElementById('kpi-daily').textContent = 0;
                     document.getElementById('kpi-weekly').textContent = 0;
@@ -1219,8 +1216,6 @@ DASHBOARD_TEMPLATE = """
                  document.getElementById('kpi-historic').textContent = 0;
                  document.getElementById('last-recalculated').textContent = 'N/D - AUTENTIQUE';
             }
-
-
         } catch (e) {
             console.error("Erro ao checar status ou stats:", e);
         }
@@ -1229,7 +1224,6 @@ DASHBOARD_TEMPLATE = """
     checkStatus();
     setInterval(checkStatus, 5000);
     
-    // NOVO (v4.4): WebSocket para notificaÃ§Ãµes de KPI em tempo real
     const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
     
@@ -1238,12 +1232,9 @@ DASHBOARD_TEMPLATE = """
         
         if (data.type === 'kpi_update') {
             const stats = data.data;
-            console.log("ðŸ“Š KPI atualizado em tempo real:", stats);
-            
-            // Atualiza a dashboard imediatamente usando a funÃ§Ã£o comum
+            console.log("📊 KPI atualizado em tempo real:", stats);
             updateKpis(stats);
             
-            // AnimaÃ§Ã£o de atualizaÃ§Ã£o (opcional, mas visual)
             const cards = document.querySelectorAll('.kpi-card');
             cards.forEach(card => {
                 card.style.backgroundColor = '#e8f5e9';
@@ -1261,16 +1252,14 @@ DASHBOARD_TEMPLATE = """
     wsKpi.onclose = () => {
         console.log("WebSocket KPI desconectado. Reconectando em 5s...");
         setTimeout(() => {
-            // Tenta reconectar (recarregar a pÃ¡gina Ã© a forma mais simples)
             location.reload();
         }, 5000);
     };
 
-
     const btnSearch = document.getElementById('btn-search');
     btnSearch.onclick = async () => {
             if (!isAuthenticated) {
-                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">Ã‰ necessÃ¡rio autenticar com o Bling para realizar buscas.</div>';
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
                 return;
             }
             
@@ -1282,7 +1271,7 @@ DASHBOARD_TEMPLATE = """
                 const r = await fetch(`${API}/product/search?q=${q}`);
                 
                 if (r.status === 401) {
-                    div.innerHTML = '<div class="alert alert-warning">SessÃ£o expirada. Autentique novamente.</div>';
+                    div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
                     checkStatus();
                     return;
                 }
@@ -1336,7 +1325,6 @@ DASHBOARD_TEMPLATE = """
             }
         };
 
-        // Carregar Kits e Produtos Simples (Todos Produtos)
         async function loadKits() {
             const div = document.getElementById('kits-list');
             const authRequiredDiv = document.getElementById('auth-required-kits');
@@ -1348,7 +1336,7 @@ DASHBOARD_TEMPLATE = """
             }
             
             authRequiredDiv.classList.add('hidden');
-            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalizaÃ§Ã£o do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
+            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
             
             try {
                 const r = await fetch(`${API}/kits`); 
@@ -1385,7 +1373,7 @@ DASHBOARD_TEMPLATE = """
                         
                         if (componentes_validos.length > 0) {
                             comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
-                                .map(c => `<small>â€¢ ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                                 .join('<br>');
                         } else {
                             comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
@@ -1416,7 +1404,7 @@ DASHBOARD_TEMPLATE = """
     </script>
 </body>
 </html>
-"""
+
 
 # ============================================================================ 
 # 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
