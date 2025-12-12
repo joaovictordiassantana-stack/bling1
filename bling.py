@@ -3,13 +3,13 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.6)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.7)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
 - CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
 - FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
 - FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
 - FIX SPAM DE LOG (v4.6): Reduzido nível de log para INFO e removidos logs DEBUG repetitivos de /api/sales/stats.
-- FEATURE (v4.6): Histórico de pedidos expandido de 9 para 30 dias.
+- FEATURE (v4.6): Histórico de pedidos expandido de 9 para 30 dias.\n- FIX CRÍTICO (v4.7): Corrigido contador de histórico para validar período de 30 d
 """
 
 import os
@@ -351,7 +351,7 @@ class SalesManager:
         """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
         now = datetime.now()
         yesterday = now - timedelta(hours=24) 
-        last_week = now - timedelta(days=7)
+        last_week = now - timedelta(days=7)\n        last_month = now - timedelta(days=30)  # ✅ NOVO: Adiciona referência de 30 dias
         
         daily = 0
         weekly = 0
@@ -392,13 +392,15 @@ class SalesManager:
                 logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
                 continue
 
-            historic += 1 
+            # ✅ CORRIGIDO: Só conta histórico se estiver nos últimos 30 dias
+            if order_date >= last_month:
+                historic += 1
                             
             if order_date >= last_week:
                 weekly += 1
                             
             if order_date >= yesterday:
-                daily += 1 
+                daily += 1
 
         # ATUALIZAÇÃO E PERSISTÊNCIA DENTRO DO LOCK
         with self.lock:
