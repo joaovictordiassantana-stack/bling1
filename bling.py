@@ -3,11 +3,13 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.5)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.6)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
 - CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
 - FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
 - FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
+- FIX SPAM DE LOG (v4.6): Reduzido nível de log para INFO e removidos logs DEBUG repetitivos de /api/sales/stats.
+- FEATURE (v4.6): Histórico de pedidos expandido de 9 para 30 dias.
 """
 
 import os
@@ -94,8 +96,8 @@ def setup_logging():
     
     # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
-    # Ajustado para DEBUG para incluir os novos logs de /api/sales/stats
-    logger.setLevel(logging.DEBUG) 
+    # FIX SPAM DE LOG (v4.6): Volta para INFO para reduzir spam de /api/sales/stats
+    logger.setLevel(logging.INFO) 
     
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=1024*1024*5, backupCount=5, encoding='utf-8'
@@ -306,9 +308,12 @@ class SalesManager:
                 self.historic_count = data.get('historic', 0)
                 # Usa a data carregada ou a data de inicialização se o carregamento falhar
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
-            logger.debug(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
-            # Se carregou com sucesso, reseta a flag
-            self._initial_load_failed = False 
+            # FIX SPAM DE LOG (v4.6): Altera para INFO e só loga se não foi a falha inicial
+            if not self._initial_load_failed:  
+                logger.info(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
+                self._initial_load_failed = False 
+            else:
+                self._initial_load_failed = False 
         else:
              # FIX (v4.5): Só loga o erro de 'Nenhum KPI encontrado' uma vez
              if self._initial_load_failed:
@@ -740,7 +745,7 @@ class AutomationOrchestrator:
 
     # MÉTODO CORRIGIDO (v4.2): Adiciona debounce lock
     def process_sales_orders(self):
-        """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
+        """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
         if not self.recalculation_lock.acquire(blocking=False):
             self.logger.warning("Recálculo de KPIs já em andamento. Ignorando nova solicitação.")
@@ -752,10 +757,11 @@ class AutomationOrchestrator:
                 self.logger.warning("Token indisponível para buscar pedidos de venda.")
                 return
 
-            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 9 dias)...")
+            # FEATURE (v4.6): Expande o período de busca de 9 para 30 dias
+            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
             
             params = {
-                'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
+                'dataEmissaoInicial': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
                 'pagina': 1,
                 'limite': 50,
             }
@@ -955,7 +961,7 @@ def token_required(f):
     return decorated
 
 # ============================================================================ 
-# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.4)
+# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.6)
 # ============================================================================
 
 DASHBOARD_TEMPLATE = """
@@ -1010,7 +1016,7 @@ DASHBOARD_TEMPLATE = """
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-historic">
-                     <h5>Pedidos Históricos (Últimos 9 dias)</h5>
+                     <h5>Pedidos Históricos (Últimos 30 dias)</h5>
                      <h3 id="kpi-historic" class="text-success">0</h3>
                  </div>
              </div>
@@ -1340,7 +1346,7 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.5)
+# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
 # ============================================================================
 
 class WebServer:
@@ -1417,8 +1423,7 @@ class WebServer:
             """Retorna os contadores Diário, Semanal e Histórico."""
             stats = sales_manager.get_stats()
             
-            # DEBUG (v4.4): Loga o que está sendo retornado
-            self.logger.debug(f"📡 API /sales/stats retornando: {stats}")
+            # FIX SPAM DE LOG (v4.6): Removido o log DEBUG que causava spam no console
             
             return jsonify(stats)
 
