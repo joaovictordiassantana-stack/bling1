@@ -3,12 +3,12 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.3)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.4)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
+- CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
+- FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
 - MELHORIA DASHBOARD: Mensagem clara na dashboard quando falta autenticação para KPIs (v4.3).
 - CORREÇÃO CRÍTICA: Sincronização de Recálculo de Vendas para Webhooks Concorrentes (v4.2).
-- FIX DE LOG: Reduz nível de log de verificação de KPI para evitar spam (v4.1).
-- Correção: Persistência dos KPIs para ambientes Multi-Worker (Gunicorn/Render) (v4.0).
 """
 
 import os
@@ -46,6 +46,9 @@ except ImportError:
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
 
+# NOVO (v4.4): Variável global para notificar subscribers sobre mudanças de KPI
+kpi_update_callbacks = []
+kpi_update_lock = Lock()
 # ============================================================================ 
 # 1. LOGS AVANÇADOS
 # ============================================================================
@@ -92,7 +95,8 @@ def setup_logging():
     
     # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
-    logger.setLevel(logging.INFO) 
+    # Ajustado para DEBUG para incluir os novos logs de /api/sales/stats
+    logger.setLevel(logging.DEBUG) 
     
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=1024*1024*5, backupCount=5, encoding='utf-8'
@@ -192,7 +196,7 @@ def load_stats_safe(path: Path):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
             # Converte a string ISO de volta para datetime
-            if data and 'last_recalculated' in data:
+            if data and 'last_recalculated' in data and isinstance(data['last_recalculated'], str):
                  data['last_recalculated'] = datetime.fromisoformat(data['last_recalculated'])
             return data
     except Exception as e:
@@ -300,9 +304,8 @@ class SalesManager:
                 self.historic_count = data.get('historic', 0)
                 # Usa a data carregada ou a data de inicialização se o carregamento falhar
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
-            logger.info(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
+            logger.debug(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
         else:
-             # FIX CRÍTICO: Mudar de INFO para DEBUG para evitar spam na interface em cada poll de status
              logger.debug("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
 
 
@@ -318,10 +321,10 @@ class SalesManager:
 
     def get_stats(self) -> Dict[str, Any]:
         """Retorna todas as estatísticas em formato JSON para a API."""
+        # CRÍTICO (v4.4): Sempre relê do arquivo para garantir sincronização entre workers
+        self._load_stats() 
+        
         with self.lock:
-            # Garante que o worker que está lendo a API tem o estado mais recente
-            self._load_stats() # Tenta carregar do arquivo novamente
-            
             # Retorna o timestamp em formato ISO para o front
             return {
                 "daily": self.daily_count,
@@ -331,52 +334,40 @@ class SalesManager:
                 "last_update": self.last_recalculated.isoformat() 
             }
 
-    # MÉTODO CORRIGIDO (v4.0): Lida com múltiplos formatos de data/hora
+    # MÉTODO CORRIGIDO (v4.4): Adiciona notificação via WebSocket
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
         """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
         now = datetime.now()
-        # Período de 24h exatas
         yesterday = now - timedelta(hours=24) 
-        # Período de 7 dias exatos
         last_week = now - timedelta(days=7)
         
         daily = 0
         weekly = 0
         historic = 0
         
-        # O cálculo é feito fora do lock, apenas a atualização do estado é protegida.
+        # O cálculo é feito fora do lock.
         for order in orders:
-            # CORREÇÃO CRÍTICA: Adiciona checagem de tipo
             if not isinstance(order, dict):
                 logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
                 continue
             
-            # FIX CRÍTICO: A data pode vir em DOIS formatos diferentes:
-            # 1. De /pedidos/vendas API: {'data': {'dataEmissao': '2025-12-12', 'horaEmissao': '14:30:00'}}
-            # 2. De Webhook/Logs: Pode ser string direta na chave 'data'
-                            
             data_emissao_str = None
                             
-            # Tenta Formato 1: Estrutura aninhada (API v3 padrão)
             data_obj = order.get('data')
             if isinstance(data_obj, dict):
                 data_emissao_str = data_obj.get('dataEmissao')
                 hora_emissao = data_obj.get('horaEmissao')
-            # Tenta Formato 2: String direta na chave 'data' (alguns webhooks)
             elif isinstance(data_obj, str):
                 data_emissao_str = data_obj
                 hora_emissao = None
                             
             if not data_emissao_str:
-                # DEBUG: Loga se a data não foi encontrada
                 logger.debug(f"Pedido {order.get('id')} sem dataEmissao. Estrutura: {order.keys()}")
                 continue
                             
             try:
-                # Constrói a data/hora para comparação
                 order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
                                     
-                # Se temos hora_emissao e ela é válida, adiciona ao datetime
                 if hora_emissao and isinstance(hora_emissao, str):
                     try:
                         parts = hora_emissao.split(':')
@@ -384,22 +375,20 @@ class SalesManager:
                             h, m, s = map(int, parts)
                             order_date = order_date.replace(hour=h, minute=m, second=s)
                     except (ValueError, AttributeError):
-                        pass  # Se não conseguir parsear a hora, usa apenas data
+                        pass
             except Exception as e:
-                # WARNING: Loga erro de parseamento
                 logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
                 continue
 
-            historic += 1  # Contagem de pedidos (dentro do intervalo buscado)
+            historic += 1 
                             
-            # O cálculo é feito sobre a data do pedido, garantindo precisão 24/7
             if order_date >= last_week:
                 weekly += 1
                             
             if order_date >= yesterday:
                 daily += 1 
 
-        # ATUALIZAÇÃO SÓ DEPOIS DO CÁLCULO, DENTRO DO LOCK
+        # ATUALIZAÇÃO E PERSISTÊNCIA DENTRO DO LOCK
         with self.lock:
             # Atualiza todos os contadores de uma vez
             self.daily_count = daily
@@ -409,6 +398,20 @@ class SalesManager:
             
             # PERSISTE O ESTADO ATUAL
             save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+            
+            # NOVO (v4.4): Notifica subscribers sobre a mudança
+            stats_data = self._get_state_for_save()
+            
+            # Converte a data de volta para ISO string para o WS
+            stats_data['last_update'] = stats_data.pop('last_recalculated').isoformat()
+            
+            global kpi_update_callbacks, kpi_update_lock
+            with kpi_update_lock:
+                for callback in kpi_update_callbacks:
+                    try:
+                        callback(stats_data)
+                    except Exception as e:
+                        logger.error(f"Erro ao notificar KPI subscriber: {e}")
             
             logger.info(f"✅ Estatísticas recalculadas com {len(orders)} pedidos analisados: "
                        f"Diário={daily}, Semanal={weekly}, Histórico={historic}")
@@ -477,20 +480,16 @@ class BlingAuth:
         """
         Tenta trocar o código OAuth por token. Implementa verificação de Lock e State.
         """
-        # Se já estiver autenticado, não faz nada
         if self.is_authenticated():
             self.logger.info("Tentativa de callback ignorada: Token já válido.")
             return True
 
-        # Validação do State - Ajuste para ser tolerante se o usuário já estivesse autenticado antes
         if self.state is None:
             self.state = state
             self._save_state(state)
         
-        # Correção OBRIGATÓRIA: Aviso em vez de bloqueio rígido se houver mismatch mas o código parecer válido
         if self.state and state != self.state:
             self.logger.warning(f"State mismatch detectado (Ignorado para evitar bloqueio): {state} vs {self.state}")
-            # Não retornamos False aqui para não travar o fluxo se o browser recarregou
             
         try:
             client = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
@@ -498,7 +497,6 @@ class BlingAuth:
             headers = {"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"}
             payload = {'grant_type': 'authorization_code', 'code': code, 'redirect_uri': self.config.REDIRECT_URI}
             
-            # Timeout curto para evitar travar worker
             response = requests.post(self.config.TOKEN_URL, data=payload, headers=headers, timeout=10)
             
             if response.status_code == 200:
@@ -581,15 +579,12 @@ def extract_image_url(prod: dict, depth=0) -> Optional[str]:
             return val
 
     # 2. Tenta encontrar dentro de listas de mídia (padrão Bling V3)
-    # Ex: midia: [{ url: "..." }] ou imagens: [{ link: "..." }]
     for list_key in ["midia", "midias", "imagens", "fotos", "anexos"]:
         items = prod.get(list_key, [])
         if isinstance(items, list):
             for item in items:
-                # Se for string direta
                 if isinstance(item, str) and item.startswith("http"):
                     return item
-                # Se for objeto, recursão rasa
                 if isinstance(item, dict):
                     ret = extract_image_url(item, depth + 1)
                     if ret: return ret
@@ -597,7 +592,6 @@ def extract_image_url(prod: dict, depth=0) -> Optional[str]:
     # 3. Tenta descer um nível se houver 'data' ou 'produto' aninhado
     for nested in ["data", "produto"]:
         if nested in prod and isinstance(prod[nested], dict):
-             # Evita recursão no mesmo ID
              if prod[nested].get('id') != prod.get('id'):
                  return extract_image_url(prod[nested], depth + 1)
 
@@ -611,7 +605,6 @@ class BlingAPIClient:
     
     def get_products(self, access_token: str, page: int = 1, limit: int = 100, **filters) -> Dict[str, Any]:
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
-        # Filters serão passados aqui: e.g. codigo='COI-B' ou nome='...'
         params = {'pagina': page, 'limite': limit, **filters}
         url = f"{self.config.BLING_API_URL}/produtos"
         
@@ -665,7 +658,6 @@ class BlingAPIClient:
                     continue
                 else:
                     self.logger.warning(f"Erro API Pedidos de Venda: {response.status_code} - {response.text}")
-                    # Adiciona log de erro com resposta completa
                     error_logger.error(f"FALHA NA BUSCA DE PEDIDOS: {response.status_code} - {response.text}") 
             except Exception as e:
                 self.logger.warning(f"Erro conexao API Pedidos de Venda: {e}")
@@ -681,20 +673,18 @@ class AutomationOrchestrator:
     def __init__(self, config: Config, sales_manager: 'SalesManager'):
         self.config = config
         self.auth = BlingAuth(config)
-        # CORREÇÃO: Passa o 'config' e não 'self.config' (ambos funcionam mas o padrão é mais limpo)
         self.api_client = BlingAPIClient(config) 
         self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
         
-        self.sales_manager = sales_manager # Gerenciador de vendas
+        self.sales_manager = sales_manager 
         
         self.kits: List[Dict[str, Any]] = []
         self.products: List[Dict[str, Any]] = []
         self.is_running: bool = False
         self.lock = Lock()
-        self.recalculation_lock = Lock() # NOVO: Lock para sincronizar o recálculo de vendas
+        self.recalculation_lock = Lock() 
         self.logger = logger
     
-    # Renomeado e refatorado para ser o método de cache do worker
     def load_bling_products(self):
         """Worker background para carregar dados."""
         if not self.auth.is_authenticated():
@@ -720,30 +710,24 @@ class AutomationOrchestrator:
         """Worker principal que busca dados, atualiza e executa a lógica."""
         self.logger.info("Iniciando Worker de carregamento de dados e lógica.")
         
-        # O sistema precisa de um token para funcionar
         if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
             self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
             return
 
-        # Loop principal do worker
         while True:
             try:
-                # 1. Checa a validade do token e o renova se necessário.
                 self.check_and_refresh_token()
                 
-                # 2. Carrega dados estáticos do Bling (kits, produtos simples)
                 self.load_bling_products() 
                 
-                # 3. FIX: Garante que o recálculo dos KPIs é acionado
+                # FIX: Garante que o recálculo dos KPIs é acionado
                 self.process_sales_orders() 
 
             except Exception as e:
-                # Em caso de erro grave (ex: 401 Unauthorized), espera mais tempo
                 self.logger.error(f"Erro grave no loop do worker: {e}. Esperando 60s antes de tentar novamente.")
                 time.sleep(60)
                 continue
             
-            # Espera um intervalo antes de executar novamente (10 minutos)
             self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
             time.sleep(600) # 10 minutos (600 segundos)
 
@@ -751,7 +735,6 @@ class AutomationOrchestrator:
     def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
-        # NOVO: Previne execuções concorrentes (debounce)
         if not self.recalculation_lock.acquire(blocking=False):
             self.logger.warning("Recálculo de KPIs já em andamento. Ignorando nova solicitação.")
             return
@@ -762,9 +745,8 @@ class AutomationOrchestrator:
                 self.logger.warning("Token indisponível para buscar pedidos de venda.")
                 return
 
-            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (SEM FILTRO DE SITUAÇÃO)...")
+            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 9 dias)...")
             
-            # O período de busca deve cobrir o semanal (7 dias) + uma margem de segurança (9 dias)
             params = {
                 'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
                 'pagina': 1,
@@ -788,16 +770,14 @@ class AutomationOrchestrator:
                         break
                     
                     page += 1
-                    time.sleep(0.5) # Pequeno delay entre páginas
+                    time.sleep(0.5) 
                 else:
                     break
                     
             if all_orders:
                 self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
                 
-                # LOG DETALHADO DOS 3 PRIMEIROS PEDIDOS (para debug dos KPIs zerados)
                 for idx, order in enumerate(all_orders[:3]):
-                    # Extrai a data da mesma forma que recalculate_from_orders faz
                     data_obj = order.get('data')
                     
                     if isinstance(data_obj, dict):
@@ -815,16 +795,11 @@ class AutomationOrchestrator:
                                    f"Data: {data_str}, Hora: {hora_str}, "
                                    f"Total: R$ {total_val}")
                 
-                # Recalcula todos os KPIs com base em todos os pedidos encontrados no período
                 self.logger.info(f"🔄 Iniciando recalculate_from_orders com {len(all_orders)} pedidos...")
                 self.sales_manager.recalculate_from_orders(all_orders)
             
-                self.logger.info(f"✅ Busca e Recálculo de KPIs concluído. "
-                               f"Resultados: Diário={self.sales_manager.daily_count}, "
-                               f"Semanal={self.sales_manager.weekly_count}, "
-                               f"Histórico={self.sales_manager.historic_count}")
             else:
-                # FIX: Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
+                # Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
                 with self.sales_manager.lock:
                     self.sales_manager.historic_count = 0 
                     self.sales_manager.daily_count = 0
@@ -836,7 +811,6 @@ class AutomationOrchestrator:
         except Exception as e:
             self.logger.exception(f"Erro no processamento de pedidos de venda: {e}")
         finally:
-            # Garante que o lock é liberado, mesmo em caso de erro.
             self.recalculation_lock.release() 
 
 
@@ -851,7 +825,6 @@ class AutomationOrchestrator:
         # PASSO 1: Baixar TUDO primeiro (Paginação)
         while True:
             try:
-                # Busca produtos incluindo estrutura se possível
                 resp = self.api_client.get_products(access_token, page=page, limit=100)
                 items = resp.get('data', [])
                 
@@ -860,12 +833,11 @@ class AutomationOrchestrator:
                 
                 todos_produtos.extend(items)
                 
-                # Se vier menos que o limite, acabou
                 if len(items) < 100:
                     break
                     
                 page += 1
-                time.sleep(0.2) # Respeita rate limit
+                time.sleep(0.2) 
             except Exception as e:
                 self.logger.error(f"Erro ao carregar página {page}: {e}")
                 break
@@ -882,34 +854,25 @@ class AutomationOrchestrator:
             estrutura = p.get("estrutura", {})
             componentes = estrutura.get("componentes", [])
             
-            # Define se é kit: tem componentes OU tipo é 'K'
             eh_kit = len(componentes) > 0 or p.get("tipo") == "K" or p.get("formato") == "K"
 
-            # Busca imagem robusta
             img_url = extract_image_url(p)
             
-            # Se for KIT, processa componentes
             if eh_kit:
                 comps_formatados = []
                 
-                # Se a lista de componentes estiver vazia mas for tipo K, 
-                # tentamos uma chamada única de detalhe (fallback)
                 if not componentes and p_id:
                      try:
-                         # Só chama API se realmente faltar info
                          det = self.api_client.get_product_details(access_token, p_id)
                          componentes = det.get("estrutura", {}).get("componentes", [])
-                         # Atualiza imagem se achou no detalhe
                          if not img_url: img_url = extract_image_url(det)
                      except:
                          pass
 
                 for c in componentes:
-                    # O componente refere-se a um produto filho
                     filho_ref = c.get("produto", {})
                     filho_id = str(filho_ref.get("id"))
                     
-                    # Tenta achar o nome no nosso MAPA (muito mais rápido)
                     produto_filho = produto_map.get(filho_id)
                     
                     nome_final = "Item não carregado"
@@ -927,17 +890,15 @@ class AutomationOrchestrator:
                 self.kits.append({
                     "id": p_id,
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"), # Chave 'produto'
+                    "produto": p.get("nome"), 
                     "imagemURL": img_url,
                     "componentes": comps_formatados
                 })
             else:
-                # É produto normal
-                # CORREÇÃO: Padroniza o nome para 'produto' para o front-end
                 self.products.append({
                     "id": p.get("id"),
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"), # Chave 'produto'
+                    "produto": p.get("nome"), 
                     "imagemURL": img_url,
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
@@ -964,9 +925,7 @@ if not config.REDIRECT_URI:
     logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
     pass
 
-# Instancia o SalesManager
 sales_manager = SalesManager(config) 
-# Passa o SalesManager para o Orchestrator
 orchestrator = AutomationOrchestrator(config, sales_manager) 
 auth = orchestrator.auth
 
@@ -978,7 +937,6 @@ def token_required(f):
     """Decorador para verificar se o token de acesso está disponível e válido."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        # Retorna 401 limpo para que o front entenda que precisa reautenticar
         if not orchestrator.auth or not orchestrator.auth.is_authenticated():
             orchestrator.auth.logger.warning("Request sem auth válida: retornando 401 json")
             return jsonify({"needAuth": True, "message": "Token expirado ou inválido"}), 401
@@ -990,7 +948,7 @@ def token_required(f):
     return decorated
 
 # ============================================================================ 
-# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO)
+# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.4)
 # ============================================================================
 
 DASHBOARD_TEMPLATE = """
@@ -1009,9 +967,9 @@ DASHBOARD_TEMPLATE = """
         .log-level-INFO { color: #4ec9b0; }
         .log-level-WARNING { color: #dcdcaa; }
         .log-level-ERROR { color: #f48771; }
+        .log-level-DEBUG { color: #569cd6; } /* Adicionado para debug */
         .hidden { display: none; }
-        /* NOVO CSS PARA KPIS */
-        .kpi-card { border-left: 5px solid; }
+        .kpi-card { border-left: 5px solid; transition: background-color 0.5s ease; }
         .kpi-daily { border-left-color: #0d6efd; }
         .kpi-weekly { border-left-color: #ffc107; }
         .kpi-historic { border-left-color: #198754; }
@@ -1099,12 +1057,11 @@ DASHBOARD_TEMPLATE = """
         if (!isoString || isoString === 'N/D') return 'N/D';
         try {
              const date = new Date(isoString);
-             // Inclui dia e mês se a data for de dias anteriores
              const now = new Date();
              const isToday = date.toDateString() === now.toDateString();
              
              if (isToday) {
-                 return date.toLocaleTimeString('pt-BR'); // Ex: 14:30:00
+                 return date.toLocaleTimeString('pt-BR'); 
              } else {
                  return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); 
              }
@@ -1126,6 +1083,15 @@ DASHBOARD_TEMPLATE = """
     }
     
     let isAuthenticated = false;
+    
+    // Função para atualizar os KPIs (chamada via polling E via WebSocket)
+    function updateKpis(dSalesStats) {
+        document.getElementById('kpi-daily').textContent = dSalesStats.daily;
+        document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
+        document.getElementById('kpi-historic').textContent = dSalesStats.historic;
+        document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+    }
+    
     async function checkStatus() {
         try {
             // 1. Check Auth Status
@@ -1148,29 +1114,20 @@ DASHBOARD_TEMPLATE = """
             }
             document.getElementById('auth-link').href = dStatus.auth_url;
 
-            // 2. Update Sales Stats (KPIs)
+            // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
             if (isAuthenticated) {
                 const rSalesStats = await fetch(API + '/sales/stats');
             
                 if (rSalesStats.ok) {
                     const dSalesStats = await rSalesStats.json();
-                
-                    document.getElementById('kpi-daily').textContent = dSalesStats.daily;
-                    document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
-                    document.getElementById('kpi-historic').textContent = dSalesStats.historic;
-        
-                    // Atualiza o tempo do último recálculo
-                    document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
-
+                    updateKpis(dSalesStats); // Usa a função de atualização
                 } else {
-                    // Se o status for OK (mas a API falhou por outro motivo)
                     document.getElementById('kpi-daily').textContent = 0;
                     document.getElementById('kpi-weekly').textContent = 0;
                     document.getElementById('kpi-historic').textContent = 0;
                     document.getElementById('last-recalculated').textContent = 'ERRO API';
                 }
             } else {
-                 // Limpa os dados porque a autenticação falhou
                  document.getElementById('kpi-daily').textContent = 0;
                  document.getElementById('kpi-weekly').textContent = 0;
                  document.getElementById('kpi-historic').textContent = 0;
@@ -1185,6 +1142,44 @@ DASHBOARD_TEMPLATE = """
     
     checkStatus();
     setInterval(checkStatus, 5000);
+    
+    // NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+    const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+    
+    wsKpi.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        
+        if (data.type === 'kpi_update') {
+            const stats = data.data;
+            console.log("📊 KPI atualizado em tempo real:", stats);
+            
+            // Atualiza a dashboard imediatamente usando a função comum
+            updateKpis(stats);
+            
+            // Animação de atualização (opcional, mas visual)
+            const cards = document.querySelectorAll('.kpi-card');
+            cards.forEach(card => {
+                card.style.backgroundColor = '#e8f5e9';
+                setTimeout(() => {
+                    card.style.backgroundColor = '';
+                }, 500);
+            });
+        }
+    };
+    
+    wsKpi.onerror = (e) => {
+        console.error("Erro WebSocket KPI:", e);
+    };
+    
+    wsKpi.onclose = () => {
+        console.log("WebSocket KPI desconectado. Reconectando em 5s...");
+        setTimeout(() => {
+            // Tenta reconectar (recarregar a página é a forma mais simples)
+            location.reload();
+        }, 5000);
+    };
+
 
     const btnSearch = document.getElementById('btn-search');
     btnSearch.onclick = async () => {
@@ -1239,7 +1234,6 @@ DASHBOARD_TEMPLATE = """
                                             <div class="mt-2">
                                                 <b>Componentes:</b><br>
                                                 ${p.componentes.map(c => 
-                                                    // CORREÇÃO: Usa 'nome' e 'sku' do componente (estrutura simplificada)
                                                     `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
                                                 ).join("<br>")}
                                             </div>
@@ -1268,11 +1262,9 @@ DASHBOARD_TEMPLATE = """
             }
             
             authRequiredDiv.classList.add('hidden');
-            // MENSAGEM AJUSTADA: avisa que pode demorar
             div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
             
             try {
-                // CORREÇÃO: Endpoint agora retorna KITS + PRODUTOS SIMPLES
                 const r = await fetch(`${API}/kits`); 
                 
                 if (r.status === 401) {
@@ -1297,13 +1289,11 @@ DASHBOARD_TEMPLATE = """
                 `;
                 
                 data.forEach(k => {
-                    // Trata imagem quebrada escondendo a tag (mantido)
                     const imgHtml = k.imagemURL 
                         ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
                         : '<span class="text-muted">-</span>';
 
                     let comps = '';
-                    // Se o item tem componentes, é um KIT
                     if (k.componentes && k.componentes.length > 0) {
                         const componentes_validos = k.componentes;
                         
@@ -1315,11 +1305,9 @@ DASHBOARD_TEMPLATE = """
                             comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
                         }
                     } else {
-                        // Produto Simples
                         comps = `<span class="text-muted" style="font-size:0.8em">Produto Simples (Estoque: ${k.estoque || 'N/D'})</span>`;
                     }
 
-                    // CORREÇÃO: Agora usa k.produto (chave unificada)
                     html += `
                         <tr>
                             <td style="width:60px">${imgHtml}</td>
@@ -1345,7 +1333,7 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO)
+# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.4)
 # ============================================================================
 
 class WebServer:
@@ -1361,7 +1349,6 @@ class WebServer:
         self.setup_websocket()
 
     def setup_routes(self):
-        # Acessa sales_manager globalmente
         global sales_manager
 
         if not self.orchestrator.config.REDIRECT_URI:
@@ -1382,22 +1369,18 @@ class WebServer:
             code = request.args.get("code")
             state = request.args.get("state")
             
-            # PROTEÇÃO 1: Se já estiver autenticado, redireciona direto
             if self.orchestrator.auth.is_authenticated():
                 self.logger.info("Callback ignorado: Usuário já autenticado.")
                 return redirect('/')
 
             if not code or not state:
-                return redirect('/') # Redireciona silent, sem erro 400
+                return redirect('/') 
 
-            # PROTEÇÃO 2: Lock global de troca de token
-            # Se não conseguir pegar o lock imediatamente, significa que outro request está processando
             if not token_exchange_lock.acquire(blocking=False):
                 self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
                 return redirect('/')
                 
             try:
-                # PROTEÇÃO 3: Previne reuso de code localmente
                 with WebServer.code_lock:
                     if code in WebServer.used_codes:
                         return redirect('/')
@@ -1406,7 +1389,6 @@ class WebServer:
                 self.logger.info(f"Processando callback code...")
                 success = self.orchestrator.auth.exchange_code_for_token(code, state)
                 
-                # Se falhou por state inválido ou outro motivo, apenas redireciona
                 return redirect('/')
             except Exception as e:
                 self.logger.error(f"Erro crítico no callback: {e}")
@@ -1416,19 +1398,22 @@ class WebServer:
 
         @self.app.route('/api/status')
         def api_status():
-            # Rota leve e rápida
             return jsonify({
                 "authenticated": self.orchestrator.auth.is_authenticated(),
                 "auth_url": self.orchestrator.auth.get_authorization_url(),
                 "is_running": self.orchestrator.is_running
             })
 
-        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA RECALCULADO E PERSISTIDO)
+        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
         @self.app.route("/api/sales/stats")
         def api_sales_stats():
             """Retorna os contadores Diário, Semanal e Histórico."""
-            # O sales_manager agora garante que o estado é lido do arquivo antes de retornar
-            return jsonify(sales_manager.get_stats())
+            stats = sales_manager.get_stats()
+            
+            # DEBUG (v4.4): Loga o que está sendo retornado
+            self.logger.debug(f"📡 API /sales/stats retornando: {stats}")
+            
+            return jsonify(stats)
 
         @self.app.route("/api/all_products", methods=["GET"])
         @token_required
@@ -1439,12 +1424,10 @@ class WebServer:
         @token_required
         def api_product_search(token):
             termo = request.args.get("q") or request.args.get("sku") or request.args.get("nome") or ""
-            termo = termo.strip() # Remove espaços
+            termo = termo.strip() 
             if not termo:
                 return jsonify([])
 
-            # --- CORREÇÃO IMPORTANTE: BUSCA HÍBRIDA NA API ---
-            
             all_results_base = []
             seen_ids = set()
 
@@ -1453,12 +1436,10 @@ class WebServer:
                 items = resp_data.get('data') or []
                 for p in items:
                     p_id = p.get('id')
-                    # Evita duplicatas se encontrar o mesmo produto por nome e código
                     if p_id and p_id in seen_ids:
                         continue
                     if p_id: seen_ids.add(p_id)
                     
-                    # Armazena apenas os dados básicos da busca inicial
                     all_results_base.append({
                         "id": p.get("id"),
                         "sku": p.get("codigo"),
@@ -1468,20 +1449,15 @@ class WebServer:
                         "preco": p.get("preco"),
                     })
 
-            # 1. Tenta buscar por CÓDIGO (SKU)
             self.logger.info(f"Buscando API por CÓDIGO: {termo}")
             resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
             process_response(resp_sku)
 
-            # 2. Tenta buscar por NOME (Descrição)
             self.logger.info(f"Buscando API por NOME: {termo}")
             resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
             process_response(resp_nome)
 
-            # 3. ENRIQUECIMENTO DE DADOS (Busca Detalhada)
             final_results = []
-            
-            # Busca detalhes para popular imagem — CORRIGIDO: limitado a 10 para não travar
             MAX_DETALHES = 10 
             
             for idx, p in enumerate(all_results_base):
@@ -1494,26 +1470,22 @@ class WebServer:
                     self.orchestrator.logger.exception("Erro ao buscar detalhe produto %s", p["id"])
                     details = {}
                 
-                # CORREÇÃO: Mapeamento de estoque correto (V3)
                 estoque_val = (
                     details.get("estoqueAtual")
                     or details.get("saldoDisponivel")
                     or details.get("estoque", {}).get("saldoVirtualTotal", 0)
                 )
 
-                # Constrói o objeto final com dados básicos e detalhes
                 produto_completo = {
                     "id": p["id"],
                     "sku": p.get("sku"),
                     "nome": p.get("nome"),
-                    "produto": p.get("nome"), # Chave unificada para o front-end
+                    "produto": p.get("nome"), 
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
                     "preco": p.get("preco"),
                     "estoque": estoque_val,
                     "descricaoCurta": details.get("descricaoCurta"),
-                    # Componentes são adicionados para kits
-                    # Ajusta a estrutura para o front-end (componente.produto.nome -> componente.nome)
                     "componentes": [
                          {
                             "nome": c.get("produto", {}).get("nome", "Sem nome"),
@@ -1522,22 +1494,18 @@ class WebServer:
                          }
                         for c in details.get("estrutura", {}).get("componentes", [])
                     ],
-                    "imagemURL": extract_image_url(details), # Usa a nova função utilitária
+                    "imagemURL": extract_image_url(details), 
                 }
                 final_results.append(produto_completo)
             
-            # CORREÇÃO: Adiciona kits que não foram encontrados na busca por nome/sku (cache local)
-            # A lista de kits é melhor mantida no cache
             kits_cache = self.orchestrator.get_all_kits()
             termo_lower = termo.lower()
             
             for kit in kits_cache:
-                # Se o ID não foi encontrado na busca da API, adiciona o kit do cache se for relevante
                 if kit.get("id") not in seen_ids and (termo_lower in str(kit.get("produto", "")).lower() or termo_lower in str(kit.get("sku", "")).lower()):
                     final_results.append(kit)
-                    seen_ids.add(kit.get("id")) # Marca como visto
+                    seen_ids.add(kit.get("id")) 
             
-            # Adicionar produtos simples do cache se a API não retornou e eles corresponderem
             produtos_cache = self.orchestrator.get_all_products()
             for prod in produtos_cache:
                 if prod.get("id") not in seen_ids and (termo_lower in str(prod.get("produto", "")).lower() or termo_lower in str(prod.get("sku", "")).lower()):
@@ -1547,7 +1515,6 @@ class WebServer:
             return jsonify(final_results)
 
 
-        # CORREÇÃO: Rota /api/kits alterada para retornar Kits E Produtos Simples do cache.
         @self.app.route('/api/kits', methods=["GET"])
         @token_required
         def api_kits(token):
@@ -1556,16 +1523,12 @@ class WebServer:
 
         @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
-            """Processa webhooks do Bling e atualiza KPIs em tempo real com validação HMAC."""
-            
-            # 1. Recupera o payload bruto e o header de assinatura
             payload = request.get_data()
             signature_header = request.headers.get('X-Bling-Signature-256', '')
 
-            # 2. Válida o HMAC usando o CLIENT_SECRET
             try:
                 expected_signature = 'sha256=' + hmac.new(
-                    self.orchestrator.config.CLIENT_SECRET.encode(), # Usa CLIENT_SECRET da Config
+                    self.orchestrator.config.CLIENT_SECRET.encode(), 
                     payload,
                     hashlib.sha256
                 ).hexdigest()
@@ -1576,23 +1539,18 @@ class WebServer:
                     
                 self.logger.info("✅ Assinatura HMAC do Webhook validada com sucesso.")
 
-                # 3. Processa o JSON após a validação
                 data = request.get_json(silent=True)
                 if not data:
-                    return jsonify({"status": "ok"}), 200 # OK se não houver dados
+                    return jsonify({"status": "ok"}), 200 
                 
                 event_type = data.get('event', '')
                 
-                # CRUCIAL 4: Verifica Token e Aciona o recálculo
                 if not self.orchestrator.auth.is_authenticated():
                     self.logger.warning("⚠️ Webhook recebido, mas token Bling não é válido. Ignorando recálculo.")
                     return jsonify({"status": "ok", "note": "awaiting_auth"}), 200
 
                 if 'order' in event_type: 
                     self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
-                    # Usa uma Thread para não bloquear a resposta do webhook enquanto o recálculo roda
-                    # A persistência em arquivo garante que o estado seja compartilhado entre processos
-                    # Chamada ao método protegido pelo novo lock.
                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
 
             except Exception as e:
@@ -1601,6 +1559,8 @@ class WebServer:
             return jsonify({"status": "ok"}), 200
 
     def setup_websocket(self):
+        global kpi_update_callbacks, kpi_update_lock
+
         @self.sock.route('/ws/logs')
         def ws_logs(ws):
             logger.info("WS conectado.")
@@ -1613,14 +1573,49 @@ class WebServer:
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
                     try:
-                        # CORREÇÃO: Tratamento para ConnectionClosed
                         ws.receive(timeout=1)
                     except ConnectionClosed:
-                         break # Sai do loop limpo
+                         break 
                     except Exception:
                         pass
                 except Exception:
                     break
+
+        # NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+        @self.sock.route('/ws/kpi-updates')
+        def ws_kpi_updates(ws):
+            logger.info("📡 WebSocket KPI conectado.")
+            
+            def notify_kpi(stats):
+                """Callback para notificar via WebSocket quando KPI muda."""
+                try:
+                    # stats já está no formato JSON-ready {'daily': 2, 'weekly': 13, 'historic': 2287, 'last_update': '2025-12-12T14:40:00.000000'}
+                    ws.send(json.dumps({"type": "kpi_update", "data": stats}))
+                    logger.debug(f"📤 KPI update enviado via WebSocket: {stats}")
+                except ConnectionClosed:
+                    pass
+                except Exception as e:
+                    logger.warning(f"Erro ao enviar KPI update: {e}")
+            
+            # Registra esse callback
+            with kpi_update_lock:
+                kpi_update_callbacks.append(notify_kpi)
+            
+            try:
+                # O loop só precisa manter a conexão viva
+                while True:
+                    try:
+                        ws.receive(timeout=5)  # Keepalive
+                    except ConnectionClosed:
+                        break
+                    except Exception:
+                        pass
+            finally:
+                # Remove o callback quando desconectar
+                with kpi_update_lock:
+                    if notify_kpi in kpi_update_callbacks:
+                        kpi_update_callbacks.remove(notify_kpi)
+                logger.info("WebSocket KPI desconectado.")
 
 # ============================================================================ 
 # 10. ENTRY POINT
@@ -1640,7 +1635,6 @@ def run_cli():
     args = parser.parse_args()
     
     if args.serve:
-        # Inicia o worker em uma thread separada
         Thread(target=orchestrator.load_data_worker, daemon=True).start()
         app.run(host='0.0.0.0', port=args.port, debug=False)
 
