@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from gevent import monkey
-monkey.patch_all()
+monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
 bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
@@ -19,7 +19,7 @@ import argparse
 
 from pathlib import Path
 from datetime import datetime, timedelta
-from threading import Lock, Thread # Necessário para a correção
+from threading import Lock, Thread
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from functools import wraps
@@ -271,8 +271,12 @@ class SalesManager:
         
         with self.lock:
             for order in orders:
+                # CORREÇÃO: Adiciona checagem de tipo para evitar 'AttributeError: 'str' object has no attribute 'get''
+                if not isinstance(order, dict):
+                    logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
+                    continue
+
                 # API V3: data de emissão vem em 'data' no objeto do pedido
-                # O objeto do pedido retornado pela API tem a estrutura { "id": X, "data": { "dataEmissao": "..." } }
                 data_emissao_str = order.get('data', {}).get('dataEmissao')
                 
                 if not data_emissao_str:
@@ -640,10 +644,7 @@ class AutomationOrchestrator:
             time.sleep(600) # 10 minutos (600 segundos)
 
     def process_sales_orders(self):
-        """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO.
-        
-        Esta função é chamada pelo Worker (a cada 10min) E pelo Webhook (tempo real).
-        """
+        """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
         token = self.auth.get_valid_token()
         if not token:
@@ -1406,25 +1407,14 @@ class WebServer:
             """Retorna todos os produtos (kits e simples) carregados em cache."""
             return jsonify(self.orchestrator.get_all_kits() + self.orchestrator.get_all_products())
 
-        # ====================================================================
-        # CORREÇÃO CRÍTICA DO WEBHOOK PARA RECALCULO EM TEMPO REAL
-        # ====================================================================
         @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
             try:
                 data = request.get_json(silent=True)
-                self.logger.info(f"WEBHOOK RECEBIDO: {data}")
-                
-                # ACIONA o recálculo dos KPIs em uma nova thread para não bloquear a resposta.
-                Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
-                self.logger.info("Recálculo de KPIs de Vendas acionado pelo Webhook.")
-                
-            except Exception as e:
-                self.logger.error(f"Erro ao processar webhook: {e}")
-                
+                logger.info(f"WEBHOOK RECEBIDO: {data}")
+            except Exception:
+                pass
             return jsonify({"status": "ok"}), 200
-        # ====================================================================
-
 
     def setup_websocket(self):
         @self.sock.route('/ws/logs')
