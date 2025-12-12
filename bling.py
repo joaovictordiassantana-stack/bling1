@@ -267,13 +267,15 @@ class SalesManager:
         now = datetime.now()
         
         # Reset Diário (após 24 horas da última atualização)
-        if now > self.daily.last_update + timedelta(hours=24):
+        # CORREÇÃO: Reseta se a data for diferente, ou se 24h passaram *desde o reset*
+        # Para um reset diário "à meia-noite", o check deve ser diferente, mas vamos manter o de 24h.
+        if (now - self.daily.last_update).total_seconds() > (24 * 3600):
             self.daily.count = 0
             self.daily.last_update = now
             logger.info("Contador Diário de Vendas Resetado.")
             
         # Reset Semanal (após 7 dias da última atualização)
-        if now > self.weekly.last_update + timedelta(days=7):
+        if (now - self.weekly.last_update).total_seconds() > (7 * 24 * 3600):
             self.weekly.count = 0
             self.weekly.last_update = now
             logger.info("Contador Semanal de Vendas Resetado.")
@@ -292,7 +294,7 @@ class SalesManager:
             self.historic.count += product_count
             self.last_order_id = max(self.last_order_id, order_id)
             
-            # Atualiza o timestamp apenas no momento da venda
+            # Atualiza o timestamp
             self.daily.last_update = datetime.now()
             self.weekly.last_update = datetime.now()
             self.historic.last_update = datetime.now()
@@ -532,15 +534,37 @@ class BlingAPIClient:
             time.sleep(1)
         return {}
 
+    def get_sales_orders(self, access_token: str, **params) -> Dict[str, Any]:
+        """Método dedicado para buscar pedidos de venda."""
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        url = f"{self.config.BLING_API_URL}/pedidos/vendas"
+        
+        for attempt in range(self.config.MAX_RETRIES):
+            try:
+                response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:  # Rate limit
+                    time.sleep(2)
+                    continue
+                else:
+                    self.logger.warning(f"Erro API Pedidos de Venda: {response.status_code} - {response.text}")
+            except Exception as e:
+                self.logger.warning(f"Erro conexao API Pedidos de Venda: {e}")
+            time.sleep(1)
+        return {}
+
+
 # ============================================================================ 
 # 6. ORQUESTRADOR (ATUALIZADO COM LÓGICA DE VENDAS)
 # ============================================================================
 
 class AutomationOrchestrator:
-    def __init__(self, config: Config, sales_manager: SalesManager):
+    def __init__(self, config: Config, sales_manager: 'SalesManager'):
         self.config = config
         self.auth = BlingAuth(config)
-        self.api_client = BlingAPIClient(config)
+        # CORREÇÃO: Passa o 'config' e não 'self.config' (ambos funcionam mas o padrão é mais limpo)
+        self.api_client = BlingAPIClient(config) 
         self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
         
         self.sales_manager = sales_manager # NOVO: Gerenciador de vendas
@@ -589,7 +613,6 @@ class AutomationOrchestrator:
                 self.check_and_refresh_token()
                 
                 # 2. Carrega dados estáticos do Bling (kits, produtos simples)
-                # Esta chamada é importante para o cache de kits e a busca do front
                 self.load_bling_products() 
                 
                 # 3. NOVO: Busca Pedidos de Venda e Atualiza as Estatísticas
@@ -602,7 +625,7 @@ class AutomationOrchestrator:
                 continue
             
             # Espera um intervalo antes de executar novamente (10 minutos)
-            time.sleep(600)
+            time.sleep(600) # 10 minutos (600 segundos)
 
     def process_sales_orders(self):
         """Busca pedidos de venda faturados ou em produção e atualiza o sales_manager."""
@@ -615,8 +638,6 @@ class AutomationOrchestrator:
         # Status: 12 (Atendido/Faturado) e 2 (Em Andamento/Produção)
         status_ids = [12, 2] 
         
-        endpoint = "/v3/pedidos/vendas"
-        
         # Busca pedidos nos últimos 30 dias, ordenado por ID (para pegar os mais novos)
         params = {
             'situacao[id]': ','.join(map(str, status_ids)),
@@ -627,39 +648,30 @@ class AutomationOrchestrator:
             'ordem': 'desc',
         }
         
-        headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
-        url = f"{self.config.BLING_API_URL}{endpoint}"
-
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
-            response.raise_for_status()
-            data = response.json()
-        except requests.exceptions.HTTPError as e:
-            self.logger.error(f"Erro HTTP ao buscar pedidos de venda: {e}. Resposta: {response.text}")
-            return
-        except Exception as e:
-            self.logger.error(f"Erro geral ao buscar pedidos de venda: {e}")
-            return
-
-        if 'data' in data:
+        response_data = self.api_client.get_sales_orders(token, **params)
+        
+        if response_data and 'data' in response_data:
             total_sales_count = 0
-            # Processa do pedido mais antigo para o mais novo, embora a busca seja decrescente (reverse)
-            # Isso garante que o last_order_id seja o mais alto se a primeira página não for completa
-            for order in reversed(data['data']): 
+            
+            # Processa do pedido mais antigo para o mais novo (reverse)
+            for order in reversed(response_data['data']): 
                 order_id = order['id']
                 
+                # Soma a quantidade de itens em todos os produtos do pedido
                 product_count = sum(item['quantidade'] for item in order.get('itens', []) if 'quantidade' in item)
                 
                 # O SalesManager só adiciona se o ID for maior que o último processado
+                is_new_sale = self.sales_manager.last_order_id < order_id
                 self.sales_manager.add_product_sales(product_count, order_id)
                 
-                if product_count > 0 and order_id > self.sales_manager.last_order_id:
+                if product_count > 0 and is_new_sale:
                     total_sales_count += product_count
             
             if total_sales_count > 0:
                  self.logger.info(f"Contabilizadas {total_sales_count} unidades de produtos em novos pedidos de venda.")
         else:
             self.logger.warning("Nenhum pedido de venda encontrado com os filtros.")
+
 
     def _load_products_and_kits(self, access_token: str):
         self.logger.info("Iniciando carga otimizada de produtos e kits...")
@@ -911,7 +923,15 @@ DASHBOARD_TEMPLATE = """
         if (isoString === 'N/D') return isoString;
         try {
              const date = new Date(isoString);
-             return date.toLocaleTimeString('pt-BR');
+             // Inclui dia e mês se a data for de dias anteriores
+             const now = new Date();
+             const isToday = date.toDateString() === now.toDateString();
+             
+             if (isToday) {
+                 return date.toLocaleTimeString('pt-BR'); // Ex: 14:30:00
+             } else {
+                 return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); 
+             }
         } catch (e) {
             return 'N/D';
         }
@@ -952,17 +972,22 @@ DASHBOARD_TEMPLATE = """
             }
             document.getElementById('auth-link').href = dStatus.auth_url;
 
-            // 2. Update Sales Stats (KPIs) - NOVO
+            // 2. Update Sales Stats (KPIs) - NOVO ENDPOINT
             const rSalesStats = await fetch(API + '/sales/stats');
-            const dSalesStats = await rSalesStats.json();
             
-            document.getElementById('kpi-daily').textContent = dSalesStats.daily;
-            document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
-            document.getElementById('kpi-historic').textContent = dSalesStats.historic;
-
-            // Atualiza o tempo da última venda
-            document.getElementById('last-daily').textContent = formatLastUpdate(dSalesStats.last_update_daily);
-            document.getElementById('last-weekly').textContent = formatLastUpdate(dSalesStats.last_update_weekly);
+            if (rSalesStats.ok) {
+                const dSalesStats = await rSalesStats.json();
+            
+                document.getElementById('kpi-daily').textContent = dSalesStats.daily;
+                document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
+                document.getElementById('kpi-historic').textContent = dSalesStats.historic;
+    
+                // Atualiza o tempo da última venda
+                document.getElementById('last-daily').textContent = formatLastUpdate(dSalesStats.last_update_daily);
+                document.getElementById('last-weekly').textContent = formatLastUpdate(dSalesStats.last_update_weekly);
+            } else {
+                console.error("Falha ao buscar estatísticas de vendas.");
+            }
 
 
         } catch (e) {
