@@ -1039,6 +1039,7 @@ def token_required(f):
 
 # -*- coding: utf-8 -*-
 
+DASHBOARD_TEMPLATE = r"""
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
@@ -1328,6 +1329,7 @@ def token_required(f):
             }
         };
 
+
         async function loadKits() {
             const div = document.getElementById('kits-list');
             const authRequiredDiv = document.getElementById('auth-required-kits');
@@ -1409,7 +1411,7 @@ def token_required(f):
     </script>
 </body>
 </html>
-
+"""
 
 # ============================================================================ 
 # 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
