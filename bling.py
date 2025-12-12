@@ -144,6 +144,7 @@ class Config:
     
     # Arquivos
     TOKENS_FILE: Path = Path('tokens.json')
+    COMPONENT_CONFIG_FILE: Path = Path('component_config.json')
 
 # ============================================================================ 
 # 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
@@ -181,36 +182,157 @@ def is_token_valid(token_data):
         return False
     return time.time() < float(expires_at) - 20
 
+# --- FUNÇÃO PARA BUSCA DE PRODUTOS (CORRIGIDO PARA V3) ---
+def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | None = None, access_token: str | None = None):
+    try:
+        filters = {}
+        if sku:
+            # CORREÇÃO: API v3 usa 'codigo' e não 'sku'
+            filters['codigo'] = sku.strip()
+        if nome and not sku:
+            filters['nome'] = nome.strip()
+
+        page = 1
+        all_items = []
+        token = access_token or getattr(bling_client, "access_token", None)
+        
+        while True:
+            resp = bling_client.get_products(token, page=page, limit=100, **filters)
+            if not resp: 
+                break
+                
+            items = resp.get('data') or resp.get('produtos') or []
+            if isinstance(items, dict) and 'produto' in items:
+                items = items.get('produto') or []
+            
+            if not items:
+                break
+                
+            all_items.extend(items)
+            if len(items) < 100:
+                break
+            page += 1
+            
+        return {"success": True, "data": all_items}
+        
+    except Exception as e:
+        logger.exception("Erro na busca de produtos no Bling: %s", e)
+        return {"success": False, "error": str(e)}
+
 # ============================================================================ 
-# 4. CLASSES DE DADOS E EXCEÇÕES
+# 4. CLASSES DE DADOS E EXCEÇÕES (ATUALIZADO PARA RECALCULO COMPLETO)
 # ============================================================================
 
+class BlingAuthError(Exception): pass
+class BlingAPIError(Exception): pass
+
+# NOVO: Estatísticas de Vendas (Simplificado para Recálculo)
 @dataclass
-class ProcessingStats:
-    success: int = 0
-    failed: int = 0
-    ops_created: int = 0
-    pos_created: int = 0
-    stock_checks: int = 0
-    elapsed_time_seconds: float = 0.0
+class SalesManager:
+    """
+    Gerencia contadores de Pedidos de Venda Diárias, Semanais e o Histórico.
+    O cálculo é feito por recálculo completo baseado na data do pedido, ideal para
+    sistemas que não rodam 24/7.
+    """
     
-    def reset(self):
-        self.success = 0
-        self.failed = 0
-        self.ops_created = 0
-        self.pos_created = 0
-        self.stock_checks = 0
-        self.elapsed_time_seconds = 0.0
+    lock: Lock = field(default_factory=Lock)
     
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            'success': self.success,
-            'failed': self.failed,
-            'ops_created': self.ops_created,
-            'pos_created': self.pos_created,
-            'stock_checks': self.stock_checks,
-            'elapsed_time_seconds': round(self.elapsed_time_seconds, 2)
-        }
+    # Contadores (serão redefinidos a cada recalculate)
+    daily_count: int = 0
+    weekly_count: int = 0
+    historic_count: int = 0
+    
+    # Data da última atualização dos dados
+    last_recalculated: datetime = field(default_factory=datetime.now)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Retorna todas as estatísticas em formato JSON para a API."""
+        with self.lock:
+            # Retorna o timestamp em formato ISO para o front
+            return {
+                "daily": self.daily_count,
+                "weekly": self.weekly_count,
+                "historic": self.historic_count,
+                # Retorna o timestamp de quando o worker processou por último
+                "last_update": self.last_recalculated.isoformat() 
+            }
+
+    def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
+        """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
+        now = datetime.now()
+        # Período de 24h exatas
+        yesterday = now - timedelta(hours=24) 
+        # Período de 7 dias exatos
+        last_week = now - timedelta(days=7)
+        
+        daily = 0
+        weekly = 0
+        historic = 0
+        
+        with self.lock:
+            for order in orders:
+                # API V3: data de emissão vem em 'data' no objeto do pedido
+                data_emissao_str = order.get('data', {}).get('dataEmissao')
+                
+                if not data_emissao_str:
+                    continue
+                
+                try:
+                    # Constrói a data/hora para comparação
+                    order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+                    
+                    # Tenta incluir a hora do pedido, se disponível (para precisão de 24h)
+                    hora_emissao = order.get('data', {}).get('horaEmissao')
+                    if hora_emissao and len(hora_emissao.split(':')) == 3:
+                        h, m, s = map(int, hora_emissao.split(':'))
+                        order_date = order_date.replace(hour=h, minute=m, second=s)
+
+                except Exception:
+                    # Se falhar o parsing da hora, usa apenas a data
+                    order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d').replace(hour=0, minute=0, second=0)
+
+
+                historic += 1 # Contagem de pedidos (dentro do intervalo buscado)
+                
+                # O cálculo é feito sobre a data do pedido, garantindo precisão 24/7
+                if order_date >= last_week:
+                    weekly += 1
+                
+                if order_date >= yesterday:
+                    daily += 1 
+
+            # Atualiza todos os contadores de uma vez
+            self.daily_count = daily
+            self.weekly_count = weekly
+            self.historic_count = historic
+            self.last_recalculated = now # Atualiza o tempo de processamento
+            logger.info(f"Estatísticas recalculadas com {len(orders)} pedidos: Diário={daily}, Semanal={weekly}, Histórico={historic}")
+
+
+class ComponentConfigManager:
+    def __init__(self, file_path: Path):
+        self.file_path = file_path
+        self._load_or_create_config()
+        self.logger = logger
+    
+    def _load_or_create_config(self) -> Dict[str, Any]:
+        if self.file_path.exists():
+            try:
+                with open(self.file_path, 'r', encoding='utf-8') as f:
+                    self.config = json.load(f)
+            except Exception:
+                self.config = {"components": []}
+        else:
+            self.config = {"components": []}
+            self._save_config()
+        return self.config
+    
+    def _save_config(self):
+        try:
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            self.logger.error(f"Erro salvando config: {e}")
 
 # ============================================================================ 
 # 5. CLIENTE BLING API E AUTH
@@ -421,16 +543,40 @@ class BlingAPIClient:
             time.sleep(1)
         return {}
 
+    def get_sales_orders(self, access_token: str, **params) -> Dict[str, Any]:
+        """Método dedicado para buscar pedidos de venda."""
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        url = f"{self.config.BLING_API_URL}/pedidos/vendas"
+        
+        for attempt in range(self.config.MAX_RETRIES):
+            try:
+                response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 429:  # Rate limit
+                    time.sleep(2)
+                    continue
+                else:
+                    self.logger.warning(f"Erro API Pedidos de Venda: {response.status_code} - {response.text}")
+            except Exception as e:
+                self.logger.warning(f"Erro conexao API Pedidos de Venda: {e}")
+            time.sleep(1)
+        return {}
+
+
 # ============================================================================ 
-# 6. ORQUESTRADOR
+# 6. ORQUESTRADOR (ATUALIZADO PARA RECALCULO DE VENDAS)
 # ============================================================================
 
 class AutomationOrchestrator:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, sales_manager: 'SalesManager'):
         self.config = config
         self.auth = BlingAuth(config)
-        self.api_client = BlingAPIClient(config)
-        self.stats = ProcessingStats()
+        # CORREÇÃO: Passa o 'config' e não 'self.config' (ambos funcionam mas o padrão é mais limpo)
+        self.api_client = BlingAPIClient(config) 
+        self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
+        
+        self.sales_manager = sales_manager # Gerenciador de vendas
         
         self.kits: List[Dict[str, Any]] = []
         self.products: List[Dict[str, Any]] = []
@@ -438,31 +584,118 @@ class AutomationOrchestrator:
         self.lock = Lock()
         self.logger = logger
     
-    def load_data_worker(self):
+    # Renomeado e refatorado para ser o método de cache do worker
+    def load_bling_products(self):
         """Worker background para carregar dados."""
+        if not self.auth.is_authenticated():
+            self.logger.info("Aguardando autenticação para carregar dados...")
+            return
+            
+        token = self.auth.get_valid_token()
+        if not token:
+             self.logger.warning("Token inválido no worker.")
+             return
+             
+        self._load_products_and_kits(token)
+    
+    def check_and_refresh_token(self):
+        """Verifica e renova o token, se necessário."""
+        if not self.auth.is_authenticated():
+            if self.auth.refresh_access_token():
+                self.logger.info("Token renovado com sucesso.")
+            else:
+                self.logger.warning("Falha ao renovar token. Autenticação manual necessária.")
+
+    def load_data_worker(self):
+        """Worker principal que busca dados, atualiza e executa a lógica."""
+        self.logger.info("Iniciando Worker de carregamento de dados e lógica.")
+        
+        # O sistema precisa de um token para funcionar
+        if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
+            self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
+            return
+
+        # Loop principal do worker
         while True:
             try:
-                if self.auth.load_tokens():
-                    token = self.auth.get_valid_token()
-                    if token:
-                        self._load_products_and_kits(token)
-                    else:
-                        self.logger.warning("Token inválido no worker.")
-                else:
-                    self.logger.info("Aguardando autenticação para carregar dados...")
-                time.sleep(3600)  # Recarrega a cada 1h
+                # 1. Checa a validade do token e o renova se necessário.
+                self.check_and_refresh_token()
+                
+                # 2. Carrega dados estáticos do Bling (kits, produtos simples)
+                # Esta operação pode ser longa e bloqueadora
+                self.load_bling_products() 
+                
+                # 3. NOVO: Busca Pedidos de Venda e Atualiza as Estatísticas (Recálculo total)
+                self.process_sales_orders() 
+
             except Exception as e:
-                self.logger.error(f"Erro worker: {e}")
+                # Em caso de erro grave (ex: 401 Unauthorized), espera mais tempo
+                self.logger.error(f"Erro grave no loop do worker: {e}. Esperando 60s antes de tentar novamente.")
                 time.sleep(60)
-    
-    def load_data(self) -> bool:
-        if self.auth.load_tokens():
-             token = self.auth.get_valid_token()
-             if token:
-                 self._load_products_and_kits(token)
-                 return True
-        return False
-    
+                continue
+            
+            # Espera um intervalo antes de executar novamente (10 minutos)
+            self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
+            time.sleep(600) # 10 minutos (600 segundos)
+
+    def process_sales_orders(self):
+        """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
+        
+        token = self.auth.get_valid_token()
+        if not token:
+            self.logger.warning("Token indisponível para buscar pedidos de venda.")
+            return
+
+        self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs...")
+        
+        # CORREÇÃO: Status ajustado para cobrir ABERTOS (2, 3, 9) e FECHADOS (12)
+        # 2: Em Andamento; 3: Em Aberto; 9: Pendente; 12: Atendido/Faturado
+        status_ids = [2, 3, 9, 12] 
+        
+        # O período de busca deve cobrir o semanal (7 dias) + uma margem de segurança (9 dias)
+        # Isso garante que a contagem semanal seja precisa, mesmo que o sistema tenha ficado desligado.
+        params = {
+            'situacao[id]': ','.join(map(str, status_ids)),
+            # Buscando pedidos dos últimos 9 dias (para cobrir a semana + margem de erro)
+            'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
+            # Usaremos a paginação completa para garantir que todos os pedidos sejam carregados
+            'pagina': 1,
+            'limite': 50,
+        }
+        
+        all_orders = []
+        page = 1
+        
+        while True:
+            current_params = params.copy()
+            current_params['pagina'] = page
+            
+            response_data = self.api_client.get_sales_orders(token, **current_params)
+            
+            if response_data and 'data' in response_data:
+                items = response_data['data']
+                all_orders.extend(items)
+                
+                if len(items) < 50:
+                    break
+                
+                page += 1
+                time.sleep(0.5) # Pequeno delay entre páginas
+            else:
+                break
+                
+        if all_orders:
+            # NOVO: Recalcula todos os KPIs com base em todos os pedidos encontrados no período
+            self.sales_manager.recalculate_from_orders(all_orders)
+        
+            self.logger.info(f"Busca e Recálculo de KPIs concluído. Total de pedidos analisados: {len(all_orders)}.")
+        else:
+            self.sales_manager.historic_count = 0 # Limpa se não encontrar nada
+            self.sales_manager.daily_count = 0
+            self.sales_manager.weekly_count = 0
+            self.logger.warning("Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
+
+
     def _load_products_and_kits(self, access_token: str):
         self.logger.info("Iniciando carga otimizada de produtos e kits...")
         self.kits.clear()
@@ -494,7 +727,6 @@ class AutomationOrchestrator:
                 break
         
         # PASSO 2: Criar Mapa para busca rápida (ID -> Produto)
-        # Isso permite achar o nome do componente instantaneamente
         produto_map = {str(p.get("id")): p for p in todos_produtos}
         
         self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando Kits...")
@@ -503,9 +735,6 @@ class AutomationOrchestrator:
         for p in todos_produtos:
             p_id = p.get("id")
             
-            # Tenta pegar estrutura (alguns endpoints retornam direto, outros precisam de details)
-            # Se for crucial ter a estrutura e ela não vier na listagem, teríamos que buscar details individualmente.
-            # Assumindo que 'estrutura' vem na lista ou que vamos usar o que tem:
             estrutura = p.get("estrutura", {})
             componentes = estrutura.get("componentes", [])
             
@@ -554,15 +783,23 @@ class AutomationOrchestrator:
                 self.kits.append({
                     "id": p_id,
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"),
+                    "produto": p.get("nome"), # Chave 'produto'
                     "imagemURL": img_url,
                     "componentes": comps_formatados
                 })
             else:
                 # É produto normal
-                # Injeta a imagem extraída para garantir que o front receba
-                p['imagemURL'] = img_url
-                self.products.append(p)
+                # CORREÇÃO: Padroniza o nome para 'produto' para o front-end
+                self.products.append({
+                    "id": p.get("id"),
+                    "sku": p.get("codigo"),
+                    "produto": p.get("nome"), # Chave 'produto'
+                    "imagemURL": img_url,
+                    "tipo": p.get("tipo"),
+                    "situacao": p.get("situacao"),
+                    "preco": p.get("preco"),
+                    "estoque": p.get("estoqueAtual", 0)
+                })
 
         self.logger.info(f"Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
 
@@ -572,6 +809,10 @@ class AutomationOrchestrator:
     def get_all_kits(self) -> List[Dict[str, Any]]:
         return self.kits
 
+    def run_purchase_check(self, create_orders=False):
+        self.logger.info("Verificação de compras iniciada (Simulação).")
+        return True
+
 # Instâncias Globais
 config = Config()
 
@@ -579,7 +820,10 @@ if not config.REDIRECT_URI:
     logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
     pass
 
-orchestrator = AutomationOrchestrator(config)
+# Instancia o SalesManager
+sales_manager = SalesManager() 
+# Passa o SalesManager para o Orchestrator
+orchestrator = AutomationOrchestrator(config, sales_manager) 
 auth = orchestrator.auth
 
 # ============================================================================ 
@@ -602,7 +846,7 @@ def token_required(f):
     return decorated
 
 # ============================================================================ 
-# 9. TEMPLATE HTML DO DASHBOARD
+# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO)
 # ============================================================================
 
 DASHBOARD_TEMPLATE = """
@@ -622,6 +866,11 @@ DASHBOARD_TEMPLATE = """
         .log-level-WARNING { color: #dcdcaa; }
         .log-level-ERROR { color: #f48771; }
         .hidden { display: none; }
+        /* NOVO CSS PARA KPIS */
+        .kpi-card { border-left: 5px solid; }
+        .kpi-daily { border-left-color: #0d6efd; }
+        .kpi-weekly { border-left-color: #ffc107; }
+        .kpi-historic { border-left-color: #198754; }
     </style>
 </head>
 <body>
@@ -636,9 +885,29 @@ DASHBOARD_TEMPLATE = """
     </nav>
 
     <div class="container mt-4">
+        <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
         <div class="row mb-4">
-             <div class="col"><div class="card p-3 text-center"><h5>Sucesso</h5><h3 id="kpi-success" class="text-success">0</h3></div></div>
-             <div class="col"><div class="card p-3 text-center"><h5>Falhas</h5><h3 id="kpi-failed" class="text-danger">0</h3></div></div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-daily">
+                     <h5>Pedidos Diários (Últimas 24h)</h5>
+                     <h3 id="kpi-daily" class="text-primary">0</h3>
+                 </div>
+             </div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-weekly">
+                     <h5>Pedidos Semanais (Últimos 7 dias)</h5>
+                     <h3 id="kpi-weekly" class="text-warning">0</h3>
+                 </div>
+             </div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-historic">
+                     <h5>Pedidos Históricos (Últimos 9 dias)</h5>
+                     <h3 id="kpi-historic" class="text-success">0</h3>
+                 </div>
+             </div>
+             <small class="text-muted mt-2">
+                Último Recálculo de KPIs: <span id="last-recalculated">N/D</span>
+            </small>
         </div>
 
         <div class="card mb-4">
@@ -650,7 +919,7 @@ DASHBOARD_TEMPLATE = """
 
         <ul class="nav nav-tabs" id="myTab" role="tablist">
             <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
-            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Kits</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Todos Produtos</button></li>
         </ul>
 
             <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
@@ -663,11 +932,12 @@ DASHBOARD_TEMPLATE = """
             </div>
 
             <div class="tab-pane fade" id="kits">
-                    <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Kits</button>
+                    <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
+                    <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
                     <div id="kits-list"></div>
                 </div>
                 <div id="auth-required-kits" class="alert alert-warning hidden">
-                    É necessário autenticar com o Bling para visualizar os Kits.
+                    É necessário autenticar com o Bling para visualizar os Produtos.
                 </div>
         </div>
     </div>
@@ -676,9 +946,27 @@ DASHBOARD_TEMPLATE = """
     <script>
     const API = '/api';
     
-    // Formatador de logs
     function formatLog(log) {
         return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
+    }
+    
+    // Função para formatar o tempo da última venda (hora/minuto)
+    function formatDateTime(isoString) {
+        if (!isoString || isoString === 'N/D') return 'N/D';
+        try {
+             const date = new Date(isoString);
+             // Inclui dia e mês se a data for de dias anteriores
+             const now = new Date();
+             const isToday = date.toDateString() === now.toDateString();
+             
+             if (isToday) {
+                 return date.toLocaleTimeString('pt-BR'); // Ex: 14:30:00
+             } else {
+                 return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); 
+             }
+        } catch (e) {
+            return 'N/D';
+        }
     }
 
     // WebSocket Logs
@@ -692,16 +980,16 @@ DASHBOARD_TEMPLATE = """
             box.scrollTop = box.scrollHeight;
         }
     }
-    // Status Polling
-    let isAuthenticated = false;
     
+    let isAuthenticated = false;
     async function checkStatus() {
         try {
-            const r = await fetch(API + '/status');
-            const d = await r.json();
+            // 1. Check Auth Status
+            const rStatus = await fetch(API + '/status');
+            const dStatus = await rStatus.json();
             const badge = document.getElementById('status-badge');
             
-            isAuthenticated = d.authenticated;
+            isAuthenticated = dStatus.authenticated;
             
             if(isAuthenticated) {
                 badge.className = 'badge bg-success me-2';
@@ -714,17 +1002,36 @@ DASHBOARD_TEMPLATE = """
                 document.getElementById('auth-link').classList.remove('d-none');
                 document.getElementById('content-tabs').classList.add('hidden');
             }
+            document.getElementById('auth-link').href = dStatus.auth_url;
+
+            // 2. Update Sales Stats (KPIs)
+            const rSalesStats = await fetch(API + '/sales/stats');
             
-            // Atualiza o link de autenticação
-            document.getElementById('auth-link').href = d.auth_url;
+            if (rSalesStats.ok) {
+                const dSalesStats = await rSalesStats.json();
             
+                document.getElementById('kpi-daily').textContent = dSalesStats.daily;
+                document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
+                document.getElementById('kpi-historic').textContent = dSalesStats.historic;
+    
+                // Atualiza o tempo do último recálculo
+                document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+
+            } else {
+                // Limpa os dados em caso de falha (provavelmente por falta de autenticação)
+                document.getElementById('kpi-daily').textContent = 0;
+                document.getElementById('kpi-weekly').textContent = 0;
+                document.getElementById('kpi-historic').textContent = 0;
+                document.getElementById('last-recalculated').textContent = 'N/D';
+            }
+
+
         } catch (e) {
-            console.error("Erro ao checar status:", e);
+            console.error("Erro ao checar status ou stats:", e);
         }
     }
     
     checkStatus();
-    // Ajuste de polling para 5 segundos (5000ms) para reduzir a carga no servidor
     setInterval(checkStatus, 5000);
 
     const btnSearch = document.getElementById('btn-search');
@@ -760,11 +1067,12 @@ DASHBOARD_TEMPLATE = """
                             <div class="list-group-item">
                                 <div class="d-flex">
                                     <img src="${p.imagemURL || ''}" 
-                                         style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1">
+                                         style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1"
+                                         onerror="this.style.display='none'">
                                     
                                     <div class="flex-grow-1">
                                         <div class="d-flex w-100 justify-content-between">
-                                            <h5 class="mb-1">${p.nome || 'Sem nome'}</h5>
+                                            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
                                             <small>${p.sku || 'N/D'}</small>
                                         </div>
         
@@ -779,7 +1087,8 @@ DASHBOARD_TEMPLATE = """
                                             <div class="mt-2">
                                                 <b>Componentes:</b><br>
                                                 ${p.componentes.map(c => 
-                                                    `${c.quantidade}x ${c.produto?.nome || 'Sem nome'}`
+                                                    // CORREÇÃO: Usa 'nome' e 'sku' do componente (estrutura simplificada)
+                                                    `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
                                                 ).join("<br>")}
                                             </div>
                                         ` : ""}
@@ -795,7 +1104,7 @@ DASHBOARD_TEMPLATE = """
             }
         };
 
-        // Carregar Kits
+        // Carregar Kits e Produtos Simples (Todos Produtos)
         async function loadKits() {
             const div = document.getElementById('kits-list');
             const authRequiredDiv = document.getElementById('auth-required-kits');
@@ -807,10 +1116,12 @@ DASHBOARD_TEMPLATE = """
             }
             
             authRequiredDiv.classList.add('hidden');
-            div.innerHTML = 'Carregando...';
+            // MENSAGEM AJUSTADA: avisa que pode demorar
+            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
             
             try {
-                const r = await fetch(`${API}/kits`);
+                // CORREÇÃO: Endpoint agora retorna KITS + PRODUTOS SIMPLES
+                const r = await fetch(`${API}/kits`); 
                 
                 if (r.status === 401) {
                     div.innerHTML = '';
@@ -819,41 +1130,57 @@ DASHBOARD_TEMPLATE = """
                     return;
                 }
 
-                    const data = await r.json();
-                    let html = `
-    <table class="table table-sm">
-    <thead>
-    <tr>
-        <th>IMG</th>
-        <th>SKU</th>
-        <th>Nome</th>
-        <th>Componentes</th>
-    </tr>
-    </thead>
-    <tbody>
-    `;
-    
-                    data.forEach(k => {
-                        const thumb = k.imagemURL ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;">` : '';
-    
-                        let comps = k.componentes
-                            .map(c => `${c.quantidade}x ${c.nome}`)
-                            .join('<br>');
-    
-                        html += `
-                            <tr>
-                                <td>${thumb}</td>
-                                <td>${k.sku}</td>
-                                <td>${k.produto}</td>
-                                <td>${comps}</td>
-                            </tr>
-                        `;
-                    });
-    
-                    html += '</tbody></table>';
+                const data = await r.json();
+                let html = `
+                <table class="table table-sm">
+                <thead>
+                <tr>
+                    <th>IMG</th>
+                    <th>SKU</th>
+                    <th>Nome</th>
+                    <th>Componentes / Tipo</th>
+                </tr>
+                </thead>
+                <tbody>
+                `;
+                
+                data.forEach(k => {
+                    // Trata imagem quebrada escondendo a tag (mantido)
+                    const imgHtml = k.imagemURL 
+                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
+                        : '<span class="text-muted">-</span>';
+
+                    let comps = '';
+                    // Se o item tem componentes, é um KIT
+                    if (k.componentes && k.componentes.length > 0) {
+                        const componentes_validos = k.componentes;
+                        
+                        if (componentes_validos.length > 0) {
+                            comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
+                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .join('<br>');
+                        } else {
+                            comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
+                        }
+                    } else {
+                        // Produto Simples
+                        comps = `<span class="text-muted" style="font-size:0.8em">Produto Simples (Estoque: ${k.estoque || 'N/D'})</span>`;
+                    }
+
+                    // CORREÇÃO: Agora usa k.produto (chave unificada)
+                    html += `
+                        <tr>
+                            <td style="width:60px">${imgHtml}</td>
+                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                            <td>${k.produto || 'N/D'}</td>
+                            <td>${comps}</td>
+                        </tr>
+                    `;
+                });
+                html += '</tbody></table>';
                 div.innerHTML = html;
         } catch(e) {
-            div.innerHTML = 'Erro ao carregar kits.';
+            div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
         }
     }
     
@@ -866,7 +1193,7 @@ DASHBOARD_TEMPLATE = """
 """
 
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS)
+# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO)
 # ============================================================================
 
 class WebServer:
@@ -882,6 +1209,9 @@ class WebServer:
         self.setup_websocket()
 
     def setup_routes(self):
+        # Acessa sales_manager globalmente
+        global sales_manager
+
         if not self.orchestrator.config.REDIRECT_URI:
             @self.app.route('/', defaults={'path': ''})
             @self.app.route('/<path:path>')
@@ -941,9 +1271,12 @@ class WebServer:
                 "is_running": self.orchestrator.is_running
             })
 
-        @self.app.route('/api/stats')
-        def api_stats():
-            return jsonify(self.orchestrator.stats.to_dict())
+        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA RECALCULADO)
+        @self.app.route("/api/sales/stats")
+        def api_sales_stats():
+            """Retorna os contadores Diário, Semanal e Histórico."""
+            # O sales_manager recalcula o Daily/Weekly baseado em 24h/7d na última execução do worker
+            return jsonify(sales_manager.get_stats())
 
         @self.app.route("/api/all_products", methods=["GET"])
         @token_required
@@ -959,8 +1292,6 @@ class WebServer:
                 return jsonify([])
 
             # --- CORREÇÃO IMPORTANTE: BUSCA HÍBRIDA NA API ---
-            # O Bling v3 exige parâmetros específicos. Não podemos assumir que o usuário
-            # está buscando 'nome' ou 'código' (SKU). Vamos buscar AMBOS na API para garantir.
             
             all_results_base = []
             seen_ids = set()
@@ -990,7 +1321,7 @@ class WebServer:
             resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
             process_response(resp_sku)
 
-            # 2. Tenta buscar por NOME (Descrição) - CORRIGIDO (código estava quebrado aqui)
+            # 2. Tenta buscar por NOME (Descrição)
             self.logger.info(f"Buscando API por NOME: {termo}")
             resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
             process_response(resp_nome)
@@ -1023,50 +1354,53 @@ class WebServer:
                     "id": p["id"],
                     "sku": p.get("sku"),
                     "nome": p.get("nome"),
+                    "produto": p.get("nome"), # Chave unificada para o front-end
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
                     "preco": p.get("preco"),
                     "estoque": estoque_val,
                     "descricaoCurta": details.get("descricaoCurta"),
-                    "componentes": details.get("estrutura", {}).get("componentes", []),
+                    # Componentes são adicionados para kits
+                    # Ajusta a estrutura para o front-end (componente.produto.nome -> componente.nome)
+                    "componentes": [
+                         {
+                            "nome": c.get("produto", {}).get("nome", "Sem nome"),
+                            "quantidade": c.get("quantidade", 0),
+                            "sku": c.get("produto", {}).get("codigo", "N/D")
+                         }
+                        for c in details.get("estrutura", {}).get("componentes", [])
+                    ],
                     "imagemURL": extract_image_url(details), # Usa a nova função utilitária
                 }
                 final_results.append(produto_completo)
             
             # CORREÇÃO: Adiciona kits que não foram encontrados na busca por nome/sku (cache local)
-            kits_nao_encontrados = [k for k in self.orchestrator.get_all_kits() if k.get("id") not in seen_ids]
-            
-            # CORREÇÃO: Adicionar produtos em cache se a API falhar ou não retornar (Search Fallback)
+            # A lista de kits é melhor mantida no cache
+            kits_cache = self.orchestrator.get_all_kits()
             termo_lower = termo.lower()
+            
+            for kit in kits_cache:
+                # Se o ID não foi encontrado na busca da API, adiciona o kit do cache se for relevante
+                if kit.get("id") not in seen_ids and (termo_lower in str(kit.get("produto", "")).lower() or termo_lower in str(kit.get("sku", "")).lower()):
+                    final_results.append(kit)
+                    seen_ids.add(kit.get("id")) # Marca como visto
+            
+            # Adicionar produtos simples do cache se a API não retornou e eles corresponderem
             produtos_cache = self.orchestrator.get_all_products()
             for prod in produtos_cache:
-                # Se não vimos este ID ainda e ele corresponde ao termo de busca
-                if prod.get('id') not in seen_ids:
-                    p_nome = str(prod.get('nome', '')).lower()
-                    p_sku = str(prod.get('codigo', '')).lower()
-                    if termo_lower in p_nome or termo_lower in p_sku:
-                         # Adiciona do cache (formato simplificado)
-                         prod_cache_fmt = {
-                             "id": prod.get("id"),
-                             "sku": prod.get("codigo"),
-                             "nome": prod.get("nome"),
-                             "tipo": prod.get("tipo"),
-                             "estoque": "Cache (N/A)",
-                             "imagemURL": prod.get("imagemURL")
-                         }
-                         final_results.append(prod_cache_fmt)
-                         # Limita a adição de cache para não poluir
-                         if len(final_results) >= MAX_DETALHES + 5:
-                             break
+                if prod.get("id") not in seen_ids and (termo_lower in str(prod.get("produto", "")).lower() or termo_lower in str(prod.get("sku", "")).lower()):
+                    final_results.append(prod)
+                    seen_ids.add(prod.get("id"))
 
-            final_results.extend(kits_nao_encontrados)
-            
             return jsonify(final_results)
 
+
+        # CORREÇÃO: Rota /api/kits alterada para retornar Kits E Produtos Simples do cache.
         @self.app.route('/api/kits', methods=["GET"])
         @token_required
         def api_kits(token):
-            return jsonify(self.orchestrator.get_all_kits())
+            """Retorna todos os produtos (kits e simples) carregados em cache."""
+            return jsonify(self.orchestrator.get_all_kits() + self.orchestrator.get_all_products())
 
         @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
@@ -1117,6 +1451,7 @@ def run_cli():
     args = parser.parse_args()
     
     if args.serve:
+        # Inicia o worker em uma thread separada
         Thread(target=orchestrator.load_data_worker, daemon=True).start()
         app.run(host='0.0.0.0', port=args.port, debug=False)
 
