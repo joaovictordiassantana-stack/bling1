@@ -3,13 +3,11 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.6)
+bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.5)
 Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
 - CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
 - FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
 - FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
-- ALTERAÇÃO (v4.6): Bloco 'Pedidos Históricos' (Produtos/Vendas) alterado de 9 para 30 dias.
-- FIX SINTAXE (v4.6): Corrige 'SyntaxError: unterminated string literal' na função extract_image_url.
 """
 
 import os
@@ -136,8 +134,6 @@ class Config:
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI')
     if not REDIRECT_URI:
-        # NOTE: A aplicação vai falhar na inicialização se esta variável for crítica e não estiver definida,
-        # mas a falha será tratada no WebServer.setup_routes.
         pass
     
     # API
@@ -590,187 +586,152 @@ def extract_image_url(prod: dict, depth=0) -> Optional[str]:
             return val
 
     # 2. Tenta encontrar dentro de listas de mídia (padrão Bling V3)
-    # A linha abaixo estava incompleta e causou o erro de SyntaxError na versão anterior.
-    for list_key in ["midia", "imagens"]: 
-        media_list = prod.get(list_key)
-        # O Bling V3 costuma aninhar imagens em um dicionário 'imagem' dentro de uma lista de 'midia'.
-        if isinstance(media_list, list):
-            for item in media_list:
-                if isinstance(item, dict) and 'imagem' in item and isinstance(item['imagem'], dict):
-                    url = item['imagem'].get('url')
-                    if url and isinstance(url, str) and url.startswith("http"):
-                        return url
-                elif isinstance(item, dict):
-                    # Tenta a URL diretamente no item (caso não esteja aninhado)
-                    url = item.get('url')
-                    if url and isinstance(url, str) and url.startswith("http"):
-                        return url
-    
-    # 3. Tenta campos aninhados (recursão, se for um produto complexo)
-    if 'produto' in prod and isinstance(prod['produto'], dict):
-        result = extract_image_url(prod['produto'], depth + 1)
-        if result:
-            return result
-            
-    return None
+    for list_key in ["midia", "midias", "imagens", "fotos", "anexos"]:
+        items = prod.get(list_key, [])
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, str) and item.startswith("http"):
+                    return item
+                if isinstance(item, dict):
+                    ret = extract_image_url(item, depth + 1)
+                    if ret: return ret
 
-# ============================================================================ 
-# 6. CLIENTE BLING API (REQUESTS)
-# ============================================================================
+    # 3. Tenta descer um nível se houver 'data' ou 'produto' aninhado
+    for nested in ["data", "produto"]:
+        if nested in prod and isinstance(prod[nested], dict):
+             if prod[nested].get('id') != prod.get('id'):
+                 return extract_image_url(prod[nested], depth + 1)
+
+    return None
 
 class BlingAPIClient:
     def __init__(self, config: Config):
         self.config = config
         self.session = requests.Session()
         self.logger = logger
-        self.session.headers.update({'Accept': 'application/json'})
-
-    def _request_with_retry(self, method: str, url: str, access_token: str, **kwargs) -> Optional[Dict[str, Any]]:
+    
+    def get_products(self, access_token: str, page: int = 1, limit: int = 100, **filters) -> Dict[str, Any]:
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
-        kwargs.setdefault('timeout', self.config.REQUEST_TIMEOUT)
-        
-        for attempt in range(self.config.MAX_RETRIES):
-            try:
-                response = self.session.request(method, url, headers=headers, **kwargs)
-                
-                if response.status_code == 200 or response.status_code == 201:
-                    return response.json()
-                elif response.status_code == 401:
-                    raise BlingAuthError("Token expirado ou inválido.")
-                elif response.status_code == 404:
-                    self.logger.warning(f"Recurso não encontrado: {url}")
-                    return None
-                elif response.status_code == 429: # Rate limit
-                    self.logger.warning(f"Rate limit. Tentando novamente em {self.config.BASE_DELAY * (2 ** attempt)}s...")
-                    time.sleep(self.config.BASE_DELAY * (2 ** attempt))
-                    continue
-                else:
-                    self.logger.error(f"Erro API ({url}): {response.status_code} - {response.text}")
-                    return None
-
-            except RequestException as e:
-                self.logger.error(f"Erro de conexão com API Bling: {e}")
-                if attempt < self.config.MAX_RETRIES - 1:
-                    time.sleep(self.config.BASE_DELAY * (2 ** attempt))
-                    continue
-                else:
-                    self.logger.error(f"Tentativas esgotadas para {url}.")
-                    return None
-            except BlingAuthError:
-                return None # Deixa o worker cuidar da renovação
-                
-        return None
-
-    def get_products(self, access_token: str, **params) -> Dict[str, Any]:
-        """Busca produtos na API V3."""
-        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        params = {'pagina': page, 'limite': limit, **filters}
         url = f"{self.config.BLING_API_URL}/produtos"
+        
         for attempt in range(self.config.MAX_RETRIES):
             try:
                 response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     return response.json()
-                elif response.status_code == 429: # Rate limit
+                elif response.status_code == 429:  # Rate limit
                     time.sleep(2)
                     continue
                 else:
                     self.logger.warning(f"Erro API Produtos: {response.status_code} - {response.text}")
             except Exception as e:
                 self.logger.warning(f"Erro conexao API: {e}")
-                time.sleep(1)
+            time.sleep(1)
         return {}
 
     def get_product_details(self, access_token: str, product_id: int) -> Dict[str, Any]:
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
         url = f"{self.config.BLING_API_URL}/produtos/{product_id}"
+        
         for attempt in range(self.config.MAX_RETRIES):
             try:
                 response = self.session.get(url, headers=headers, timeout=self.config.REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     # O Bling V3 retorna o objeto do produto dentro de 'data'
                     return response.json().get("data", {})
-                elif response.status_code == 429: # Rate limit
+                elif response.status_code == 429:  # Rate limit
                     time.sleep(2)
                     continue
                 else:
                     self.logger.warning(f"Erro API Detalhes Produto {product_id}: {response.status_code} - {response.text}")
             except Exception as e:
                 self.logger.warning(f"Erro conexao API Detalhes Produto {product_id}: {e}")
-                time.sleep(1)
+            time.sleep(1)
         return {}
 
     def get_sales_orders(self, access_token: str, **params) -> Dict[str, Any]:
         """Método dedicado para buscar pedidos de venda."""
         headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
         url = f"{self.config.BLING_API_URL}/pedidos/vendas"
+        
         for attempt in range(self.config.MAX_RETRIES):
             try:
                 response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
                 if response.status_code == 200:
                     return response.json()
-                elif response.status_code == 429: # Rate limit
+                elif response.status_code == 429:  # Rate limit
                     time.sleep(2)
                     continue
                 else:
                     self.logger.warning(f"Erro API Pedidos de Venda: {response.status_code} - {response.text}")
+                    error_logger.error(f"FALHA NA BUSCA DE PEDIDOS: {response.status_code} - {response.text}") 
             except Exception as e:
                 self.logger.warning(f"Erro conexao API Pedidos de Venda: {e}")
-                time.sleep(1)
+            time.sleep(1)
         return {}
 
 
 # ============================================================================ 
-# 7. ORCHESTRATOR DE AUTOMAÇÃO (THREAD PRINCIPAL)
+# 6. ORQUESTRADOR (ATUALIZADO PARA RECALCULO DE VENDAS)
 # ============================================================================
 
-@dataclass
 class AutomationOrchestrator:
-    """Gerencia o cliente API, autenticação e a thread de processamento."""
-    
-    config: Config = field(default_factory=Config)
-    auth: BlingAuth = field(init=False)
-    api_client: BlingAPIClient = field(init=False)
-    sales_manager: SalesManager = field(init=False)
-    component_manager: ComponentConfigManager = field(init=False)
-    recalculation_lock: Lock = field(default_factory=Lock)
-    
-    # Cache
-    products: List[Dict[str, Any]] = field(default_factory=list)
-    kits: List[Dict[str, Any]] = field(default_factory=list)
-    
-    def __post_init__(self):
-        self.auth = BlingAuth(self.config)
-        self.api_client = BlingAPIClient(self.config)
-        # Deve ser inicializado após o self.config
-        self.sales_manager = SalesManager(self.config) 
-        self.component_manager = ComponentConfigManager(self.config.COMPONENT_CONFIG_FILE)
-        self.logger = logger
+    def __init__(self, config: Config, sales_manager: 'SalesManager'):
+        self.config = config
+        self.auth = BlingAuth(config)
+        self.api_client = BlingAPIClient(config) 
+        self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
         
+        self.sales_manager = sales_manager 
+        
+        self.kits: List[Dict[str, Any]] = []
+        self.products: List[Dict[str, Any]] = []
+        self.is_running: bool = False
+        self.lock = Lock()
+        self.recalculation_lock = Lock() 
+        self.logger = logger
+    
+    def load_bling_products(self):
+        """Worker background para carregar dados."""
+        if not self.auth.is_authenticated():
+            self.logger.info("Aguardando autenticação para carregar dados...")
+            return
+            
+        token = self.auth.get_valid_token()
+        if not token:
+             self.logger.warning("Token inválido no worker.")
+             return
+             
+        self._load_products_and_kits(token)
+    
+    def check_and_refresh_token(self):
+        """Verifica e renova o token, se necessário."""
+        if not self.auth.is_authenticated():
+            if self.auth.refresh_access_token():
+                self.logger.info("Token renovado com sucesso.")
+            else:
+                self.logger.warning("Falha ao renovar token. Autenticação manual necessária.")
+
     def load_data_worker(self):
-        """Loop principal do worker de automação (executa a cada 10 min)."""
+        """Worker principal que busca dados, atualiza e executa a lógica."""
+        self.logger.info("Iniciando Worker de carregamento de dados e lógica.")
+        
+        if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
+            self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
+            return
+
         while True:
             try:
-                # 1. Checar/renovar token
-                if not self.auth.get_valid_token():
-                    self.logger.warning("Token inválido/expirado e falha na renovação. Não é possível rodar o worker.")
-                    time.sleep(60)
-                    continue
+                self.check_and_refresh_token()
                 
-                # 2. Processar Pedidos de Venda (Recálculo de KPIs)
-                self.process_sales_orders()
+                self.load_bling_products() 
                 
-                # 3. Recarregar e Processar Produtos/Kits
-                self.load_all_products_and_kits()
-                
-                # 4. Outras automações (ex: checar estoque mínimo, atualizar e-commerce, etc.)
-                self.logger.info("Outras rotinas de automação executadas com sucesso.")
-                
-            except BlingAuthError:
-                self.logger.error("Erro de autenticação. Pulando ciclo e tentando novamente.")
-                time.sleep(60)
-                continue
+                # FIX: Garante que o recálculo dos KPIs é acionado
+                self.process_sales_orders() 
+
             except Exception as e:
-                self.logger.exception(f"Erro crítico no worker: {e}. Pulando ciclo e tentando novamente.")
+                self.logger.error(f"Erro grave no loop do worker: {e}. Esperando 60s antes de tentar novamente.")
                 time.sleep(60)
                 continue
             
@@ -780,134 +741,163 @@ class AutomationOrchestrator:
     # MÉTODO CORRIGIDO (v4.2): Adiciona debounce lock
     def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento e ATUALIZA O SALES_MANAGER POR RECALCULO."""
+        
         if not self.recalculation_lock.acquire(blocking=False):
             self.logger.warning("Recálculo de KPIs já em andamento. Ignorando nova solicitação.")
             return
-        
+
         try:
             token = self.auth.get_valid_token()
             if not token:
                 self.logger.warning("Token indisponível para buscar pedidos de venda.")
                 return
+
+            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 9 dias)...")
             
-            # >>> ALTERAÇÃO PARA 30 DIAS <<<
-            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
-            params = { 
-                'dataEmissaoInicial': (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d'),
+            params = {
+                'dataEmissaoInicial': (datetime.now() - timedelta(days=9)).strftime('%Y-%m-%d'),
                 'pagina': 1,
                 'limite': 50,
             }
             
             all_orders = []
             page = 1
+            
             while True:
                 current_params = params.copy()
                 current_params['pagina'] = page
+                
                 response_data = self.api_client.get_sales_orders(token, **current_params)
                 
                 if response_data and 'data' in response_data:
                     items = response_data['data']
                     all_orders.extend(items)
+                    
                     if len(items) < 50:
                         break
+                    
                     page += 1
-                    time.sleep(0.5)
+                    time.sleep(0.5) 
                 else:
                     break
-
+                    
             if all_orders:
                 self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
+                
                 for idx, order in enumerate(all_orders[:3]):
                     data_obj = order.get('data')
+                    
                     if isinstance(data_obj, dict):
                         data_str = data_obj.get('dataEmissao', 'N/A')
                         hora_str = data_obj.get('horaEmissao', 'N/A')
                     elif isinstance(data_obj, str):
                         data_str = data_obj
-                        hora_str = 'N/A'
+                        hora_str = "N/A"
                     else:
-                        data_str, hora_str = 'N/A', 'N/A'
-                        
-                    self.logger.debug(f"Amostra de Pedido {idx+1}: ID={order.get('id')}, Data={data_str} {hora_str}")
+                        data_str = "ERRO: tipo inesperado"
+                        hora_str = "N/A"
                     
-                self.sales_manager.recalculate_from_orders(all_orders)
-            else:
-                self.logger.warning("Nenhum pedido encontrado no período (30 dias). KPIs mantidos em 0.")
-                self.sales_manager.recalculate_from_orders([]) # Garante notificação e persistência de 0
+                    total_val = order.get('total', 0)
+                    self.logger.info(f"  [{idx+1}] ID: {order.get('id')}, "
+                                   f"Data: {data_str}, Hora: {hora_str}, "
+                                   f"Total: R$ {total_val}")
                 
-        finally:
-            self.recalculation_lock.release()
-
-
-    def load_all_products_and_kits(self):
-        """Busca todos os produtos e kits para cache."""
-        token = self.auth.get_valid_token()
-        if not token:
-            self.logger.warning("Token indisponível para buscar produtos.")
-            return
-        
-        self.logger.info("Iniciando cache de produtos e kits...")
-        
-        # 1. Busca todos os produtos (ativos)
-        # Obs: É necessário buscar todos para montar o mapa de kits
-        products_resp = get_bling_products_safe(self.api_client, access_token=token)
-        
-        if not products_resp.get("success"):
-            self.logger.error("Falha ao buscar produtos para cache: %s", products_resp.get("error"))
-            return
+                self.logger.info(f"🔄 Iniciando recalculate_from_orders com {len(all_orders)} pedidos...")
+                self.sales_manager.recalculate_from_orders(all_orders)
             
-        all_products = products_resp["data"]
-        product_map = {str(p.get("id")): p for p in all_products if p.get("id")}
+            else:
+                # Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
+                with self.sales_manager.lock:
+                    self.sales_manager.historic_count = 0 
+                    self.sales_manager.daily_count = 0
+                    self.sales_manager.weekly_count = 0
+                    self.sales_manager.last_recalculated = datetime.now()
+                    save_stats(self.sales_manager._get_state_for_save(), self.config.SALES_STATS_FILE)
+                
+                self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
+        except Exception as e:
+            self.logger.exception(f"Erro no processamento de pedidos de venda: {e}")
+        finally:
+            self.recalculation_lock.release() 
+
+
+    def _load_products_and_kits(self, access_token: str):
+        self.logger.info("Iniciando carga otimizada de produtos e kits...")
+        self.kits.clear()
+        self.products.clear()
         
-        self.products = []
-        self.kits = []
+        todos_produtos = []
+        page = 1
         
-        self.logger.info(f"Total de {len(all_products)} produtos encontrados no Bling.")
+        # PASSO 1: Baixar TUDO primeiro (Paginação)
+        while True:
+            try:
+                resp = self.api_client.get_products(access_token, page=page, limit=100)
+                items = resp.get('data', [])
+                
+                if not items:
+                    break
+                
+                todos_produtos.extend(items)
+                
+                if len(items) < 100:
+                    break
+                    
+                page += 1
+                time.sleep(0.2) 
+            except Exception as e:
+                self.logger.error(f"Erro ao carregar página {page}: {e}")
+                break
         
-        # 2. Processa e separa Produtos Simples e Kits
-        for p in all_products:
+        # PASSO 2: Criar Mapa para busca rápida (ID -> Produto)
+        produto_map = {str(p.get("id")): p for p in todos_produtos}
+        
+        self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando Kits...")
+
+        # PASSO 3: Separar Kits e preencher nomes dos componentes
+        for p in todos_produtos:
             p_id = p.get("id")
+            
             estrutura = p.get("estrutura", {})
             componentes = estrutura.get("componentes", [])
             
-            # Verifica se é um kit por estrutura, tipo ou formato (V3 usa a propriedade 'estrutura')
             eh_kit = len(componentes) > 0 or p.get("tipo") == "K" or p.get("formato") == "K"
-            
+
             img_url = extract_image_url(p)
             
             if eh_kit:
                 comps_formatados = []
-                # Se não tem componentes no retorno de lista, tenta buscar os detalhes do produto
+                
                 if not componentes and p_id:
-                    try:
-                        det = self.api_client.get_product_details(access_token, p_id)
-                        componentes = det.get("estrutura", {}).get("componentes", [])
-                        if not img_url:
-                            img_url = extract_image_url(det)
-                    except:
-                        pass
-                        
+                     try:
+                         det = self.api_client.get_product_details(access_token, p_id)
+                         componentes = det.get("estrutura", {}).get("componentes", [])
+                         if not img_url: img_url = extract_image_url(det)
+                     except:
+                         pass
+
                 for c in componentes:
                     filho_ref = c.get("produto", {})
                     filho_id = str(filho_ref.get("id"))
-                    produto_filho = product_map.get(filho_id)
+                    
+                    produto_filho = produto_map.get(filho_id)
                     
                     nome_final = "Item não carregado"
                     if produto_filho:
                         nome_final = produto_filho.get("nome")
                     elif filho_ref.get("nome"):
                         nome_final = filho_ref.get("nome")
-
+                    
                     comps_formatados.append({
                         "nome": nome_final,
                         "quantidade": c.get("quantidade", 0),
                         "sku": produto_filho.get("codigo") if produto_filho else ""
                     })
-                    
+
                 self.kits.append({
                     "id": p_id,
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"),
+                    "produto": p.get("nome"), 
                     "imagemURL": img_url,
                     "componentes": comps_formatados
                 })
@@ -915,47 +905,76 @@ class AutomationOrchestrator:
                 self.products.append({
                     "id": p.get("id"),
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"),
+                    "produto": p.get("nome"), 
                     "imagemURL": img_url,
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
                     "preco": p.get("preco"),
                     "estoque": p.get("estoqueAtual", 0)
                 })
-                
+
         self.logger.info(f"Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
-        
+
     def get_all_products(self) -> List[Dict[str, Any]]:
         return self.products
-        
+
     def get_all_kits(self) -> List[Dict[str, Any]]:
         return self.kits
 
+    def run_purchase_check(self, create_orders=False):
+        self.logger.info("Verificação de compras iniciada (Simulação).")
+        return True
+
+# Instâncias Globais
+config = Config()
+
+if not config.REDIRECT_URI:
+    logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
+    pass
+
+sales_manager = SalesManager(config) 
+orchestrator = AutomationOrchestrator(config, sales_manager) 
+auth = orchestrator.auth
+
 # ============================================================================ 
-# 8. TEMPLATE HTML (DASHBOARD)
-# ============================================================================
-# ============================================================================ 
-# 7. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.5)
+# 7. DECORADOR (TOKEN REQUIRED AJUSTADO)
 # ============================================================================
 
-# O template utiliza Bootstrap 5.3 para o design 'premium'
+def token_required(f):
+    """Decorador para verificar se o token de acesso está disponível e válido."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not orchestrator.auth or not orchestrator.auth.is_authenticated():
+            orchestrator.auth.logger.warning("Request sem auth válida: retornando 401 json")
+            return jsonify({"needAuth": True, "message": "Token expirado ou inválido"}), 401
+
+        token = orchestrator.auth.get_valid_token()
+        if not token:
+            return jsonify({"needAuth": True, "message": "Falha no refresh token"}), 401
+        return f(token=token, *args, **kwargs)
+    return decorated
+
+# ============================================================================ 
+# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.4)
+# ============================================================================
+
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bling Automação Premium</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <title>Painel Bling - Sw Moveis</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
-        body {
-            background-color: #f8f9fa;
-        }
-        .navbar {
-            background-color: #343a40 !important; /* Cor escura para a navbar */
-            border-bottom: 3px solid #0d6efd;
-        }
-        /* Custom CSS para os KPIs e esconder elementos até autenticação/debug */
+        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
+        .log-level-INFO { color: #4ec9b0; }
+        .log-level-WARNING { color: #dcdcaa; }
+        .log-level-ERROR { color: #f48771; }
+        .log-level-DEBUG { color: #569cd6; } /* Adicionado para debug */
         .hidden { display: none; }
         .kpi-card { border-left: 5px solid; transition: background-color 0.5s ease; }
         .kpi-daily { border-left-color: #0d6efd; }
@@ -973,248 +992,211 @@ DASHBOARD_TEMPLATE = """
             </div>
         </div>
     </nav>
+
     <div class="container mt-4">
         <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
         <div class="row mb-4">
-            <div class="col-md-4">
-                <div class="card p-3 text-center kpi-card kpi-daily">
-                    <h5>Pedidos Diários (Últimas 24h)</h5>
-                    <h3 id="kpi-daily" class="text-primary">0</h3>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card p-3 text-center kpi-card kpi-weekly">
-                    <h5>Pedidos Semanais (Últimos 7 dias)</h5>
-                    <h3 id="kpi-weekly" class="text-warning">0</h3>
-                </div>
-            </div>
-            <div class="col-md-4">
-                <div class="card p-3 text-center kpi-card kpi-historic">
-                    <h5>Pedidos Históricos (Últimos 9 dias)</h5>
-                    <h3 id="kpi-historic" class="text-success">0</h3>
-                </div>
-            </div>
-            <small class="text-muted mt-2"> Último Recálculo de KPIs: <span id="last-recalculated">N/D</span> </small>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-daily">
+                     <h5>Pedidos Diários (Últimas 24h)</h5>
+                     <h3 id="kpi-daily" class="text-primary">0</h3>
+                 </div>
+             </div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-weekly">
+                     <h5>Pedidos Semanais (Últimos 7 dias)</h5>
+                     <h3 id="kpi-weekly" class="text-warning">0</h3>
+                 </div>
+             </div>
+             <div class="col-md-4">
+                 <div class="card p-3 text-center kpi-card kpi-historic">
+                     <h5>Pedidos Históricos (Últimos 9 dias)</h5>
+                     <h3 id="kpi-historic" class="text-success">0</h3>
+                 </div>
+             </div>
+             <small class="text-muted mt-2">
+                Último Recálculo de KPIs: <span id="last-recalculated">N/D</span>
+            </small>
         </div>
-        
-        <div id="content-tabs" class="hidden">
-            <ul class="nav nav-tabs" id="mainTab" role="tablist">
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link active" id="products-tab" data-bs-toggle="tab" data-bs-target="#products-pane" type="button" role="tab">🔍 Buscar Produtos</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits-pane" type="button" role="tab" onclick="loadKits()">📦 Kits/Estruturas</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="config-tab" data-bs-toggle="tab" data-bs-target="#config-pane" type="button" role="tab">⚙️ Configurações</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="logs-tab" data-bs-toggle="tab" data-bs-target="#logs-pane" type="button" role="tab" onclick="connectLogs()">📝 Logs</button>
-                </li>
-            </ul>
 
-            <div class="tab-content pt-3" id="mainTabContent">
-                <div class="tab-pane fade show active" id="products-pane" role="tabpanel" tabindex="0">
-                    <div class="input-group mb-3">
-                        <input type="text" class="form-control" placeholder="Buscar por SKU ou Nome do Produto/Kit..." id="search-input" onkeyup="if(event.key === 'Enter') performSearch()">
-                        <button class="btn btn-primary" type="button" onclick="performSearch()">Buscar</button>
-                    </div>
-                    <div id="search-results">
-                        <div class="alert alert-info">Digite o SKU ou Nome e clique em Buscar.</div>
-                    </div>
-                </div>
-
-                <div class="tab-pane fade" id="kits-pane" role="tabpanel" tabindex="0">
-                    <p class="text-muted">Lista de Kits/Produtos com Estrutura (Sincronizado automaticamente). Componentes são buscados em tempo real ao expandir.</p>
-                    <div id="kits-content">
-                        <div class="alert alert-info">Carregando Kits...</div>
-                    </div>
-                </div>
-
-                <div class="tab-pane fade" id="config-pane" role="tabpanel" tabindex="0">
-                    <h4>Configurações Gerais (Em desenvolvimento)</h4>
-                    <p class="text-muted">Aguardando a implementação de persistência de configurações editáveis.</p>
-                </div>
-
-                <div class="tab-pane fade" id="logs-pane" role="tabpanel" tabindex="0">
-                    <div class="card">
-                        <div class="card-header d-flex justify-content-between">
-                            Logs em Tempo Real
-                            <span class="badge bg-secondary" id="ws-status">Desconectado</span>
-                        </div>
-                        <div class="card-body" style="height: 400px; overflow-y: scroll; background-color: #212529; color: #f8f9fa;">
-                            <pre id="logs-content" style="white-space: pre-wrap; word-wrap: break-word; font-size: 0.8rem;"></pre>
-                        </div>
-                    </div>
-                </div>
+        <div class="card mb-4">
+            <div class="card-header">Logs em Tempo Real</div>
+            <div class="card-body bg-dark p-0">
+                <div id="logs-content" class="log-box"></div>
             </div>
+        </div>
+
+        <ul class="nav nav-tabs" id="myTab" role="tablist">
+            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Todos Produtos</button></li>
+        </ul>
+
+            <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
+            <div class="tab-pane fade show active" id="search">
+                <div class="input-group mb-3">
+                    <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
+                    <button class="btn btn-primary" id="btn-search">Buscar</button>
+                </div>
+                <div id="search-results"></div>
+            </div>
+
+            <div class="tab-pane fade" id="kits">
+                    <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
+                    <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
+                    <div id="kits-list"></div>
+                </div>
+                <div id="auth-required-kits" class="alert alert-warning hidden">
+                    É necessário autenticar com o Bling para visualizar os Produtos.
+                </div>
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
-
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        const API = '/api';
-        
-        // Função utilitária para formatar a data/hora
-        function formatDateTime(isoString) {
-            if (!isoString) return 'N/D';
-            try {
-                const date = new Date(isoString);
-                // Formato Brasileiro: DD/MM/AAAA HH:MM:SS
-                return date.toLocaleDateString('pt-BR', {
-                    year: 'numeric', month: '2-digit', day: '2-digit',
-                    hour: '2-digit', minute: '2-digit', second: '2-digit',
-                    hour12: false
-                });
-            } catch {
-                return isoString;
-            }
+    const API = '/api';
+    
+    function formatLog(log) {
+        return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
+    }
+    
+    // Função para formatar o tempo da última venda (hora/minuto)
+    function formatDateTime(isoString) {
+        if (!isoString || isoString === 'N/D') return 'N/D';
+        try {
+             const date = new Date(isoString);
+             const now = new Date();
+             const isToday = date.toDateString() === now.toDateString();
+             
+             if (isToday) {
+                 return date.toLocaleTimeString('pt-BR'); 
+             } else {
+                 return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); 
+             }
+        } catch (e) {
+            return 'N/D';
         }
-        
-        // Log Formatting (Para Logs via WebSocket)
-        function formatLog(log) {
-            const levelClass = log.level === 'ERROR' ? 'text-danger' : 
-                               log.level === 'WARNING' ? 'text-warning' : 
-                               log.level === 'INFO' ? 'text-info' : 
-                               'text-secondary';
-            return `<div class="${levelClass}">[${log.timestamp.split('T')[1].split('.')[0]}] ${log.message}</div>`;
+    }
+
+    // WebSocket Logs
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+    ws.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        const box = document.getElementById('logs-content');
+        if(data.logs) {
+            data.logs.forEach(l => box.innerHTML += formatLog(l));
+            box.scrollTop = box.scrollHeight;
         }
-
-        // WebSocket de Logs
-        function connectLogs() {
-            const wsStatus = document.getElementById('ws-status');
-            const box = document.getElementById('logs-content');
-
-            // Se o WebSocket já estiver aberto ou tentando, não faz nada
-            if (wsStatus.textContent !== 'Desconectado') return;
+    }
+    
+    let isAuthenticated = false;
+    
+    // Função para atualizar os KPIs (chamada via polling E via WebSocket)
+    function updateKpis(dSalesStats) {
+        document.getElementById('kpi-daily').textContent = dSalesStats.daily;
+        document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
+        document.getElementById('kpi-historic').textContent = dSalesStats.historic;
+        document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+    }
+    
+    async function checkStatus() {
+        try {
+            // 1. Check Auth Status
+            const rStatus = await fetch(API + '/status');
+            const dStatus = await rStatus.json();
+            const badge = document.getElementById('status-badge');
             
-            wsStatus.textContent = 'Conectando...';
-
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+            isAuthenticated = dStatus.authenticated;
             
-            ws.onopen = () => {
-                wsStatus.textContent = 'Conectado';
-                wsStatus.className = 'badge bg-success';
-                // Puxa os logs iniciais
-                fetch(API + '/logs')
-                    .then(r => r.json())
-                    .then(data => {
-                        box.innerHTML = ''; // Limpa antes de carregar o histórico
-                        data.logs.forEach(l => box.innerHTML += formatLog(l));
-                        box.scrollTop = box.scrollHeight;
-                    })
+            if(isAuthenticated) {
+                badge.className = 'badge bg-success me-2';
+                badge.textContent = 'Online';
+                document.getElementById('auth-link').classList.add('d-none');
+                document.getElementById('content-tabs').classList.remove('hidden');
+            } else {
+                badge.className = 'badge bg-danger me-2';
+                badge.textContent = 'Offline';
+                document.getElementById('auth-link').classList.remove('d-none');
+                document.getElementById('content-tabs').classList.add('hidden');
             }
+            document.getElementById('auth-link').href = dStatus.auth_url;
+
+            // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
+            if (isAuthenticated) {
+                const rSalesStats = await fetch(API + '/sales/stats');
             
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                if(data.logs) {
-                    data.logs.forEach(l => box.innerHTML += formatLog(l));
-                    box.scrollTop = box.scrollHeight;
-                }
-            }
-
-            ws.onerror = ws.onclose = () => {
-                wsStatus.textContent = 'Desconectado';
-                wsStatus.className = 'badge bg-danger';
-                // Tenta reconectar a cada 5 segundos se a aba de logs estiver ativa
-                if(document.getElementById('logs-tab').classList.contains('active')) {
-                    setTimeout(connectLogs, 5000);
-                }
-            }
-        }
-        
-        let isAuthenticated = false;
-
-        // Função para atualizar os KPIs (chamada via polling E via WebSocket)
-        function updateKpis(dSalesStats) {
-            document.getElementById('kpi-daily').textContent = dSalesStats.daily;
-            document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
-            document.getElementById('kpi-historic').textContent = dSalesStats.historic;
-            document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
-        }
-
-        // WebSocket de KPIs (para real-time)
-        function connectKpiWs() {
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            // NOTA: Conecta-se ao WS de logs, mas o backend envia os KPIs via callback
-            const ws = new WebSocket(`${proto}://${window.location.host}/ws/kpis`);
-            
-            ws.onmessage = (e) => {
-                const data = JSON.parse(e.data);
-                if (data.kpi_update) {
-                    updateKpis(data.kpi_update);
-                }
-            }
-
-            ws.onerror = ws.onclose = () => {
-                // Tenta reconectar em 5 segundos
-                setTimeout(connectKpiWs, 5000);
-            }
-        }
-
-        async function checkStatus() {
-            try {
-                // 1. Check Auth Status
-                const rStatus = await fetch(API + '/status');
-                const dStatus = await rStatus.json();
-                
-                const badge = document.getElementById('status-badge');
-                isAuthenticated = dStatus.authenticated;
-                
-                if(isAuthenticated) {
-                    badge.className = 'badge bg-success me-2';
-                    badge.textContent = 'Online';
-                    document.getElementById('auth-link').classList.add('d-none');
-                    document.getElementById('content-tabs').classList.remove('hidden');
+                if (rSalesStats.ok) {
+                    const dSalesStats = await rSalesStats.json();
+                    updateKpis(dSalesStats); // Usa a função de atualização
                 } else {
-                    badge.className = 'badge bg-danger me-2';
-                    badge.textContent = 'Offline';
-                    document.getElementById('auth-link').classList.remove('d-none');
-                    document.getElementById('content-tabs').classList.add('hidden');
+                    document.getElementById('kpi-daily').textContent = 0;
+                    document.getElementById('kpi-weekly').textContent = 0;
+                    document.getElementById('kpi-historic').textContent = 0;
+                    document.getElementById('last-recalculated').textContent = 'ERRO API';
                 }
-                
-                document.getElementById('auth-link').href = dStatus.auth_url;
-                
-                // 2. Update Sales Stats (KPIs) via Polling (Mantido como fallback)
-                if (isAuthenticated) {
-                    const rSalesStats = await fetch(API + '/sales/stats');
-                    if (rSalesStats.ok) {
-                        const dSalesStats = await rSalesStats.json();
-                        updateKpis(dSalesStats); // Usa a função de atualização
-                    } else {
-                        document.getElementById('kpi-daily').textContent = 0;
-                        document.getElementById('kpi-weekly').textContent = 0;
-                        document.getElementById('kpi-historic').textContent = 0;
-                        document.getElementById('last-recalculated').textContent = 'Erro';
-                    }
-                }
-                
-            } catch(e) {
-                console.error("Erro ao verificar status:", e);
-                // Falha silenciosa
-            } finally {
-                // Polling a cada 30 segundos (principalmente para atualizar os KPIs caso o WS falhe)
-                setTimeout(checkStatus, 30000); 
+            } else {
+                 document.getElementById('kpi-daily').textContent = 0;
+                 document.getElementById('kpi-weekly').textContent = 0;
+                 document.getElementById('kpi-historic').textContent = 0;
+                 document.getElementById('last-recalculated').textContent = 'N/D - AUTENTIQUE';
             }
-        }
 
-        // Função de busca de produtos
-        const performSearch = async () => {
-            if (!isAuthenticated) { 
-                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar para realizar buscas.</div>';
+
+        } catch (e) {
+            console.error("Erro ao checar status ou stats:", e);
+        }
+    }
+    
+    checkStatus();
+    setInterval(checkStatus, 5000);
+    
+    // NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+    const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+    
+    wsKpi.onmessage = (e) => {
+        const data = JSON.parse(e.data);
+        
+        if (data.type === 'kpi_update') {
+            const stats = data.data;
+            console.log("📊 KPI atualizado em tempo real:", stats);
+            
+            // Atualiza a dashboard imediatamente usando a função comum
+            updateKpis(stats);
+            
+            // Animação de atualização (opcional, mas visual)
+            const cards = document.querySelectorAll('.kpi-card');
+            cards.forEach(card => {
+                card.style.backgroundColor = '#e8f5e9';
+                setTimeout(() => {
+                    card.style.backgroundColor = '';
+                }, 500);
+            });
+        }
+    };
+    
+    wsKpi.onerror = (e) => {
+        console.error("Erro WebSocket KPI:", e);
+    };
+    
+    wsKpi.onclose = () => {
+        console.log("WebSocket KPI desconectado. Reconectando em 5s...");
+        setTimeout(() => {
+            // Tenta reconectar (recarregar a página é a forma mais simples)
+            location.reload();
+        }, 5000);
+    };
+
+
+    const btnSearch = document.getElementById('btn-search');
+    btnSearch.onclick = async () => {
+            if (!isAuthenticated) {
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
                 return;
             }
             
             const q = document.getElementById('search-input').value;
             const div = document.getElementById('search-results');
-            
-            if (q.length < 3) {
-                div.innerHTML = '<div class="alert alert-warning">Digite ao menos 3 caracteres para buscar.</div>';
-                return;
-            }
-
             div.innerHTML = 'Buscando...';
             
             try {
@@ -1225,7 +1207,7 @@ DASHBOARD_TEMPLATE = """
                     checkStatus();
                     return;
                 }
-                
+
                 const data = await r.json();
                 
                 if(!data.length) {
@@ -1235,123 +1217,130 @@ DASHBOARD_TEMPLATE = """
                 
                 let html = '<div class="list-group">';
                 data.forEach(p => {
-                    // Determina se é Kit para usar o Collapse
-                    const isKit = p.componentes && p.componentes.length > 0;
-                    const collapseId = `collapse-${p.id}`;
-
-                    html += `
-                    <div class="list-group-item">
-                        <div class="d-flex align-items-center ${isKit ? 'cursor-pointer' : ''}" ${isKit ? `data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}"` : ''}>
-                            <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
-                            <div class="flex-grow-1">
-                                <div class="d-flex w-100 justify-content-between">
-                                    <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                    <small class="text-secondary">${p.sku || 'N/D'}</small>
+                        html += `
+                            <div class="list-group-item">
+                                <div class="d-flex">
+                                    <img src="${p.imagemURL || ''}" 
+                                         style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1"
+                                         onerror="this.style.display='none'">
+                                    
+                                    <div class="flex-grow-1">
+                                        <div class="d-flex w-100 justify-content-between">
+                                            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                            <small>${p.sku || 'N/D'}</small>
+                                        </div>
+        
+                                        <p class="mb-1">${p.descricaoCurta || ''}</p>
+        
+                                        <small class="text-muted d-block">
+                                            <b>Estoque:</b> ${p.estoque}  
+                                            <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                        </small>
+        
+                                        ${p.componentes && p.componentes.length > 0 ? `
+                                            <div class="mt-2">
+                                                <b>Componentes:</b><br>
+                                                ${p.componentes.map(c => 
+                                                    `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
+                                                ).join("<br>")}
+                                            </div>
+                                        ` : ""}
+                                    </div>
                                 </div>
-                                <p class="mb-1 text-muted">${p.descricaoCurta || ''}</p>
-                                <small class="text-muted d-block">
-                                    <b>Estoque:</b> ${p.estoque} 
-                                    <b style="margin-left:10px;">Tipo:</b> ${p.tipo} 
-                                    <b style="margin-left:10px;">Situação:</b> ${p.situacao}
-                                </small>
                             </div>
-                            ${isKit ? '<i class="ms-3 fas fa-chevron-down text-primary"></i>' : ''}
-                        </div>
-                        
-                        ${isKit ? `
-                        <div class="collapse mt-2" id="${collapseId}">
-                            <div class="card card-body bg-light">
-                                <b>Componentes:</b><br> 
-                                ${p.componentes.map(c => `<small class="d-block">${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`).join("")}
-                            </div>
-                        </div>
-                        ` : ""}
-                    </div>
-                    `;
+                        `;
                 });
                 html += '</div>';
                 div.innerHTML = html;
-
             } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro ao buscar: ${e}</div>`;
+                div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
             }
         };
 
-        // Função de carregamento da lista de Kits
-        const loadKits = async () => {
-            const div = document.getElementById('kits-content');
-            if (!isAuthenticated) { 
-                div.innerHTML = '<div class="alert alert-warning">É necessário autenticar para carregar kits.</div>';
+        // Carregar Kits e Produtos Simples (Todos Produtos)
+        async function loadKits() {
+            const div = document.getElementById('kits-list');
+            const authRequiredDiv = document.getElementById('auth-required-kits');
+            
+            if (!isAuthenticated) {
+                div.innerHTML = '';
+                authRequiredDiv.classList.remove('hidden');
                 return;
             }
             
-            div.innerHTML = '<div class="alert alert-info">Buscando kits no Bling (pode demorar)...</div>';
-
+            authRequiredDiv.classList.add('hidden');
+            div.innerHTML = '<div class="alert alert-info">Carregando dados. Este processo depende da finalização do cache em segundo plano (Worker) e pode demorar alguns minutos.</div>';
+            
             try {
-                const r = await fetch(`${API}/product/kits`);
+                const r = await fetch(`${API}/kits`); 
                 
                 if (r.status === 401) {
-                    div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
+                    div.innerHTML = '';
+                    authRequiredDiv.classList.remove('hidden');
                     checkStatus();
                     return;
                 }
-                
+
                 const data = await r.json();
+                let html = `
+                <table class="table table-sm">
+                <thead>
+                <tr>
+                    <th>IMG</th>
+                    <th>SKU</th>
+                    <th>Nome</th>
+                    <th>Componentes / Tipo</th>
+                </tr>
+                </thead>
+                <tbody>
+                `;
                 
-                if(!data.length) {
-                    div.innerHTML = '<div class="alert alert-warning">Nenhum Kit/Estrutura encontrado.</div>';
-                    return;
-                }
-                
-                let html = '<div class="list-group">';
-                data.forEach(p => {
-                    const collapseId = `kit-collapse-${p.id}`;
-                    html += `
-                    <div class="list-group-item">
-                        <div class="d-flex align-items-center cursor-pointer" data-bs-toggle="collapse" data-bs-target="#${collapseId}" aria-expanded="false" aria-controls="${collapseId}">
-                            <img src="${p.imagemURL || ''}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">
-                            <div class="flex-grow-1">
-                                <div class="d-flex w-100 justify-content-between">
-                                    <h5 class="mb-1">${p.produto || 'Sem nome'}</h5>
-                                    <small class="text-secondary">${p.sku || 'N/D'}</small>
-                                </div>
-                                <small class="text-muted d-block">
-                                    <b>ID Bling:</b> ${p.id}
-                                </small>
-                            </div>
-                            <i class="ms-3 fas fa-chevron-down text-primary"></i>
-                        </div>
+                data.forEach(k => {
+                    const imgHtml = k.imagemURL 
+                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
+                        : '<span class="text-muted">-</span>';
+
+                    let comps = '';
+                    if (k.componentes && k.componentes.length > 0) {
+                        const componentes_validos = k.componentes;
                         
-                        <div class="collapse mt-2" id="${collapseId}">
-                            <div class="card card-body bg-light">
-                                <b>Componentes:</b><br> 
-                                ${p.componentes.map(c => `<small class="d-block">${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`).join("")}
-                            </div>
-                        </div>
-                    </div>
+                        if (componentes_validos.length > 0) {
+                            comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
+                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .join('<br>');
+                        } else {
+                            comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
+                        }
+                    } else {
+                        comps = `<span class="text-muted" style="font-size:0.8em">Produto Simples (Estoque: ${k.estoque || 'N/D'})</span>`;
+                    }
+
+                    html += `
+                        <tr>
+                            <td style="width:60px">${imgHtml}</td>
+                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                            <td>${k.produto || 'N/D'}</td>
+                            <td>${comps}</td>
+                        </tr>
                     `;
                 });
-                html += '</div>';
+                html += '</tbody></table>';
                 div.innerHTML = html;
-
-            } catch(e) {
-                div.innerHTML = '<div class="alert alert-danger">Erro ao carregar lista. Verifique os logs.</div>';
-            }
-        };
-
-
-        document.addEventListener('DOMContentLoaded', () => {
-            // Inicia o check de status/auth e polling
-            checkStatus();
-            // Inicia o WebSocket para atualizações de KPI em tempo real
-            connectKpiWs();
-        });
+        } catch(e) {
+            div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+        }
+    }
+    
+    document.addEventListener('DOMContentLoaded', () => {
+        loadKits();
+    });
     </script>
 </body>
 </html>
 """
+
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
+# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.5)
 # ============================================================================
 
 class WebServer:
@@ -1368,7 +1357,7 @@ class WebServer:
 
     def setup_routes(self):
         global sales_manager
-        
+
         if not self.orchestrator.config.REDIRECT_URI:
             @self.app.route('/', defaults={'path': ''})
             @self.app.route('/<path:path>')
@@ -1376,7 +1365,7 @@ class WebServer:
                 from flask import abort
                 self.logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
                 abort(500)
-                
+        
         @self.app.route("/")
         def dashboard():
             auth_url = self.orchestrator.auth.get_authorization_url()
@@ -1386,29 +1375,28 @@ class WebServer:
         def callback():
             code = request.args.get("code")
             state = request.args.get("state")
-
+            
             if self.orchestrator.auth.is_authenticated():
                 self.logger.info("Callback ignorado: Usuário já autenticado.")
                 return redirect('/')
 
             if not code or not state:
-                return redirect('/')
+                return redirect('/') 
 
             if not token_exchange_lock.acquire(blocking=False):
                 self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
                 return redirect('/')
-
+                
             try:
                 with WebServer.code_lock:
-                    # Previne processamento duplicado (Webhooks ou recarga de página)
                     if code in WebServer.used_codes:
                         return redirect('/')
                     WebServer.used_codes.add(code)
-                    
-                    self.logger.info(f"Processando callback code...")
-                    success = self.orchestrator.auth.exchange_code_for_token(code, state)
-                    
-                    return redirect('/')
+                
+                self.logger.info(f"Processando callback code...")
+                success = self.orchestrator.auth.exchange_code_for_token(code, state)
+                
+                return redirect('/')
             except Exception as e:
                 self.logger.error(f"Erro crítico no callback: {e}")
                 return redirect('/')
@@ -1419,160 +1407,212 @@ class WebServer:
         def api_status():
             return jsonify({
                 "authenticated": self.orchestrator.auth.is_authenticated(),
-                "auth_url": self.orchestrator.auth.get_authorization_url()
+                "auth_url": self.orchestrator.auth.get_authorization_url(),
+                "is_running": self.orchestrator.is_running
             })
 
-        @self.app.route('/api/sales/stats')
+        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
+        @self.app.route("/api/sales/stats")
         def api_sales_stats():
-            # A chamada ao get_stats já garante a leitura sincronizada do arquivo
-            return jsonify(self.orchestrator.sales_manager.get_stats())
-        
-        @self.app.route('/api/product/search')
-        def api_product_search():
-            if not self.orchestrator.auth.is_authenticated():
-                return jsonify({"error": "Unauthorized"}), 401
-                
-            termo = request.args.get('q', '').strip()
-            if len(termo) < 3:
+            """Retorna os contadores Diário, Semanal e Histórico."""
+            stats = sales_manager.get_stats()
+            
+            # DEBUG (v4.4): Loga o que está sendo retornado
+            self.logger.debug(f"📡 API /sales/stats retornando: {stats}")
+            
+            return jsonify(stats)
+
+        @self.app.route("/api/all_products", methods=["GET"])
+        @token_required
+        def api_all_products(token):
+            return jsonify(self.orchestrator.get_all_products())
+
+        @self.app.route('/api/product/search', methods=["GET"])
+        @token_required
+        def api_product_search(token):
+            termo = request.args.get("q") or request.args.get("sku") or request.args.get("nome") or ""
+            termo = termo.strip() 
+            if not termo:
                 return jsonify([])
 
-            final_results = []
+            all_results_base = []
             seen_ids = set()
+
+            def process_response(resp_data):
+                """Processa resposta da API e adiciona à lista de resultados básicos"""
+                items = resp_data.get('data') or []
+                for p in items:
+                    p_id = p.get('id')
+                    if p_id and p_id in seen_ids:
+                        continue
+                    if p_id: seen_ids.add(p_id)
+                    
+                    all_results_base.append({
+                        "id": p.get("id"),
+                        "sku": p.get("codigo"),
+                        "nome": p.get("nome"),
+                        "tipo": p.get("tipo"),
+                        "situacao": p.get("situacao"),
+                        "preco": p.get("preco"),
+                    })
+
+            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
+            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
+            process_response(resp_sku)
+
+            self.logger.info(f"Buscando API por NOME: {termo}")
+            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
+            process_response(resp_nome)
+
+            final_results = []
+            MAX_DETALHES = 10 
             
-            produtos_cache = self.orchestrator.get_all_products()
+            for idx, p in enumerate(all_results_base):
+                if idx >= MAX_DETALHES:
+                    break
+                    
+                try:
+                    details = self.orchestrator.api_client.get_product_details(token, p["id"])
+                except Exception as e:
+                    self.orchestrator.logger.exception("Erro ao buscar detalhe produto %s", p["id"])
+                    details = {}
+                
+                estoque_val = (
+                    details.get("estoqueAtual")
+                    or details.get("saldoDisponivel")
+                    or details.get("estoque", {}).get("saldoVirtualTotal", 0)
+                )
+
+                produto_completo = {
+                    "id": p["id"],
+                    "sku": p.get("sku"),
+                    "nome": p.get("nome"),
+                    "produto": p.get("nome"), 
+                    "tipo": p.get("tipo"),
+                    "situacao": p.get("situacao"),
+                    "preco": p.get("preco"),
+                    "estoque": estoque_val,
+                    "descricaoCurta": details.get("descricaoCurta"),
+                    "componentes": [
+                         {
+                            "nome": c.get("produto", {}).get("nome", "Sem nome"),
+                            "quantidade": c.get("quantidade", 0),
+                            "sku": c.get("produto", {}).get("codigo", "N/D")
+                         }
+                        for c in details.get("estrutura", {}).get("componentes", [])
+                    ],
+                    "imagemURL": extract_image_url(details), 
+                }
+                final_results.append(produto_completo)
+            
             kits_cache = self.orchestrator.get_all_kits()
-            
             termo_lower = termo.lower()
             
-            # 1. Busca nos produtos simples em cache
-            for p in produtos_cache:
-                if p.get("id") not in seen_ids and (termo_lower in str(p.get("produto", "")).lower() or termo_lower in str(p.get("sku", "")).lower()):
-                    final_results.append(p)
-                    seen_ids.add(p.get("id"))
-            
-            # 2. Busca nos kits em cache
             for kit in kits_cache:
                 if kit.get("id") not in seen_ids and (termo_lower in str(kit.get("produto", "")).lower() or termo_lower in str(kit.get("sku", "")).lower()):
                     final_results.append(kit)
-                    seen_ids.add(kit.get("id"))
+                    seen_ids.add(kit.get("id")) 
+            
+            produtos_cache = self.orchestrator.get_all_products()
+            for prod in produtos_cache:
+                if prod.get("id") not in seen_ids and (termo_lower in str(prod.get("produto", "")).lower() or termo_lower in str(prod.get("sku", "")).lower()):
+                    final_results.append(prod)
+                    seen_ids.add(prod.get("id"))
+
+            return jsonify(final_results)
+
+
+        @self.app.route('/api/kits', methods=["GET"])
+        @token_required
+        def api_kits(token):
+            """Retorna todos os produtos (kits e simples) carregados em cache."""
+            return jsonify(self.orchestrator.get_all_kits() + self.orchestrator.get_all_products())
+
+        @self.app.route("/webhook/bling", methods=["POST"])
+        def webhook_bling():
+            payload = request.get_data()
+            signature_header = request.headers.get('X-Bling-Signature-256', '')
+
+            try:
+                expected_signature = 'sha256=' + hmac.new(
+                    self.orchestrator.config.CLIENT_SECRET.encode(), 
+                    payload,
+                    hashlib.sha256
+                ).hexdigest()
+
+                if not hmac.compare_digest(signature_header, expected_signature):
+                    self.logger.warning(f"❌ Assinatura inválida no Webhook. Header: {signature_header}")
+                    return jsonify({"error": "Invalid signature"}), 401
                     
-            # 3. Busca em tempo real na API (para buscar algo que possa ter ficado fora do cache, mas sem detalhes)
-            token = self.orchestrator.auth.get_valid_token()
-            if token and len(final_results) < 5:
-                self.logger.info(f"Buscando termo '{termo}' diretamente na API (Produtos e Kits)...")
-                api_resp = get_bling_products_safe(self.orchestrator.api_client, nome=termo, access_token=token)
+                self.logger.info("✅ Assinatura HMAC do Webhook validada com sucesso.")
+
+                data = request.get_json(silent=True)
+                if not data:
+                    return jsonify({"status": "ok"}), 200 
                 
-                if api_resp.get("success"):
-                    for p in api_resp["data"]:
-                        p_id = p.get("id")
-                        if p_id and p_id not in seen_ids:
-                            # Tenta pegar detalhes para estoque/componentes se não for um kit simples
-                            details = self.orchestrator.api_client.get_product_details(token, p_id) or {}
-                            
-                            estoque_val = ( 
-                                p.get("estoqueAtual", 0) 
-                                or details.get("estoque", {}).get("saldoVirtualTotal", 0) 
-                            )
+                event_type = data.get('event', '')
+                
+                if not self.orchestrator.auth.is_authenticated():
+                    self.logger.warning("⚠️ Webhook recebido, mas token Bling não é válido. Ignorando recálculo.")
+                    return jsonify({"status": "ok", "note": "awaiting_auth"}), 200
 
-                            produto_completo = {
-                                "id": p_id,
-                                "sku": p.get("codigo"),
-                                "nome": p.get("nome"),
-                                "produto": p.get("nome"),
-                                "tipo": p.get("tipo"),
-                                "situacao": p.get("situacao"),
-                                "preco": p.get("preco"),
-                                "estoque": estoque_val,
-                                "descricaoCurta": details.get("descricaoCurta"),
-                                "componentes": [
-                                    {
-                                        "nome": c.get("produto", {}).get("nome", "Sem nome"),
-                                        "quantidade": c.get("quantidade", 0),
-                                        "sku": c.get("produto", {}).get("codigo", "N/D")
-                                    } 
-                                    for c in details.get("estrutura", {}).get("componentes", [])
-                                ],
-                                "imagemURL": extract_image_url(details) or extract_image_url(p),
-                            }
-                            final_results.append(produto_completo)
-                            seen_ids.add(p_id)
-            
-            # Limita o resultado final para evitar sobrecarga (max 15)
-            return jsonify(final_results[:15])
+                if 'order' in event_type: 
+                    self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
+                    Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
 
-        @self.app.route('/api/product/kits')
-        def api_product_kits():
-            if not self.orchestrator.auth.is_authenticated():
-                return jsonify({"error": "Unauthorized"}), 401
-            
-            # Retorna apenas os kits que estão em cache
-            return jsonify(self.orchestrator.get_all_kits())
-
-        @self.app.route('/api/logs')
-        def api_logs():
-            """Retorna os logs em memória (para a carga inicial)."""
-            global memory_handler
-            return jsonify({"logs": memory_handler.get_logs(limit=200)})
+            except Exception as e:
+                self.logger.exception(f"Erro no webhook: {e}")
+                
+            return jsonify({"status": "ok"}), 200
 
     def setup_websocket(self):
-        global memory_handler, kpi_update_callbacks, kpi_update_lock
-        
+        global kpi_update_callbacks, kpi_update_lock
+
         @self.sock.route('/ws/logs')
-        def logs_consumer(ws):
-            """WebSocket para logs em tempo real."""
+        def ws_logs(ws):
+            logger.info("WS conectado.")
             last_idx = 0
-            self.logger.info("Novo WebSocket de log conectado.")
-            
-            # Envia logs antigos imediatamente
-            all_logs = memory_handler.get_logs(limit=200)
-            if all_logs:
-                 ws.send(json.dumps({"logs": all_logs}))
-                 last_idx = len(all_logs)
-                 
             while True:
                 try:
-                    time.sleep(1) # Polling a cada 1 segundo
                     all_logs = memory_handler.get_logs()
                     if len(all_logs) > last_idx:
                         new_logs = all_logs[last_idx:]
                         ws.send(json.dumps({"logs": new_logs}))
                         last_idx = len(all_logs)
                     try:
-                        # CORREÇÃO: Tratamento para ConnectionClosed
                         ws.receive(timeout=1)
                     except ConnectionClosed:
-                         break # Sai do loop limpo
+                         break 
                     except Exception:
                         pass
                 except Exception:
                     break
-            self.logger.info("WebSocket de log desconectado.")
+
+        # NOVO (v4.4): WebSocket para notificações de KPI em tempo real
+        @self.sock.route('/ws/kpi-updates')
+        def ws_kpi_updates(ws):
+            logger.info("📡 WebSocket KPI conectado.")
             
-        @self.sock.route('/ws/kpis')
-        def kpis_consumer(ws):
-            """WebSocket para notificação de KPI em Tempo Real."""
-            
-            def notify_kpi(stats_data):
-                """Função que será chamada pelo SalesManager."""
+            def notify_kpi(stats):
+                """Callback para notificar via WebSocket quando KPI muda."""
                 try:
-                    ws.send(json.dumps(stats_data))
+                    # stats já está no formato JSON-ready {'daily': 2, 'weekly': 13, 'historic': 2287, 'last_update': '2025-12-12T14:40:00.000000'}
+                    ws.send(json.dumps({"type": "kpi_update", "data": stats}))
+                    logger.debug(f"📤 KPI update enviado via WebSocket: {stats}")
                 except ConnectionClosed:
-                    # A conexão será fechada e tratada no finally
                     pass
                 except Exception as e:
-                    self.logger.error(f"Erro ao enviar KPI via WS: {e}")
-
-            # 1. Registra o callback
+                    logger.warning(f"Erro ao enviar KPI update: {e}")
+            
+            # Registra esse callback
             with kpi_update_lock:
                 kpi_update_callbacks.append(notify_kpi)
             
-            self.logger.info("WebSocket KPI conectado e registrado.")
-            
-            # 2. Loop de keepalive (mantém a conexão aberta)
             try:
+                # O loop só precisa manter a conexão viva
                 while True:
                     try:
-                        ws.receive(timeout=5) # Keepalive
+                        ws.receive(timeout=5)  # Keepalive
                     except ConnectionClosed:
                         break
                     except Exception:
@@ -1582,8 +1622,7 @@ class WebServer:
                 with kpi_update_lock:
                     if notify_kpi in kpi_update_callbacks:
                         kpi_update_callbacks.remove(notify_kpi)
-                self.logger.info("WebSocket KPI desconectado.")
-
+                logger.info("WebSocket KPI desconectado.")
 
 # ============================================================================ 
 # 10. ENTRY POINT
@@ -1591,13 +1630,9 @@ class WebServer:
 
 def create_app() -> Flask:
     app = Flask(__name__)
-    # A instância do orchestrator deve ser global para ser acessível pelo Gunicorn/Flask
-    global orchestrator
     WebServer(app, orchestrator)
     return app
 
-# Cria a instância global do orchestrator
-orchestrator = AutomationOrchestrator()
 app = create_app()
 
 def run_cli():
@@ -1607,7 +1642,6 @@ def run_cli():
     args = parser.parse_args()
     
     if args.serve:
-        # Inicia o worker em uma thread separada
         Thread(target=orchestrator.load_data_worker, daemon=True).start()
         app.run(host='0.0.0.0', port=args.port, debug=False)
 
@@ -1616,4 +1650,5 @@ if __name__ == "__main__":
 
 # --- GUNICORN CONFIGURAÇÕES (TIMEOUT AJUSTADO PARA 300) ---
 import os as _os
-_os.environ.setdefault("GUNICORN_CMD_ARGS", "--bind 0.0.0.0:8000 --workers 4 --threads 2 --worker-class gevent --timeout 300 --graceful-timeout 300")
+_os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 300 --keep-alive 5")
+APP_PORT = int(_os.getenv("PORT", "10000"))
