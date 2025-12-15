@@ -34,7 +34,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Lock, Thread
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 
 import requests
@@ -1829,6 +1829,90 @@ class WebServer:
                 'avg_daily': avg_daily,
                 'growth': growth
             })
+        
+        @self.app.route('/api/components/usage')
+        @token_required
+        def api_component_usage(token):
+            """Analisa pedidos vendidos e conta uso de componentes"""
+            try:
+                now = datetime.now()
+                params = {
+                    'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+                    'dataEmissaoFinal': now.strftime('%Y-%m-%d'),
+                    'pagina': 1,
+                    'limite': 100
+                }
+                
+                # Buscar pedidos recentes
+                all_orders = []
+                page = 1
+                while page <= 50:  # Limita a 5000 pedidos
+                    current_params = params.copy()
+                    current_params['pagina'] = page
+                    
+                    response = self.orchestrator.api_client.get_sales_orders(token, **current_params)
+                    items = response.get('data', [])
+                    
+                    if not items:
+                        break
+                    
+                    all_orders.extend(items)
+                    
+                    if len(items) < 100:
+                        break
+                    
+                    page += 1
+                    time.sleep(0.2)
+                
+                # Processar componentes
+                component_usage = {}
+                
+                for order in all_orders:
+                    # A estrutura do pedido de venda Bling v3 é diferente da v2.
+                    # Vamos assumir que a lista de itens está em 'itens' dentro do objeto 'data'
+                    order_data = order.get('data', {})
+                    items = order_data.get('itens', [])
+                    
+                    for item in items:
+                        produto_id = item.get('produto', {}).get('id')
+                        qtd_vendida = item.get('quantidade', 1)
+                        
+                        # Buscar se é kit
+                        kit = next((k for k in self.orchestrator.get_all_kits() if str(k.get('id')) == str(produto_id)), None)
+                        
+                        if kit and kit.get('componentes'):
+                            for comp in kit['componentes']:
+                                comp_nome = comp['nome']
+                                comp_sku = comp.get('sku', 'N/D')
+                                comp_qtd = comp['quantidade'] * qtd_vendida
+                                
+                                # Usar SKU como chave para evitar problemas com nomes duplicados
+                                key = comp_sku if comp_sku != 'N/D' else comp_nome
+                                
+                                if key not in component_usage:
+                                    component_usage[key] = {
+                                        'nome': comp_nome,
+                                        'sku': comp_sku,
+                                        'quantidade': 0,
+                                        'produtos': set()
+                                    }
+                                
+                                component_usage[key]['quantidade'] += comp_qtd
+                                component_usage[key]['produtos'].add(kit.get('produto', 'N/D'))
+                
+                # Converter sets para listas
+                result = []
+                for comp in component_usage.values():
+                    comp['produtos'] = list(comp['produtos'])
+                    result.append(comp)
+                
+                return jsonify({
+                    'components': sorted(result, key=lambda x: x['quantidade'], reverse=True)
+                })
+                
+            except Exception as e:
+                self.orchestrator.logger.error(f"Erro ao calcular uso de componentes: {e}")
+                return jsonify({'components': [], 'error': str(e)})
 
         @self.app.route("/api/all_products", methods=["GET"])
         @token_required
