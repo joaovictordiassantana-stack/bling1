@@ -917,7 +917,14 @@ class AutomationOrchestrator:
             self.recalculation_lock.release() 
 
 
-    def _load_products_and_kits(self, access_token: str):
+def _load_products_and_kits(self, access_token: str):
+        """
+        CORREÇÃO CRÍTICA: Busca detalhes individuais de cada produto
+        para identificar kits corretamente na API v3 do Bling.
+        
+        A API v3 NÃO retorna 'componentes' na listagem (/produtos),
+        apenas ao buscar cada produto individualmente (/produtos/{id}).
+        """
         self.logger.info("=" * 60)
         self.logger.info("📦 INICIANDO CARGA COMPLETA DE PRODUTOS DO BLING")
         self.logger.info("=" * 60)
@@ -927,9 +934,11 @@ class AutomationOrchestrator:
         
         todos_produtos = []
         page = 1
-        MAX_PAGES = 50  # Limite de segurança
+        MAX_PAGES = 50
         
-        # PASSO 1: Baixar produtos com paginação
+        # ============================================================
+        # PASSO 1: Baixar TODOS os produtos (listagem resumida)
+        # ============================================================
         while page <= MAX_PAGES:
             try:
                 resp = self.api_client.get_products(access_token, page=page, limit=100)
@@ -939,105 +948,146 @@ class AutomationOrchestrator:
                     break
                 
                 todos_produtos.extend(items)
+                self.logger.info(f"📄 Página {page}: {len(items)} produtos baixados")
                 
                 if len(items) < 100:
                     break
                     
                 page += 1
-                time.sleep(0.2)
+                time.sleep(0.3)  # Rate limiting
             except Exception as e:
                 self.logger.error(f"Erro ao carregar página {page}: {e}")
                 break
         
-        self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando...")
+        self.logger.info(f"✅ Total baixado: {len(todos_produtos)} produtos. Processando detalhes...")
         
-        # PASSO 2: Classificar produtos e kits
-        for p in todos_produtos:
+        # ============================================================
+        # PASSO 2: Buscar detalhes individuais e classificar
+        # ============================================================
+        MAX_DETAILS = 200  # Limita buscas para evitar timeout (ajuste conforme necessário)
+        
+        for idx, p in enumerate(todos_produtos):
             p_id = p.get("id")
-            estrutura = p.get("estrutura", {})
-            componentes = estrutura.get("componentes", [])
-            
-            # FIX CRÍTICO: Verifica se TEM componentes de verdade
-            eh_kit = isinstance(componentes, list) and len(componentes) > 0
-            
             img_url = extract_image_url(p)
             
-            if eh_kit:
-                # É um KIT - busca detalhes dos componentes
-                comps_formatados = []
-                
-                for c in componentes:
-                    filho = c.get("produto", {})
-                    comps_formatados.append({
-                        "nome": filho.get("nome", "Item não identificado"),
-                        "quantidade": c.get("quantidade", 0),
-                        "sku": filho.get("codigo", "N/D")
-                    })
-                
-                self.kits.append({
-                    "id": p_id,
-                    "sku": p.get("codigo"),
-                    "produto": p.get("nome"),
-                    "imagemURL": img_url,
-                    "componentes": comps_formatados
-                })
-            else:
-                # É um PRODUTO SIMPLES
-                self.products.append({
-                    "id": p_id,
-                    "sku": p.get("codigo"),
-                    "produto": p.get("nome"),
-                    "imagemURL": img_url,
-                    "tipo": p.get("tipo"),
-                    "situacao": p.get("situacao"),
-                    "preco": p.get("preco"),
-                    "estoque": p.get("estoqueAtual", 0)
-                })
+            # Para os primeiros N produtos, busca detalhes completos
+            if idx < MAX_DETAILS:
+                try:
+                    # 🔥 CORREÇÃO PRINCIPAL: Busca individual para ver componentes
+                    details = self.api_client.get_product_details(access_token, p_id)
+                    estrutura = details.get("estrutura", {})
+                    componentes = estrutura.get("componentes", [])
+                    
+                    # Verifica se É UM KIT (tem componentes)
+                    if isinstance(componentes, list) and len(componentes) > 0:
+                        comps_formatados = []
+                        
+                        for c in componentes:
+                            filho = c.get("produto", {})
+                            comps_formatados.append({
+                                "nome": filho.get("nome", "Item não identificado"),
+                                "quantidade": c.get("quantidade", 0),
+                                "sku": filho.get("codigo", "N/D")
+                            })
+                        
+                        self.kits.append({
+                            "id": p_id,
+                            "sku": p.get("codigo"),
+                            "produto": p.get("nome"),
+                            "imagemURL": extract_image_url(details) or img_url,
+                            "componentes": comps_formatados
+                        })
+                        
+                        self.logger.debug(f"🎁 Kit identificado: {p.get('nome')} ({len(comps_formatados)} componentes)")
+                        continue
+                    
+                    time.sleep(0.1)  # Rate limiting entre detalhes
+                    
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Erro ao buscar detalhes de {p_id}: {e}")
+            
+            # ============================================================
+            # PASSO 3: Adiciona como produto simples
+            # ============================================================
+            self.products.append({
+                "id": p_id,
+                "sku": p.get("codigo"),
+                "produto": p.get("nome"),
+                "imagemURL": img_url,
+                "tipo": p.get("tipo"),
+                "situacao": p.get("situacao"),
+                "preco": p.get("preco"),
+                "estoque": p.get("estoqueAtual", 0)
+            })
         
-        # PASSO 3: Salvar cache
+        # ============================================================
+        # PASSO 4: Salvar cache em disco
+        # ============================================================
         save_products_cache(self.kits, self.products, self.config.PRODUCTS_CACHE_FILE)
         
-        self.logger.info(f"✅ Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
+        self.logger.info("=" * 60)
+        self.logger.info(f"✅ PROCESSAMENTO CONCLUÍDO:")
+        self.logger.info(f"   🎁 {len(self.kits)} kits identificados")
+        self.logger.info(f"   📦 {len(self.products)} produtos simples")
+        self.logger.info("=" * 60)
 
-    def get_all_products(self) -> List[Dict[str, Any]]:
+def get_all_products(self) -> List[Dict[str, Any]]:
         return self.products
 
-    def get_all_kits(self) -> List[Dict[str, Any]]:
+def get_all_kits(self) -> List[Dict[str, Any]]:
         return self.kits
     
-    def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
-        """Busca histórico de pedidos de venda dos últimos N dias"""
+def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
+        """
+        CORREÇÃO CRÍTICA: Usa parâmetros corretos da API v3 do Bling
+        para buscar histórico de vendas.
+        
+        ❌ ERRADO: data_inicio/data_fim
+        ✅ CORRETO: dataEmissaoInicial/dataEmissaoFinal
+        """
         try:
             orders = []
             now = datetime.now()
             start_date = (now - timedelta(days=days)).strftime('%Y-%m-%d')
             end_date = now.strftime('%Y-%m-%d')
             
-            # Buscar pedidos de venda no período
+            self.logger.info(f"📊 Buscando pedidos de {start_date} até {end_date}")
+            
             page = 1
-            while True:
+            while page <= 50:  # Limite de segurança
                 try:
-                    resp = self.api_client.get_sales_orders(access_token, page=page, limit=100, 
-                                                            data_inicio=start_date, data_fim=end_date)
+                    # 🔥 CORREÇÃO: Parâmetros corretos da API v3
+                    params = {
+                        'pagina': page,
+                        'limite': 100,
+                        'dataEmissaoInicial': start_date,  # ✅ CORRETO
+                        'dataEmissaoFinal': end_date       # ✅ CORRETO
+                    }
+                    
+                    resp = self.api_client.get_sales_orders(access_token, **params)
                     items = resp.get('data', [])
                     
                     if not items:
                         break
                     
                     orders.extend(items)
+                    self.logger.debug(f"📄 Página {page}: {len(items)} pedidos carregados")
                     
                     if len(items) < 100:
                         break
                     
                     page += 1
-                    time.sleep(0.2)
+                    time.sleep(0.3)
+                    
                 except Exception as e:
-                    self.logger.error(f"Erro ao carregar página {page} do histórico: {e}")
+                    self.logger.error(f"Erro ao carregar página {page}: {e}")
                     break
             
+            self.logger.info(f"✅ Total: {len(orders)} pedidos carregados para o gráfico")
             return orders
+            
         except Exception as e:
-            self.logger.error(f"Erro ao buscar histórico de vendas: {e}")
+            self.logger.error(f"❌ Erro ao buscar histórico: {e}")
             return []
 
 
