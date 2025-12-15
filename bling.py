@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
-from gevent import monkey
-monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
+# Removido gevent monkey.patch_all() - overhead desnecessário
 """
 ================================================================================
 bling.py - Sistema de Automação Bling com OAuth 2.0 e Dashboard Web Premium
@@ -53,16 +52,14 @@ except ImportError:
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
 
-# NOVO (v4.4): Variável global para notificar subscribers sobre mudanças de KPI
-kpi_update_callbacks = []
-kpi_update_lock = Lock()
+# Removido: kpi_update_callbacks (será gerenciado internamente no SalesManager)
 # ============================================================================ 
 # 1. LOGS AVANÇADOS
 # ============================================================================
 
 class InMemoryLogHandler(logging.Handler):
     """Handler de log que armazena os registros em memória para o WebSocket."""
-    def __init__(self, max_logs=500):
+    def __init__(self, max_logs=100):
         super().__init__()
         self.logs = []
         self.max_logs = max_logs
@@ -471,16 +468,9 @@ class BlingAuth:
         self.expires_at: Optional[float] = None
         self.logger = logger
         self.load_tokens()
-        self.state: Optional[str] = self._load_state()
-
-    def _load_state(self) -> Optional[str]:
+        # Carrega state diretamente
         tokens = load_tokens_safe(self.config.TOKENS_FILE)
-        return tokens.get("state")
-
-    def _save_state(self, state: str):
-        tokens = load_tokens_safe(self.config.TOKENS_FILE)
-        tokens["state"] = state
-        save_tokens(tokens)
+        self.state: Optional[str] = tokens.get("state")
         
     def get_authorization_url(self) -> str:
         # Só gera novo state se não estiver autenticado E não tiver state salvo
@@ -489,7 +479,10 @@ class BlingAuth:
             
         if self.state is None:
             self.state = secrets.token_urlsafe(16)
-            self._save_state(self.state)
+            # Salva state inline
+            tokens = load_tokens_safe(self.config.TOKENS_FILE)
+            tokens["state"] = self.state
+            save_tokens(tokens)
             
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&scope=*/*&state={self.state}"
     
@@ -580,38 +573,26 @@ class BlingAuth:
             return self.access_token
         return None
 
-# CORREÇÃO: Adicionado limite de profundidade para evitar loop infinito
+# Simplificado: busca direta sem recursão profunda
 def extract_image_url(prod: dict, depth=0) -> Optional[str]:
-    """Extrai URL da imagem procurando em midia, imagens e campos diretos."""
+    """Extrai URL da imagem procurando em campos diretos."""
     if not prod or not isinstance(prod, dict):
         return None
     
-    # Proteção contra loop
-    if depth > 3: return None
-
-    # 1. Tenta campos diretos comuns
-    for key in ["imagemURL", "url", "urlThumbnail", "link", "caminho"]:
+    # Busca direta em campos comuns
+    for key in ["imagemURL", "url"]:
         val = prod.get(key)
         if val and isinstance(val, str) and val.startswith("http"):
             return val
-
-    # 2. Tenta encontrar dentro de listas de mídia (padrão Bling V3)
-    for list_key in ["midia", "midias", "imagens", "fotos", "anexos"]:
-        items = prod.get(list_key, [])
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, str) and item.startswith("http"):
-                    return item
-                if isinstance(item, dict):
-                    ret = extract_image_url(item, depth + 1)
-                    if ret: return ret
-
-    # 3. Tenta descer um nível se houver 'data' ou 'produto' aninhado
-    for nested in ["data", "produto"]:
-        if nested in prod and isinstance(prod[nested], dict):
-             if prod[nested].get('id') != prod.get('id'):
-                 return extract_image_url(prod[nested], depth + 1)
-
+    
+    # Busca em midia[0].url
+    midia = prod.get("midia", [])
+    if isinstance(midia, list) and len(midia) > 0:
+        if isinstance(midia[0], dict):
+            url = midia[0].get("url")
+            if url and isinstance(url, str) and url.startswith("http"):
+                return url
+    
     return None
 
 class BlingAPIClient:
@@ -921,9 +902,10 @@ class AutomationOrchestrator:
         
         todos_produtos = []
         page = 1
+        MAX_PAGES = 50  # Limite de segurança
         
-        # PASSO 1: Baixar TUDO primeiro (Paginação)
-        while True:
+        # PASSO 1: Baixar produtos com paginação
+        while page <= MAX_PAGES:
             try:
                 resp = self.api_client.get_products(access_token, page=page, limit=100)
                 items = resp.get('data', [])
@@ -937,79 +919,60 @@ class AutomationOrchestrator:
                     break
                     
                 page += 1
-                time.sleep(0.2) 
+                time.sleep(0.2)
             except Exception as e:
                 self.logger.error(f"Erro ao carregar página {page}: {e}")
                 break
         
-        # PASSO 2: Criar Mapa para busca rápida (ID -> Produto)
-        produto_map = {str(p.get("id")): p for p in todos_produtos}
+        self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando...")
         
-        self.logger.info(f"Total baixado: {len(todos_produtos)}. Processando Kits...")
-
-        # PASSO 3: Separar Kits e preencher nomes dos componentes
+        # PASSO 2: Classificar produtos e kits
         for p in todos_produtos:
             p_id = p.get("id")
-            
             estrutura = p.get("estrutura", {})
             componentes = estrutura.get("componentes", [])
             
-            eh_kit = len(componentes) > 0 or p.get("tipo") == "K" or p.get("formato") == "K"
-
-            img_url = extract_image_url(p)
+            # FIX CRÍTICO: Verifica se TEM componentes de verdade
+            eh_kit = isinstance(componentes, list) and len(componentes) > 0
+            
+            img_url = p.get("imagemURL") or p.get("imagem", {}).get("url")
             
             if eh_kit:
+                # É um KIT - busca detalhes dos componentes
                 comps_formatados = []
                 
-                if not componentes and p_id:
-                     try:
-                         det = self.api_client.get_product_details(access_token, p_id)
-                         componentes = det.get("estrutura", {}).get("componentes", [])
-                         if not img_url: img_url = extract_image_url(det)
-                     except:
-                         pass
-
                 for c in componentes:
-                    filho_ref = c.get("produto", {})
-                    filho_id = str(filho_ref.get("id"))
-                    
-                    produto_filho = produto_map.get(filho_id)
-                    
-                    nome_final = "Item não carregado"
-                    if produto_filho:
-                        nome_final = produto_filho.get("nome")
-                    elif filho_ref.get("nome"):
-                        nome_final = filho_ref.get("nome")
-                    
+                    filho = c.get("produto", {})
                     comps_formatados.append({
-                        "nome": nome_final,
+                        "nome": filho.get("nome", "Item não identificado"),
                         "quantidade": c.get("quantidade", 0),
-                        "sku": produto_filho.get("codigo") if produto_filho else ""
+                        "sku": filho.get("codigo", "N/D")
                     })
-
+                
                 self.kits.append({
                     "id": p_id,
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"), 
+                    "produto": p.get("nome"),
                     "imagemURL": img_url,
                     "componentes": comps_formatados
                 })
             else:
+                # É um PRODUTO SIMPLES
                 self.products.append({
-                    "id": p.get("id"),
+                    "id": p_id,
                     "sku": p.get("codigo"),
-                    "produto": p.get("nome"), 
+                    "produto": p.get("nome"),
                     "imagemURL": img_url,
                     "tipo": p.get("tipo"),
                     "situacao": p.get("situacao"),
                     "preco": p.get("preco"),
                     "estoque": p.get("estoqueAtual", 0)
                 })
-
-        # PASSO 4: Salvar o cache em disco
+        
+        # PASSO 3: Salvar cache
         save_products_cache(self.kits, self.products, self.config.PRODUCTS_CACHE_FILE)
         
-        self.logger.info(f"Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
+        self.logger.info(f"✅ Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
 
     def get_all_products(self) -> List[Dict[str, Any]]:
         return self.products
