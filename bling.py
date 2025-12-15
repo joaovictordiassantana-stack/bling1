@@ -702,14 +702,15 @@ class AutomationOrchestrator:
     def load_bling_products(self):
         """Worker background para carregar dados."""
         if not self.auth.is_authenticated():
-            self.logger.info("Aguardando autenticação para carregar dados...")
+            self.logger.warning("⚠️ Worker: Aguardando autenticação para carregar dados...")
             return
             
         token = self.auth.get_valid_token()
         if not token:
-             self.logger.warning("Token inválido no worker.")
+             self.logger.error("❌ Worker: Token inválido!")
              return
-             
+        
+        self.logger.info("✅ Worker: Token válido obtido. Iniciando carga de produtos...")
         self._load_products_and_kits(token)
     
     def check_and_refresh_token(self):
@@ -722,7 +723,11 @@ class AutomationOrchestrator:
 
     def load_data_worker(self):
         """Worker principal que busca dados, atualiza e executa a lógica."""
-        self.logger.info("Iniciando Worker de carregamento de dados e lógica.")
+        self.logger.info("🚀🚀🚀 WORKER INICIADO COM SUCESSO 🚀🚀🚀")
+        
+        # Adiciona delay inicial para garantir que a app está pronta
+        time.sleep(5)
+        self.logger.info("Worker aguardou 5 segundos. Iniciando verificações...")
         
         if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
             self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
@@ -903,7 +908,10 @@ class AutomationOrchestrator:
 
 
     def _load_products_and_kits(self, access_token: str):
-        self.logger.info("Iniciando carga otimizada de produtos e kits...")
+        self.logger.info("=" * 60)
+        self.logger.info("📦 INICIANDO CARGA COMPLETA DE PRODUTOS DO BLING")
+        self.logger.info("=" * 60)
+        
         self.kits.clear()
         self.products.clear()
         
@@ -1071,6 +1079,7 @@ DASHBOARD_TEMPLATE = r"""
             <a class="navbar-brand text-white" href="#">Bling Automação</a>
             <div class="d-flex">
                 <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
+                <button class="btn btn-sm btn-warning me-2" onclick="forceLoadProducts(event)">🔄 Forçar Carregamento</button>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
             </div>
         </div>
@@ -1139,6 +1148,28 @@ DASHBOARD_TEMPLATE = r"""
     <script>
     const API = '/api';
     
+    async function forceLoadProducts(event) {
+        if (!isAuthenticated) {
+            alert('Faça login primeiro!');
+            return;
+        }
+        
+        const btn = event.target;
+        btn.disabled = true;
+        btn.textContent = '⏳ Carregando...';
+        
+        try {
+            const r = await fetch('/api/force-load', { method: 'POST' });
+            const data = await r.json();
+            alert('Carregamento iniciado! Aguarde 2 minutos e recarregue a página.');
+        } catch(e) {
+            alert('Erro: ' + e);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '🔄 Forçar Carregamento';
+        }
+    }
+
     function formatLog(log) {
         return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
     }
@@ -1492,6 +1523,18 @@ class WebServer:
                 "is_running": self.orchestrator.is_running
             })
 
+        @self.app.route('/api/debug/worker')
+        def api_debug_worker():
+            """Endpoint para debug do worker"""
+            return jsonify({
+                "authenticated": self.orchestrator.auth.is_authenticated(),
+                "kits_count": len(self.orchestrator.get_all_kits()),
+                "products_count": len(self.orchestrator.get_all_products()),
+                "worker_running": self.orchestrator.is_running,
+                "has_token": bool(self.orchestrator.auth.access_token),
+                "token_expires_in": (self.orchestrator.auth.expires_at - time.time()) if self.orchestrator.auth.expires_at else 0
+            })
+
         # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
         @self.app.route("/api/sales/stats")
         def api_sales_stats():
@@ -1613,6 +1656,13 @@ class WebServer:
                 self.logger.warning("⚠️ CACHE VAZIO! Worker pode não ter rodado ainda. Aguarde até 10 minutos.")
             return jsonify(kits + products)
 
+        @self.app.route('/api/force-load', methods=['POST'])
+        @token_required
+        def api_force_load(token):
+            """Força carregamento manual dos produtos"""
+            Thread(target=self.orchestrator.load_bling_products, daemon=True).start()
+            return jsonify({"status": "started"})
+
         @self.app.route("/webhook/bling", methods=["POST"])
         def webhook_bling():
             payload = request.get_data()
@@ -1716,8 +1766,13 @@ class WebServer:
 def create_app() -> Flask:
     app = Flask(__name__)
     WebServer(app, orchestrator)
-    # INICIA O WORKER EM BACKGROUND
-    Thread(target=orchestrator.load_data_worker, daemon=True).start()
+    
+    # FORÇA INÍCIO DO WORKER
+    logger.info("🎯 create_app: Iniciando worker em background...")
+    worker_thread = Thread(target=orchestrator.load_data_worker, daemon=True)
+    worker_thread.start()
+    logger.info(f"✅ Worker thread iniciada: {worker_thread.is_alive()}")
+    
     return app
 
 app = create_app()
@@ -1739,3 +1794,8 @@ if __name__ == "__main__":
 import os as _os
 _os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 300 --keep-alive 5")
 APP_PORT = int(_os.getenv("PORT", "10000"))
+
+# GARANTE QUE O WORKER INICIA NO GUNICORN
+if 'gunicorn' in _os.environ.get('SERVER_SOFTWARE', ''):
+    logger.info("🚀 Detectado ambiente Gunicorn. Iniciando worker em background...")
+    Thread(target=orchestrator.load_data_worker, daemon=True).start()
