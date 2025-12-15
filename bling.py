@@ -3,13 +3,19 @@
 from gevent import monkey
 monkey.patch_all()   # torna as bibliotecas padrão cooperativas com gevent (requests, socket, threading...)
 """
-bling.py - Sistema completo de automação Bling com design premium (CORRIGIDO v4.6)
-Implementa OAuth 2.0, API robusta, gerenciamento de estoque/compras e dashboard web.
-- CORREÇÃO CRÍTICA (v4.4): Implementação de WebSocket para notificação em TEMPO REAL de KPIs.
-- FIX SINCRONIZAÇÃO (v4.4): get_stats() agora força a leitura do arquivo para sincronização multi-worker.
-- FIX SPAM DE LOG (v4.5): Ajuste no _load_stats para evitar logs repetitivos de 'Nenhum KPI encontrado'.
-- FIX SPAM DE LOG (v4.6): Reduzido nível de log para INFO e removidos logs DEBUG repetitivos de /api/sales/stats.
-- FEATURE (v4.6): Histórico de pedidos expandido de 9 para 30 dias.
+================================================================================
+bling.py - Sistema de Automação Bling com OAuth 2.0 e Dashboard Web Premium
+================================================================================
+
+Autor: João Victor Dias Santana
+Copyright (c) 2025 João Victor Dias Santana
+
+Implementa integração completa com Bling API v3, gerenciamento de estoque,
+KPIs de vendas em tempo real via WebSocket e dashboard interativo.
+
+Versão: 4.6
+Última atualização: Dezembro 2025
+================================================================================
 """
 
 import os
@@ -28,7 +34,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Lock, Thread
 from typing import List, Optional, Dict, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import wraps
 
 import requests
@@ -149,14 +155,11 @@ class Config:
     BASE_DELAY: float = 1.0
     
     # Automação
-    CHECK_MIN_STOCK: bool = True
-    MIN_STOCK_THRESHOLD: int = 10
-    DEFAULT_BATCH_SIZE: int = 10
-    DELAY_BETWEEN_BATCHES: float = 0.5
+
     
     # Arquivos
     TOKENS_FILE: Path = Path('tokens.json')
-    COMPONENT_CONFIG_FILE: Path = Path('component_config.json')
+
     SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
     PRODUCTS_CACHE_FILE: Path = Path('products_cache.json') # Persistência de Produtos e Kits
 
@@ -454,30 +457,7 @@ class SalesManager:
                        f"Diário={daily}, Semanal={weekly}, Histórico={historic}")
 
 
-class ComponentConfigManager:
-    def __init__(self, file_path: Path):
-        self.file_path = file_path
-        self._load_or_create_config()
-        self.logger = logger
-    
-    def _load_or_create_config(self) -> Dict[str, Any]:
-        if self.file_path.exists():
-            try:
-                with open(self.file_path, 'r', encoding='utf-8') as f:
-                    self.config = json.load(f)
-            except Exception:
-                self.config = {"components": []}
-        else:
-            self.config = {"components": []}
-            self._save_config()
-        return self.config
-    
-    def _save_config(self):
-        try:
-            with open(self.file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=4)
-        except Exception as e:
-            self.logger.error(f"Erro salvando config: {e}")
+
 
 # ============================================================================ 
 # 5. CLIENTE BLING API E AUTH
@@ -710,8 +690,7 @@ class AutomationOrchestrator:
     def __init__(self, config: Config, sales_manager: 'SalesManager'):
         self.config = config
         self.auth = BlingAuth(config)
-        self.api_client = BlingAPIClient(config) 
-        self.component_config = ComponentConfigManager(config.COMPONENT_CONFIG_FILE)
+        self.api_client = BlingAPIClient(config)
         
         self.sales_manager = sales_manager 
         
@@ -1037,10 +1016,43 @@ class AutomationOrchestrator:
 
     def get_all_kits(self) -> List[Dict[str, Any]]:
         return self.kits
+    
+    def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
+        """Busca histórico de pedidos de venda dos últimos N dias"""
+        try:
+            orders = []
+            now = datetime.now()
+            start_date = (now - timedelta(days=days)).strftime('%Y-%m-%d')
+            end_date = now.strftime('%Y-%m-%d')
+            
+            # Buscar pedidos de venda no período
+            page = 1
+            while True:
+                try:
+                    resp = self.api_client.get_sales_orders(access_token, page=page, limit=100, 
+                                                            data_inicio=start_date, data_fim=end_date)
+                    items = resp.get('data', [])
+                    
+                    if not items:
+                        break
+                    
+                    orders.extend(items)
+                    
+                    if len(items) < 100:
+                        break
+                    
+                    page += 1
+                    time.sleep(0.2)
+                except Exception as e:
+                    self.logger.error(f"Erro ao carregar página {page} do histórico: {e}")
+                    break
+            
+            return orders
+        except Exception as e:
+            self.logger.error(f"Erro ao buscar histórico de vendas: {e}")
+            return []
 
-    def run_purchase_check(self, create_orders=False):
-        self.logger.info("Verificação de compras iniciada (Simulação).")
-        return True
+
 
 # Instâncias Globais
 config = Config()
@@ -1099,6 +1111,25 @@ DASHBOARD_TEMPLATE = r"""
         .kpi-daily { border-left-color: #0d6efd; }
         .kpi-weekly { border-left-color: #ffc107; }
         .kpi-historic { border-left-color: #198754; }
+        footer { box-shadow: 0 -1px 3px rgba(0, 0, 0, 0.05); }
+        footer strong { color: #495057; }
+        footer p { margin-bottom: 0; }
+        .metric-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            border-radius: 10px;
+            color: white;
+            text-align: center;
+        }
+        .metric-label {
+            font-size: 0.9em;
+            opacity: 0.9;
+            margin-bottom: 5px;
+        }
+        .metric-value {
+            font-size: 2em;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -1149,6 +1180,8 @@ DASHBOARD_TEMPLATE = r"""
         <ul class="nav nav-tabs" id="myTab" role="tablist">
             <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Todos Produtos</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kpi-chart">📊 Dashboard KPI</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#component-usage">🔧 Componentes</button></li>
         </ul>
 
         <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
@@ -1168,6 +1201,56 @@ DASHBOARD_TEMPLATE = r"""
 
             <div id="auth-required-kits" class="alert alert-warning hidden">
                 É necessário autenticar com o Bling para visualizar os Produtos.
+            </div>
+            
+            <div class="tab-pane fade" id="kpi-chart">
+                <div class="row">
+                    <div class="col-md-8">
+                        <div class="card">
+                            <div class="card-header bg-primary text-white">
+                                <h5>📈 Evolução de Pedidos (Últimos 30 dias)</h5>
+                            </div>
+                            <div class="card-body" style="height: 400px;">
+                                <canvas id="salesChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-4">
+                        <div class="card">
+                            <div class="card-header bg-success text-white">
+                                <h5>🎯 Métricas Rápidas</h5>
+                            </div>
+                            <div class="card-body">
+                                <div class="metric-box mb-3">
+                                    <div class="metric-label">Média Diária</div>
+                                    <div class="metric-value" id="avg-daily">0</div>
+                                </div>
+                                <div class="metric-box mb-3">
+                                    <div class="metric-label">Crescimento Semanal</div>
+                                    <div class="metric-value text-success" id="growth-weekly">+0%</div>
+                                </div>
+                                <div class="metric-box">
+                                    <div class="metric-label">Tendência</div>
+                                    <div class="metric-value" id="trend-indicator">📊 Estável</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="tab-pane fade" id="component-usage">
+                <div class="card">
+                    <div class="card-header bg-warning">
+                        <h5>🔧 Consumo de Componentes por Vendas (Últimos 30 dias)</h5>
+                        <small>Atualizado conforme pedidos são processados</small>
+                    </div>
+                    <div class="card-body">
+                        <div id="component-usage-content">
+                            <p class="text-center text-muted">Carregando dados...</p>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
@@ -1478,10 +1561,127 @@ DASHBOARD_TEMPLATE = r"""
             }
         }
     
+    // Função para carregar o gráfico KPI
+    let salesChart = null;
+    
+    async function loadKPIChart() {
+        try {
+            const r = await fetch('/api/sales/history');
+            const data = await r.json();
+            
+            const ctx = document.getElementById('salesChart').getContext('2d');
+            
+            if (salesChart) salesChart.destroy();
+            
+            salesChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: 'Pedidos Diários',
+                        data: data.daily,
+                        borderColor: '#0d6efd',
+                        backgroundColor: 'rgba(13, 110, 253, 0.1)',
+                        tension: 0.4,
+                        fill: true
+                    }, {
+                        label: 'Média Móvel (7 dias)',
+                        data: data.moving_avg,
+                        borderColor: '#ffc107',
+                        borderDash: [5, 5],
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'top' },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false
+                        }
+                    },
+                    scales: {
+                        y: { beginAtZero: true }
+                    }
+                }
+            });
+            
+            // Atualizar métricas
+            document.getElementById('avg-daily').textContent = data.avg_daily.toFixed(1);
+            document.getElementById('growth-weekly').textContent = 
+                (data.growth > 0 ? '+' : '') + data.growth.toFixed(1) + '%';
+            document.getElementById('trend-indicator').textContent = 
+                data.growth > 10 ? '📈 Crescendo' : data.growth < -10 ? '📉 Caindo' : '📊 Estável';
+        } catch(e) {
+            console.error('Erro ao carregar gráfico KPI:', e);
+        }
+    }
+    
+    // Função para carregar uso de componentes
+    async function loadComponentUsage() {
+        const div = document.getElementById('component-usage-content');
+        
+        if (!isAuthenticated) {
+            div.innerHTML = '<div class="alert alert-warning">Necessário autenticar para visualizar.</div>';
+            return;
+        }
+        
+        try {
+            const r = await fetch('/api/components/usage');
+            const data = await r.json();
+            
+            if (!data.components || data.components.length === 0) {
+                div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
+                return;
+            }
+            
+            let html = '<table class="table table-striped"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Utilizada</th><th>Produtos que Usam</th></tr></thead><tbody>';
+            
+            let total = 0;
+            data.components.forEach(comp => {
+                total += comp.quantidade;
+                html += '<tr><td><strong>' + comp.nome + '</strong></td><td><code>' + comp.sku + '</code></td><td><span class="badge bg-success">' + comp.quantidade + 'x</span></td><td><small>' + comp.produtos.join(', ') + '</small></td></tr>';
+            });
+            
+            html += '</tbody></table><div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos Consumidos: <span class="badge bg-primary fs-5">' + total + '</span></h6></div>';
+            
+            div.innerHTML = html;
+        } catch(e) {
+            div.innerHTML = '<div class="alert alert-danger">Erro ao carregar: ' + e + '</div>';
+        }
+    }
+    
     document.addEventListener('DOMContentLoaded', () => {
         loadKits();
+        
+        // Adicionar event listener para carregar o gráfico quando a aba for ativada
+        const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
+        if (kpiTab) {
+            kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
+        }
+        
+        // Adicionar event listener para a aba de componentes
+        const componentTab = document.querySelector('[data-bs-target="#component-usage"]');
+        if (componentTab) {
+            componentTab.addEventListener('shown.bs.tab', loadComponentUsage);
+        }
     });
     </script>
+    
+    <!-- Assinatura do Desenvolvedor -->
+    <footer style="background-color: #f8f9fa; border-top: 1px solid #dee2e6; margin-top: 3rem; padding: 1.5rem 0; text-align: center; color: #6c757d; font-size: 0.85rem;">
+        <div class="container">
+            <p style="margin: 0; font-weight: 500;">
+                <span style="opacity: 0.7;">Desenvolvido por</span> 
+                <strong>João Victor Dias Santana</strong>
+            </p>
+            <p style="margin: 0.25rem 0 0 0; opacity: 0.6; font-size: 0.8rem;">
+                &copy; 2025 • Bling Automação Dashboard v4.6
+            </p>
+        </div>
+    </footer>
 </body>
 </html>
 """
@@ -1558,17 +1758,7 @@ class WebServer:
                 "is_running": self.orchestrator.is_running
             })
 
-        @self.app.route('/api/debug/worker')
-        def api_debug_worker():
-            """Endpoint para debug do worker"""
-            return jsonify({
-                "authenticated": self.orchestrator.auth.is_authenticated(),
-                "kits_count": len(self.orchestrator.get_all_kits()),
-                "products_count": len(self.orchestrator.get_all_products()),
-                "worker_running": self.orchestrator.is_running,
-                "has_token": bool(self.orchestrator.auth.access_token),
-                "token_expires_in": (self.orchestrator.auth.expires_at - time.time()) if self.orchestrator.auth.expires_at else 0
-            })
+
 
         # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
         @self.app.route("/api/sales/stats")
@@ -1579,6 +1769,66 @@ class WebServer:
             # FIX SPAM DE LOG (v4.6): Removido o log DEBUG que causava spam no console
             
             return jsonify(stats)
+        
+        @self.app.route("/api/sales/history")
+        @token_required
+        def api_sales_history(token):
+            """Retorna histórico de vendas dos últimos 30 dias para gráfico"""
+            now = datetime.now()
+            daily_counts = {}
+            
+            # Inicializar os últimos 30 dias
+            for i in range(30):
+                date = (now - timedelta(days=i)).strftime('%Y-%m-%d')
+                daily_counts[date] = 0
+            
+            # Buscar pedidos do histórico de vendas
+            try:
+                # Buscar pedidos dos últimos 30 dias
+                orders = self.orchestrator.get_sales_history(token, days=30)
+                
+                # Contar pedidos por dia
+                for order in orders:
+                    if isinstance(order, dict):
+                        data_obj = order.get('data', {})
+                        if isinstance(data_obj, dict):
+                            data_emissao_str = data_obj.get('dataEmissao')
+                        else:
+                            data_emissao_str = data_obj
+                        
+                        if data_emissao_str:
+                            try:
+                                date_key = data_emissao_str[:10]
+                                if date_key in daily_counts:
+                                    daily_counts[date_key] += 1
+                            except:
+                                pass
+            except Exception as e:
+                self.logger.error(f"Erro ao buscar histórico de vendas: {e}")
+            
+            # Ordenar as datas
+            labels = sorted(daily_counts.keys())
+            values = [daily_counts[date] for date in labels]
+            
+            # Calcular média móvel (7 dias)
+            moving_avg = []
+            for i in range(len(values)):
+                window = values[max(0, i-6):i+1]
+                moving_avg.append(sum(window) / len(window) if window else 0)
+            
+            # Calcular média diária e crescimento
+            avg_daily = sum(values) / len(values) if values else 0
+            growth = 0
+            if len(values) > 0 and values[0] > 0:
+                growth = ((values[-1] - values[0]) / values[0] * 100)
+            
+            return jsonify({
+                'labels': labels,
+                'daily': values,
+                'moving_avg': moving_avg,
+                'avg_daily': avg_daily,
+                'growth': growth
+            })
 
         @self.app.route("/api/all_products", methods=["GET"])
         @token_required
