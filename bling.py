@@ -1079,7 +1079,7 @@ DASHBOARD_TEMPLATE = r"""
             <a class="navbar-brand text-white" href="#">Bling Automação</a>
             <div class="d-flex">
                 <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
-                <button class="btn btn-sm btn-warning me-2" onclick="forceLoadProducts(event)">🔄 Forçar Carregamento</button>
+                
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
             </div>
         </div>
@@ -1133,7 +1133,7 @@ DASHBOARD_TEMPLATE = r"""
             </div>
 
             <div class="tab-pane fade" id="kits">
-                <button class="btn btn-sm btn-info mb-3" onclick="loadKits()">Recarregar Lista</button>
+                <button class="btn btn-sm btn-warning mb-3" onclick="forceAndReloadKits(event)">🔄 Forçar Recarregamento</button>
                 <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
                 <div id="kits-list"></div>
             </div>
@@ -1148,7 +1148,7 @@ DASHBOARD_TEMPLATE = r"""
     <script>
     const API = '/api';
     
-    async function forceLoadProducts(event) {
+    async function forceAndReloadKits(event) {
         if (!isAuthenticated) {
             alert('Faça login primeiro!');
             return;
@@ -1156,17 +1156,24 @@ DASHBOARD_TEMPLATE = r"""
         
         const btn = event.target;
         btn.disabled = true;
-        btn.textContent = '⏳ Carregando...';
+        btn.textContent = '⏳ Forçando Recarregamento...';
         
         try {
+            // 1. Força o recarregamento no servidor
             const r = await fetch('/api/force-load', { method: 'POST' });
             const data = await r.json();
-            alert('Carregamento iniciado! Aguarde 2 minutos e recarregue a página.');
+            
+            // 2. Notifica o usuário sobre o processo assíncrono
+            alert('Carregamento de cache iniciado! Aguarde 2 minutos para que os dados sejam processados e atualizados.');
+            
+            // 3. Recarrega a lista imediatamente (mostrará os dados atuais ou a mensagem de carregamento)
+            await loadKits();
+            
         } catch(e) {
-            alert('Erro: ' + e);
+            alert('Erro ao forçar recarregamento: ' + e);
         } finally {
             btn.disabled = false;
-            btn.textContent = '🔄 Forçar Carregamento';
+            btn.textContent = '🔄 Forçar Recarregamento';
         }
     }
 
