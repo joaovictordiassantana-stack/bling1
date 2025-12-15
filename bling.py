@@ -52,7 +52,9 @@ except ImportError:
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
 
-# Removido: kpi_update_callbacks (será gerenciado internamente no SalesManager)
+# Variáveis globais para notificar subscribers sobre mudanças de KPI
+kpi_update_callbacks = []
+kpi_update_lock = Lock()
 # ============================================================================ 
 # 1. LOGS AVANÇADOS
 # ============================================================================
@@ -471,6 +473,12 @@ class BlingAuth:
         # Carrega state diretamente
         tokens = load_tokens_safe(self.config.TOKENS_FILE)
         self.state: Optional[str] = tokens.get("state")
+    
+    def _save_state(self, state):
+        """Salva o state OAuth no arquivo de tokens"""
+        tokens = load_tokens_safe(self.config.TOKENS_FILE)
+        tokens["state"] = state
+        save_tokens(tokens)
         
     def get_authorization_url(self) -> str:
         # Só gera novo state se não estiver autenticado E não tiver state salvo
@@ -479,10 +487,7 @@ class BlingAuth:
             
         if self.state is None:
             self.state = secrets.token_urlsafe(16)
-            # Salva state inline
-            tokens = load_tokens_safe(self.config.TOKENS_FILE)
-            tokens["state"] = self.state
-            save_tokens(tokens)
+            self._save_state(self.state)
             
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&scope=*/*&state={self.state}"
     
@@ -573,25 +578,45 @@ class BlingAuth:
             return self.access_token
         return None
 
-# Simplificado: busca direta sem recursão profunda
-def extract_image_url(prod: dict, depth=0) -> Optional[str]:
-    """Extrai URL da imagem procurando em campos diretos."""
+def extract_image_url(prod: dict) -> Optional[str]:
+    """Extrai URL da imagem de produto do Bling v3 (busca em múltiplos locais)"""
     if not prod or not isinstance(prod, dict):
         return None
     
-    # Busca direta em campos comuns
-    for key in ["imagemURL", "url"]:
+    # 1. Busca direta em campos raiz
+    for key in ["imagemURL", "url", "urlThumbnail"]:
         val = prod.get(key)
         if val and isinstance(val, str) and val.startswith("http"):
             return val
     
-    # Busca em midia[0].url
+    # 2. Busca em prod.imagem (objeto aninhado)
+    imagem_obj = prod.get("imagem", {})
+    if isinstance(imagem_obj, dict):
+        url = imagem_obj.get("url") or imagem_obj.get("link")
+        if url and isinstance(url, str) and url.startswith("http"):
+            return url
+    
+    # 3. Busca em prod.midia[0] (array de mídias)
     midia = prod.get("midia", [])
     if isinstance(midia, list) and len(midia) > 0:
-        if isinstance(midia[0], dict):
-            url = midia[0].get("url")
+        first_media = midia[0]
+        if isinstance(first_media, dict):
+            url = first_media.get("url") or first_media.get("link")
             if url and isinstance(url, str) and url.startswith("http"):
                 return url
+        elif isinstance(first_media, str) and first_media.startswith("http"):
+            return first_media
+    
+    # 4. Busca em prod.imagens[0] (campo alternativo)
+    imagens = prod.get("imagens", [])
+    if isinstance(imagens, list) and len(imagens) > 0:
+        first_img = imagens[0]
+        if isinstance(first_img, dict):
+            url = first_img.get("url") or first_img.get("link")
+            if url and isinstance(url, str) and url.startswith("http"):
+                return url
+        elif isinstance(first_img, str) and first_img.startswith("http"):
+            return first_img
     
     return None
 
@@ -935,7 +960,7 @@ class AutomationOrchestrator:
             # FIX CRÍTICO: Verifica se TEM componentes de verdade
             eh_kit = isinstance(componentes, list) and len(componentes) > 0
             
-            img_url = p.get("imagemURL") or p.get("imagem", {}).get("url")
+            img_url = extract_image_url(p)
             
             if eh_kit:
                 # É um KIT - busca detalhes dos componentes
