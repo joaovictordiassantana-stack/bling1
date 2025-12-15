@@ -1911,18 +1911,35 @@ class WebServer:
                     order_data = order.get('data', {})
                     items = order_data.get('itens', [])
                     
-                    for item in items:
-                        produto_id = item.get('produto', {}).get('id')
-                        qtd_vendida = item.get('quantidade', 1)
-                        
-                        # Buscar se é kit
-                        kit = next((k for k in self.orchestrator.get_all_kits() if str(k.get('id')) == str(produto_id)), None)
-                        
-                        if kit and kit.get('componentes'):
-                            for comp in kit['componentes']:
-                                comp_nome = comp['nome']
+                        for item in items:
+                            # Normalização do campo 'produto' (CAUSA 1)
+                            produto = item.get('produto')
+                            if isinstance(produto, dict):
+                                produto_id = produto.get('id')
+                            elif isinstance(produto, str):
+                                # Se for string, não tem ID para buscar kit
+                                continue
+                            else:
+                                continue
+                                
+                            qtd_vendida = item.get('quantidade', 1)
+                            
+                            # Buscar se é kit
+                            kit = next((k for k in self.orchestrator.get_all_kits() if str(k.get('id')) == str(produto_id)), None)
+                            
+                            # Blindar acesso a componentes (CAUSA 3)
+                            componentes = kit.get('componentes') if kit else None
+                            
+                            if kit and componentes and isinstance(componentes, list):
+                            for comp in componentes:
+                                # Blindar componente (CAUSA 2 e 3)
+                                if not isinstance(comp, dict):
+                                    self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {kit.get('sku')}: {comp}")
+                                    continue
+                                    
+                                comp_nome = comp.get('nome', 'Item não identificado')
                                 comp_sku = comp.get('sku', 'N/D')
-                                comp_qtd = comp['quantidade'] * qtd_vendida
+                                comp_qtd = comp.get('quantidade', 0) * qtd_vendida
                                 
                                 # Usar SKU como chave para evitar problemas com nomes duplicados
                                 key = comp_sku if comp_sku != 'N/D' else comp_nome
@@ -1949,7 +1966,11 @@ class WebServer:
                 })
                 
             except Exception as e:
-                self.orchestrator.logger.error(f"Erro ao calcular uso de componentes: {e}")
+                # Log de erro com contexto (CAUSA 4)
+                self.orchestrator.logger.error(
+                    f"Erro CRÍTICO ao calcular uso de componentes: {e}",
+                    exc_info=True # Adiciona traceback completo
+                )
                 return jsonify({'components': [], 'error': str(e)})
 
         @self.app.route("/api/all_products", methods=["GET"])
