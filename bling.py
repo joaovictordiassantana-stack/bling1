@@ -917,7 +917,7 @@ class AutomationOrchestrator:
             self.recalculation_lock.release() 
 
 
-def _load_products_and_kits(self, access_token: str):
+    def _load_products_and_kits(self, access_token: str):
         """
         CORREÇÃO CRÍTICA: Busca detalhes individuais de cada produto
         para identificar kits corretamente na API v3 do Bling.
@@ -1031,13 +1031,13 @@ def _load_products_and_kits(self, access_token: str):
         self.logger.info(f"   📦 {len(self.products)} produtos simples")
         self.logger.info("=" * 60)
 
-def get_all_products(self) -> List[Dict[str, Any]]:
+    def get_all_products(self) -> List[Dict[str, Any]]:
         return self.products
 
-def get_all_kits(self) -> List[Dict[str, Any]]:
+    def get_all_kits(self) -> List[Dict[str, Any]]:
         return self.kits
     
-def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
+    def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
         """
         CORREÇÃO CRÍTICA: Usa parâmetros corretos da API v3 do Bling
         para buscar histórico de vendas.
