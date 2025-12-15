@@ -158,6 +158,7 @@ class Config:
     TOKENS_FILE: Path = Path('tokens.json')
     COMPONENT_CONFIG_FILE: Path = Path('component_config.json')
     SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
+    PRODUCTS_CACHE_FILE: Path = Path('products_cache.json') # Persistência de Produtos e Kits
 
 # ============================================================================ 
 # 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
@@ -217,6 +218,28 @@ def save_stats(data: Dict[str, Any], path: Path):
         logger.info("Estatísticas de KPIs salvas com sucesso.")
     except Exception as e:
         logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
+
+def load_products_cache(path: Path):
+    """Carrega o cache de produtos e kits de forma segura."""
+    if not path.exists():
+        return {"kits": [], "products": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data
+    except Exception as e:
+        logger.error(f"Erro lendo cache de produtos {path.name}: {e}")
+        return {"kits": [], "products": []}
+
+def save_products_cache(kits: List[Dict], products: List[Dict], path: Path):
+    """Salva o cache de produtos e kits."""
+    try:
+        data_to_save = {"kits": kits, "products": products}
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(data_to_save, file, indent=4, ensure_ascii=False)
+        logger.info("Cache de produtos e kits salvo com sucesso.")
+    except Exception as e:
+        logger.error(f"Erro ao salvar cache de produtos e kits: {e}")
 
 def is_token_valid(token_data):
     if not token_data:
@@ -692,8 +715,10 @@ class AutomationOrchestrator:
         
         self.sales_manager = sales_manager 
         
-        self.kits: List[Dict[str, Any]] = []
-        self.products: List[Dict[str, Any]] = []
+        # Carrega o cache na inicialização
+        cache = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
+        self.kits: List[Dict[str, Any]] = cache.get("kits", [])
+        self.products: List[Dict[str, Any]] = cache.get("products", [])
         self.is_running: bool = False
         self.lock = Lock()
         self.recalculation_lock = Lock() 
@@ -1002,6 +1027,9 @@ class AutomationOrchestrator:
                     "estoque": p.get("estoqueAtual", 0)
                 })
 
+        # PASSO 4: Salvar o cache em disco
+        save_products_cache(self.kits, self.products, self.config.PRODUCTS_CACHE_FILE)
+        
         self.logger.info(f"Processamento final: {len(self.kits)} kits, {len(self.products)} produtos.")
 
     def get_all_products(self) -> List[Dict[str, Any]]:
@@ -1658,9 +1686,12 @@ class WebServer:
             """Retorna todos os produtos (kits e simples) carregados em cache."""
             kits = self.orchestrator.get_all_kits()
             products = self.orchestrator.get_all_products()
+            
+            # A verificação de cache vazio é feita agora no Orchestrator.__init__ ao carregar do disco.
+            # Se o cache estiver vazio, a lista estará vazia, mas não precisamos de um WARNING no log
+            # a cada requisição, pois o worker rodará em background.
             self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
-            if len(kits) == 0 and len(products) == 0:
-                self.logger.warning("⚠️ CACHE VAZIO! Worker pode não ter rodado ainda. Aguarde até 10 minutos.")
+            
             return jsonify(kits + products)
 
         @self.app.route('/api/force-load', methods=['POST'])
