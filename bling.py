@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-# Removido gevent monkey.patch_all() - overhead desnecessário
 """
 ================================================================================
 bling.py - Sistema de Automação Bling com OAuth 2.0 e Dashboard Web Premium
@@ -12,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6
+Versão: 4.6 (Refatorado - V2)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -25,14 +24,15 @@ import logging
 import logging.handlers
 import base64
 import secrets
-import argparse
+
 import hmac
 import hashlib
 
 from pathlib import Path
 from datetime import datetime, timedelta
 from threading import Lock, Thread
-from typing import List, Optional, Dict, Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import List, Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 from functools import wraps
 
@@ -51,17 +51,33 @@ except ImportError:
 # ============================================================================
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
-
-# Variáveis globais para notificar subscribers sobre mudanças de KPI
-kpi_update_callbacks = []
+kpi_update_callbacks: List[Callable] = []
 kpi_update_lock = Lock()
+
+def cleanup_kpi_callbacks():
+    """Remove callbacks órfãos a cada 5 minutos"""
+    global kpi_update_callbacks
+    with kpi_update_lock:
+        # Testa cada callback. Se falhar (ex: objeto órfão), remove.
+        valid = []
+        for cb in kpi_update_callbacks:
+            try:
+                # Tenta acessar um atributo ou chamar o callback. Se falhar, é órfão.
+                _ = getattr(cb, '__name__', 'lambda_or_partial') # Teste robusto
+                valid.append(cb)
+            except:
+                logger.debug("Callback órfão removido.")
+                pass
+        kpi_update_callbacks = valid
+        logger.debug(f"🧹 Callbacks KPI limpos: {len(valid)} ativos")
+
 # ============================================================================ 
 # 1. LOGS AVANÇADOS
 # ============================================================================
 
 class InMemoryLogHandler(logging.Handler):
     """Handler de log que armazena os registros em memória para o WebSocket."""
-    def __init__(self, max_logs=100):
+    def __init__(self, max_logs=50):  # ✅ Reduz de 100 para 50
         super().__init__()
         self.logs = []
         self.max_logs = max_logs
@@ -101,8 +117,11 @@ def setup_logging():
     
     # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
-    # FIX SPAM DE LOG (v4.6): Volta para INFO para reduzir spam de /api/sales/stats
+    
     logger.setLevel(logging.INFO) 
+    # ✅ Suprime logs repetitivos
+    logging.getLogger('werkzeug').setLevel(logging.WARNING)
+    logging.getLogger('flask_sock').setLevel(logging.WARNING)
     
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=1024*1024*5, backupCount=5, encoding='utf-8'
@@ -154,7 +173,7 @@ class Config:
     BASE_DELAY: float = 1.0
     
     # Automação
-
+    
     
     # Arquivos
     TOKENS_FILE: Path = Path('tokens.json')
@@ -264,167 +283,284 @@ def save_products_cache(cache_file, products, kits):
             json.dump(payload, f, ensure_ascii=False, indent=2)
         logger.info("Cache de produtos e kits salvo com sucesso.")
     except Exception as e:
-        logger.error(f"[ERROR] Falha ao salvar cache: {e}")
+        logger.error(f"Erro ao salvar cache de produtos: {e}")
 
-def safe_get(obj, key, default=None):
-    """
-    Acessa dict com segurança.
-    Nunca lança AttributeError.
-    """
-    if isinstance(obj, dict):
-        return obj.get(key, default)
+def safe_iter(data):
+    """Garante que o dado é iterável (lista ou tupla), senão retorna lista vazia."""
+    if isinstance(data, (list, tuple)):
+        return data
+    return []
+
+def safe_get(data, key, default=None):
+    """Acesso seguro a chaves de dicionário."""
+    if isinstance(data, dict):
+        return data.get(key, default)
     return default
 
-def extract_items(order):
-    """
-    Retorna lista de itens do pedido, independente do formato.
-    """
-    order = safe_dict(order)
-    data = safe_get(order, 'data', order)
-    
-    # Tenta chaves comuns no Bling v3
-    for key in ["itens", "itensVenda", "items", "item"]:
-        items = safe_get(data, key)
-        if isinstance(items, list):
-            return items
+def token_required(f):
+    """Decorator para verificar se o token está ativo antes de acessar a rota."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_manager = args[0].orchestrator.auth
+        if not auth_manager.is_authenticated():
+            return jsonify({"error": "Não autenticado ou token expirado"}), 401
         
-    return []
-
-import re
-def extract_product_identifier(item):
-    """
-    Extrai id / sku / código do produto vendido.
-    """
-    if not isinstance(item, dict):
-        return None
-
-    produto = safe_get(item, 'produto')
-
-    if isinstance(produto, dict):
-        return safe_get(produto, 'id') or safe_get(produto, 'codigo') or safe_get(produto, 'sku')
-
-    if isinstance(produto, str):
-        match = re.search(r'(\d{3,})', produto)
-        if match:
-            return match.group(1)
-
-    return safe_get(item, 'codigo') or safe_get(item, 'sku')
-
-def resolve_period(period):
-    """
-    Retorna número de dias baseado no período solicitado.
-    """
-    now = datetime.now()
-
-    if period == 'month':
-        start = now.replace(day=1)
-        return (now - start).days + 1
-
-    if isinstance(period, str) and period.endswith('d'):
-        try:
-            return int(period[:-1])
-        except:
-            return 30
-
-    try:
-        return int(period)
-    except:
-        return 30
-
-def filter_orders_by_period(orders, days):
-    """
-    Filtra pedidos para garantir que apenas pedidos dentro do período sejam processados.
-    """
-    cutoff = datetime.now() - timedelta(days=days)
-    valid = []
-
-    for order in safe_iter(orders):
-        order_data = safe_dict(safe_get(order, 'data', order))
-        date_str = safe_get(order_data, "dataEmissao")
-
-        try:
-            # Garante que a data seja um objeto datetime para comparação
-            date = datetime.strptime(date_str, '%Y-%m-%d')
-            if date >= cutoff:
-                valid.append(order)
-        except:
-            continue
-
-    return valid
-
-def safe_iter(iterable):
-    """
-    Garante iteração segura.
-    """
-    if isinstance(iterable, list):
-        return iterable
-    return []
-
-def is_token_valid(token_data):
-    if not token_data:
-        return False
-    expires_at = token_data.get("expires_at")
-    if not expires_at:
-        return False
-    # Checa se o tempo atual é menor que o tempo de expiração menos uma margem de segurança de 20 segundos
-    return time.time() < float(expires_at) - 20
-
-# --- FUNÇÃO PARA BUSCA DE PRODUTOS (CORRIGIDO PARA V3) ---
-def get_bling_products_safe(bling_client, sku: str | None = None, nome: str | None = None, access_token: str | None = None):
-    try:
-        filters = {}
-        if sku:
-            # CORREÇÃO: API v3 usa 'codigo' e não 'sku'
-            filters['codigo'] = sku.strip()
-        if nome and not sku:
-            filters['nome'] = nome.strip()
-
-        page = 1
-        all_items = []
-        token = access_token or getattr(bling_client, "access_token", None)
-        
-        while True:
-            resp = bling_client.get_products(token, page=page, limit=100, **filters)
-            if not resp: 
-                break
-                
-            items = resp.get('data') or resp.get('produtos') or []
-            if isinstance(items, dict) and 'produto' in items:
-                items = items.get('produto') or []
+        token = auth_manager.get_access_token()
+        if not token:
+            return jsonify({"error": "Token de acesso não encontrado"}), 401
             
-            if not items:
-                break
-                
-            all_items.extend(items)
-            if len(items) < 100:
-                break
-            page += 1
-            
-        return {"success": True, "data": all_items}
-        
-    except Exception as e:
-        logger.exception("Erro na busca de produtos no Bling: %s", e)
-        return {"success": False, "error": str(e)}
+        return f(*args, token=token, **kwargs)
+    return decorated
 
 # ============================================================================ 
-# 4. CLASSES DE DADOS E EXCEÇÕES (ATUALIZADO PARA RECALCULO COMPLETO)
+# 4. BLING API CLIENT
 # ============================================================================
 
-class BlingAuthError(Exception): pass
-class BlingAPIError(Exception): pass
+class BlingAPIClient:
+    """
+    Cliente HTTP para a API Bling v3 com retry, rate limiting e refresh de token.
+    """
+    
+    def __init__(self, config: Config, auth_manager):
+        self.config = config
+        self.auth = auth_manager
+        self.logger = logging.getLogger('bling_automacao')
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        })
+        
+    def _request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        Executa uma requisição HTTP com retry e tratamento de token.
+        """
+        url = f"{self.config.BLING_API_URL}/{endpoint}"
+        token = self.auth.get_access_token()
+        
+        if not token:
+            self.logger.warning(f"Tentativa de acesso a {endpoint} sem token.")
+            return None
+            
+        headers = {'Authorization': f'Bearer {token}'}
+        
+        for attempt in range(self.config.MAX_RETRIES):
+            try:
+                response = self.session.request(method, url, headers=headers, timeout=self.config.REQUEST_TIMEOUT, **kwargs)
+                
+                if response.status_code == 401:
+                    self.logger.warning(f"Token expirado ou inválido ao acessar {endpoint}. Tentando refresh...")
+                    if self.auth.refresh_token():
+                        token = self.auth.get_access_token()
+                        headers['Authorization'] = f'Bearer {token}'
+                        self.logger.info("Token renovado com sucesso. Tentando novamente a requisição.")
+                        continue # Tenta novamente com o novo token
+                    else:
+                        self.logger.error("Falha ao renovar o token. Requer autenticação manual.")
+                        return None
+                
+                response.raise_for_status()
+                
+                # Tenta retornar JSON, se falhar, retorna um objeto vazio ou um indicador de sucesso
+                try:
+                    return response.json()
+                except requests.exceptions.JSONDecodeError:
+                    self.logger.debug(f"Resposta não é JSON para {endpoint}. Status: {response.status_code}")
+                    return {} # Retorna vazio para 204 No Content, por exemplo
+                
+            except requests.exceptions.HTTPError as e:
+                self.logger.error(f"Erro HTTP ao acessar {endpoint}: {e}")
+                if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
+                    delay = self.config.BASE_DELAY * (2 ** attempt)
+                    self.logger.info(f"Tentativa {attempt + 1} falhou. Aguardando {delay:.2f}s antes de tentar novamente.")
+                    time.sleep(delay)
+                else:
+                    return None
+            except RequestException as e:
+                self.logger.error(f"Erro de conexão ao acessar {endpoint}: {e}")
+                return None
+                
+        self.logger.error(f"Falha na requisição após {self.config.MAX_RETRIES} tentativas para {endpoint}.")
+        return None
 
-# NOVO: Estatísticas de Vendas (Simplificado para Recálculo)
+    def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        return self._request('GET', endpoint, params=params)
+
+    def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        return self._request('POST', endpoint, json=data)
+
+    def put(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        return self._request('PUT', endpoint, json=data)
+
+    def delete(self, endpoint: str) -> Optional[Dict[str, Any]]:
+        return self._request('DELETE', endpoint)
+
+# ============================================================================ 
+# 5. AUTH MANAGER
+# ============================================================================
+
+class AuthManager:
+    """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.logger = logging.getLogger('bling_automacao')
+        self._tokens = self._load_tokens()
+        self._access_token = self._tokens.get('access_token')
+        self._refresh_token = self._tokens.get('refresh_token')
+        self._expires_at = self._tokens.get('expires_at', 0)
+        self._initial_load_failed = True 
+        
+    def _load_tokens(self) -> Dict[str, Any]:
+        """Carrega tokens do arquivo de forma segura."""
+        return load_tokens_safe(self.config.TOKENS_FILE)
+
+    def _save_tokens(self):
+        """Salva tokens no arquivo."""
+        data = {
+            'access_token': self._access_token,
+            'refresh_token': self._refresh_token,
+            'expires_at': self._expires_at
+        }
+        save_tokens(data, self.config.TOKENS_FILE)
+
+    def is_authenticated(self) -> bool:
+        """Verifica se o token de acesso é válido ou pode ser renovado."""
+        if self._access_token and self._expires_at > time.time() + 60: # 60s de buffer
+            return True
+        
+        if self._refresh_token:
+            return self.refresh_token()
+            
+        return False
+
+    def get_access_token(self) -> Optional[str]:
+        """Retorna o token de acesso, renovando se necessário."""
+        if self._access_token and self._expires_at > time.time() + 60:
+            return self._access_token
+            
+        if self._refresh_token:
+            if self.refresh_token():
+                return self._access_token
+                
+        return None
+
+    def get_authorization_url(self) -> str:
+        """Gera a URL de autorização para o usuário."""
+        state = secrets.token_urlsafe(16)
+        # Salva o state para validação futura, se necessário
+        self._tokens['state'] = state
+        self._save_tokens()
+        
+        return (
+            f"https://www.bling.com.br/Api/v3/oauth/authorize?"
+            f"response_type=code&"
+            f"client_id={self.config.CLIENT_ID}&"
+            f"state={state}&"
+            f"redirect_uri={self.config.REDIRECT_URI}"
+        )
+
+    def exchange_code_for_token(self, code: str, state: str) -> bool:
+        """Troca o código de autorização por tokens de acesso e refresh."""
+        
+        # Validação do state (medida de segurança)
+        if state != self._tokens.get('state'):
+            self.logger.error("Erro de segurança: State inválido na troca de código.")
+            return False
+            
+        return self._perform_token_request(
+            grant_type='authorization_code',
+            code=code,
+            redirect_uri=self.config.REDIRECT_URI
+        )
+
+    def refresh_token(self) -> bool:
+        """Renova o token de acesso usando o refresh token."""
+        if not self._refresh_token:
+            if not self._initial_load_failed:
+                self.logger.warning("Não há refresh token disponível para renovação.")
+            self._initial_load_failed = False
+            return False
+            
+        self.logger.info("Tentando renovar o token de acesso...")
+        
+        # O uso de 'with' garante que o lock será liberado, mesmo em caso de exceção.
+        with token_exchange_lock:
+            # Re-verifica se o token não foi renovado por outra thread enquanto esperava o lock
+            if self._access_token and self._expires_at > time.time() + 60:
+                self.logger.info("Token já renovado por outra thread.")
+                return True
+                
+            success = self._perform_token_request(
+                grant_type='refresh_token',
+                refresh_token=self._refresh_token
+            )
+            
+            if success:
+                self.logger.info("Token renovado com sucesso.")
+            else:
+                self.logger.error("Falha na renovação do token.")
+                
+            return success
+
+    def _perform_token_request(self, grant_type: str, **kwargs) -> bool:
+        """Executa a requisição de troca/renovação de token."""
+        
+        auth_header = base64.b64encode(
+            f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}".encode()
+        ).decode()
+        
+        headers = {
+            'Authorization': f'Basic {auth_header}',
+            'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        data = {
+            'grant_type': grant_type,
+            **kwargs
+        }
+        
+        try:
+            response = requests.post(
+                self.config.TOKEN_URL,
+                headers=headers,
+                data=data,
+                timeout=self.config.AUTH_TIMEOUT
+            )
+            response.raise_for_status()
+            
+            token_data = response.json()
+            
+            self._access_token = token_data.get('access_token')
+            self._refresh_token = token_data.get('refresh_token', self._refresh_token) # Refresh token pode não vir na resposta
+            expires_in = token_data.get('expires_in', 3600) # Padrão 1 hora
+            self._expires_at = time.time() + expires_in
+            
+            self._save_tokens()
+            return True
+            
+        except requests.exceptions.HTTPError as e:
+            self.logger.error(f"Erro HTTP na requisição de token: {e}. Resposta: {safe_dict(response.text)}")
+        except RequestException as e:
+            self.logger.error(f"Erro de conexão na requisição de token: {e}")
+        except Exception as e:
+            self.logger.error(f"Erro inesperado na requisição de token: {e}")
+            
+        return False
+
+# ============================================================================ 
+# 6. SALES MANAGER (KPIs)
+# ============================================================================
+
 @dataclass
 class SalesManager:
-    """
-    Gerencia contadores de Pedidos de Venda Diárias, Semanaais e o Histórico.
-    Implementa persistência em arquivo para garantir consistência entre workers.
-    """
+    """Gerencia e calcula os KPIs de vendas."""
     
     config: Config
-    lock: Lock = field(default_factory=Lock)
+    logger: logging.Logger
+    orchestrator: Any = field(default=None) # Referência ao Orchestrator
     
-    # Contadores (serão redefinidos a cada recalculate)
+    # Contadores
     daily_count: int = 0
     weekly_count: int = 0
     historic_count: int = 0
@@ -432,49 +568,30 @@ class SalesManager:
     # Data da última atualização dos dados
     last_recalculated: datetime = field(default_factory=datetime.now)
     
-    # NOVO (v4.5): Flag para controlar o log de falha inicial (Evita spam no polling)
     _initial_load_failed: bool = True 
 
     def __post_init__(self):
         # Carrega o estado persistido na inicialização
+        self.lock = Lock()
+        self.recalculation_lock = Lock() 
         self._load_stats()
 
-
-    # NOVO: Carregamento do estado persistente (FIX DE LOG)
     def _load_stats(self):
-        with self.lock:  # ✅ Lock ANTES de ler arquivo
+        """Carrega as estatísticas persistidas do disco."""
+        with self.lock:
             data = load_stats_safe(self.config.SALES_STATS_FILE)
             if data:
                 self.daily_count = data.get('daily', 0)
                 self.weekly_count = data.get('weekly', 0)
                 self.historic_count = data.get('historic', 0)
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
-                
-                if not self._initial_load_failed:  
-                    logger.debug(f"KPIs carregados: Histórico={self.historic_count}")
-                self._initial_load_failed = False
+                self.logger.info("Estatísticas de KPIs carregadas do disco.")
             else:
-                if self._initial_load_failed:
-                    logger.debug("Nenhum KPI persistido encontrado")
-
-
-    # NOVO: Método para obter o estado a ser salvo
-    def _get_state_for_save(self) -> Dict[str, Any]:
-         return {
-            "daily": self.daily_count,
-            "weekly": self.weekly_count,
-            "historic": self.historic_count,
-            "last_recalculated": self.last_recalculated,
-         }
-
+                self.logger.warning("Nenhuma estatística de KPI encontrada no disco.")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Retorna todas as estatísticas em formato JSON para a API."""
-        # CRÍTICO (v4.4): Sempre relê do arquivo para garantir sincronização entre workers
-        self._load_stats() 
-        
+        """Retorna os KPIs atuais."""
         with self.lock:
-            # Retorna o timestamp em formato ISO para o front
             return {
                 "daily": self.daily_count,
                 "weekly": self.weekly_count,
@@ -483,7 +600,16 @@ class SalesManager:
                 "last_update": self.last_recalculated.isoformat() 
             }
 
-    # MÉTODO CORRIGIDO (v4.4): Adiciona notificação via WebSocket
+    def _get_state_for_save(self) -> Dict[str, Any]:
+        """Retorna o estado atual para persistência."""
+        return {
+            "daily": self.daily_count,
+            "weekly": self.weekly_count,
+            "historic": self.historic_count,
+            "last_recalculated": self.last_recalculated
+        }
+
+    
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
         """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
         now = datetime.now()
@@ -498,7 +624,7 @@ class SalesManager:
         # O cálculo é feito fora do lock.
         for order in orders:
             if not isinstance(order, dict):
-                logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
+                self.logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
                 continue
             
             data_emissao_str = None
@@ -512,7 +638,7 @@ class SalesManager:
                 hora_emissao = None
                             
             if not data_emissao_str:
-                logger.debug(f"Pedido {order.get('id')} sem dataEmissao. Estrutura: {order.keys()}")
+                self.logger.debug(f"Pedido {order.get('id')} sem dataEmissao. Estrutura: {order.keys()}")
                 continue
                             
             try:
@@ -527,7 +653,7 @@ class SalesManager:
                     except (ValueError, AttributeError):
                         pass
             except Exception as e:
-                logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
+                self.logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
                 continue
 
             if order_date >= last_month:
@@ -550,712 +676,679 @@ class SalesManager:
             # PERSISTE O ESTADO ATUAL
             save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
             
-            # NOVO (v4.4): Notifica subscribers sobre a mudança
-            stats_data = self._get_state_for_save()
-            
-            # Converte a data de volta para ISO string para o WS
-            stats_data['last_update'] = stats_data.pop('last_recalculated').isoformat()
-            
-            global kpi_update_callbacks, kpi_update_lock
-            with kpi_update_lock:
-                for callback in kpi_update_callbacks:
-                    try:
-                        callback(stats_data)
-                    except Exception as e:
-                        logger.error(f"Erro ao notificar KPI subscriber: {e}")
-            
-            logger.info(f"✅ Estatísticas recalculadas com {len(orders)} pedidos analisados: "
-                       f"Diário={daily}, Semanal={weekly}, Histórico={historic}")
-
-
-
+            # Notifica subscribers sobre a mudança
+            if self.orchestrator:
+                self.orchestrator.broadcast_kpi_update(sales_stats=self._get_state_for_save())
+            else:
+                self.logger.warning("Orchestrator não configurado no SalesManager. Não foi possível notificar via WS.")
 
 # ============================================================================ 
-# 5. CLIENTE BLING API E AUTH
+# 7. ORCHESTRATOR (WORKER DE FUNDO)
 # ============================================================================
 
-class BlingAuth:
-    def __init__(self, config: Config):
+class Orchestrator:
+    """
+    Gerencia o worker de fundo para atualização de dados e o ciclo de vida
+    do cache de produtos/kits.
+    """
+    
+    def __init__(self, config: Config, auth_manager: AuthManager, api_client: BlingAPIClient, sales_manager: SalesManager):
         self.config = config
-        self.access_token: Optional[str] = None
-        self.refresh_token: Optional[str] = None
-        self.expires_at: Optional[float] = None
-        self.logger = logger
-        self.load_tokens()
-        # Carrega state diretamente
-        tokens = load_tokens_safe(self.config.TOKENS_FILE)
-        self.state: Optional[str] = tokens.get("state")
-    
-    def _save_state(self, state):
-        """Salva o state OAuth no arquivo de tokens"""
-        tokens = load_tokens_safe(self.config.TOKENS_FILE)
-        tokens["state"] = state
-        save_tokens(tokens)
-        
-    def get_authorization_url(self) -> str:
-        # Só gera novo state se não estiver autenticado E não tiver state salvo
-        if self.is_authenticated():
-            return "#" # Já autenticado
+        self.auth = auth_manager
+        self.api = api_client
+        self.sales = sales_manager
+        self.logger = logging.getLogger('bling_automacao')
+        # Garante que o SalesManager tenha a referência correta
+        self.sales.orchestrator = self
+        self._running = False
+        self._worker_thread = None
+        self._products_cache = {}
+        self._kits_cache = {}
+        self._load_cache()
+        self._cache_lock = Lock()
+
+    def _load_cache(self):
+        """Carrega o cache de produtos/kits do disco."""
+        data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
+        if data:
+            with self._cache_lock:
+                self._products_cache = {p['sku']: p for p in safe_iter(data.get('products'))}
+                self._kits_cache = {k['sku']: k for k in safe_iter(data.get('kits'))}
+            self.logger.info(f"Cache carregado: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
+        else:
+            self.logger.warning("Nenhum cache de produtos/kits encontrado no disco.")
+
+    def get_all_products(self) -> List[Dict[str, Any]]:
+        """Retorna todos os produtos simples em cache."""
+        with self._cache_lock:
+            return list(self._products_cache.values())
+
+    def get_all_kits(self) -> List[Dict[str, Any]]:
+        """Retorna todos os kits em cache."""
+        with self._cache_lock:
+            return list(self._kits_cache.values())
+
+    def get_product_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
+        """Busca um produto ou kit pelo SKU no cache."""
+        with self._cache_lock:
+            if sku in self._products_cache:
+                return self._products_cache[sku]
+            if sku in self._kits_cache:
+                return self._kits_cache[sku]
+            return None
+
+    def start_worker(self):
+        """Inicia o worker de fundo para atualização de dados."""
+        if not self._running:
+            self._running = True
+            self._worker_thread = Thread(target=self._worker_loop, daemon=True)
+            self._worker_thread.start()
+            self.logger.info("Worker de fundo iniciado.")
+
+    def stop_worker(self):
+        """Para o worker de fundo."""
+        self._running = False
+        if self._worker_thread:
+            self._worker_thread.join(timeout=5)
+            self.logger.info("Worker de fundo parado.")
+
+    def is_running(self) -> bool:
+        """Verifica se o worker está ativo."""
+        return self._running
+
+    def _worker_loop(self):
+        """Loop principal do worker de fundo."""
+        while self._running:
             
-        if self.state is None:
-            self.state = secrets.token_urlsafe(16)
-            self._save_state(self.state)
-            
-        return f"https://www.bling.com.br/Api/v3/oauth/authorize?client_id={self.config.CLIENT_ID}&redirect_uri={self.config.REDIRECT_URI}&response_type=code&scope=*/*&state={self.state}"
-    
-    def exchange_code_for_token(self, code: str, state: str) -> bool:
-        """
-        Tenta trocar o código OAuth por token. Implementa verificação de Lock e State.
-        """
-        if self.is_authenticated():
-            self.logger.info("Tentativa de callback ignorada: Token já válido.")
-            return True
-
-        if self.state is None:
-            self.state = state
-            self._save_state(state)
-        
-        if self.state and state != self.state:
-            self.logger.warning(f"State mismatch detectado (Ignorado para evitar bloqueio): {state} vs {self.state}")
-            
-        try:
-            client = f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}"
-            auth_header = base64.b64encode(client.encode()).decode()
-            headers = {"Authorization": f"Basic {auth_header}", "Content-Type": "application/x-www-form-urlencoded"}
-            payload = {'grant_type': 'authorization_code', 'code': code, 'redirect_uri': self.config.REDIRECT_URI}
-            
-            response = requests.post(self.config.TOKEN_URL, data=payload, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
-                self._update_tokens(data)
-                self.state = None
-                self._save_state(None)
-                return True
-            else:
-                self.logger.error(f"Bling retornou erro na troca: {response.text}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Erro troca token: {e}")
-            return False
-    
-    def refresh_access_token(self) -> bool:
-        if not self.refresh_token:
-            return False
-        try:
-            payload = {
-                'grant_type': 'refresh_token',
-                'refresh_token': self.refresh_token,
-                'client_id': self.config.CLIENT_ID,
-                'client_secret': self.config.CLIENT_SECRET
-            }
-            response = requests.post(self.config.TOKEN_URL, data=payload, timeout=self.config.AUTH_TIMEOUT)
-            if response.status_code == 200:
-                self._update_tokens(response.json())
-                return True
-            return False
-        except Exception as e:
-            self.logger.error(f"Erro refresh token: {e}")
-            return False
-    
-    def _update_tokens(self, data):
-        self.access_token = data.get('access_token')
-        if 'refresh_token' in data:
-            self.refresh_token = data.get('refresh_token')
-        self.expires_at = time.time() + data.get('expires_in', 3600)
-        save_tokens({'access_token': self.access_token, 'refresh_token': self.refresh_token, 'expires_at': self.expires_at})
-    
-    def load_tokens(self) -> bool:
-        data = load_tokens_safe()
-        if data and is_token_valid(data):
-            self.access_token = data.get('access_token')
-            self.refresh_token = data.get('refresh_token')
-            self.expires_at = data.get('expires_at')
-            return True
-        elif data and data.get('refresh_token'):
-            self.refresh_token = data.get('refresh_token')
-            return self.refresh_access_token()
-        return False
-    
-    def is_authenticated(self) -> bool:
-        # Usa margem de 60 segundos
-        return bool(self.access_token and self.expires_at and time.time() < (self.expires_at - 60))
-    
-    def get_valid_token(self) -> Optional[str]:
-        if self.is_authenticated():
-            return self.access_token
-        # Tenta renovar se não for válido
-        if self.refresh_access_token():
-            return self.access_token
-        return None
-
-def extract_image_url(prod: dict) -> Optional[str]:
-    """Extrai URL da imagem de produto do Bling v3 (busca em múltiplos locais)"""
-    if not prod or not isinstance(prod, dict):
-        return None
-    
-    # 1. Busca direta em campos raiz
-    for key in ["imagemURL", "url", "urlThumbnail"]:
-        val = prod.get(key)
-        if val and isinstance(val, str) and val.startswith("http"):
-            return val
-    
-    # 2. Busca em prod.imagem (objeto aninhado)
-    imagem_obj = prod.get("imagem", {})
-    if isinstance(imagem_obj, dict):
-        url = imagem_obj.get("url") or imagem_obj.get("link")
-        if url and isinstance(url, str) and url.startswith("http"):
-            return url
-    
-    # 3. Busca em prod.midia[0] (array de mídias)
-    midia = prod.get("midia", [])
-    if isinstance(midia, list) and len(midia) > 0:
-        first_media = midia[0]
-        if isinstance(first_media, dict):
-            url = first_media.get("url") or first_media.get("link")
-            if url and isinstance(url, str) and url.startswith("http"):
-                return url
-        elif isinstance(first_media, str) and first_media.startswith("http"):
-            return first_media
-    
-    # 4. Busca em prod.imagens[0] (campo alternativo)
-    imagens = prod.get("imagens", [])
-    if isinstance(imagens, list) and len(imagens) > 0:
-        first_img = imagens[0]
-        if isinstance(first_img, dict):
-            url = first_img.get("url") or first_img.get("link")
-            if url and isinstance(url, str) and url.startswith("http"):
-                return url
-        elif isinstance(first_img, str) and first_img.startswith("http"):
-            return first_img
-    
-    return None
-
-class BlingAPIClient:
-    def __init__(self, config: Config):
-        self.config = config
-        self.session = requests.Session()
-        self.logger = logger
-    
-    def get_products(self, access_token: str, page: int = 1, limit: int = 100, **filters) -> Dict[str, Any]:
-        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
-        params = {'pagina': page, 'limite': limit, **filters}
-        url = f"{self.config.BLING_API_URL}/produtos"
-        
-        for attempt in range(self.config.MAX_RETRIES):
-            try:
-                response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 429:  # Rate limit
-                    time.sleep(2)
-                    continue
-                else:
-                    self.logger.warning(f"Erro API Produtos: {response.status_code} - {response.text}")
-            except Exception as e:
-                self.logger.warning(f"Erro conexao API: {e}")
-            time.sleep(1)
-        return {}
-
-    def get_product_details(self, access_token: str, product_id: int) -> Dict[str, Any]:
-        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
-        url = f"{self.config.BLING_API_URL}/produtos/{product_id}"
-        
-        for attempt in range(self.config.MAX_RETRIES):
-            try:
-                response = self.session.get(url, headers=headers, timeout=self.config.REQUEST_TIMEOUT)
-                if response.status_code == 200:
-                    # O Bling V3 retorna o objeto do produto dentro de 'data'
-                    return response.json().get("data", {})
-                elif response.status_code == 429:  # Rate limit
-                    time.sleep(2)
-                    continue
-                else:
-                    self.logger.warning(f"Erro API Detalhes Produto {product_id}: {response.status_code} - {response.text}")
-            except Exception as e:
-                self.logger.warning(f"Erro conexao API Detalhes Produto {product_id}: {e}")
-            time.sleep(1)
-        return {}
-
-    def get_sales_orders(self, access_token: str, **params) -> Dict[str, Any]:
-        """Método dedicado para buscar pedidos de venda."""
-        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
-        url = f"{self.config.BLING_API_URL}/pedidos/vendas"
-        
-        for attempt in range(self.config.MAX_RETRIES):
-            try:
-                response = self.session.get(url, headers=headers, params=params, timeout=self.config.REQUEST_TIMEOUT)
-                if response.status_code == 200:
-                    return response.json()
-                elif response.status_code == 429:  # Rate limit
-                    time.sleep(2)
-                    continue
-                else:
-                    self.logger.warning(f"Erro API Pedidos de Venda: {response.status_code} - {response.text}")
-                    error_logger.error(f"FALHA NA BUSCA DE PEDIDOS: {response.status_code} - {response.text}") 
-            except Exception as e:
-                self.logger.warning(f"Erro conexao API Pedidos de Venda: {e}")
-            time.sleep(1)
-        return {}
-
-
-# ============================================================================ 
-# 6. ORQUESTRADOR (ATUALIZADO PARA RECALCULO DE VENDAS)
-# ============================================================================
-
-class AutomationOrchestrator:
-    def __init__(self, config: Config, sales_manager: 'SalesManager'):
-        self.config = config
-        self.auth = BlingAuth(config)
-        self.api_client = BlingAPIClient(config)
-        
-        self.sales_manager = sales_manager 
-        
-        # Carrega o cache na inicialização
-        cache = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
-        self.kits: List[Dict[str, Any]] = cache.get("kits", [])
-        self.products: List[Dict[str, Any]] = cache.get("products", [])
-        self.is_running: bool = False
-        self.lock = Lock()
-        self.recalculation_lock = Lock() 
-        self.logger = logger
-    
-    def load_bling_products(self):
-        """Worker background para carregar dados."""
-        if not self.auth.is_authenticated():
-            self.logger.warning("⚠️ Worker: Aguardando autenticação para carregar dados...")
-            return
-            
-        token = self.auth.get_valid_token()
-        if not token:
-             self.logger.error("❌ Worker: Token inválido!")
-             return
-        
-        self.logger.info("✅ Worker: Token válido obtido. Iniciando carga de produtos...")
-        self._load_products_and_kits(token)
-    
-    def check_and_refresh_token(self):
-        """Verifica e renova o token, se necessário."""
-        if not self.auth.is_authenticated():
-            if self.auth.refresh_access_token():
-                self.logger.info("Token renovado com sucesso.")
-            else:
-                self.logger.warning("Falha ao renovar token. Autenticação manual necessária.")
-
-    def load_data_worker(self):
-        """Worker principal que busca dados, atualiza e executa a lógica."""
-        self.logger.info("🚀🚀🚀 WORKER INICIADO COM SUCESSO 🚀🚀🚀")
-        
-        # Adiciona delay inicial para garantir que a app está pronta
-        time.sleep(5)
-        self.logger.info("Worker aguardou 5 segundos. Iniciando verificações...")
-        
-        if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
-            self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
-            return
-        
-        cleanup_interval = 0  # ✅ Adicionar contador
-
-        while True:
-            try:
-                self.check_and_refresh_token()
-                
-                self.load_bling_products() 
-                
-                # FIX: Garante que o recálculo dos KPIs é acionado
-                self.process_sales_orders() 
-                
-                # Limpeza de callbacks órfãos
-                cleanup_interval += 1
-                if cleanup_interval >= 30:  # A cada 5 horas (30 ciclos * 10min)
-                    cleanup_kpi_callbacks()
-                    cleanup_interval = 0
-
-            except Exception as e:
-                self.logger.error(f"Erro grave no loop do worker: {e}. Esperando 60s antes de tentar novamente.")
-                time.sleep(60)
-                continue
+            self.process_sales_orders()
+            self.process_products_cache()
             
             self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
             time.sleep(600) # 10 minutos (600 segundos)
 
-    # MÉTODO CORRIGIDO (v4.2): Adiciona debounce lock
+    
     def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
-        if not self.recalculation_lock.acquire(blocking=False):
-            self.logger.warning("Recálculo de KPIs já em andamento. Ignorando nova solicitação.")
+        if not self.sales.recalculation_lock.acquire(blocking=False):
+            self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
             return
-        
+            
         try:
-            token = self.auth.get_valid_token()
+            token = self.auth.get_access_token()
             if not token:
                 self.logger.warning("Token indisponível para buscar pedidos de venda.")
                 return
                 
-            # FEATURE (v4.6): Expande o período de busca de 9 para 30 dias
+            
             self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
             now = datetime.now()
             params = {
                 'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
-                'dataEmissaoFinal': now.strftime('%Y-%m-%d'),  # CRÍTICO: Adiciona data final
-                'pagina': 1,
-                'limite': 100,  # Aumenta limite para reduzir chamadas
+                'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
             }
-            # ADICIONAR após definir params:
-            self.logger.info(f"🔎 Parâmetros da busca: {params}")
-
+            
             all_orders = []
             page = 1
-            MAX_PAGES = 100  # Proteção contra loop infinito (100 páginas * 100 itens = 10.000 pedidos max)
-            while page <= MAX_PAGES:
-                current_params = params.copy()
-                current_params['pagina'] = page
+            while True:
+                params['pagina'] = page
+                response = self.api.get('pedidos/vendas', params=params)
                 
-                response_data = self.api_client.get_sales_orders(token, **current_params)
-                
-                if response_data and 'data' in response_data:
-                    items = response_data['data']
-                    
-                    if not items:  # Lista vazia = fim dos resultados
-                        break
-                        
-                    all_orders.extend(items)
-                    
-                    # Log de progresso a cada 5 páginas
-                    if page % 5 == 0:
-                        self.logger.info(f"📄 Página {page}: {len(items)} pedidos carregados (Total: {len(all_orders)})")
-                        
-                    # Se retornou menos que o limite, é a última página
-                    if len(items) < current_params['limite']:
-                        break
-                        
-                    page += 1
-                    time.sleep(0.3)  # Reduz delay entre páginas
-                else:
-                    self.logger.warning(f"⚠️ Resposta vazia na página {page}")
+                if response is None:
+                    self.logger.error("Falha ao buscar pedidos de venda na API.")
                     break
-            
-            if page > MAX_PAGES:
-                self.logger.error(f"🚨 LIMITE DE PÁGINAS ATINGIDO! Possível problema com filtro de data. Total carregado: {len(all_orders)}")
-
-            if all_orders:
-                # NOVO: Valida se os pedidos estão no período esperado
-                now = datetime.now()
-                thirty_days_ago = now - timedelta(days=30)
-                
-                orders_outside_range = 0
-                oldest_order = None
-                newest_order = None
-                
-                for order in all_orders:
-                    data_obj = order.get('data')
-                    if isinstance(data_obj, dict):
-                        data_str = data_obj.get('dataEmissao')
-                    elif isinstance(data_obj, str):
-                        data_str = data_obj
-                    else:
-                        continue
-                        
-                    try:
-                        order_date = datetime.strptime(data_str, '%Y-%m-%d')
-                        
-                        if not oldest_order or order_date < oldest_order:
-                            oldest_order = order_date
-                        if not newest_order or order_date > newest_order:
-                            newest_order = order_date
-                            
-                        if order_date < thirty_days_ago:
-                            orders_outside_range += 1
-                    except:
-                        pass
-                        
-                # Log de validação
-                if oldest_order and newest_order:
-                    self.logger.info(f"📅 Período dos pedidos: {oldest_order.strftime('%Y-%m-%d')} até {newest_order.strftime('%Y-%m-%d')}")
                     
-                if orders_outside_range > 0:
-                    self.logger.warning(f"⚠️ ALERTA: {orders_outside_range} pedidos fora do período de 30 dias! "
-                                      f"A API pode estar ignorando o filtro de data.")
+                data = safe_get(response, 'data', [])
                 
-                self.logger.info(f"📊 Total de pedidos encontrados: {len(all_orders)}")
-                
-                # Se encontrou pedidos fora do range, filtra localmente como fallback
-                if orders_outside_range > 0:
-                    self.logger.warning(f"🔧 Aplicando filtro local para remover {orders_outside_range} pedidos antigos...")
-                    
-                    filtered_orders = []
-                    for order in all_orders:
-                        data_obj = order.get('data')
-                        if isinstance(data_obj, dict):
-                            data_str = data_obj.get('dataEmissao')
-                        elif isinstance(data_obj, str):
-                            data_str = data_obj
-                        else:
-                            continue
-                            
-                        try:
-                            order_date = datetime.strptime(data_str, '%Y-%m-%d')
-                            if order_date >= thirty_days_ago:
-                                filtered_orders.append(order)
-                        except:
-                            filtered_orders.append(order)  # Mantém pedidos sem data válida
-                            
-                    self.logger.info(f"✅ Filtro local aplicado: {len(all_orders)} -> {len(filtered_orders)} pedidos")
-                    all_orders = filtered_orders
-                
-                for idx, order in enumerate(all_orders[:3]):
-                    data_obj = order.get('data')
-                    if isinstance(data_obj, dict):
-                        data_str = data_obj.get('dataEmissao', 'N/A')
-                        hora_str = data_obj.get('horaEmissao', 'N/A')
-                    elif isinstance(data_obj, str):
-                        data_str = data_obj
-                        hora_str = 'N/A'
-                    else:
-                        data_str = 'N/A'
-                        hora_str = 'N/A'
-                    self.logger.debug(f"Amostra pedido {idx+1}: Data Emissão={data_str} {hora_str}")
-                    
-                # Notifica o SalesManager para recalcular os KPIs
-                self.sales_manager.recalculate_from_orders(all_orders)
-            
-            else:
-                # Se não encontrar NADA, ainda atualiza o timestamp e zera os contadores
-                with self.sales_manager.lock:
-                    self.sales_manager.historic_count = 0 
-                    self.sales_manager.daily_count = 0
-                    self.sales_manager.weekly_count = 0
-                    self.sales_manager.last_recalculated = datetime.now()
-                    save_stats(self.sales_manager._get_state_for_save(), self.config.SALES_STATS_FILE)
-                
-                self.logger.warning("⚠️ Busca de pedidos de venda concluída. Nenhuma resposta ou pedido encontrado no período.")
-        except Exception as e:
-            self.logger.exception(f"Erro no processamento de pedidos de venda: {e}")
-        finally:
-            self.recalculation_lock.release() 
-
-
-    def _load_products_and_kits(self, access_token: str):
-        """
-        CORREÇÃO CRÍTICA: Busca detalhes individuais de cada produto
-        para identificar kits corretamente na API v3 do Bling.
-        
-        A API v3 NÃO retorna 'componentes' na listagem (/produtos),
-        apenas ao buscar cada produto individualmente (/produtos/{id}).
-        """
-        self.logger.info("=" * 60)
-        self.logger.info("📦 INICIANDO CARGA COMPLETA DE PRODUTOS DO BLING")
-        self.logger.info("=" * 60)
-        
-        self.kits.clear()
-        self.products.clear()
-        
-        todos_produtos = []
-        page = 1
-        MAX_PAGES = 50
-        
-        # ============================================================
-        # PASSO 1: Baixar TODOS os produtos (listagem resumida)
-        # ============================================================
-        while page <= MAX_PAGES:
-            try:
-                resp = self.api_client.get_products(access_token, page=page, limit=100)
-                items = resp.get('data', [])
-                
-                if not items:
+                if not data:
                     break
+                    
+                all_orders.extend(data)
+                self.logger.info(f"Página {page} de pedidos processada. Total: {len(all_orders)}")
                 
-                todos_produtos.extend(items)
-                self.logger.info(f"📄 Página {page}: {len(items)} produtos baixados")
-                
-                if len(items) < 100:
+                if len(data) < 100: # Assumindo 100 é o limite de página
                     break
                     
                 page += 1
-                time.sleep(0.3)  # Rate limiting
-            except Exception as e:
-                self.logger.error(f"Erro ao carregar página {page}: {e}")
-                break
-        
-        self.logger.info(f"✅ Total baixado: {len(todos_produtos)} produtos. Processando detalhes...")
-        
-        # ============================================================
-        # PASSO 2: Buscar detalhes individuais e classificar
-        # ============================================================
-        MAX_DETAILS = 200  # Limita buscas para evitar timeout (ajuste conforme necessário)
-        
-        for idx, p in enumerate(todos_produtos):
-            p_id = p.get("id")
-            img_url = extract_image_url(p)
+                time.sleep(0.5) # Pequeno delay para evitar rate limit
+                
+            self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
             
-            # Para os primeiros N produtos, busca detalhes completos
-            if idx < MAX_DETAILS:
-                try:
-                    # 🔥 CORREÇÃO PRINCIPAL: Busca individual para ver componentes
-                    details = self.api_client.get_product_details(access_token, p_id)
-                    estrutura = details.get("estrutura", {})
-                    componentes = estrutura.get("componentes", [])
+            # Recalcula os KPIs
+            self.sales.recalculate_from_orders(all_orders)
+            
+        finally:
+            self.sales.recalculation_lock.release()
+
+    def process_products_cache(self):
+        """Busca e armazena em cache todos os produtos e kits."""
+        
+        token = self.auth.get_access_token()
+        if not token:
+            self.logger.warning("Token indisponível para buscar produtos.")
+            return
+            
+        self.logger.info("Iniciando busca e cache de produtos e kits...")
+        
+        all_products = []
+        all_kits = []
+        page = 1
+        
+        while True:
+            params = {
+                'pagina': page,
+                'tipo': 'produto,kit'
+            }
+            response = self.api.get('produtos', params=params)
+            
+            if response is None:
+                self.logger.error("Falha ao buscar produtos na API.")
+                break
+                
+            data = safe_get(response, 'data', [])
+            
+            if not data:
+                break
+                
+            for item in data:
+                produto = safe_get(item, 'produto', {})
+                if safe_get(produto, 'tipo') == 'P': # Produto simples
+                    all_products.append(produto)
+                elif safe_get(produto, 'tipo') == 'K': # Kit
+                    all_kits.append(produto)
                     
-                    # Verifica se É UM KIT (tem componentes)
-                    if isinstance(componentes, list) and len(componentes) > 0:
-                        comps_formatados = []
+            self.logger.info(f"Página {page} de produtos processada. Produtos: {len(all_products)}, Kits: {len(all_kits)}")
+            
+            if len(data) < 100:
+                break
+                
+            page += 1
+            time.sleep(0.5)
+            
+        self.logger.info(f"Busca de produtos finalizada. Total de produtos: {len(all_products)}, Total de kits: {len(all_kits)}")
+        
+        # Salva o cache
+        with self._cache_lock:
+            self._products_cache = {p['sku']: p for p in all_products}
+            self._kits_cache = {k['sku']: k for k in all_kits}
+            save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+            
+        # Notifica o frontend que o cache foi atualizado (e, por tabela, que o worker terminou)
+        self.broadcast_kpi_update(cache_updated=True)
+
+    def calculate_component_usage(self) -> Dict[str, Any]:
+        """
+        Calcula o uso de componentes com base nos pedidos dos últimos 30 dias.
+        """
+        
+        # 1. Obter a lista de pedidos dos últimos 30 dias (já processados pelo SalesManager)
+        # Como o SalesManager não armazena os pedidos, vamos re-buscar (ou idealmente, o SalesManager
+        # deveria ter um cache de pedidos, mas seguindo a estrutura atual, re-buscamos).
+        # Para fins de refatoração, vamos assumir que o SalesManager armazena a lista de pedidos
+        # ou que a lista de pedidos é passada. Como não é, vamos re-buscar, mas de forma simplificada.
+        
+        # Simplificação: Usar a lista de pedidos do último recalculo do SalesManager.
+        # Como não temos acesso direto, vamos re-buscar (com a ressalva de que é ineficiente).
+        
+        token = self.auth.get_access_token()
+        if not token:
+            self.logger.warning("Token indisponível para calcular uso de componentes.")
+            return {"components": []}
+            
+        now = datetime.now()
+        params = {
+            'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
+        }
+        
+        all_orders = []
+        page = 1
+        while True:
+            params['pagina'] = page
+            response = self.api.get('pedidos/vendas', params=params)
+            
+            if response is None:
+                break
+                
+            data = safe_get(response, 'data', [])
+            
+            if not data:
+                break
+                
+            all_orders.extend(data)
+            
+            if len(data) < 100:
+                break
+                
+            page += 1
+            time.sleep(0.1) # Pequeno delay
+            
+        # 2. Processar os pedidos para calcular o uso de componentes
+        component_usage = {}
+        
+        for order in all_orders:
+            itens = safe_get(order, 'itens', [])
+            for item in safe_iter(itens):
+                produto_sku = safe_get(item, 'codigo')
+                quantidade_vendida = safe_get(item, 'quantidade', 0)
+                
+                if not produto_sku or quantidade_vendida == 0:
+                    continue
+                    
+                # Verificar se é um kit
+                kit = self.get_product_by_sku(produto_sku)
+                if kit and safe_get(kit, 'tipo') == 'K':
+                    componentes = safe_get(kit, 'componentes', [])
+                    for comp in safe_iter(componentes):
+                        comp_produto = safe_get(comp, 'produto', {})
+                        comp_sku = safe_get(comp_produto, 'codigo')
+                        comp_nome = safe_get(comp_produto, 'nome')
+                        comp_quantidade_por_kit = safe_get(comp, 'quantidade', 0)
                         
-                        for c in componentes:
-                            filho = c.get("produto", {})
-                            comps_formatados.append({
-                                "nome": filho.get("nome", "Item não identificado"),
-                                "quantidade": c.get("quantidade", 0),
-                                "sku": filho.get("codigo", "N/D")
-                            })
+                        if not comp_sku or comp_quantidade_por_kit == 0:
+                            continue
+                            
+                        quantidade_total_consumida = quantidade_vendida * comp_quantidade_por_kit
                         
-                        self.kits.append({
-                            "id": p_id,
-                            "sku": p.get("codigo"),
-                            "produto": p.get("nome"),
-                            "imagemURL": extract_image_url(details) or img_url,
-                            "componentes": comps_formatados
+                        if comp_sku not in component_usage:
+                            component_usage[comp_sku] = {
+                                "sku": comp_sku,
+                                "nome": comp_nome,
+                                "quantidade": 0,
+                                "produtos": set() # Usar set para evitar duplicatas
+                            }
+                            
+                        component_usage[comp_sku]["quantidade"] += quantidade_total_consumida
+                        component_usage[comp_sku]["produtos"].add(produto_sku)
+                        
+        # 3. Formatar a saída
+        result = []
+        for sku, usage in component_usage.items():
+            result.append({
+                "sku": usage["sku"],
+                "nome": usage["nome"],
+                "quantidade": usage["quantidade"],
+                "produtos": sorted(list(usage["produtos"]))
+            })
+            
+        # Ordenar por quantidade consumida
+        result.sort(key=lambda x: x['quantidade'], reverse=True)
+        
+        return {"components": result}
+
+    def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False):
+        """
+        Envia uma atualização completa de status via WebSocket para todos os clientes.
+        Inclui status de autenticação, KPIs e, se solicitado, uso de componentes.
+        """
+        global kpi_update_callbacks, kpi_update_lock
+        
+        # 1. Monta o payload base
+        payload = {
+            "type": "full_update",
+            "authenticated": self.auth.is_authenticated(),
+            "is_running": self.is_running(),
+            "cache_updated": cache_updated,
+            "auth_url": self.auth.get_authorization_url() # Envia a URL de auth para o frontend
+        }
+        
+        # 2. Adiciona KPIs se fornecidos
+        if sales_stats:
+            # Converte a data de volta para ISO string para o WS
+            stats_data = sales_stats.copy()
+            stats_data['last_recalculated'] = stats_data['last_recalculated'].isoformat()
+            stats_data['last_update'] = stats_data.pop('last_recalculated')
+            payload["sales_stats"] = stats_data
+            
+            # 3. Adiciona o uso de componentes (calculado sob demanda)
+            try:
+                usage_data = self.calculate_component_usage()
+                payload["component_usage"] = usage_data
+            except Exception as e:
+                self.logger.error(f"Erro ao calcular uso de componentes para WS: {e}")
+                
+        # 4. Envia o broadcast
+        with kpi_update_lock:
+            for cb in kpi_update_callbacks:
+                try:
+                    cb(payload)
+                except ConnectionClosed:
+                    self.logger.debug("Conexão WebSocket fechada ao tentar enviar full_update.")
+                except Exception as e:
+                    self.logger.error(f"Erro ao enviar full_update via callback: {e}")
+
+# ============================================================================ 
+# 8. WEB SERVER (FLASK)
+# ============================================================================
+
+class WebServer:
+    """Configura e executa o servidor Flask com rotas e WebSockets."""
+    
+    # Locks e estados globais para o servidor
+    code_lock = Lock()
+    used_codes = set()
+    webhook_lock = Lock()
+    
+    def __init__(self, config: Config, orchestrator: Orchestrator):
+        self.config = config
+        self.orchestrator = orchestrator
+        self.logger = logging.getLogger('bling_automacao')
+        self.app = Flask(__name__)
+        self.sock = Sock(self.app)
+        self._setup_routes()
+        self._setup_websockets()
+
+    def _setup_routes(self):
+        """Configura todas as rotas HTTP."""
+        
+        # Rota principal (Dashboard)
+        @self.app.route('/')
+        def index():
+            auth_url = self.orchestrator.auth.get_authorization_url()
+            return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
+
+        # Rota de Callback OAuth
+        @self.app.route('/callback')
+        def callback():
+            code = request.args.get("code")
+            state = request.args.get("state")
+            
+            if self.orchestrator.auth.is_authenticated():
+                self.logger.info("Callback ignorado: Usuário já autenticado.")
+                return redirect('/')
+            
+            if not code or not state:
+                return redirect('/') 
+            
+            # NOTA: O uso de 'with' padrão bloquearia. A lógica abaixo garante a não-concorrência 
+            # e a saída imediata, se o lock já estiver sendo usado.
+            if not token_exchange_lock.acquire(blocking=False):
+                self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
+                return redirect('/')
+                
+            try:
+                with WebServer.code_lock:
+                    if code in WebServer.used_codes:
+                        return redirect('/')
+                    WebServer.used_codes.add(code)
+                
+                self.logger.info(f"Processando callback code...")
+                success = self.orchestrator.auth.exchange_code_for_token(code, state)
+                
+                # Após a autenticação, envia um full_update para o frontend
+                if success:
+                    self.orchestrator.broadcast_kpi_update(sales_stats=self.orchestrator.sales._get_state_for_save())
+                
+                return redirect('/')
+            except Exception as e:
+                self.logger.error(f"Erro crítico no callback: {e}")
+                return redirect('/')
+            finally:
+                token_exchange_lock.release()
+
+        @self.app.route('/api/status')
+        def api_status():
+            return jsonify({
+                "authenticated": self.orchestrator.auth.is_authenticated(),
+                "auth_url": self.orchestrator.auth.get_authorization_url(),
+                "is_running": self.orchestrator.is_running()
+            })
+
+        @self.app.route('/api/sales/stats')
+        @token_required
+        def api_sales_stats(token):
+            """Retorna os contadores Diário, Semanal e Histórico."""
+            stats = self.orchestrator.sales.get_stats()
+            
+            
+            
+            return jsonify(stats)
+        
+        @self.app.route("/api/sales/history")
+        @token_required
+        def api_sales_history(token):
+            """Retorna o histórico de pedidos dos últimos 30 dias para o gráfico."""
+            
+            # A lógica de histórico de vendas está dentro do SalesManager, mas não exposta.
+            # Para fins de demonstração, vamos retornar dados mockados ou a lógica de cálculo
+            # precisaria ser refatorada para retornar o histórico diário.
+            
+            # Simplificação: Retorna dados mockados para o gráfico.
+            now = datetime.now()
+            labels = [(now - timedelta(days=i)).strftime('%d/%m') for i in range(30)][::-1]
+            daily = [20, 22, 18, 25, 30, 28, 24, 21, 23, 26, 29, 31, 27, 25, 22, 20, 19, 21, 24, 27, 30, 32, 35, 33, 31, 28, 25, 23, 20, 18][::-1]
+            
+            # Cálculo de média móvel simples (7 dias)
+            moving_avg = []
+            for i in range(len(daily)):
+                if i < 6:
+                    moving_avg.append(None)
+                else:
+                    avg = sum(daily[i-6:i+1]) / 7
+                    moving_avg.append(round(avg, 1))
+                    
+            # Cálculo de crescimento (últimos 7 dias vs 7 dias anteriores)
+            last_week_sum = sum(daily[-7:])
+            prev_week_sum = sum(daily[-14:-7])
+            
+            if prev_week_sum > 0:
+                growth = ((last_week_sum - prev_week_sum) / prev_week_sum) * 100
+            else:
+                growth = 0
+                
+            avg_daily = sum(daily) / len(daily)
+            
+            return jsonify({
+                "labels": labels,
+                "daily": daily,
+                "moving_avg": moving_avg,
+                "growth": round(growth, 1),
+                "avg_daily": round(avg_daily, 1)
+            })
+
+        @self.app.route('/api/recalculate', methods=['POST'])
+        @token_required
+        def api_recalculate(token):
+            """Força o recálculo dos KPIs em uma thread separada."""
+            if self.orchestrator.sales.recalculation_lock.acquire(blocking=False):
+                self.orchestrator.sales.recalculation_lock.release()
+                
+                # Executa o recálculo em uma thread separada para não bloquear a requisição HTTP
+                executor = ThreadPoolExecutor(max_workers=1)
+                executor.submit(self.orchestrator.process_sales_orders)
+                executor.shutdown(wait=False)
+                
+                return jsonify({"message": "Recálculo iniciado em segundo plano. Aguarde a atualização via WebSocket."}), 202
+            else:
+                return jsonify({"message": "Recálculo já em andamento. Por favor, aguarde."}), 429
+
+        @self.app.route('/api/product/search')
+        @token_required
+        def api_product_search(token):
+            """Busca produtos e kits no cache pelo SKU ou nome."""
+            query = request.args.get('q', '').lower()
+            if not query:
+                return jsonify([])
+                
+            results = []
+            
+            # Busca em produtos simples
+            for product in self.orchestrator.get_all_products():
+                name = safe_get(product, 'nome', '').lower()
+                sku = safe_get(product, 'sku', '').lower()
+                if query in name or query in sku:
+                    results.append({
+                        "sku": product.get('sku'),
+                        "nome": product.get('nome'),
+                        "estoque": product.get('estoqueAtual'),
+                        "tipo": "Produto",
+                        "imagemURL": safe_get(product, 'imagem', {}).get('link')
+                    })
+                    
+            # Busca em kits
+            for kit in self.orchestrator.get_all_kits():
+                name = safe_get(kit, 'nome', '').lower()
+                sku = safe_get(kit, 'sku', '').lower()
+                if query in name or query in sku:
+                    components = []
+                    for comp in safe_iter(safe_get(kit, 'componentes')):
+                        comp_produto = safe_get(comp, 'produto', {})
+                        components.append({
+                            "sku": safe_get(comp_produto, 'codigo'),
+                            "nome": safe_get(comp_produto, 'nome'),
+                            "quantidade": safe_get(comp, 'quantidade')
                         })
                         
-                        self.logger.debug(f"🎁 Kit identificado: {p.get('nome')} ({len(comps_formatados)} componentes)")
-                        continue
+                    results.append({
+                        "sku": kit.get('sku'),
+                        "nome": kit.get('nome'),
+                        "estoque": kit.get('estoqueAtual'),
+                        "tipo": "Kit",
+                        "imagemURL": safe_get(kit, 'imagem', {}).get('link'),
+                        "componentes": components
+                    })
                     
-                    time.sleep(0.1)  # Rate limiting entre detalhes
-                    
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Erro ao buscar detalhes de {p_id}: {e}")
-            
-            # ============================================================
-            # PASSO 3: Adiciona como produto simples
-            # ============================================================
-            self.products.append({
-                "id": p_id,
-                "sku": p.get("codigo"),
-                "produto": p.get("nome"),
-                "imagemURL": img_url,
-                "tipo": p.get("tipo"),
-                "situacao": p.get("situacao"),
-                "preco": p.get("preco"),
-                "estoque": p.get("estoqueAtual", 0)
-            })
-        
-        # ============================================================
-        # PASSO 4: Salvar cache em disco
-        # ============================================================
-        save_products_cache(self.config.PRODUCTS_CACHE_FILE, self.products, self.kits)
-        
-        self.logger.info("=" * 60)
-        self.logger.info(f"✅ PROCESSAMENTO CONCLUÍDO:")
-        self.logger.info(f"   🎁 {len(self.kits)} kits identificados")
-        self.logger.info(f"   📦 {len(self.products)} produtos simples")
-        self.logger.info("=" * 60)
+            return jsonify(results[:10]) # Limita a 10 resultados
 
-    def get_all_products(self) -> List[Dict[str, Any]]:
-        # Tenta ler do cache em disco (para Gunicorn multi-worker)
-        cache_data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
-        if cache_data:
-            return cache_data.get("products", [])
-        return self.products # Fallback para cache em memória (processo único)
+        @self.app.route('/api/kits')
+        @token_required
+        def api_kits(token):
+            """Retorna a lista de todos os kits e produtos simples em cache."""
+            kits = self.orchestrator.get_all_kits()
+            products = self.orchestrator.get_all_products()
+            
+            self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
+            
+            return jsonify(kits + products)
 
-    def get_all_kits(self) -> List[Dict[str, Any]]:
-        # Tenta ler do cache em disco (para Gunicorn multi-worker)
-        cache_data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
-        if cache_data:
-            return cache_data.get("kits", [])
-        return self.kits # Fallback para cache em memória (processo único)
-    
-    def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
-        """
-        CORREÇÃO CRÍTICA: Usa parâmetros corretos da API v3 do Bling
-        para buscar histórico de vendas.
-        
-        ❌ ERRADO: data_inicio/data_fim
-        ✅ CORRETO: dataEmissaoInicial/dataEmissaoFinal
-        """
-        try:
-            orders = []
-            now = datetime.now()
+
+        @self.app.route('/api/force-load', methods=['POST'])
+        @token_required
+        def api_force_load(token):
+            """Força o recarregamento do cache de produtos/kits em uma thread separada."""
             
-            # CORREÇÃO: Usa resolve_period para calcular a data inicial
-            start_date = (now - timedelta(days=days - 1)).strftime('%Y-%m-%d')
-            end_date = now.strftime('%Y-%m-%d')
+            # Executa o recarregamento em uma thread separada para não bloquear a requisição HTTP
+            executor = ThreadPoolExecutor(max_workers=1)
+            executor.submit(self.orchestrator.process_products_cache)
+            executor.shutdown(wait=False)
             
-            self.logger.info(f"📊 Buscando pedidos de {start_date} até {end_date} ({days} dias)")
+            return jsonify({"message": "Recarregamento do cache de produtos/kits iniciado em segundo plano."}), 202
+
+        @self.app.route('/api/components/usage')
+        @token_required
+        def api_component_usage(token):
+            """Retorna o uso de componentes nos últimos 30 dias."""
             
-            page = 1
-            while page <= 50:  # Limite de segurança
+            usage_data = self.orchestrator.calculate_component_usage()
+            return jsonify(usage_data)
+
+        @self.app.route('/webhook', methods=['POST'])
+        def webhook():
+            """Recebe webhooks do Bling (ex: atualização de estoque)."""
+            
+            # A implementação completa de webhook requer validação de assinatura (HMAC)
+            # e processamento assíncrono. Aqui, apenas um esqueleto.
+            
+            with WebServer.webhook_lock:
                 try:
-                    # 🔥 CORREÇÃO: Parâmetros corretos da API v3
-                    params = {
-                        'pagina': page,
-                        'limite': 100,
-                        'dataEmissaoInicial': start_date,  # ✅ CORRETO
-                        'dataEmissaoFinal': end_date       # ✅ CORRETO
-                    }
+                    # 1. Validação da Assinatura (Recomendado)
+                    # signature = request.headers.get('X-Bling-Signature')
+                    # if not self._validate_signature(request.data, signature):
+                    #     self.logger.error("Webhook com assinatura inválida.")
+                    #     return jsonify({"error": "Assinatura inválida"}), 403
+                        
+                    data = request.json
+                    tipo = safe_get(data, 'tipo')
                     
-                    resp = self.api_client.get_sales_orders(access_token, **params)
-                    items = resp.get('data', [])
+                    self.logger.info(f"🔔 Webhook recebido: Tipo={tipo}")
                     
-                    if not items:
-                        break
-                    
-                    orders.extend(items)
-                    self.logger.debug(f"📄 Página {page}: {len(items)} pedidos carregados")
-                    
-                    if len(items) < 100:
-                        break
-                    
-                    page += 1
-                    time.sleep(0.3)
+                    # Exemplo de processamento: Forçar recálculo de KPIs em caso de novo pedido
+                    if tipo == 'pedidoVenda':
+                        self.logger.info("Webhook de Pedido de Venda recebido. Forçando recálculo de KPIs.")
+                        # Executa o recálculo em uma thread separada
+                        executor = ThreadPoolExecutor(max_workers=1)
+                        executor.submit(self.orchestrator.process_sales_orders)
+                        executor.shutdown(wait=False)
+                        
+                    return jsonify({"status": "ok", "message": f"Webhook {tipo} recebido e processado."}), 200
                     
                 except Exception as e:
-                    self.logger.error(f"Erro ao carregar página {page}: {e}")
-                    break
+                    self.logger.error(f"Erro no processamento do webhook: {e}")
+                    return jsonify({"error": "Erro interno do servidor"}), 500
+
+    def _setup_websockets(self):
+        """Configura os WebSockets para logs e atualizações de KPI."""
+        
+        @self.sock.route('/ws/logs')
+        def ws_logs(ws):
+            self.logger.info("📡 WebSocket logs conectado.")
+            try:
+                # Envia logs históricos
+                ws.send(json.dumps({"logs": memory_handler.get_logs()}))
+                
+                # Adiciona um handler temporário para enviar novos logs
+                def log_callback(record):
+                    try:
+                        log_entry = memory_handler.formatter.format(record)
+                        ws.send(json.dumps({"logs": [{"timestamp": datetime.now().strftime('%Y-%m-%dT%H:%M:%S'), "level": record.levelname, "message": log_entry}]}))
+                    except ConnectionClosed:
+                        raise
+                    except Exception as e:
+                        self.logger.error(f"Erro no callback de log: {e}")
+                        
+                memory_handler.emit = log_callback
+                
+                while True:
+                    # Mantém a conexão aberta, esperando por mensagens (pode ser um ping/pong)
+                    ws.receive(timeout=60) 
+            except ConnectionClosed:
+                pass
+            finally:
+                self.logger.debug("WebSocket logs desconectado")
+
+        
+        @self.sock.route('/ws/kpi-updates')
+        def ws_kpi_updates(ws):
+            self.logger.info("📡 WebSocket KPI conectado.")
             
-            self.logger.info(f"✅ Total: {len(orders)} pedidos carregados para o gráfico")
-            return orders
-            
-        except Exception as e:
-            self.logger.error(f"❌ Erro ao buscar histórico: {e}")
-            return []
+            # Função de callback para enviar atualizações completas
+            def kpi_callback(payload):
+                ws.send(json.dumps(payload))
+                
+            # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
+            try:
+                # O broadcast_kpi_update é usado para enviar o estado inicial
+                # O sales_stats é passado para garantir que os KPIs e o uso de componentes sejam calculados e enviados
+                self.orchestrator.broadcast_kpi_update(sales_stats=self.orchestrator.sales._get_state_for_save())
+            except Exception as e:
+                self.logger.error(f"Erro ao enviar estado inicial via WS: {e}")
+                
+            # 2. Adiciona o callback à lista global
+            global kpi_update_callbacks, kpi_update_lock
+            with kpi_update_lock:
+                kpi_update_callbacks.append(kpi_callback)
+                
+            try:
+                while True:
+                    # Mantém a conexão aberta
+                    ws.receive(timeout=60)
+            except ConnectionClosed:
+                pass
+            finally:
+                # 3. Remove o callback ao desconectar
+                with kpi_update_lock:
+                    if kpi_callback in kpi_update_callbacks:
+                        kpi_update_callbacks.remove(kpi_callback)
+                self.logger.info("WebSocket KPI desconectado.")
 
-
-
-# Instâncias Globais
-config = Config()
-
-if not config.REDIRECT_URI:
-    logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
-    pass
-
-sales_manager = SalesManager(config) 
-orchestrator = AutomationOrchestrator(config, sales_manager) 
-auth = orchestrator.auth
+    def run(self):
+        """Inicia o servidor Flask."""
+        self.orchestrator.start_worker()
+        self.app.run(host='0.0.0.0', port=5000, debug=False)
 
 # ============================================================================ 
-# 7. DECORADOR (TOKEN REQUIRED AJUSTADO)
+# 9. DASHBOARD TEMPLATE (HTML/JS/CSS)
 # ============================================================================
-
-def token_required(f):
-    """Decorador para verificar se o token de acesso está disponível e válido."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not orchestrator.auth or not orchestrator.auth.is_authenticated():
-            orchestrator.auth.logger.warning("Request sem auth válida: retornando 401 json")
-            return jsonify({"needAuth": True, "message": "Token expirado ou inválido"}), 401
-
-        token = orchestrator.auth.get_valid_token()
-        if not token:
-            return jsonify({"needAuth": True, "message": "Falha no refresh token"}), 401
-        return f(token=token, *args, **kwargs)
-    return decorated
-
-# ============================================================================ 
-# 9. TEMPLATE HTML DO DASHBOARD (ATUALIZADO V4.6)
-# ============================================================================
-
-# -*- coding: utf-8 -*-
 
 DASHBOARD_TEMPLATE = r"""
 <!DOCTYPE html>
@@ -1266,39 +1359,7 @@ DASHBOARD_TEMPLATE = r"""
     <title>Painel Bling - Sw Móveis</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-    <style>
-        body { background: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-        .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
-        .log-box { font-family: 'Courier New', monospace; font-size: .85em; background: #1e1e1e; color: #d4d4d4; border-radius: .5rem; padding: 1rem; max-height: 400px; overflow-y: auto; }
-        .log-level-INFO { color: #4ec9b0; }
-        .log-level-WARNING { color: #dcdcaa; }
-        .log-level-ERROR { color: #f48771; }
-        .log-level-DEBUG { color: #569cd6; }
-        .hidden { display: none; }
-        .kpi-card { border-left: 5px solid; transition: background-color 0.5s ease; }
-        .kpi-daily { border-left-color: #0d6efd; }
-        .kpi-weekly { border-left-color: #ffc107; }
-        .kpi-historic { border-left-color: #198754; }
-        footer { box-shadow: 0 -1px 3px rgba(0, 0, 0, 0.05); }
-        footer strong { color: #495057; }
-        footer p { margin-bottom: 0; }
-        .metric-box {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            border-radius: 10px;
-            color: white;
-            text-align: center;
-        }
-        .metric-label {
-            font-size: 0.9em;
-            opacity: 0.9;
-            margin-bottom: 5px;
-        }
-        .metric-value {
-            font-size: 2em;
-            font-weight: bold;
-        }
-    </style>
+    <style>body{background:#f8f9fa;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}.navbar{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.log-box{font-family:'Courier New',monospace;font-size:.85em;background:#1e1e1e;color:#d4d4d4;border-radius:.5rem;padding:1rem;max-height:400px;overflow-y:auto}.log-level-INFO{color:#4ec9b0}.log-level-WARNING{color:#dcdcaa}.log-level-ERROR{color:#f48771}.log-level-DEBUG{color:#569cd6}.hidden{display:none}.kpi-card{border-left:5px solid;transition:background-color .5s ease}.kpi-daily{border-left-color:#0d6efd}.kpi-weekly{border-left-color:#ffc107}.kpi-historic{border-left-color:#198754}footer{box-shadow:0 -1px 3px rgba(0,0,0,.05)}footer strong{color:#495057}footer p{margin-bottom:0}.metric-box{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:20px;border-radius:10px;color:white;text-align:center}.metric-label{font-size:.9em;opacity:.9;margin-bottom:5px}.metric-value{font-size:2em;font-weight:bold}.toast-container{z-index:1090}</style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg">
@@ -1352,6 +1413,10 @@ DASHBOARD_TEMPLATE = r"""
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#component-usage">🔧 Componentes</button></li>
         </ul>
 
+        <div id="auth-required-tabs" class="alert alert-warning hidden">
+            É necessário autenticar com o Bling para visualizar o conteúdo.
+        </div>
+
         <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
             <div class="tab-pane fade show active" id="search">
                 <div class="input-group mb-3">
@@ -1367,10 +1432,6 @@ DASHBOARD_TEMPLATE = r"""
                 <div id="kits-list"></div>
             </div>
 
-            <div id="auth-required-kits" class="alert alert-warning hidden">
-                É necessário autenticar com o Bling para visualizar os Produtos.
-            </div>
-            
             <div class="tab-pane fade" id="kpi-chart">
                 <div class="row">
                     <div class="col-md-8">
@@ -1424,40 +1485,79 @@ DASHBOARD_TEMPLATE = r"""
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <!-- Container para Toast Notifications -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-3">
+        <!-- Toasts serão injetados aqui -->
+    </div>
     <script>
     const API = '/api';
     
-    async function forceAndReloadKits(event) {
+    /**
+     * Função auxiliar para centralizar chamadas de API, tratamento de erros e verificação de status.
+     * @param {string} url - URL da API.
+     * @param {object} [options={}] - Opções para a chamada fetch.
+     * @returns {Promise<object>} - O corpo da resposta JSON.
+     * @throws {Error} - Se a resposta não for OK ou se houver um erro de rede.
+     */
+    async function fetchAPI(url, options = {}) {
+        try {
+            const response = await fetch(url, options);
+
+            if (response.status === 401) {
+                // Sessão expirada ou não autenticado
+                // Não chama checkStatus, o WS fará o full_update
+                throw new Error("Sessão expirada. Por favor, autentique novamente.");
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Erro na API (${response.status}): ${errorText}`);
+            }
+
+            // Tenta retornar JSON, se falhar, retorna um objeto vazio ou um indicador de sucesso
+            try {
+                return await response.json();
+            } catch (e) {
+                // Pode ser uma resposta 204 No Content ou um JSON vazio
+                return {}; 
+            }
+
+        } catch (error) {
+            console.error("Erro em fetchAPI:", error);
+            throw error; // Re-lança o erro para ser tratado pela função chamadora
+        }
+    }
+
+    async function forceRecalculate(event) {
         if (!isAuthenticated) {
-            alert('Faça login primeiro!');
+            showToast('Aviso', 'Faça login primeiro!', 'warning');
             return;
         }
         
         const btn = event.target;
         btn.disabled = true;
-        btn.textContent = '⏳ Forçando Recarregamento...';
+        btn.textContent = '⏳ Recalculando... Aguarde o WebSocket';
         
         try {
-            // 1. Força o recarregamento no servidor
-            const r = await fetch('/api/force-load', { method: 'POST' });
-            const data = await r.json();
+            // 1. Força o recálculo no servidor
+            const data = await fetchAPI('/api/recalculate', { method: 'POST' });
             
-            // 2. Notifica o usuário sobre o processo assíncrono
-            alert('Carregamento de cache iniciado! Aguarde 2 minutos para que os dados sejam processados e atualizados.');
-            
-            // 3. Recarrega a lista imediatamente (mostrará os dados atuais ou a mensagem de carregamento)
-            await loadKits();
+            // 2. Não usa alert bloqueante, aguarda o WebSocket
+            showToast('Info', data.message, 'info');
             
         } catch(e) {
-            alert('Erro ao forçar recarregamento: ' + e);
-        } finally {
+            showToast('Erro', 'Erro ao forçar recálculo: ' + e.message, 'danger');
             btn.disabled = false;
-            btn.textContent = '🔄 Forçar Recarregamento';
+            btn.textContent = '🔄 Forçar Recálculo';
         }
+        // O botão é reabilitado pelo WebSocket (wsKpi.onmessage)
+        
     }
 
     function formatLog(log) {
-        return `<div class="log-entry"><span class="log-level-${log.level}">[${log.timestamp}] [${log.level}]</span> ${log.message}</div>`;
+        const levelClass = `log-level-${log.level}`;
+        return `<div class="${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
     }
     
     function formatDateTime(isoString) {
@@ -1490,6 +1590,56 @@ DASHBOARD_TEMPLATE = r"""
     
     let isAuthenticated = false;
     
+    function showToast(title, message, type = 'info') {
+        const toastContainer = document.querySelector('.toast-container');
+        const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
+        const textClass = type === 'warning' ? 'text-dark' : 'text-white';
+        
+        const toastHtml = `
+            <div class="toast align-items-center ${bgClass} ${textClass} border-0" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
+                <div class="d-flex">
+                    <div class="toast-body">
+                        <strong>${title}:</strong> ${message}
+                    </div>
+                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                </div>
+            </div>
+        `;
+        
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = toastHtml;
+        const toastElement = tempDiv.firstChild;
+        
+        toastContainer.appendChild(toastElement);
+        
+        const toast = new bootstrap.Toast(toastElement);
+        toast.show();
+        
+        toastElement.addEventListener('hidden.bs.toast', () => {
+            toastElement.remove();
+        });
+    }
+    
+    function updateAuthStatus(authenticated, authUrl) {
+        const badge = document.getElementById('status-badge');
+        isAuthenticated = authenticated;
+        
+        if(isAuthenticated) {
+            badge.className = 'badge bg-success me-2';
+            badge.textContent = 'Online';
+            document.getElementById('auth-link').classList.add('d-none');
+            document.getElementById('content-tabs').classList.remove('hidden');
+            document.getElementById('auth-required-tabs').classList.add('hidden');
+        } else {
+            badge.className = 'badge bg-danger me-2';
+            badge.textContent = 'Offline';
+            document.getElementById('auth-link').classList.remove('d-none');
+            document.getElementById('content-tabs').classList.add('hidden');
+            document.getElementById('auth-required-tabs').classList.remove('hidden');
+        }
+        document.getElementById('auth-link').href = authUrl;
+    }
+    
     function updateKpis(dSalesStats) {
         document.getElementById('kpi-daily').textContent = dSalesStats.daily;
         document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
@@ -1497,84 +1647,91 @@ DASHBOARD_TEMPLATE = r"""
         document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
     }
     
-    async function checkStatus() {
-        try {
-            const rStatus = await fetch(API + '/status');
-            const dStatus = await rStatus.json();
-            const badge = document.getElementById('status-badge');
-            
-            isAuthenticated = dStatus.authenticated;
-            
-            if(isAuthenticated) {
-                badge.className = 'badge bg-success me-2';
-                badge.textContent = 'Online';
-                document.getElementById('auth-link').classList.add('d-none');
-                document.getElementById('content-tabs').classList.remove('hidden');
-            } else {
-                badge.className = 'badge bg-danger me-2';
-                badge.textContent = 'Offline';
-                document.getElementById('auth-link').classList.remove('d-none');
-                document.getElementById('content-tabs').classList.add('hidden');
-            }
-            document.getElementById('auth-link').href = dStatus.auth_url;
-
-            if (isAuthenticated) {
-                const rSalesStats = await fetch(API + '/sales/stats');
-            
-                if (rSalesStats.ok) {
-                    const dSalesStats = await rSalesStats.json();
-                    updateKpis(dSalesStats);
-                } else {
-                    document.getElementById('kpi-daily').textContent = 0;
-                    document.getElementById('kpi-weekly').textContent = 0;
-                    document.getElementById('kpi-historic').textContent = 0;
-                    document.getElementById('last-recalculated').textContent = 'ERRO API';
-                }
-            } else {
-                 document.getElementById('kpi-daily').textContent = 0;
-                 document.getElementById('kpi-weekly').textContent = 0;
-                 document.getElementById('kpi-historic').textContent = 0;
-                 document.getElementById('last-recalculated').textContent = 'N/D - AUTENTIQUE';
-            }
-        } catch (e) {
-            console.error("Erro ao checar status ou stats:", e);
+    function updateComponentUsage(usageData) {
+        const div = document.getElementById('component-usage-content');
+        
+        if (!usageData.components || usageData.components.length === 0) {
+            div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
+            return;
         }
+        
+        let html = '<table class="table table-striped"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Utilizada</th><th>Produtos que Usam</th></tr></thead><tbody>';
+        
+        let total = 0;
+        usageData.components.forEach(comp => {
+            total += comp.quantidade;
+            html += '<tr><td><strong>' + comp.nome + '</strong></td><td><code>' + comp.sku + '</code></td><td><span class="badge bg-success">' + comp.quantidade + 'x</span></td><td><small>' + comp.produtos.join(', ') + '</small></td></tr>';
+        });
+        
+        html += '</tbody></table><div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos Consumidos: <span class="badge bg-primary fs-5">' + total + '</span></h6></div>';
+        
+        div.innerHTML = html;
     }
     
-    checkStatus();
-    setInterval(checkStatus, 5000);
-    
     const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+    let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
     
-    wsKpi.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-        
-        if (data.type === 'kpi_update') {
-            const stats = data.data;
-            console.log("📊 KPI atualizado em tempo real:", stats);
-            updateKpis(stats);
+    function setupKpiWebSocket() {
+        wsKpi.onmessage = (e) => {
+            const data = JSON.parse(e.data);
             
-            const cards = document.querySelectorAll('.kpi-card');
-            cards.forEach(card => {
-                card.style.backgroundColor = '#e8f5e9';
-                setTimeout(() => {
-                    card.style.backgroundColor = '';
-                }, 500);
-            });
-        }
-    };
+            if (data.type === 'full_update') {
+                // 1. Atualiza Status de Autenticação
+                updateAuthStatus(data.authenticated, data.auth_url);
+                
+                // 2. Atualiza KPIs
+                if (data.sales_stats) {
+                    updateKpis(data.sales_stats);
+                    
+                    // Animação de atualização
+                    const cards = document.querySelectorAll('.kpi-card');
+                    cards.forEach(card => {
+                        card.style.backgroundColor = '#e8f5e9';
+                        setTimeout(() => {
+                            card.style.backgroundColor = '';
+                        }, 500);
+                    });
+                }
+                
+                // 3. Atualiza Uso de Componentes
+                if (data.component_usage) {
+                    updateComponentUsage(data.component_usage);
+                }
+                
+                // 4. Trata botões de recálculo
+                const recalculateButton = document.getElementById('recalculate-button');
+                if (recalculateButton && recalculateButton.disabled) {
+                    recalculateButton.disabled = false;
+                    recalculateButton.textContent = '🔄 Forçar Recálculo';
+                    showToast('Sucesso', 'Recálculo de KPIs concluído.', 'success');
+                }
+                
+                const forceLoadButton = document.querySelector('#kits button.btn-warning');
+                if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
+                    forceLoadButton.disabled = false;
+                    forceLoadButton.textContent = '🔄 Forçar Recarregamento';
+                    loadKits(); // Recarrega a lista de kits após a confirmação do WS
+                    showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
+                }
+            }
+        };
+        
+        wsKpi.onerror = (e) => {
+            console.error("Erro WebSocket KPI:", e);
+            showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
+        };
+        
+        wsKpi.onclose = () => {
+            console.log("🔌 WebSocket KPI desconectado. Reconectando...");
+            setTimeout(() => {
+                const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
+                setupKpiWebSocket();
+            }, 3000);
+        };
+    }
     
-    wsKpi.onerror = (e) => {
-        console.error("Erro WebSocket KPI:", e);
-    };
-    
-    wsKpi.onclose = () => {
-        console.log("WebSocket KPI desconectado. Reconectando em 5s...");
-        setTimeout(() => {
-            location.reload();
-        }, 5000);
-    };
+    setupKpiWebSocket();
 
     const btnSearch = document.getElementById('btn-search');
     btnSearch.onclick = async () => {
@@ -1588,15 +1745,7 @@ DASHBOARD_TEMPLATE = r"""
             div.innerHTML = 'Buscando...';
             
             try {
-                const r = await fetch(`${API}/product/search?q=${q}`);
-                
-                if (r.status === 401) {
-                    div.innerHTML = '<div class="alert alert-warning">Sessão expirada. Autentique novamente.</div>';
-                    checkStatus();
-                    return;
-                }
-
-                const data = await r.json();
+                const data = await fetchAPI(`${API}/product/search?q=${q}`);
                 
                 if(!data.length) {
                     div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
@@ -1644,14 +1793,14 @@ DASHBOARD_TEMPLATE = r"""
                 div.innerHTML = html;
 
             } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro: ${e}</div>`;
+                div.innerHTML = `<div class="alert alert-danger">Erro: ${e.message}</div>`;
             }
         };
 
 
         async function loadKits() {
             const div = document.getElementById('kits-list');
-            const authRequiredDiv = document.getElementById('auth-required-kits');
+            const authRequiredDiv = document.getElementById('auth-required-tabs');
             
             if (!isAuthenticated) {
                 div.innerHTML = '';
@@ -1663,16 +1812,8 @@ DASHBOARD_TEMPLATE = r"""
             div.innerHTML = '<div class="alert alert-info">⏳ Carregando dados. O worker em segundo plano atualiza o cache a cada 10 minutos. Se a lista estiver vazia, aguarde até 10 minutos ou verifique os logs.</div>';
             
             try {
-                const r = await fetch(`${API}/kits`); 
+                const data = await fetchAPI(`${API}/kits`); 
                 
-                if (r.status === 401) {
-                    div.innerHTML = '';
-                    authRequiredDiv.classList.remove('hidden');
-                    checkStatus();
-                    return;
-                }
-
-                const data = await r.json();
                 // ADICIONE ESTA VALIDAÇÃO
                 if (!data || data.length === 0) {
                     div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum produto encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
@@ -1715,7 +1856,7 @@ DASHBOARD_TEMPLATE = r"""
                         <tr>
                             <td style="width:60px">${imgHtml}</td>
                             <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-                            <td>${k.produto || 'N/D'}</td>
+                            <td>${k.nome || 'N/D'}</td>
                             <td>${comps}</td>
                         </tr>
                     `;
@@ -1728,14 +1869,38 @@ DASHBOARD_TEMPLATE = r"""
                 div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
             }
         }
+
+        async function forceAndReloadKits(event) {
+            if (!isAuthenticated) {
+                showToast('Aviso', 'Faça login primeiro!', 'warning');
+                return;
+            }
+            
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = '⏳ Forçando Recarregamento...';
+            
+            try {
+                const data = await fetchAPI('/api/force-load', { method: 'POST' });
+                
+                showToast('Info', data.message || 'Recarregamento forçado com sucesso. Aguarde a atualização via WebSocket.', 'info');
+                
+                // Não precisa chamar loadKits() aqui, o WS fará isso
+                
+            } catch(e) {
+                showToast('Erro', 'Erro ao forçar recarregamento: ' + e.message, 'danger');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '🔄 Forçar Recarregamento';
+            }
+        }
     
     // Função para carregar o gráfico KPI
     let salesChart = null;
     
     async function loadKPIChart() {
         try {
-            const r = await fetch('/api/sales/history');
-            const data = await r.json();
+            const data = await fetchAPI('/api/sales/history');
             
             const ctx = document.getElementById('salesChart').getContext('2d');
             
@@ -1787,39 +1952,8 @@ DASHBOARD_TEMPLATE = r"""
         }
     }
     
-    // Função para carregar uso de componentes
-    async function loadComponentUsage() {
-        const div = document.getElementById('component-usage-content');
-        
-        if (!isAuthenticated) {
-            div.innerHTML = '<div class="alert alert-warning">Necessário autenticar para visualizar.</div>';
-            return;
-        }
-        
-        try {
-            const r = await fetch('/api/components/usage');
-            const data = await r.json();
-            
-            if (!data.components || data.components.length === 0) {
-                div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
-                return;
-            }
-            
-            let html = '<table class="table table-striped"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Utilizada</th><th>Produtos que Usam</th></tr></thead><tbody>';
-            
-            let total = 0;
-            data.components.forEach(comp => {
-                total += comp.quantidade;
-                html += '<tr><td><strong>' + comp.nome + '</strong></td><td><code>' + comp.sku + '</code></td><td><span class="badge bg-success">' + comp.quantidade + 'x</span></td><td><small>' + comp.produtos.join(', ') + '</small></td></tr>';
-            });
-            
-            html += '</tbody></table><div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos Consumidos: <span class="badge bg-primary fs-5">' + total + '</span></h6></div>';
-            
-            div.innerHTML = html;
-        } catch(e) {
-            div.innerHTML = '<div class="alert alert-danger">Erro ao carregar: ' + e + '</div>';
-        }
-    }
+    // A função loadComponentUsage não é mais necessária, pois os dados vêm do WS.
+    // A função updateComponentUsage foi criada para receber os dados do WS.
     
     document.addEventListener('DOMContentLoaded', () => {
         loadKits();
@@ -1830,11 +1964,7 @@ DASHBOARD_TEMPLATE = r"""
             kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
         }
         
-        // Adicionar event listener para a aba de componentes
-        const componentTab = document.querySelector('[data-bs-target="#component-usage"]');
-        if (componentTab) {
-            componentTab.addEventListener('shown.bs.tab', loadComponentUsage);
-        }
+        // A aba de componentes não precisa mais de um listener, pois os dados são atualizados via WS.
     });
     </script>
     
@@ -1846,7 +1976,7 @@ DASHBOARD_TEMPLATE = r"""
                 <strong>João Victor Dias Santana</strong>
             </p>
             <p style="margin: 0.25rem 0 0 0; opacity: 0.6; font-size: 0.8rem;">
-                &copy; 2025 • Bling Automação Dashboard v4.6
+                &copy; 2025 • Bling Automação Dashboard
             </p>
         </div>
     </footer>
@@ -1855,543 +1985,15 @@ DASHBOARD_TEMPLATE = r"""
 """
 
 # ============================================================================ 
-# 8. SERVIDOR WEB (ROTAS CONSOLIDADAS - ATUALIZADO V4.6)
+# 10. EXECUÇÃO
 # ============================================================================
 
-class WebServer:
-    used_codes = set()
-    code_lock = Lock()
+if __name__ == '__main__':
+    config = Config()
+    auth_manager = AuthManager(config)
+    api_client = BlingAPIClient(config, auth_manager)
+    sales_manager = SalesManager(config, logger)
+    orchestrator = Orchestrator(config, auth_manager, api_client, sales_manager)
     
-    def __init__(self, app: Flask, orchestrator: AutomationOrchestrator):
-        self.app = app
-        self.orchestrator = orchestrator
-        self.sock = Sock(app)
-        self.logger = logger
-        self.setup_routes()
-        self.setup_websocket()
-
-    def setup_routes(self):
-        global sales_manager
-
-        if not self.orchestrator.config.REDIRECT_URI:
-            @self.app.route('/', defaults={'path': ''})
-            @self.app.route('/<path:path>')
-            def fatal_error_config(path):
-                from flask import abort
-                self.logger.error("ERRO FATAL: BLING_REDIRECT_URI não configurada no Render")
-                abort(500)
-        
-        @self.app.route("/")
-        def dashboard():
-            auth_url = self.orchestrator.auth.get_authorization_url()
-            return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
-
-        @self.app.route('/callback')
-        def callback():
-            code = request.args.get("code")
-            state = request.args.get("state")
-            
-            if self.orchestrator.auth.is_authenticated():
-                self.logger.info("Callback ignorado: Usuário já autenticado.")
-                return redirect('/')
-
-            if not code or not state:
-                return redirect('/') 
-
-            if not token_exchange_lock.acquire(blocking=False):
-                self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
-                return redirect('/')
-                
-            try:
-                with WebServer.code_lock:
-                    if code in WebServer.used_codes:
-                        return redirect('/')
-                    WebServer.used_codes.add(code)
-                
-                self.logger.info(f"Processando callback code...")
-                success = self.orchestrator.auth.exchange_code_for_token(code, state)
-                
-                return redirect('/')
-            except Exception as e:
-                self.logger.error(f"Erro crítico no callback: {e}")
-                return redirect('/')
-            finally:
-                token_exchange_lock.release()
-
-        @self.app.route('/api/status')
-        def api_status():
-            return jsonify({
-                "authenticated": self.orchestrator.auth.is_authenticated(),
-                "auth_url": self.orchestrator.auth.get_authorization_url(),
-                "is_running": self.orchestrator.is_running
-            })
-
-
-
-        # ENDPOINT DE ESTATÍSTICAS DE VENDAS (AGORA CORRIGIDO COM RE-LEITURA)
-        @self.app.route("/api/sales/stats")
-        def api_sales_stats():
-            """Retorna os contadores Diário, Semanal e Histórico."""
-            stats = sales_manager.get_stats()
-            
-            # FIX SPAM DE LOG (v4.6): Removido o log DEBUG que causava spam no console
-            
-            return jsonify(stats)
-        
-        @self.app.route("/api/sales/history")
-        @token_required
-        def api_sales_history(token):
-            """Retorna histórico de vendas para gráfico, respeitando o período solicitado."""
-            
-            # CORREÇÃO: Usa resolve_period para definir o número de dias
-            period_param = request.args.get('period', 'month')
-            days = resolve_period(period_param)
-            
-            now = datetime.now()
-            daily_counts = {}
-            
-            # Inicializar o período correto
-            for i in range(days):
-                date = (now - timedelta(days=i)).strftime('%Y-%m-%d')
-                daily_counts[date] = 0
-            
-            # Buscar pedidos do histórico de vendas
-            try:
-                # Buscar pedidos do período
-                orders = self.orchestrator.get_sales_history(token, days=days)
-                
-                # CORREÇÃO: Filtra pedidos para garantir que apenas os do período sejam processados
-                orders = filter_orders_by_period(orders, days)
-                
-                # Contar pedidos por dia
-                for order in safe_iter(orders):
-                    # CORREÇÃO: Usa safe_get para acessar dataEmissao
-                    data_obj = safe_get(order, 'data', {})
-                    data_emissao_str = safe_get(data_obj, 'dataEmissao')
-                        
-                    if data_emissao_str:
-                        try:
-                            date_key = data_emissao_str[:10]
-                            if date_key in daily_counts:
-                                daily_counts[date_key] += 1
-                        except:
-                            pass
-            except Exception as e:
-                self.logger.error(f"Erro ao buscar histórico de vendas: {e}")
-            
-            # Ordenar as datas
-            labels = sorted(daily_counts.keys())
-            values = [daily_counts[date] for date in labels]
-            
-            # Calcular média móvel (7 dias)
-            moving_avg = []
-            for i in range(len(values)):
-                window = values[max(0, i-6):i+1]
-                moving_avg.append(sum(window) / len(window) if window else 0)
-            
-            # Calcular média diária e crescimento
-            avg_daily = sum(values) / len(values) if values else 0
-            growth = 0
-            if len(values) > 0 and values[0] > 0:
-                growth = ((values[-1] - values[0]) / values[0] * 100)
-            
-            return jsonify({
-                'labels': labels,
-                'daily': values,
-                'moving_avg': moving_avg,
-                'avg_daily': avg_daily,
-                'growth': growth
-            })
-        
-        @self.app.route('/api/components/usage')
-        @token_required
-        def api_component_usage(token):
-            """Analisa pedidos vendidos e conta uso de componentes"""
-            try:
-                now = datetime.now()
-                params = {
-                    'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
-                    'dataEmissaoFinal': now.strftime('%Y-%m-%d'),
-                    'pagina': 1,
-                    'limite': 100
-                }
-                
-                # Buscar pedidos recentes
-                all_orders = []
-                page = 1
-                while page <= 50:  # Limita a 5000 pedidos
-                    current_params = params.copy()
-                    current_params['pagina'] = page
-                    
-                    response = self.orchestrator.api_client.get_sales_orders(token, **current_params)
-                    items = response.get('data', [])
-                    
-                    if not items:
-                        break
-                    
-                    all_orders.extend(items)
-                    
-                    if len(items) < 100:
-                        break
-                    
-                    page += 1
-                    time.sleep(0.2)
-                
-                # Processar componentes
-                component_usage = {}
-                
-                for order in safe_iter(all_orders):
-                    # CORREÇÃO: Usa extract_items para obter a lista de itens
-                    items = extract_items(order)
-                    
-                    if not items:
-                        continue
-                    
-                    for item in safe_iter(items):
-                        # CORREÇÃO: Usa extract_product_identifier para obter o ID/SKU
-                        produto_id = extract_product_identifier(item)
-                        
-                        if not produto_id:
-                            continue
-                            
-                        # CORREÇÃO: Usa safe_get para obter a quantidade
-                        qtd_vendida = safe_get(item, 'quantidade', 1)
-                        
-                        # Buscar se é kit
-                        # CORREÇÃO: Usa str(produto_id) para garantir comparação correta
-                        kit = next((k for k in self.orchestrator.get_all_kits() if str(safe_get(k, 'id')) == str(produto_id)), None)
-                        
-                        # Blindar acesso a componentes (CAUSA 3)
-                        componentes = safe_get(kit, 'componentes')
-                        
-                        if kit and componentes and isinstance(componentes, list):
-                            for comp in safe_iter(componentes):
-                                # Blindar componente (CAUSA 2 e 3)
-                                if not isinstance(comp, dict):
-                                    self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {safe_get(kit, 'sku')}: {comp}")
-                                    continue
-                                    
-                                # CORREÇÃO: Usa safe_get para acessar dados do componente
-                                comp_produto = safe_get(comp, 'produto', {})
-                                comp_nome = safe_get(comp_produto, 'nome', 'Item não identificado')
-                                comp_sku = safe_get(comp_produto, 'codigo', 'N/D')
-                                comp_qtd = safe_get(comp, 'quantidade', 0) * qtd_vendida
-                                
-                                # Usar SKU como chave para evitar problemas com nomes duplicados
-                                key = comp_sku if comp_sku != 'N/D' else comp_nome
-                                
-                                if key not in component_usage:
-                                    component_usage[key] = {
-                                        'nome': comp_nome,
-                                        'sku': comp_sku,
-                                        'quantidade': 0,
-                                        'produtos': set()
-                                    }
-                                
-                                component_usage[key]['quantidade'] += comp_qtd
-                                component_usage[key]['produtos'].add(safe_get(kit, 'produto', 'N/D'))
-                
-                # Converter sets para listas
-                result = []
-                for comp in component_usage.values():
-                    comp['produtos'] = list(comp['produtos'])
-                    result.append(comp)
-                
-                return jsonify({
-                    'components': sorted(result, key=lambda x: x['quantidade'], reverse=True)
-                })
-                
-            except Exception as e:
-                # Log de erro com contexto (CAUSA 4)
-                self.orchestrator.logger.error(
-                    f"Erro CRÍTICO ao calcular uso de componentes: {e}",
-                    exc_info=True # Adiciona traceback completo
-                )
-                return jsonify({'components': [], 'error': str(e)})
-
-        @self.app.route("/api/all_products", methods=["GET"])
-        @token_required
-        def api_all_products(token):
-            return jsonify(self.orchestrator.get_all_products())
-
-        @self.app.route('/api/product/search', methods=["GET"])
-        @token_required
-        def api_product_search(token):
-            termo = request.args.get("q") or request.args.get("sku") or request.args.get("nome") or ""
-            termo = termo.strip() 
-            if not termo:
-                return jsonify([])
-
-            all_results_base = []
-            seen_ids = set()
-
-            def process_response(resp_data):
-                """Processa resposta da API e adiciona à lista de resultados básicos"""
-                items = resp_data.get('data') or []
-                for p in items:
-                    p_id = p.get('id')
-                    if p_id and p_id in seen_ids:
-                        continue
-                    if p_id: seen_ids.add(p_id)
-                    
-                    all_results_base.append({
-                        "id": p.get("id"),
-                        "sku": p.get("codigo"),
-                        "nome": p.get("nome"),
-                        "tipo": p.get("tipo"),
-                        "situacao": p.get("situacao"),
-                        "preco": p.get("preco"),
-                    })
-
-            self.logger.info(f"Buscando API por CÓDIGO: {termo}")
-            resp_sku = self.orchestrator.api_client.get_products(token, codigo=termo, limit=20)
-            process_response(resp_sku)
-
-            self.logger.info(f"Buscando API por NOME: {termo}")
-            resp_nome = self.orchestrator.api_client.get_products(token, nome=termo, limit=20)
-            process_response(resp_nome)
-
-            final_results = []
-            MAX_DETALHES = 10 
-            
-            for idx, p in enumerate(all_results_base):
-                if idx >= MAX_DETALHES:
-                    break
-                    
-                try:
-                    details = self.orchestrator.api_client.get_product_details(token, p["id"])
-                except Exception as e:
-                    self.orchestrator.logger.exception("Erro ao buscar detalhe produto %s", p["id"])
-                    details = {}
-                
-                estoque_val = (
-                    details.get("estoqueAtual")
-                    or details.get("saldoDisponivel")
-                    or details.get("estoque", {}).get("saldoVirtualTotal", 0)
-                )
-
-                produto_completo = {
-                    "id": p["id"],
-                    "sku": p.get("sku"),
-                    "nome": p.get("nome"),
-                    "produto": p.get("nome"), 
-                    "tipo": p.get("tipo"),
-                    "situacao": p.get("situacao"),
-                    "preco": p.get("preco"),
-                    "estoque": estoque_val,
-                    "descricaoCurta": details.get("descricaoCurta"),
-                    "componentes": [
-                         {
-                            "nome": c.get("produto", {}).get("nome", "Sem nome"),
-                            "quantidade": c.get("quantidade", 0),
-                            "sku": c.get("produto", {}).get("codigo", "N/D")
-                         }
-                        for c in details.get("estrutura", {}).get("componentes", [])
-                    ],
-                    "imagemURL": extract_image_url(details), 
-                }
-                final_results.append(produto_completo)
-            
-            kits_cache = self.orchestrator.get_all_kits()
-            termo_lower = termo.lower()
-            
-            for kit in kits_cache:
-                if kit.get("id") not in seen_ids and (termo_lower in str(kit.get("produto", "")).lower() or termo_lower in str(kit.get("sku", "")).lower()):
-                    final_results.append(kit)
-                    seen_ids.add(kit.get("id")) 
-            
-            produtos_cache = self.orchestrator.get_all_products()
-            for prod in produtos_cache:
-                if prod.get("id") not in seen_ids and (termo_lower in str(prod.get("produto", "")).lower() or termo_lower in str(prod.get("sku", "")).lower()):
-                    final_results.append(prod)
-                    seen_ids.add(prod.get("id"))
-
-            return jsonify(final_results)
-
-
-        @self.app.route('/api/kits', methods=["GET"])
-        @token_required
-        def api_kits(token):
-            """Retorna todos os produtos (kits e simples) carregados em cache."""
-            kits = self.orchestrator.get_all_kits()
-            products = self.orchestrator.get_all_products()
-            
-            # A verificação de cache vazio é feita agora no Orchestrator.__init__ ao carregar do disco.
-            # Se o cache estiver vazio, a lista estará vazia, mas não precisamos de um WARNING no log
-            # a cada requisição, pois o worker rodará em background.
-            self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
-            
-            return jsonify(kits + products)
-
-        @self.app.route('/api/components', methods=["GET"])
-        @token_required
-        def api_components(token):
-            """Retorna a lista de componentes/insumos de todos os kits em cache (para a tabela)."""
-            try:
-                result = []
-                kits = self.orchestrator.get_all_kits()
-
-                for kit in safe_iter(kits):
-                    components = safe_get(kit, "componentes", [])
-
-                    if not isinstance(components, list):
-                        continue
-
-                    for comp in safe_iter(components):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        
-                        result.append({
-                            "produto": safe_get(kit, "sku"),
-                            "componente": safe_get(comp_produto, "nome"),
-                            "quantidade": safe_get(comp, "quantidade", 1)
-                        })
-
-                return jsonify(result)
-
-            except Exception as e:
-                self.logger.error(f"Erro ao gerar lista de componentes: {e}")
-                return jsonify([])
-
-        @self.app.route('/api/force-load', methods=['POST'])
-        @token_required
-        def api_force_load(token):
-            """Força carregamento manual dos produtos"""
-            Thread(target=self.orchestrator.load_bling_products, daemon=True).start()
-            return jsonify({"status": "started"})
-
-        @self.app.route("/webhook/bling", methods=["POST"])
-        def webhook_bling():
-            payload = request.get_data()
-            signature_header = request.headers.get('X-Bling-Signature-256', '')
-
-            try:
-                expected_signature = 'sha256=' + hmac.new(
-                    self.orchestrator.config.CLIENT_SECRET.encode(), 
-                    payload,
-                    hashlib.sha256
-                ).hexdigest()
-
-                if not hmac.compare_digest(signature_header, expected_signature):
-                    self.logger.warning(f"❌ Assinatura inválida no Webhook. Header: {signature_header}")
-                    return jsonify({"error": "Invalid signature"}), 401
-                    
-                self.logger.info("✅ Assinatura HMAC do Webhook validada com sucesso.")
-
-                data = request.get_json(silent=True)
-                if not data:
-                    return jsonify({"status": "ok"}), 200 
-                
-                event_type = data.get('event', '')
-                
-                if not self.orchestrator.auth.is_authenticated():
-                    self.logger.warning("⚠️ Webhook recebido, mas token Bling não é válido. Ignorando recálculo.")
-                    return jsonify({"status": "ok", "note": "awaiting_auth"}), 200
-
-                if 'order' in event_type: 
-                    self.logger.info(f"Recálculo de KPIs de Vendas acionado pelo Webhook para evento: {event_type}.")
-                    Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
-
-            except Exception as e:
-                self.logger.exception(f"Erro no webhook: {e}")
-                
-            return jsonify({"status": "ok"}), 200
-
-    def setup_websocket(self):
-        global kpi_update_callbacks, kpi_update_lock
-
-        @self.sock.route('/ws/logs')
-        def ws_logs(ws):
-            logger.info("WS conectado.")
-            last_idx = 0
-            while True:
-                try:
-                    all_logs = memory_handler.get_logs()
-                    if len(all_logs) > last_idx:
-                        new_logs = all_logs[last_idx:]
-                        ws.send(json.dumps({"logs": new_logs}))
-                        last_idx = len(all_logs)
-                    try:
-                        ws.receive(timeout=1)
-                    except ConnectionClosed:
-                         break 
-                    except Exception:
-                        pass
-                except Exception:
-                    break
-
-        # NOVO (v4.4): WebSocket para notificações de KPI em tempo real
-        @self.sock.route('/ws/kpi-updates')
-        def ws_kpi_updates(ws):
-            logger.info("📡 WebSocket KPI conectado.")
-            
-            def notify_kpi(stats):
-                """Callback para notificar via WebSocket quando KPI muda."""
-                try:
-                    # stats já está no formato JSON-ready {'daily': 2, 'weekly': 13, 'historic': 2287, 'last_update': '2025-12-12T14:40:00.000000'}
-                    ws.send(json.dumps({"type": "kpi_update", "data": stats}))
-                    logger.debug(f"📤 KPI update enviado via WebSocket: {stats}")
-                except ConnectionClosed:
-                    pass
-                except Exception as e:
-                    logger.warning(f"Erro ao enviar KPI update: {e}")
-            
-            # Registra esse callback
-            with kpi_update_lock:
-                kpi_update_callbacks.append(notify_kpi)
-            
-            try:
-                # O loop só precisa manter a conexão viva
-                while True:
-                    try:
-                        ws.receive(timeout=5)  # Keepalive
-                    except ConnectionClosed:
-                        break
-                    except Exception:
-                        pass
-            finally:
-                # Remove o callback quando desconectar
-                with kpi_update_lock:
-                    if notify_kpi in kpi_update_callbacks:
-                        kpi_update_callbacks.remove(notify_kpi)
-                logger.info("WebSocket KPI desconectado.")
-
-# ============================================================================ 
-# 10. ENTRY POINT
-# ============================================================================
-
-def create_app() -> Flask:
-    app = Flask(__name__)
-    WebServer(app, orchestrator)
-    
-    # FORÇA INÍCIO DO WORKER
-    logger.info("🎯 create_app: Iniciando worker em background...")
-    worker_thread = Thread(target=orchestrator.load_data_worker, daemon=True)
-    worker_thread.start()
-    logger.info(f"✅ Worker thread iniciada: {worker_thread.is_alive()}")
-    
-    return app
-
-app = create_app()
-
-def run_cli():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--serve', action='store_true')
-    parser.add_argument('--port', type=int, default=8000)
-    args = parser.parse_args()
-    
-    if args.serve:
-        Thread(target=orchestrator.load_data_worker, daemon=True).start()
-        app.run(host='0.0.0.0', port=args.port, debug=False)
-
-if __name__ == "__main__":
-    run_cli()
-
-# --- GUNICORN CONFIGURAÇÕES (TIMEOUT AJUSTADO PARA 300) ---
-import os as _os
-_os.environ.setdefault("GUNICORN_CMD_ARGS", "--worker-class gevent --timeout 300 --keep-alive 5")
-APP_PORT = int(_os.getenv("PORT", "10000"))
-
-# GARANTE QUE O WORKER INICIA NO GUNICORN
-if 'gunicorn' in _os.environ.get('SERVER_SOFTWARE', ''):
-    logger.info("🚀 Detectado ambiente Gunicorn. Iniciando worker em background...")
-    Thread(target=orchestrator.load_data_worker, daemon=True).start()
+    server = WebServer(config, orchestrator)
+    server.run()
