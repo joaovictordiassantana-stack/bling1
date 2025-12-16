@@ -11,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6 (Refatorado - V8 - Cache Inicial e Estabilidade)
+Versão: 4.6 (Refatorado - V10 - Confirmação de Inicialização Única)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -338,7 +338,8 @@ def token_required(f):
     """Decorator para verificar se o token está ativo antes de acessar a rota."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth_manager = args[0].orchestrator.auth
+        global orchestrator # Acessa a instância global
+        auth_manager = orchestrator.auth
         if not auth_manager.is_authenticated():
             return jsonify({"error": "Não autenticado ou token expirado"}), 401
         
@@ -1546,7 +1547,7 @@ DASHBOARD_TEMPLATE = r"""
                     </div>
                     <div class="col-md-4">
                         <div class="card">
-                            <div class="card-header bg-success text-white">
+                            <div class="card-header bg-success">
                                 <h5>🎯 Métricas Rápidas</h5>
                             </div>
                             <div class="card-body">
