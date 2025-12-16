@@ -221,6 +221,19 @@ def save_stats(data: Dict[str, Any], path: Path):
     except Exception as e:
         logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
 
+def safe_dict(data):
+    """
+    Garante que o objeto é um dict, tentando carregar de string JSON se necessário.
+    """
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, str):
+        try:
+            return json.loads(data)
+        except:
+            return {}
+    return {}
+
 def load_products_cache(cache_file):
     """
     Carrega cache de produtos e kits do disco.
@@ -262,31 +275,19 @@ def safe_get(obj, key, default=None):
         return obj.get(key, default)
     return default
 
-def normalize_order_items(order):
+def extract_items(order):
     """
     Retorna lista de itens do pedido, independente do formato.
     """
-    if not isinstance(order, dict):
-        return []
-
+    order = safe_dict(order)
     data = safe_get(order, 'data', order)
-
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except Exception:
-            return []
     
-    if not isinstance(data, dict):
-        return []
-
-    for key in ('itens', 'itensVenda', 'item'):
-        value = safe_get(data, key)
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict) and 'item' in value:
-            return safe_get(value, 'item', [])
-
+    # Tenta chaves comuns no Bling v3
+    for key in ["itens", "itensVenda", "items", "item"]:
+        items = safe_get(data, key)
+        if isinstance(items, list):
+            return items
+        
     return []
 
 import re
@@ -329,6 +330,27 @@ def resolve_period(period):
         return int(period)
     except:
         return 30
+
+def filter_orders_by_period(orders, days):
+    """
+    Filtra pedidos para garantir que apenas pedidos dentro do período sejam processados.
+    """
+    cutoff = datetime.now() - timedelta(days=days)
+    valid = []
+
+    for order in safe_iter(orders):
+        order_data = safe_dict(safe_get(order, 'data', order))
+        date_str = safe_get(order_data, "dataEmissao")
+
+        try:
+            # Garante que a data seja um objeto datetime para comparação
+            date = datetime.strptime(date_str, '%Y-%m-%d')
+            if date >= cutoff:
+                valid.append(order)
+        except:
+            continue
+
+    return valid
 
 def safe_iter(iterable):
     """
@@ -1935,6 +1957,9 @@ class WebServer:
                 # Buscar pedidos do período
                 orders = self.orchestrator.get_sales_history(token, days=days)
                 
+                # CORREÇÃO: Filtra pedidos para garantir que apenas os do período sejam processados
+                orders = filter_orders_by_period(orders, days)
+                
                 # Contar pedidos por dia
                 for order in safe_iter(orders):
                     # CORREÇÃO: Usa safe_get para acessar dataEmissao
@@ -2013,8 +2038,8 @@ class WebServer:
                 component_usage = {}
                 
                 for order in safe_iter(all_orders):
-                    # CORREÇÃO: Usa normalize_order_items para obter a lista de itens
-                    items = normalize_order_items(order)
+                    # CORREÇÃO: Usa extract_items para obter a lista de itens
+                    items = extract_items(order)
                     
                     if not items:
                         continue
@@ -2194,6 +2219,35 @@ class WebServer:
             self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
             
             return jsonify(kits + products)
+
+        @self.app.route('/api/components', methods=["GET"])
+        @token_required
+        def api_components(token):
+            """Retorna a lista de componentes/insumos de todos os kits em cache (para a tabela)."""
+            try:
+                result = []
+                kits = self.orchestrator.get_all_kits()
+
+                for kit in safe_iter(kits):
+                    components = safe_get(kit, "componentes", [])
+
+                    if not isinstance(components, list):
+                        continue
+
+                    for comp in safe_iter(components):
+                        comp_produto = safe_get(comp, 'produto', {})
+                        
+                        result.append({
+                            "produto": safe_get(kit, "sku"),
+                            "componente": safe_get(comp_produto, "nome"),
+                            "quantidade": safe_get(comp, "quantidade", 1)
+                        })
+
+                return jsonify(result)
+
+            except Exception as e:
+                self.logger.error(f"Erro ao gerar lista de componentes: {e}")
+                return jsonify([])
 
         @self.app.route('/api/force-load', methods=['POST'])
         @token_required
