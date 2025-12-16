@@ -442,25 +442,20 @@ class SalesManager:
 
     # NOVO: Carregamento do estado persistente (FIX DE LOG)
     def _load_stats(self):
-        data = load_stats_safe(self.config.SALES_STATS_FILE)
-        if data:
-            with self.lock:
+        with self.lock:  # ✅ Lock ANTES de ler arquivo
+            data = load_stats_safe(self.config.SALES_STATS_FILE)
+            if data:
                 self.daily_count = data.get('daily', 0)
                 self.weekly_count = data.get('weekly', 0)
                 self.historic_count = data.get('historic', 0)
-                # Usa a data carregada ou a data de inicialização se o carregamento falhar
                 self.last_recalculated = data.get('last_recalculated', datetime.now())
-            # FIX SPAM DE LOG (v4.6): Altera para INFO e só loga se não foi a falha inicial
-            if not self._initial_load_failed:  
-                logger.debug(f"KPIs carregados do arquivo. Histórico: {self.historic_count}.")
-                self._initial_load_failed = False 
+                
+                if not self._initial_load_failed:  
+                    logger.debug(f"KPIs carregados: Histórico={self.historic_count}")
+                self._initial_load_failed = False
             else:
-                self._initial_load_failed = False 
-        else:
-             # FIX (v4.5): Só loga o erro de 'Nenhum KPI encontrado' uma vez
-             if self._initial_load_failed:
-                 logger.debug("Nenhum KPI persistido encontrado, usando valores iniciais (0).")
-                # A flag permanece True até que um load seja bem-sucedido.
+                if self._initial_load_failed:
+                    logger.debug("Nenhum KPI persistido encontrado")
 
 
     # NOVO: Método para obter o estado a ser salvo
@@ -859,6 +854,8 @@ class AutomationOrchestrator:
         if not self.config.CLIENT_ID or not self.config.REDIRECT_URI:
             self.logger.error("Configurações BLING_CLIENT_ID/REDIRECT_URI ausentes. O worker não pode iniciar.")
             return
+        
+        cleanup_interval = 0  # ✅ Adicionar contador
 
         while True:
             try:
@@ -868,6 +865,12 @@ class AutomationOrchestrator:
                 
                 # FIX: Garante que o recálculo dos KPIs é acionado
                 self.process_sales_orders() 
+                
+                # Limpeza de callbacks órfãos
+                cleanup_interval += 1
+                if cleanup_interval >= 30:  # A cada 5 horas (30 ciclos * 10min)
+                    cleanup_kpi_callbacks()
+                    cleanup_interval = 0
 
             except Exception as e:
                 self.logger.error(f"Erro grave no loop do worker: {e}. Esperando 60s antes de tentar novamente.")
