@@ -11,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6 (Refatorado - V2)
+Versão: 4.6 (Refatorado - V3 - Compatibilidade WSGI)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -515,11 +515,6 @@ class AuthManager:
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         
-        data = {
-            'grant_type': grant_type,
-            **kwargs
-        }
-        
         try:
             response = requests.post(
                 self.config.TOKEN_URL,
@@ -884,8 +879,6 @@ class Orchestrator:
         # 1. Obter a lista de pedidos dos últimos 30 dias (já processados pelo SalesManager)
         # Como o SalesManager não armazena os pedidos, vamos re-buscar (ou idealmente, o SalesManager
         # deveria ter um cache de pedidos, mas seguindo a estrutura atual, re-buscamos).
-        # Para fins de refatoração, vamos assumir que o SalesManager armazena a lista de pedidos
-        # ou que a lista de pedidos é passada. Como não é, vamos re-buscar, mas de forma simplificada.
         
         # Simplificação: Usar a lista de pedidos do último recalculo do SalesManager.
         # Como não temos acesso direto, vamos re-buscar (com a ressalva de que é ineficiente).
@@ -1029,15 +1022,17 @@ class WebServer:
     used_codes = set()
     webhook_lock = Lock()
     
-    def __init__(self, config: Config, orchestrator: Orchestrator):
+    def __init__(self, config: Config, orchestrator: Orchestrator, flask_app: Flask):
         self.config = config
         self.orchestrator = orchestrator
         self.logger = logging.getLogger('bling_automacao')
-        self.app = Flask(__name__)
+        self.app = flask_app
         self.sock = Sock(self.app)
         self._setup_routes()
         self._setup_websockets()
 
+    # O método run() foi removido para compatibilidade com Gunicorn.
+    # A inicialização do worker agora é feita no create_app().
     def _setup_routes(self):
         """Configura todas as rotas HTTP."""
         
@@ -1341,11 +1336,6 @@ class WebServer:
                         kpi_update_callbacks.remove(kpi_callback)
                 self.logger.info("WebSocket KPI desconectado.")
 
-    def run(self):
-        """Inicia o servidor Flask."""
-        self.orchestrator.start_worker()
-        self.app.run(host='0.0.0.0', port=5000, debug=False)
-
 # ============================================================================ 
 # 9. DASHBOARD TEMPLATE (HTML/JS/CSS)
 # ============================================================================
@@ -1592,7 +1582,7 @@ DASHBOARD_TEMPLATE = r"""
     
     function showToast(title, message, type = 'info') {
         const toastContainer = document.querySelector('.toast-container');
-        const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
+        const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' ? 'bg-danger' : 'bg-success';
         const textClass = type === 'warning' ? 'text-dark' : 'text-white';
         
         const toastHtml = `
@@ -1755,12 +1745,14 @@ DASHBOARD_TEMPLATE = r"""
                 let html = '<div class="list-group">';
 
                 data.forEach(p => {
+                    const imgHtml = p.imagemURL 
+                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">` 
+                        : '<span class="text-muted">-</span>';
+
                     html += `
                         <div class="list-group-item">
                             <div class="d-flex">
-                                <img src="${p.imagemURL || ''}" 
-                                     style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1"
-                                     onerror="this.style.display='none'">
+                                ${imgHtml}
                                 
                                 <div class="flex-grow-1">
                                     <div class="d-flex w-100 justify-content-between">
@@ -1809,7 +1801,7 @@ DASHBOARD_TEMPLATE = r"""
             }
             
             authRequiredDiv.classList.add('hidden');
-            div.innerHTML = '<div class="alert alert-info">⏳ Carregando dados. O worker em segundo plano atualiza o cache a cada 10 minutos. Se a lista estiver vazia, aguarde até 10 minutos ou verifique os logs.</div>';
+            div.innerHTML = '<div class="alert alert-info">⏳ Carregando dados. O worker em segundo plano atualiza o cache a cada 10 minutos. Se a lista estiver vazia, aguarde até 10 minutos e recarregue a página.</div>';
             
             try {
                 const data = await fetchAPI(`${API}/kits`); 
@@ -1988,12 +1980,39 @@ DASHBOARD_TEMPLATE = r"""
 # 10. EXECUÇÃO
 # ============================================================================
 
-if __name__ == '__main__':
-    config = Config()
-    auth_manager = AuthManager(config)
-    api_client = BlingAPIClient(config, auth_manager)
-    sales_manager = SalesManager(config, logger)
-    orchestrator = Orchestrator(config, auth_manager, api_client, sales_manager)
+# Variáveis globais necessárias para o create_app
+config = Config()
+auth_manager = AuthManager(config)
+api_client = BlingAPIClient(config, auth_manager)
+sales_manager = SalesManager(config, logger)
+orchestrator = Orchestrator(config, auth_manager, api_client, sales_manager)
+
+def create_app() -> Flask:
+    """Função de fábrica para criar e configurar a aplicação Flask."""
+    global orchestrator # Garante que estamos usando o objeto global
     
-    server = WebServer(config, orchestrator)
-    server.run()
+    flask_app = Flask(__name__)
+    # Inicializa o WebServer com o Flask app e o Orchestrator
+    WebServer(config, orchestrator, flask_app) 
+    
+    # LÓGICA DE INÍCIO DO WORKER (DEVE RODAR APENAS UMA VEZ)
+    # Verifica se o worker já foi tentado a iniciar (para evitar duplicação no Gunicorn)
+    if not hasattr(create_app, '_worker_started'):
+        # O worker deve ser iniciado pelo Orchestrator, que já está configurado.
+        # Vamos usar a lógica de worker do Orchestrator.
+        
+        orchestrator.start_worker()
+        logger.info("✅ Worker de fundo iniciado via create_app.")
+        
+        # Marca que o worker já foi tentado a iniciar para não duplicar no Gunicorn
+        setattr(create_app, '_worker_started', True)
+    
+    return flask_app
+
+# 1. DEFINE A VARIÁVEL GLOBAL 'app' (Gunicorn OBRIGATORIAMENTE procura por esta linha)
+app = create_app() 
+
+if __name__ == '__main__':
+    # Apenas para testes locais
+    logger.info("Iniciando servidor Flask em modo local...")
+    app.run(host='0.0.0.0', port=5000, debug=False)
