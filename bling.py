@@ -11,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6 (Refatorado - V10 - Confirmação de Inicialização Única)
+Versão: 4.6 (Refatorado - V12 - Fluxo de Worker Pós-OAuth e Proteção de Cache)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -310,6 +310,13 @@ def save_products_cache(cache_file, products, kits):
     """
     Salva cache de produtos e kits no disco.
     """
+    total_produtos = len(products or []) + len(kits or [])
+    
+    # ✅ 3. Nunca salvar cache se produtos == 0
+    if total_produtos == 0:
+        logger.warning("⛔ Cache vazio ignorado. Não salvando no disco.")
+        return
+        
     try:
         payload = {
             "updated_at": datetime.now().isoformat(),
@@ -318,7 +325,7 @@ def save_products_cache(cache_file, products, kits):
         }
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        logger.info("Cache de produtos e kits salvo com sucesso.")
+        logger.info(f"Cache de produtos e kits salvo com sucesso. Total: {total_produtos}")
     except Exception as e:
         logger.error(f"Erro ao salvar cache de produtos: {e}")
 
@@ -797,10 +804,8 @@ class Orchestrator:
             products_empty = len(self._products_cache) == 0
             kits_empty = len(self._kits_cache) == 0
             
-            if products_empty and kits_empty:
-                self.logger.info("🚀 Primeira execução: carregando cache imediatamente...")
-                # Executa a primeira carga de forma síncrona
-                Thread(target=self._initial_load, daemon=True).start()
+            # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
+            # O worker principal ainda inicia, mas ele se protege com a verificação de token.
             
             self._worker_thread = Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
@@ -845,9 +850,9 @@ class Orchestrator:
             return
             
         try:
-            token = self.auth.get_access_token()
-            if not token:
-                self.logger.warning("Token indisponível para buscar pedidos de venda.")
+            # ✅ 1. Bloquear qualquer worker sem token
+            if not self.auth.is_authenticated():
+                self.logger.warning("⛔ Worker abortado: token inexistente.")
                 return
                 
             
@@ -904,9 +909,9 @@ class Orchestrator:
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
         
-        token = self.auth.get_access_token()
-        if not token:
-            self.logger.warning("Token indisponível para buscar produtos.")
+        # ✅ 1. Bloquear qualquer worker sem token
+        if not self.auth.is_authenticated():
+            self.logger.warning("⛔ Worker abortado: token inexistente.")
             return
             
         self.logger.info("Iniciando busca e cache de produtos e kits...")
@@ -962,6 +967,7 @@ class Orchestrator:
         with self._cache_lock:
             self._products_cache = {p['sku']: p for p in all_products}
             self._kits_cache = {k['sku']: k for k in all_kits}
+            # ✅ 3. Nunca salvar cache se produtos == 0 (proteção já implementada em save_products_cache)
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
             
         # Notifica o frontend que o cache foi atualizado (e, por tabela, que o worker terminou)
@@ -1172,7 +1178,16 @@ class WebServer:
                 
                 # Após a autenticação, envia um full_update para o frontend
                 if success:
-                    self.orchestrator.broadcast_kpi_update(sales_stats=self.orchestrator.sales._get_state_for_save())
+                    # ✅ 2. Após /callback, FORÇAR reload do cache e KPIs
+                    self.logger.info("✅ Autenticação bem-sucedida. Forçando carga inicial de dados (KPIs e Cache).")
+                    
+                    # Executa o recálculo e o cache em threads separadas para não bloquear o callback
+                    executor = ThreadPoolExecutor(max_workers=2)
+                    executor.submit(self.orchestrator.process_sales_orders)
+                    executor.submit(self.orchestrator.process_products_cache)
+                    executor.shutdown(wait=False)
+                    
+                    # O broadcast será feito no final de process_products_cache
                 
                 return redirect('/')
             except Exception as e:
@@ -1918,8 +1933,11 @@ DASHBOARD_TEMPLATE = r"""
                 const data = await fetchAPI(`${API}/kits`); 
                 
                 // ADICIONE ESTA VALIDAÇÃO
-                if (!data || data.length === 0) {
-                    div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum produto encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
+                // ✅ 4. Frontend: ignorar “Produto simples / estoque”
+                const kitsOnly = data.filter(p => p.tipo === 'Kit' || (p.componentes && p.componentes.length > 0));
+                
+                if (!kitsOnly || kitsOnly.length === 0) {
+                    div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
                     return;
                 }
                 let html = `
@@ -1935,7 +1953,7 @@ DASHBOARD_TEMPLATE = r"""
                 <tbody>
                 `;
 
-                data.forEach(k => {
+                kitsOnly.forEach(k => {
                     const imgHtml = k.imagemURL 
                         ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
                         : '<span class="text-muted">-</span>';
@@ -1952,7 +1970,9 @@ DASHBOARD_TEMPLATE = r"""
                             comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
                         }
                     } else {
-                        comps = `<span class="text-muted" style="font-size:0.8em">Produto Simples (Estoque: ${k.estoque || 'N/D'})</span>`;
+                        // ✅ 4. Frontend: ignorar “Produto simples / estoque”
+                        // Se não é kit, não renderiza a linha (o filter já removeu, mas para segurança)
+                        return; 
                     }
 
                     html += `
@@ -2067,7 +2087,22 @@ DASHBOARD_TEMPLATE = r"""
             kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
         }
         
-        // A aba de componentes não precisa mais de um listener, pois os dados são atualizados via WS.
+        // ✅ 5. Componentes: timeout + erro visível
+        const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
+        if (componentUsageTab) {
+            componentUsageTab.addEventListener('shown.bs.tab', () => {
+                const contentDiv = document.getElementById('component-usage-content');
+                
+                // Se o conteúdo ainda for o "Carregando dados...", inicia o timeout
+                if (contentDiv.innerHTML.includes('Carregando dados...')) {
+                    setTimeout(() => {
+                        if (contentDiv.innerHTML.includes('Carregando dados...')) {
+                            contentDiv.innerHTML = '<div class="alert alert-danger">❌ Não foi possível carregar o uso de componentes em tempo hábil. Verifique a autenticação e os logs.</div>';
+                        }
+                    }, 8000); // 8 segundos de timeout
+                }
+            });
+        }
     });
     </script>
     
@@ -2107,19 +2142,22 @@ def create_app() -> Flask:
     WebServer(config, orchestrator, flask_app) 
     
     # LÓGICA DE INÍCIO DO WORKER (DEVE RODAR APENAS UMA VEZ)
-    # Verifica se o worker já foi tentado a iniciar (para evitar duplicação no Gunicorn)
-    if not hasattr(create_app, '_worker_started'):
-        # O worker deve ser iniciado pelo Orchestrator, que já está configurado.
-        # Vamos usar a lógica de worker do Orchestrator.
-        
-        orchestrator.start_worker()
-        logger.info("✅ Worker de fundo iniciado via create_app.")
-        
-        # ✅ Inicia o timer de limpeza de callbacks (Instrução 3)
-        start_cleanup_timer()
-        
-        # Marca que o worker já foi tentado a iniciar para não duplicar no Gunicorn
-        setattr(create_app, '_worker_started', True)
+    # Garante que o worker de fundo só inicie em UMA instância Gunicorn, usando o 
+    # ambiente (os.environ) como flag persistente através dos processos (forks).
+    if os.environ.get('BLING_WORKER_STARTED') is None:
+        try:
+            orchestrator.start_worker()
+            logger.info("✅ Worker de fundo iniciado via create_app (Singleton).")
+            
+            # ✅ Inicia o timer de limpeza de callbacks
+            start_cleanup_timer()
+            
+            # Marca a flag no ambiente para que outros processos Gunicorn não iniciem
+            os.environ['BLING_WORKER_STARTED'] = 'True' 
+        except Exception as e:
+            logger.error(f"❌ Falha ao iniciar worker: {e}")
+    else:
+        logger.info("ℹ️ Worker de fundo já iniciado em outro processo Gunicorn. Pulando...")
     
     return flask_app
 
