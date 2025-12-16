@@ -885,21 +885,21 @@ class Orchestrator:
                 params['pagina'] = page
                 response = self.api.get('pedidos/vendas', params=params)
                 
-                if response is None:
+            if response is None:
                     self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
-                    break
+                break
                             
                 data = safe_get(response, 'data', [])
                 
                 if not data:
                     self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
-                    break
+                break
                             
                 all_orders.extend(data)
                 self.logger.info(f"Página {page} de pedidos processada. Total: {len(all_orders)}")
                 
                 if len(data) < 100: # Assumindo 100 é o limite de página
-                    break
+                break
                     
                 page += 1
                 time.sleep(1.5) # ✅ Aumenta de 0.5s para 1.5s
@@ -943,16 +943,16 @@ class Orchestrator:
             }
             response = self.api.get('produtos', params=params)
             
-                if response is None:
-                    self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
-                    # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
-                    break
+            if response is None:
+                self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+                # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
+                break
                         
                 data = safe_get(response, 'data', [])
                 
                 if not data:
                     self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
-                    break
+                break
                         
                 for item in data:
                 produto = safe_get(item, 'produto', {})
