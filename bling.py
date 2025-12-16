@@ -384,7 +384,7 @@ class BlingAPIClient:
         token = self.auth.get_access_token()
         
         if not token:
-            self.logger.warning(f"Tentativa de acesso a {endpoint} sem token.")
+            self.logger.error(f"⛔ Token de acesso ausente para {endpoint}. Abortando requisição.")
             return None
             
         headers = {'Authorization': f'Bearer {token}'}
@@ -418,17 +418,23 @@ class BlingAPIClient:
                 if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
                     # ✅ Rate limit especial: aguarda mais tempo
                     if response.status_code == 429:
-                        delay = 5.0 * (2 ** attempt)  # Começa com 5s, depois 10s, 20s
+                        # Prioriza Retry-After, senão usa backoff exponencial (5s, 10s, 20s...)
                         retry_after = response.headers.get('Retry-After')
+                        wait_time = 5.0 * (2 ** attempt)
                         if retry_after:
                             try:
-                                delay = max(delay, float(retry_after))
+                                wait_time = max(wait_time, float(retry_after))
+                                self.logger.warning(f"⚠️ Status 429. Bling sugeriu Retry-After: {wait_time:.2f}s. Aguardando...")
                             except ValueError:
-                                pass # Ignora se Retry-After não for um número
+                                self.logger.warning(f"⚠️ Status 429. Retry-After inválido. Usando backoff: {wait_time:.2f}s.")
+                        else:
+                            self.logger.warning(f"⚠️ Status 429. Retry-After ausente. Usando backoff: {wait_time:.2f}s.")
+                        delay = wait_time
                     else:
                         delay = self.config.BASE_DELAY * (2 ** attempt)
                     
-                    self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
+                    if response.status_code != 429:
+                        self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
                     time.sleep(delay)
                 else:
                     return None
@@ -465,7 +471,12 @@ class AuthManager:
         self._access_token = self._tokens.get('access_token')
         self._refresh_token = self._tokens.get('refresh_token')
         self._expires_at = self._tokens.get('expires_at', 0)
-        self._initial_load_failed = True 
+        self._initial_load_failed = True
+        
+        if not self._access_token and not self._refresh_token:
+            self.logger.warning("⚠️ Nenhum token encontrado no arquivo. Necessário realizar autenticação OAuth.")
+        elif not self._access_token and self._refresh_token:
+            self.logger.info("Refresh Token encontrado. Tentativa de renovação será feita na primeira requisição.") 
         
     def _load_tokens(self) -> Dict[str, Any]:
         """Carrega tokens do arquivo de forma segura."""
@@ -874,14 +885,15 @@ class Orchestrator:
                 params['pagina'] = page
                 response = self.api.get('pedidos/vendas', params=params)
                 
-                if response is None:
-                    self.logger.error("Falha ao buscar pedidos de venda na API.")
-                    break
+        if response is None:
+            self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
+            break
                     
                 data = safe_get(response, 'data', [])
                 
-                if not data:
-                    break
+        if not data:
+            self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
+            break
                     
                 all_orders.extend(data)
                 self.logger.info(f"Página {page} de pedidos processada. Total: {len(all_orders)}")
@@ -911,7 +923,7 @@ class Orchestrator:
         
         # ✅ 1. Bloquear qualquer worker sem token
         if not self.auth.is_authenticated():
-            self.logger.warning("⛔ Worker abortado: token inexistente.")
+            self.logger.error("⛔ Worker abortado: token inexistente ou falha na renovação.")
             return
             
         self.logger.info("Iniciando busca e cache de produtos e kits...")
@@ -931,14 +943,16 @@ class Orchestrator:
             }
             response = self.api.get('produtos', params=params)
             
-            if response is None:
-                self.logger.error("Falha ao buscar produtos na API.")
-                break
+        if response is None:
+            self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+            # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
+            break
                 
             data = safe_get(response, 'data', [])
             
-            if not data:
-                break
+        if not data:
+            self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
+            break
                 
             for item in data:
                 produto = safe_get(item, 'produto', {})
@@ -949,8 +963,9 @@ class Orchestrator:
                     
             self.logger.info(f"Página {page} de produtos processada. Produtos: {len(all_products)}, Kits: {len(all_kits)}")
             
-            if len(data) < 100:
-                break
+        if len(data) < 100:
+            self.logger.info(f"Página {page} de produtos com menos de 100 itens. Fim da paginação.")
+            break
                 
             page += 1
             time.sleep(1.5) # ✅ Aumenta de 0.5s para 1.5s
@@ -1012,8 +1027,9 @@ class Orchestrator:
                 
             all_orders.extend(data)
             
-            if len(data) < 100:
-                break
+        if len(data) < 100:
+            self.logger.info(f"Página {page} de produtos com menos de 100 itens. Fim da paginação.")
+            break
                 
             page += 1
             time.sleep(0.1) # Pequeno delay
