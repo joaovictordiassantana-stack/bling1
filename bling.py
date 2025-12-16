@@ -1911,7 +1911,7 @@ class WebServer:
                     order_data = order.get('data', {})
                     items = order_data.get('itens', [])
                     
-                        for item in items:
+                    for item in items:
                             # Normalização do campo 'produto' (CAUSA 1)
                             produto = item.get('produto')
                             if isinstance(produto, dict):
@@ -1931,29 +1931,29 @@ class WebServer:
                             componentes = kit.get('componentes') if kit else None
                             
                             if kit and componentes and isinstance(componentes, list):
-                            for comp in componentes:
-                                # Blindar componente (CAUSA 2 e 3)
-                                if not isinstance(comp, dict):
-                                    self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {kit.get('sku')}: {comp}")
-                                    continue
+                                for comp in componentes:
+                                    # Blindar componente (CAUSA 2 e 3)
+                                    if not isinstance(comp, dict):
+                                        self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {kit.get('sku')}: {comp}")
+                                        continue
+                                        
+                                    comp_nome = comp.get('nome', 'Item não identificado')
+                                    comp_sku = comp.get('sku', 'N/D')
+                                    comp_qtd = comp.get('quantidade', 0) * qtd_vendida
                                     
-                                comp_nome = comp.get('nome', 'Item não identificado')
-                                comp_sku = comp.get('sku', 'N/D')
-                                comp_qtd = comp.get('quantidade', 0) * qtd_vendida
-                                
-                                # Usar SKU como chave para evitar problemas com nomes duplicados
-                                key = comp_sku if comp_sku != 'N/D' else comp_nome
-                                
-                                if key not in component_usage:
-                                    component_usage[key] = {
-                                        'nome': comp_nome,
-                                        'sku': comp_sku,
-                                        'quantidade': 0,
-                                        'produtos': set()
-                                    }
-                                
-                                component_usage[key]['quantidade'] += comp_qtd
-                                component_usage[key]['produtos'].add(kit.get('produto', 'N/D'))
+                                    # Usar SKU como chave para evitar problemas com nomes duplicados
+                                    key = comp_sku if comp_sku != 'N/D' else comp_nome
+                                    
+                                    if key not in component_usage:
+                                        component_usage[key] = {
+                                            'nome': comp_nome,
+                                            'sku': comp_sku,
+                                            'quantidade': 0,
+                                            'produtos': set()
+                                        }
+                                    
+                                    component_usage[key]['quantidade'] += comp_qtd
+                                    component_usage[key]['produtos'].add(kit.get('produto', 'N/D'))
                 
                 # Converter sets para listas
                 result = []
