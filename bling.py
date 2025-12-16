@@ -11,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6 (Refatorado - V3 - Compatibilidade WSGI)
+Versão: 4.6 (Refatorado - V5 - Estabilidade Final)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -53,23 +53,6 @@ except ImportError:
 token_exchange_lock = Lock()
 kpi_update_callbacks: List[Callable] = []
 kpi_update_lock = Lock()
-
-def cleanup_kpi_callbacks():
-    """Remove callbacks órfãos a cada 5 minutos"""
-    global kpi_update_callbacks
-    with kpi_update_lock:
-        # Testa cada callback. Se falhar (ex: objeto órfão), remove.
-        valid = []
-        for cb in kpi_update_callbacks:
-            try:
-                # Tenta acessar um atributo ou chamar o callback. Se falhar, é órfão.
-                _ = getattr(cb, '__name__', 'lambda_or_partial') # Teste robusto
-                valid.append(cb)
-            except:
-                logger.debug("Callback órfão removido.")
-                pass
-        kpi_update_callbacks = valid
-        logger.debug(f"🧹 Callbacks KPI limpos: {len(valid)} ativos")
 
 # ============================================================================ 
 # 1. LOGS AVANÇADOS
@@ -147,6 +130,33 @@ def setup_logging():
     return logger, error_logger
 
 logger, error_logger = setup_logging()
+
+# ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
+def cleanup_kpi_callbacks():
+    """Remove callbacks órfãos a cada 5 minutos"""
+    global kpi_update_callbacks
+    with kpi_update_lock:
+        # Testa cada callback. Se falhar (ex: objeto órfão), remove.
+        valid = []
+        for cb in kpi_update_callbacks:
+            try:
+                # Tenta acessar um atributo ou chamar o callback. Se falhar, é órfão.
+                _ = getattr(cb, '__name__', 'lambda_or_partial') # Teste robusto
+                valid.append(cb)
+            except:
+                logger.debug("Callback órfão removido.")
+                pass
+        kpi_update_callbacks = valid
+        logger.debug(f"🧹 Callbacks KPI limpos: {len(valid)} ativos")
+
+def start_cleanup_timer():
+    """Inicia timer para limpar callbacks órfãos a cada 5 minutos"""
+    def cleanup_loop():
+        while True:
+            time.sleep(300)  # 5 minutos
+            cleanup_kpi_callbacks()
+    
+    Thread(target=cleanup_loop, daemon=True).start()
 
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
@@ -464,10 +474,11 @@ class AuthManager:
         """Troca o código de autorização por tokens de acesso e refresh."""
         
         # Validação do state (medida de segurança)
-        if state != self._tokens.get('state'):
-            self.logger.error("Erro de segurança: State inválido na troca de código.")
-            return False
-            
+        saved_state = self._tokens.get('state')
+        if saved_state and state != saved_state:
+            self.logger.warning(f"State diferente detectado. Saved: {saved_state}, Received: {state}. Ignorando validação para compatibilidade WSGI/Serverless.")
+            # Não retorna False, apenas avisa (conforme instrução)
+        
         return self._perform_token_request(
             grant_type='authorization_code',
             code=code,
@@ -513,6 +524,12 @@ class AuthManager:
         headers = {
             'Authorization': f'Basic {auth_header}',
             'Content-Type': 'application/x-www-form-urlencoded'
+        }
+        
+        # ✅ Definição da variável 'data' (Correção de bug: garante que 'data' está definido)
+        data = {
+            'grant_type': grant_type,
+            **kwargs
         }
         
         try:
@@ -711,7 +728,7 @@ class Orchestrator:
                 self._kits_cache = {k['sku']: k for k in safe_iter(data.get('kits'))}
             self.logger.info(f"Cache carregado: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
         else:
-            self.logger.warning("Nenhum cache de produtos/kits encontrado no disco.")
+            self.logger.warning("Nenhuma cache de produtos/kits encontrado no disco.")
 
     def get_all_products(self) -> List[Dict[str, Any]]:
         """Retorna todos os produtos simples em cache."""
@@ -1053,12 +1070,16 @@ class WebServer:
                 return redirect('/')
             
             if not code or not state:
+                self.logger.error("Callback sem code ou state.")
                 return redirect('/') 
+            
+            # ✅ ADICIONE logging detalhado:
+            self.logger.info(f"Callback recebido - Code: {code[:10]}..., State: {state}")
             
             # NOTA: O uso de 'with' padrão bloquearia. A lógica abaixo garante a não-concorrência 
             # e a saída imediata, se o lock já estiver sendo usado.
             if not token_exchange_lock.acquire(blocking=False):
-                self.logger.warning("Concorrência detectada no callback. Redirecionando para home.")
+                self.logger.warning("Concorrência detectada no callback. Redirecionando.")
                 return redirect('/')
                 
             try:
@@ -1308,7 +1329,14 @@ class WebServer:
             
             # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
-                ws.send(json.dumps(payload))
+                try:
+                    ws.send(json.dumps(payload))
+                except ConnectionClosed:
+                    # ✅ ADICIONE: Sinaliza para remover este callback
+                    raise
+                except Exception as e:
+                    self.logger.error(f"Erro enviando via WS: {e}")
+                    raise ConnectionClosed()  # Força desconexão
                 
             # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
             try:
@@ -1582,7 +1610,7 @@ DASHBOARD_TEMPLATE = r"""
     
     function showToast(title, message, type = 'info') {
         const toastContainer = document.querySelector('.toast-container');
-        const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' ? 'bg-danger' : 'bg-success';
+        const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
         const textClass = type === 'warning' ? 'text-dark' : 'text-white';
         
         const toastHtml = `
@@ -2003,6 +2031,9 @@ def create_app() -> Flask:
         
         orchestrator.start_worker()
         logger.info("✅ Worker de fundo iniciado via create_app.")
+        
+        # ✅ Inicia o timer de limpeza de callbacks (Instrução 3)
+        start_cleanup_timer()
         
         # Marca que o worker já foi tentado a iniciar para não duplicar no Gunicorn
         setattr(create_app, '_worker_started', True)
