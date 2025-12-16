@@ -885,16 +885,16 @@ class Orchestrator:
                 params['pagina'] = page
                 response = self.api.get('pedidos/vendas', params=params)
                 
-        if response is None:
-            self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
-            break
-                    
+                if response is None:
+                    self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
+                    break
+                            
                 data = safe_get(response, 'data', [])
                 
-        if not data:
-            self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
-            break
-                    
+                if not data:
+                    self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
+                    break
+                            
                 all_orders.extend(data)
                 self.logger.info(f"Página {page} de pedidos processada. Total: {len(all_orders)}")
                 
