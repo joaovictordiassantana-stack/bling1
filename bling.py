@@ -11,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6 (Refatorado - V6 - Estabilidade Final WS)
+Versão: 4.6 (Refatorado - V8 - Cache Inicial e Estabilidade)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -408,8 +408,19 @@ class BlingAPIClient:
             except requests.exceptions.HTTPError as e:
                 self.logger.error(f"Erro HTTP ao acessar {endpoint}: {e}")
                 if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
-                    delay = self.config.BASE_DELAY * (2 ** attempt)
-                    self.logger.info(f"Tentativa {attempt + 1} falhou. Aguardando {delay:.2f}s antes de tentar novamente.")
+                    # ✅ Rate limit especial: aguarda mais tempo
+                    if response.status_code == 429:
+                        delay = 5.0 * (2 ** attempt)  # Começa com 5s, depois 10s, 20s
+                        retry_after = response.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                delay = max(delay, float(retry_after))
+                            except ValueError:
+                                pass # Ignora se Retry-After não for um número
+                    else:
+                        delay = self.config.BASE_DELAY * (2 ** attempt)
+                    
+                    self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
                     time.sleep(delay)
                 else:
                     return None
@@ -503,7 +514,7 @@ class AuthManager:
         # Validação do state (medida de segurança)
         saved_state = self._tokens.get('state')
         if saved_state and state != saved_state:
-            self.logger.warning(f"State diferente detectado. Saved: {saved_state}, Received: {state}. Ignorando validação para compatibilidade WSGI/Serverless.")
+            self.logger.info(f"ℹ️ State diferente detectado (Saved: {saved_state}, Received: {state}). Ignorando validação (ambiente WSGI).")
             # Não retorna False, apenas avisa (conforme instrução)
         
         return self._perform_token_request(
@@ -780,6 +791,16 @@ class Orchestrator:
         """Inicia o worker de fundo para atualização de dados."""
         if not self._running:
             self._running = True
+            
+            # ✅ ADICIONE: Verifica se é a primeira execução
+            products_empty = len(self._products_cache) == 0
+            kits_empty = len(self._kits_cache) == 0
+            
+            if products_empty and kits_empty:
+                self.logger.info("🚀 Primeira execução: carregando cache imediatamente...")
+                # Executa a primeira carga de forma síncrona
+                Thread(target=self._initial_load, daemon=True).start()
+            
             self._worker_thread = Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
             self.logger.info("Worker de fundo iniciado.")
@@ -795,6 +816,15 @@ class Orchestrator:
         """Verifica se o worker está ativo."""
         return self._running
 
+    def _initial_load(self):
+        """Carrega cache de produtos na primeira execução."""
+        try:
+            self.logger.info("⏳ Carregando cache inicial de produtos/kits...")
+            self.process_products_cache()
+            self.logger.info("✅ Cache inicial carregado com sucesso!")
+        except Exception as e:
+            self.logger.error(f"❌ Erro no carregamento inicial: {e}")
+            
     def _worker_loop(self):
         """Loop principal do worker de fundo."""
         while self._running:
@@ -829,6 +859,11 @@ class Orchestrator:
             
             all_orders = []
             page = 1
+            
+            # ✅ Limita a 3 páginas por vez para evitar rate limit
+            MAX_PAGES_PER_BATCH = 3
+            batch_count = 0
+            
             while True:
                 params['pagina'] = page
                 response = self.api.get('pedidos/vendas', params=params)
@@ -849,7 +884,13 @@ class Orchestrator:
                     break
                     
                 page += 1
-                time.sleep(0.5) # Pequeno delay para evitar rate limit
+                time.sleep(1.5) # ✅ Aumenta de 0.5s para 1.5s
+                
+                batch_count += 1
+                if batch_count >= MAX_PAGES_PER_BATCH:
+                    self.logger.info(f"⏸️ Pausa de 5s após {batch_count} páginas (rate limit)")
+                    time.sleep(5)  # Pausa de 5 segundos a cada 3 páginas
+                    batch_count = 0
                 
             self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
             
@@ -872,6 +913,10 @@ class Orchestrator:
         all_products = []
         all_kits = []
         page = 1
+        
+        # ✅ Limita a 3 páginas por vez para evitar rate limit
+        MAX_PAGES_PER_BATCH = 3
+        batch_count = 0
         
         while True:
             params = {
@@ -902,7 +947,13 @@ class Orchestrator:
                 break
                 
             page += 1
-            time.sleep(0.5)
+            time.sleep(1.5) # ✅ Aumenta de 0.5s para 1.5s
+            
+            batch_count += 1
+            if batch_count >= MAX_PAGES_PER_BATCH:
+                self.logger.info(f"⏸️ Pausa de 5s após {batch_count} páginas (rate limit)")
+                time.sleep(5)  # Pausa de 5 segundos a cada 3 páginas
+                batch_count = 0
             
         self.logger.info(f"Busca de produtos finalizada. Total de produtos: {len(all_products)}, Total de kits: {len(all_kits)}")
         
