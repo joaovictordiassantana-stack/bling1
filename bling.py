@@ -943,18 +943,18 @@ class Orchestrator:
             }
             response = self.api.get('produtos', params=params)
             
-        if response is None:
-            self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
-            # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
-            break
+                if response is None:
+                    self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+                    # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
+                    break
+                        
+                data = safe_get(response, 'data', [])
                 
-            data = safe_get(response, 'data', [])
-            
-        if not data:
-            self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
-            break
-                
-            for item in data:
+                if not data:
+                    self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
+                    break
+                        
+                for item in data:
                 produto = safe_get(item, 'produto', {})
                 if safe_get(produto, 'tipo') == 'P': # Produto simples
                     all_products.append(produto)
