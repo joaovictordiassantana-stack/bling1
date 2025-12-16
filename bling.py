@@ -47,12 +47,6 @@ except ImportError:
     class ConnectionClosed(Exception): pass
 
 # ============================================================================ 
-# Variáveis globais de cache (Solução 1)
-PRODUCTS_CACHE = {}
-KITS_CACHE = {}
-CACHE_LAST_UPDATED = None
-
-# ============================================================================ 
 # 0. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
 # ============================================================================
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
@@ -227,27 +221,122 @@ def save_stats(data: Dict[str, Any], path: Path):
     except Exception as e:
         logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
 
-def load_products_cache(path: Path):
-    """Carrega o cache de produtos e kits de forma segura."""
-    if not path.exists():
-        return {"kits": [], "products": []}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data
-    except Exception as e:
-        logger.error(f"Erro lendo cache de produtos {path.name}: {e}")
-        return {"kits": [], "products": []}
+def load_products_cache(cache_file):
+    """
+    Carrega cache de produtos e kits do disco.
+    Retorna dict vazio se não existir ou falhar.
+    """
+    if not cache_file or not os.path.exists(cache_file):
+        return {}
 
-def save_products_cache(kits: List[Dict], products: List[Dict], path: Path):
-    """Salva o cache de produtos e kits."""
     try:
-        data_to_save = {"kits": kits, "products": products}
-        with open(path, "w", encoding="utf-8") as file:
-            json.dump(data_to_save, file, indent=4, ensure_ascii=False)
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"[WARN] Falha ao carregar cache do disco: {e}")
+        return {}
+
+
+def save_products_cache(cache_file, products, kits):
+    """
+    Salva cache de produtos e kits no disco.
+    """
+    try:
+        payload = {
+            "updated_at": datetime.now().isoformat(),
+            "products": products or [],
+            "kits": kits or []
+        }
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         logger.info("Cache de produtos e kits salvo com sucesso.")
     except Exception as e:
-        logger.error(f"Erro ao salvar cache de produtos e kits: {e}")
+        logger.error(f"[ERROR] Falha ao salvar cache: {e}")
+
+def safe_get(obj, key, default=None):
+    """
+    Acessa dict com segurança.
+    Nunca lança AttributeError.
+    """
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+def normalize_order_items(order):
+    """
+    Retorna lista de itens do pedido, independente do formato.
+    """
+    if not isinstance(order, dict):
+        return []
+
+    data = safe_get(order, 'data', order)
+
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            return []
+    
+    if not isinstance(data, dict):
+        return []
+
+    for key in ('itens', 'itensVenda', 'item'):
+        value = safe_get(data, key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict) and 'item' in value:
+            return safe_get(value, 'item', [])
+
+    return []
+
+import re
+def extract_product_identifier(item):
+    """
+    Extrai id / sku / código do produto vendido.
+    """
+    if not isinstance(item, dict):
+        return None
+
+    produto = safe_get(item, 'produto')
+
+    if isinstance(produto, dict):
+        return safe_get(produto, 'id') or safe_get(produto, 'codigo') or safe_get(produto, 'sku')
+
+    if isinstance(produto, str):
+        match = re.search(r'(\d{3,})', produto)
+        if match:
+            return match.group(1)
+
+    return safe_get(item, 'codigo') or safe_get(item, 'sku')
+
+def resolve_period(period):
+    """
+    Retorna número de dias baseado no período solicitado.
+    """
+    now = datetime.now()
+
+    if period == 'month':
+        start = now.replace(day=1)
+        return (now - start).days + 1
+
+    if isinstance(period, str) and period.endswith('d'):
+        try:
+            return int(period[:-1])
+        except:
+            return 30
+
+    try:
+        return int(period)
+    except:
+        return 30
+
+def safe_iter(iterable):
+    """
+    Garante iteração segura.
+    """
+    if isinstance(iterable, list):
+        return iterable
+    return []
 
 def is_token_valid(token_data):
     if not token_data:
@@ -1027,15 +1116,9 @@ class AutomationOrchestrator:
             })
         
         # ============================================================
-        # PASSO 4: Salvar cache em disco E em memória global
+        # PASSO 4: Salvar cache em disco
         # ============================================================
-        save_products_cache(self.kits, self.products, self.config.PRODUCTS_CACHE_FILE)
-        
-        # Atualiza cache global em memória
-        global PRODUCTS_CACHE, KITS_CACHE, CACHE_LAST_UPDATED
-        PRODUCTS_CACHE = self.products
-        KITS_CACHE = self.kits
-        CACHE_LAST_UPDATED = datetime.now()
+        save_products_cache(self.config.PRODUCTS_CACHE_FILE, self.products, self.kits)
         
         self.logger.info("=" * 60)
         self.logger.info(f"✅ PROCESSAMENTO CONCLUÍDO:")
@@ -1044,12 +1127,18 @@ class AutomationOrchestrator:
         self.logger.info("=" * 60)
 
     def get_all_products(self) -> List[Dict[str, Any]]:
-        global PRODUCTS_CACHE
-        return PRODUCTS_CACHE or self.products # Fallback para self.products se global estiver vazio
+        # Tenta ler do cache em disco (para Gunicorn multi-worker)
+        cache_data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
+        if cache_data:
+            return cache_data.get("products", [])
+        return self.products # Fallback para cache em memória (processo único)
 
     def get_all_kits(self) -> List[Dict[str, Any]]:
-        global KITS_CACHE
-        return KITS_CACHE or self.kits # Fallback para self.kits se global estiver vazio
+        # Tenta ler do cache em disco (para Gunicorn multi-worker)
+        cache_data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
+        if cache_data:
+            return cache_data.get("kits", [])
+        return self.kits # Fallback para cache em memória (processo único)
     
     def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
         """
@@ -1062,10 +1151,12 @@ class AutomationOrchestrator:
         try:
             orders = []
             now = datetime.now()
-            start_date = (now - timedelta(days=days)).strftime('%Y-%m-%d')
+            
+            # CORREÇÃO: Usa resolve_period para calcular a data inicial
+            start_date = (now - timedelta(days=days - 1)).strftime('%Y-%m-%d')
             end_date = now.strftime('%Y-%m-%d')
             
-            self.logger.info(f"📊 Buscando pedidos de {start_date} até {end_date}")
+            self.logger.info(f"📊 Buscando pedidos de {start_date} até {end_date} ({days} dias)")
             
             page = 1
             while page <= 50:  # Limite de segurança
@@ -1825,36 +1916,38 @@ class WebServer:
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
-            """Retorna histórico de vendas dos últimos 30 dias para gráfico"""
+            """Retorna histórico de vendas para gráfico, respeitando o período solicitado."""
+            
+            # CORREÇÃO: Usa resolve_period para definir o número de dias
+            period_param = request.args.get('period', 'month')
+            days = resolve_period(period_param)
+            
             now = datetime.now()
             daily_counts = {}
             
-            # Inicializar os últimos 30 dias
-            for i in range(30):
+            # Inicializar o período correto
+            for i in range(days):
                 date = (now - timedelta(days=i)).strftime('%Y-%m-%d')
                 daily_counts[date] = 0
             
             # Buscar pedidos do histórico de vendas
             try:
-                # Buscar pedidos dos últimos 30 dias
-                orders = self.orchestrator.get_sales_history(token, days=30)
+                # Buscar pedidos do período
+                orders = self.orchestrator.get_sales_history(token, days=days)
                 
                 # Contar pedidos por dia
-                for order in orders:
-                    if isinstance(order, dict):
-                        data_obj = order.get('data', {})
-                        if isinstance(data_obj, dict):
-                            data_emissao_str = data_obj.get('dataEmissao')
-                        else:
-                            data_emissao_str = data_obj
+                for order in safe_iter(orders):
+                    # CORREÇÃO: Usa safe_get para acessar dataEmissao
+                    data_obj = safe_get(order, 'data', {})
+                    data_emissao_str = safe_get(data_obj, 'dataEmissao')
                         
-                        if data_emissao_str:
-                            try:
-                                date_key = data_emissao_str[:10]
-                                if date_key in daily_counts:
-                                    daily_counts[date_key] += 1
-                            except:
-                                pass
+                    if data_emissao_str:
+                        try:
+                            date_key = data_emissao_str[:10]
+                            if date_key in daily_counts:
+                                daily_counts[date_key] += 1
+                        except:
+                            pass
             except Exception as e:
                 self.logger.error(f"Erro ao buscar histórico de vendas: {e}")
             
@@ -1919,63 +2012,42 @@ class WebServer:
                 # Processar componentes
                 component_usage = {}
                 
-                for order in all_orders:
-                    # A estrutura do pedido de venda Bling v3 é diferente da v2.
-                    # Vamos assumir que a lista de itens está em 'itens' dentro do objeto 'data'
+                for order in safe_iter(all_orders):
+                    # CORREÇÃO: Usa normalize_order_items para obter a lista de itens
+                    items = normalize_order_items(order)
                     
-                    # Validar tipo de order
-                    if not isinstance(order, dict):
-                        logger.warning(f"Pedido em formato inesperado ignorado: {order}")
+                    if not items:
                         continue
                     
-                    order_data = order.get('data', {})
-                    
-                    # Validar tipo de order_data
-                    if not isinstance(order_data, dict):
-                        logger.warning(f"Dados do pedido em formato inesperado ignorado: {order_data}")
-                        continue
-                    
-                    items = order_data.get('itens', [])
-                    
-                    for item in items:
-                        # Validar tipo de item
-                        if not isinstance(item, dict):
-                            logger.warning(f"Item em formato inesperado ignorado: {item}")
-                            continue
+                    for item in safe_iter(items):
+                        # CORREÇÃO: Usa extract_product_identifier para obter o ID/SKU
+                        produto_id = extract_product_identifier(item)
                         
-                        # Normalização do campo 'produto' (CAUSA 1)
-                        produto = item.get('produto')
-                        if isinstance(produto, dict):
-                            produto_id = produto.get('id')
-                        elif isinstance(produto, str):
-                            # Se for string, não tem ID para buscar kit
-                            continue
-                        else:
+                        if not produto_id:
                             continue
                             
-                        qtd_vendida = item.get('quantidade', 1)
+                        # CORREÇÃO: Usa safe_get para obter a quantidade
+                        qtd_vendida = safe_get(item, 'quantidade', 1)
                         
                         # Buscar se é kit
-                        kit = next((k for k in self.orchestrator.get_all_kits() if str(k.get('id')) == str(produto_id)), None)
+                        # CORREÇÃO: Usa str(produto_id) para garantir comparação correta
+                        kit = next((k for k in self.orchestrator.get_all_kits() if str(safe_get(k, 'id')) == str(produto_id)), None)
                         
                         # Blindar acesso a componentes (CAUSA 3)
-                        # Validar tipo de kit antes de acessar .get()
-                        if kit and not isinstance(kit, dict):
-                            logger.warning(f"Kit em formato inesperado ignorado: {kit}")
-                            continue
-                        
-                        componentes = kit.get('componentes') if kit else None
+                        componentes = safe_get(kit, 'componentes')
                         
                         if kit and componentes and isinstance(componentes, list):
-                            for comp in componentes:
+                            for comp in safe_iter(componentes):
                                 # Blindar componente (CAUSA 2 e 3)
                                 if not isinstance(comp, dict):
-                                    self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {kit.get('sku')}: {comp}")
+                                    self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {safe_get(kit, 'sku')}: {comp}")
                                     continue
                                     
-                                comp_nome = comp.get('nome', 'Item não identificado')
-                                comp_sku = comp.get('sku', 'N/D')
-                                comp_qtd = comp.get('quantidade', 0) * qtd_vendida
+                                # CORREÇÃO: Usa safe_get para acessar dados do componente
+                                comp_produto = safe_get(comp, 'produto', {})
+                                comp_nome = safe_get(comp_produto, 'nome', 'Item não identificado')
+                                comp_sku = safe_get(comp_produto, 'codigo', 'N/D')
+                                comp_qtd = safe_get(comp, 'quantidade', 0) * qtd_vendida
                                 
                                 # Usar SKU como chave para evitar problemas com nomes duplicados
                                 key = comp_sku if comp_sku != 'N/D' else comp_nome
@@ -1989,7 +2061,7 @@ class WebServer:
                                     }
                                 
                                 component_usage[key]['quantidade'] += comp_qtd
-                                component_usage[key]['produtos'].add(kit.get('produto', 'N/D'))
+                                component_usage[key]['produtos'].add(safe_get(kit, 'produto', 'N/D'))
                 
                 # Converter sets para listas
                 result = []
