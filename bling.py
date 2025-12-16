@@ -11,7 +11,7 @@ Copyright (c) 2025 João Victor Dias Santana
 Implementa integração completa com Bling API v3, gerenciamento de estoque,
 KPIs de vendas em tempo real via WebSocket e dashboard interativo.
 
-Versão: 4.6 (Refatorado - V5 - Estabilidade Final)
+Versão: 4.6 (Refatorado - V6 - Estabilidade Final WS)
 Última atualização: Dezembro 2025
 ================================================================================
 """
@@ -68,6 +68,9 @@ class InMemoryLogHandler(logging.Handler):
             '%(asctime)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%dT%H:%M:%S'
         )
+        # ✅ ADICIONE: Lista de callbacks ativos
+        self.ws_callbacks = []
+        self.ws_lock = Lock()
         
     def emit(self, record):
         try:
@@ -80,6 +83,20 @@ class InMemoryLogHandler(logging.Handler):
             self.logs.append(log_entry)
             if len(self.logs) > self.max_logs:
                 self.logs.pop(0)
+            
+            # ✅ ADICIONE: Notifica todos os WebSockets ativos
+            with self.ws_lock:
+                dead_callbacks = []
+                for cb in self.ws_callbacks:
+                    try:
+                        cb(log_entry)
+                    except:
+                        dead_callbacks.append(cb)
+                
+                # Remove callbacks mortos
+                for cb in dead_callbacks:
+                    self.ws_callbacks.remove(cb)
+                    
         except Exception:
             self.handleError(record)
     
@@ -87,6 +104,16 @@ class InMemoryLogHandler(logging.Handler):
         if limit:
             return self.logs[-limit:]
         return self.logs.copy()
+        
+    # ✅ ADICIONE: Métodos para gerenciar callbacks
+    def add_ws_callback(self, callback):
+        with self.ws_lock:
+            self.ws_callbacks.append(callback)
+    
+    def remove_ws_callback(self, callback):
+        with self.ws_lock:
+            if callback in self.ws_callbacks:
+                self.ws_callbacks.remove(callback)
 
 # Configuração global de diretórios e logs
 LOGS_DIR = Path('logs')
@@ -1298,21 +1325,23 @@ class WebServer:
         @self.sock.route('/ws/logs')
         def ws_logs(ws):
             self.logger.info("📡 WebSocket logs conectado.")
+            
+            # ✅ Callback seguro para este WebSocket específico
+            def ws_callback(log_entry):
+                try:
+                    ws.send(json.dumps({"logs": [log_entry]}))
+                except ConnectionClosed:
+                    raise  # Propaga para remoção automática
+                except Exception as e:
+                    self.logger.error(f"Erro enviando log via WS: {e}")
+                    raise ConnectionClosed() # Força desconexão
+            
             try:
                 # Envia logs históricos
                 ws.send(json.dumps({"logs": memory_handler.get_logs()}))
                 
-                # Adiciona um handler temporário para enviar novos logs
-                def log_callback(record):
-                    try:
-                        log_entry = memory_handler.formatter.format(record)
-                        ws.send(json.dumps({"logs": [{"timestamp": datetime.now().strftime('%Y-%m-%dT%H:%M:%S'), "level": record.levelname, "message": log_entry}]}))
-                    except ConnectionClosed:
-                        raise
-                    except Exception as e:
-                        self.logger.error(f"Erro no callback de log: {e}")
-                        
-                memory_handler.emit = log_callback
+                # ✅ Registra callback
+                memory_handler.add_ws_callback(ws_callback)
                 
                 while True:
                     # Mantém a conexão aberta, esperando por mensagens (pode ser um ping/pong)
@@ -1320,6 +1349,8 @@ class WebServer:
             except ConnectionClosed:
                 pass
             finally:
+                # ✅ Remove callback ao desconectar
+                memory_handler.remove_ws_callback(ws_callback)
                 self.logger.debug("WebSocket logs desconectado")
 
         
