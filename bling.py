@@ -47,6 +47,12 @@ except ImportError:
     class ConnectionClosed(Exception): pass
 
 # ============================================================================ 
+# Variáveis globais de cache (Solução 1)
+PRODUCTS_CACHE = {}
+KITS_CACHE = {}
+CACHE_LAST_UPDATED = None
+
+# ============================================================================ 
 # 0. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
 # ============================================================================
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
@@ -1021,9 +1027,15 @@ class AutomationOrchestrator:
             })
         
         # ============================================================
-        # PASSO 4: Salvar cache em disco
+        # PASSO 4: Salvar cache em disco E em memória global
         # ============================================================
         save_products_cache(self.kits, self.products, self.config.PRODUCTS_CACHE_FILE)
+        
+        # Atualiza cache global em memória
+        global PRODUCTS_CACHE, KITS_CACHE, CACHE_LAST_UPDATED
+        PRODUCTS_CACHE = self.products
+        KITS_CACHE = self.kits
+        CACHE_LAST_UPDATED = datetime.now()
         
         self.logger.info("=" * 60)
         self.logger.info(f"✅ PROCESSAMENTO CONCLUÍDO:")
@@ -1032,10 +1044,12 @@ class AutomationOrchestrator:
         self.logger.info("=" * 60)
 
     def get_all_products(self) -> List[Dict[str, Any]]:
-        return self.products
+        global PRODUCTS_CACHE
+        return PRODUCTS_CACHE or self.products # Fallback para self.products se global estiver vazio
 
     def get_all_kits(self) -> List[Dict[str, Any]]:
-        return self.kits
+        global KITS_CACHE
+        return KITS_CACHE or self.kits # Fallback para self.kits se global estiver vazio
     
     def get_sales_history(self, access_token: str, days: int = 30) -> List[Dict[str, Any]]:
         """
@@ -1908,52 +1922,74 @@ class WebServer:
                 for order in all_orders:
                     # A estrutura do pedido de venda Bling v3 é diferente da v2.
                     # Vamos assumir que a lista de itens está em 'itens' dentro do objeto 'data'
+                    
+                    # Validar tipo de order
+                    if not isinstance(order, dict):
+                        logger.warning(f"Pedido em formato inesperado ignorado: {order}")
+                        continue
+                    
                     order_data = order.get('data', {})
+                    
+                    # Validar tipo de order_data
+                    if not isinstance(order_data, dict):
+                        logger.warning(f"Dados do pedido em formato inesperado ignorado: {order_data}")
+                        continue
+                    
                     items = order_data.get('itens', [])
                     
                     for item in items:
-                            # Normalização do campo 'produto' (CAUSA 1)
-                            produto = item.get('produto')
-                            if isinstance(produto, dict):
-                                produto_id = produto.get('id')
-                            elif isinstance(produto, str):
-                                # Se for string, não tem ID para buscar kit
-                                continue
-                            else:
-                                continue
+                        # Validar tipo de item
+                        if not isinstance(item, dict):
+                            logger.warning(f"Item em formato inesperado ignorado: {item}")
+                            continue
+                        
+                        # Normalização do campo 'produto' (CAUSA 1)
+                        produto = item.get('produto')
+                        if isinstance(produto, dict):
+                            produto_id = produto.get('id')
+                        elif isinstance(produto, str):
+                            # Se for string, não tem ID para buscar kit
+                            continue
+                        else:
+                            continue
+                            
+                        qtd_vendida = item.get('quantidade', 1)
+                        
+                        # Buscar se é kit
+                        kit = next((k for k in self.orchestrator.get_all_kits() if str(k.get('id')) == str(produto_id)), None)
+                        
+                        # Blindar acesso a componentes (CAUSA 3)
+                        # Validar tipo de kit antes de acessar .get()
+                        if kit and not isinstance(kit, dict):
+                            logger.warning(f"Kit em formato inesperado ignorado: {kit}")
+                            continue
+                        
+                        componentes = kit.get('componentes') if kit else None
+                        
+                        if kit and componentes and isinstance(componentes, list):
+                            for comp in componentes:
+                                # Blindar componente (CAUSA 2 e 3)
+                                if not isinstance(comp, dict):
+                                    self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {kit.get('sku')}: {comp}")
+                                    continue
+                                    
+                                comp_nome = comp.get('nome', 'Item não identificado')
+                                comp_sku = comp.get('sku', 'N/D')
+                                comp_qtd = comp.get('quantidade', 0) * qtd_vendida
                                 
-                            qtd_vendida = item.get('quantidade', 1)
-                            
-                            # Buscar se é kit
-                            kit = next((k for k in self.orchestrator.get_all_kits() if str(k.get('id')) == str(produto_id)), None)
-                            
-                            # Blindar acesso a componentes (CAUSA 3)
-                            componentes = kit.get('componentes') if kit else None
-                            
-                            if kit and componentes and isinstance(componentes, list):
-                                for comp in componentes:
-                                    # Blindar componente (CAUSA 2 e 3)
-                                    if not isinstance(comp, dict):
-                                        self.orchestrator.logger.warning(f"Componente inválido encontrado no kit {kit.get('sku')}: {comp}")
-                                        continue
-                                        
-                                    comp_nome = comp.get('nome', 'Item não identificado')
-                                    comp_sku = comp.get('sku', 'N/D')
-                                    comp_qtd = comp.get('quantidade', 0) * qtd_vendida
-                                    
-                                    # Usar SKU como chave para evitar problemas com nomes duplicados
-                                    key = comp_sku if comp_sku != 'N/D' else comp_nome
-                                    
-                                    if key not in component_usage:
-                                        component_usage[key] = {
-                                            'nome': comp_nome,
-                                            'sku': comp_sku,
-                                            'quantidade': 0,
-                                            'produtos': set()
-                                        }
-                                    
-                                    component_usage[key]['quantidade'] += comp_qtd
-                                    component_usage[key]['produtos'].add(kit.get('produto', 'N/D'))
+                                # Usar SKU como chave para evitar problemas com nomes duplicados
+                                key = comp_sku if comp_sku != 'N/D' else comp_nome
+                                
+                                if key not in component_usage:
+                                    component_usage[key] = {
+                                        'nome': comp_nome,
+                                        'sku': comp_sku,
+                                        'quantidade': 0,
+                                        'produtos': set()
+                                    }
+                                
+                                component_usage[key]['quantidade'] += comp_qtd
+                                component_usage[key]['produtos'].add(kit.get('produto', 'N/D'))
                 
                 # Converter sets para listas
                 result = []
