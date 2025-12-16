@@ -88,15 +88,15 @@ class InMemoryLogHandler(logging.Handler):
             with self.ws_lock:
                 dead_callbacks = []
                 for cb in self.ws_callbacks:
-                    try:
-                        cb(log_entry)
-                    except:
-                        dead_callbacks.append(cb)
+try:
+    cb(log_entry)
+except:
+    dead_callbacks.append(cb)
                 
                 # Remove callbacks mortos
                 for cb in dead_callbacks:
-                    self.ws_callbacks.remove(cb)
-                    
+self.ws_callbacks.remove(cb)
+
         except Exception:
             self.handleError(record)
     
@@ -394,50 +394,50 @@ class BlingAPIClient:
                 response = self.session.request(method, url, headers=headers, timeout=self.config.REQUEST_TIMEOUT, **kwargs)
                 
                 if response.status_code == 401:
-                    self.logger.warning(f"Token expirado ou inválido ao acessar {endpoint}. Tentando refresh...")
-                    if self.auth.refresh_token():
-                        token = self.auth.get_access_token()
-                        headers['Authorization'] = f'Bearer {token}'
-                        self.logger.info("Token renovado com sucesso. Tentando novamente a requisição.")
-                        continue # Tenta novamente com o novo token
-                    else:
-                        self.logger.error("Falha ao renovar o token. Requer autenticação manual.")
-                        return None
+self.logger.warning(f"Token expirado ou inválido ao acessar {endpoint}. Tentando refresh...")
+if self.auth.refresh_token():
+    token = self.auth.get_access_token()
+    headers['Authorization'] = f'Bearer {token}'
+    self.logger.info("Token renovado com sucesso. Tentando novamente a requisição.")
+    continue # Tenta novamente com o novo token
+else:
+    self.logger.error("Falha ao renovar o token. Requer autenticação manual.")
+    return None
                 
                 response.raise_for_status()
                 
                 # Tenta retornar JSON, se falhar, retorna um objeto vazio ou um indicador de sucesso
                 try:
-                    return response.json()
+return response.json()
                 except requests.exceptions.JSONDecodeError:
-                    self.logger.debug(f"Resposta não é JSON para {endpoint}. Status: {response.status_code}")
-                    return {} # Retorna vazio para 204 No Content, por exemplo
+self.logger.debug(f"Resposta não é JSON para {endpoint}. Status: {response.status_code}")
+return {} # Retorna vazio para 204 No Content, por exemplo
                 
             except requests.exceptions.HTTPError as e:
                 self.logger.error(f"Erro HTTP ao acessar {endpoint}: {e}")
                 if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
-                    # ✅ Rate limit especial: aguarda mais tempo
-                    if response.status_code == 429:
-                        # Prioriza Retry-After, senão usa backoff exponencial (5s, 10s, 20s...)
-                        retry_after = response.headers.get('Retry-After')
-                        wait_time = 5.0 * (2 ** attempt)
-                        if retry_after:
-                            try:
-                                wait_time = max(wait_time, float(retry_after))
-                                self.logger.warning(f"⚠️ Status 429. Bling sugeriu Retry-After: {wait_time:.2f}s. Aguardando...")
-                            except ValueError:
-                                self.logger.warning(f"⚠️ Status 429. Retry-After inválido. Usando backoff: {wait_time:.2f}s.")
-                        else:
-                            self.logger.warning(f"⚠️ Status 429. Retry-After ausente. Usando backoff: {wait_time:.2f}s.")
-                        delay = wait_time
-                    else:
-                        delay = self.config.BASE_DELAY * (2 ** attempt)
-                    
-                    if response.status_code != 429:
-                        self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
-                    time.sleep(delay)
+# ✅ Rate limit especial: aguarda mais tempo
+if response.status_code == 429:
+    # Prioriza Retry-After, senão usa backoff exponencial (5s, 10s, 20s...)
+    retry_after = response.headers.get('Retry-After')
+    wait_time = 5.0 * (2 ** attempt)
+    if retry_after:
+try:
+    wait_time = max(wait_time, float(retry_after))
+    self.logger.warning(f"⚠️ Status 429. Bling sugeriu Retry-After: {wait_time:.2f}s. Aguardando...")
+except ValueError:
+    self.logger.warning(f"⚠️ Status 429. Retry-After inválido. Usando backoff: {wait_time:.2f}s.")
+    else:
+self.logger.warning(f"⚠️ Status 429. Retry-After ausente. Usando backoff: {wait_time:.2f}s.")
+    delay = wait_time
+else:
+    delay = self.config.BASE_DELAY * (2 ** attempt)
+
+if response.status_code != 429:
+    self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
+time.sleep(delay)
                 else:
-                    return None
+return None
             except RequestException as e:
                 self.logger.error(f"Erro de conexão ao acessar {endpoint}: {e}")
                 return None
@@ -697,7 +697,7 @@ class SalesManager:
                 continue
             
             data_emissao_str = None
-                            
+
             data_obj = order.get('data')
             if isinstance(data_obj, dict):
                 data_emissao_str = data_obj.get('dataEmissao')
@@ -705,32 +705,32 @@ class SalesManager:
             elif isinstance(data_obj, str):
                 data_emissao_str = data_obj
                 hora_emissao = None
-                            
+
             if not data_emissao_str:
                 self.logger.debug(f"Pedido {order.get('id')} sem dataEmissao. Estrutura: {order.keys()}")
                 continue
-                            
+
             try:
                 order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-                                    
+        
                 if hora_emissao and isinstance(hora_emissao, str):
-                    try:
-                        parts = hora_emissao.split(':')
-                        if len(parts) == 3:
-                            h, m, s = map(int, parts)
-                            order_date = order_date.replace(hour=h, minute=m, second=s)
-                    except (ValueError, AttributeError):
-                        pass
+try:
+    parts = hora_emissao.split(':')
+    if len(parts) == 3:
+h, m, s = map(int, parts)
+order_date = order_date.replace(hour=h, minute=m, second=s)
+except (ValueError, AttributeError):
+    pass
             except Exception as e:
                 self.logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
                 continue
 
             if order_date >= last_month:
                 historic += 1 
-                            
+
             if order_date >= last_week:
                 weekly += 1
-                            
+
             if order_date >= yesterday:
                 daily += 1 
 
@@ -885,30 +885,29 @@ class Orchestrator:
                 params['pagina'] = page
                 response = self.api.get('pedidos/vendas', params=params)
                 
-            if response is None:
+                    if response is None:
                     self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
-                break
-                            
+                    break
+
                 data = safe_get(response, 'data', [])
                 
-                if not data:
-                    self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
-                break
-                            
+                            self.logger.info(f"Página {page} de pedidos vazia. Fim da paginação.")
+        break
+
                 all_orders.extend(data)
                 self.logger.info(f"Página {page} de pedidos processada. Total: {len(all_orders)}")
                 
                 if len(data) < 100: # Assumindo 100 é o limite de página
-                break
-                    
+        break
+
                 page += 1
                 time.sleep(1.5) # ✅ Aumenta de 0.5s para 1.5s
                 
                 batch_count += 1
                 if batch_count >= MAX_PAGES_PER_BATCH:
-                    self.logger.info(f"⏸️ Pausa de 5s após {batch_count} páginas (rate limit)")
-                    time.sleep(5)  # Pausa de 5 segundos a cada 3 páginas
-                    batch_count = 0
+self.logger.info(f"⏸️ Pausa de 5s após {batch_count} páginas (rate limit)")
+time.sleep(5)  # Pausa de 5 segundos a cada 3 páginas
+batch_count = 0
                 
             self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
             
@@ -943,24 +942,24 @@ class Orchestrator:
             }
             response = self.api.get('produtos', params=params)
             
-            if response is None:
+                    if response is None:
                 self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
                 # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
-                break
-                        
+        break
+    
                 data = safe_get(response, 'data', [])
                 
                 if not data:
-                    self.logger.info(f"Página {page} de produtos vazia. Fim da paginação.")
-                break
-                        
+self.logger.info(f"Página {page} de pedidos vazia. Fim da paginação.")
+        break
+    
                 for item in data:
                 produto = safe_get(item, 'produto', {})
                 if safe_get(produto, 'tipo') == 'P': # Produto simples
-                    all_products.append(produto)
+all_products.append(produto)
                 elif safe_get(produto, 'tipo') == 'K': # Kit
-                    all_kits.append(produto)
-                    
+all_kits.append(produto)
+
             self.logger.info(f"Página {page} de produtos processada. Produtos: {len(all_products)}, Kits: {len(all_kits)}")
             
         if len(data) < 100:
@@ -1017,13 +1016,13 @@ class Orchestrator:
             params['pagina'] = page
             response = self.api.get('pedidos/vendas', params=params)
             
-            if response is None:
-                break
+                    if response is None:
+        break
                 
             data = safe_get(response, 'data', [])
             
             if not data:
-                break
+        break
                 
             all_orders.extend(data)
             
@@ -1044,34 +1043,34 @@ class Orchestrator:
                 quantidade_vendida = safe_get(item, 'quantidade', 0)
                 
                 if not produto_sku or quantidade_vendida == 0:
-                    continue
-                    
+continue
+
                 # Verificar se é um kit
                 kit = self.get_product_by_sku(produto_sku)
                 if kit and safe_get(kit, 'tipo') == 'K':
-                    componentes = safe_get(kit, 'componentes', [])
-                    for comp in safe_iter(componentes):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        comp_sku = safe_get(comp_produto, 'codigo')
-                        comp_nome = safe_get(comp_produto, 'nome')
-                        comp_quantidade_por_kit = safe_get(comp, 'quantidade', 0)
-                        
-                        if not comp_sku or comp_quantidade_por_kit == 0:
-                            continue
-                            
-                        quantidade_total_consumida = quantidade_vendida * comp_quantidade_por_kit
-                        
-                        if comp_sku not in component_usage:
-                            component_usage[comp_sku] = {
-                                "sku": comp_sku,
-                                "nome": comp_nome,
-                                "quantidade": 0,
-                                "produtos": set() # Usar set para evitar duplicatas
-                            }
-                            
-                        component_usage[comp_sku]["quantidade"] += quantidade_total_consumida
-                        component_usage[comp_sku]["produtos"].add(produto_sku)
-                        
+componentes = safe_get(kit, 'componentes', [])
+for comp in safe_iter(componentes):
+    comp_produto = safe_get(comp, 'produto', {})
+    comp_sku = safe_get(comp_produto, 'codigo')
+    comp_nome = safe_get(comp_produto, 'nome')
+    comp_quantidade_por_kit = safe_get(comp, 'quantidade', 0)
+    
+    if not comp_sku or comp_quantidade_por_kit == 0:
+continue
+
+    quantidade_total_consumida = quantidade_vendida * comp_quantidade_por_kit
+    
+    if comp_sku not in component_usage:
+component_usage[comp_sku] = {
+    "sku": comp_sku,
+    "nome": comp_nome,
+    "quantidade": 0,
+    "produtos": set() # Usar set para evitar duplicatas
+}
+
+    component_usage[comp_sku]["quantidade"] += quantidade_total_consumida
+    component_usage[comp_sku]["produtos"].add(produto_sku)
+    
         # 3. Formatar a saída
         result = []
         for sku, usage in component_usage.items():
@@ -1122,11 +1121,11 @@ class Orchestrator:
         with kpi_update_lock:
             for cb in kpi_update_callbacks:
                 try:
-                    cb(payload)
+cb(payload)
                 except ConnectionClosed:
-                    self.logger.debug("Conexão WebSocket fechada ao tentar enviar full_update.")
+self.logger.debug("Conexão WebSocket fechada ao tentar enviar full_update.")
                 except Exception as e:
-                    self.logger.error(f"Erro ao enviar full_update via callback: {e}")
+self.logger.error(f"Erro ao enviar full_update via callback: {e}")
 
 # ============================================================================ 
 # 8. WEB SERVER (FLASK)
@@ -1185,25 +1184,25 @@ class WebServer:
                 
             try:
                 with WebServer.code_lock:
-                    if code in WebServer.used_codes:
-                        return redirect('/')
-                    WebServer.used_codes.add(code)
+if code in WebServer.used_codes:
+    return redirect('/')
+WebServer.used_codes.add(code)
                 
                 self.logger.info(f"Processando callback code...")
                 success = self.orchestrator.auth.exchange_code_for_token(code, state)
                 
                 # Após a autenticação, envia um full_update para o frontend
                 if success:
-                    # ✅ 2. Após /callback, FORÇAR reload do cache e KPIs
-                    self.logger.info("✅ Autenticação bem-sucedida. Forçando carga inicial de dados (KPIs e Cache).")
-                    
-                    # Executa o recálculo e o cache em threads separadas para não bloquear o callback
-                    executor = ThreadPoolExecutor(max_workers=2)
-                    executor.submit(self.orchestrator.process_sales_orders)
-                    executor.submit(self.orchestrator.process_products_cache)
-                    executor.shutdown(wait=False)
-                    
-                    # O broadcast será feito no final de process_products_cache
+# ✅ 2. Após /callback, FORÇAR reload do cache e KPIs
+self.logger.info("✅ Autenticação bem-sucedida. Forçando carga inicial de dados (KPIs e Cache).")
+
+# Executa o recálculo e o cache em threads separadas para não bloquear o callback
+executor = ThreadPoolExecutor(max_workers=2)
+executor.submit(self.orchestrator.process_sales_orders)
+executor.submit(self.orchestrator.process_products_cache)
+executor.shutdown(wait=False)
+
+# O broadcast será feito no final de process_products_cache
                 
                 return redirect('/')
             except Exception as e:
@@ -1248,11 +1247,11 @@ class WebServer:
             moving_avg = []
             for i in range(len(daily)):
                 if i < 6:
-                    moving_avg.append(None)
+moving_avg.append(None)
                 else:
-                    avg = sum(daily[i-6:i+1]) / 7
-                    moving_avg.append(round(avg, 1))
-                    
+avg = sum(daily[i-6:i+1]) / 7
+moving_avg.append(round(avg, 1))
+
             # Cálculo de crescimento (últimos 7 dias vs 7 dias anteriores)
             last_week_sum = sum(daily[-7:])
             prev_week_sum = sum(daily[-14:-7])
@@ -1303,37 +1302,37 @@ class WebServer:
                 name = safe_get(product, 'nome', '').lower()
                 sku = safe_get(product, 'sku', '').lower()
                 if query in name or query in sku:
-                    results.append({
-                        "sku": product.get('sku'),
-                        "nome": product.get('nome'),
-                        "estoque": product.get('estoqueAtual'),
-                        "tipo": "Produto",
-                        "imagemURL": safe_get(product, 'imagem', {}).get('link')
-                    })
-                    
+results.append({
+    "sku": product.get('sku'),
+    "nome": product.get('nome'),
+    "estoque": product.get('estoqueAtual'),
+    "tipo": "Produto",
+    "imagemURL": safe_get(product, 'imagem', {}).get('link')
+})
+
             # Busca em kits
             for kit in self.orchestrator.get_all_kits():
                 name = safe_get(kit, 'nome', '').lower()
                 sku = safe_get(kit, 'sku', '').lower()
                 if query in name or query in sku:
-                    components = []
-                    for comp in safe_iter(safe_get(kit, 'componentes')):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        components.append({
-                            "sku": safe_get(comp_produto, 'codigo'),
-                            "nome": safe_get(comp_produto, 'nome'),
-                            "quantidade": safe_get(comp, 'quantidade')
-                        })
-                        
-                    results.append({
-                        "sku": kit.get('sku'),
-                        "nome": kit.get('nome'),
-                        "estoque": kit.get('estoqueAtual'),
-                        "tipo": "Kit",
-                        "imagemURL": safe_get(kit, 'imagem', {}).get('link'),
-                        "componentes": components
-                    })
-                    
+components = []
+for comp in safe_iter(safe_get(kit, 'componentes')):
+    comp_produto = safe_get(comp, 'produto', {})
+    components.append({
+"sku": safe_get(comp_produto, 'codigo'),
+"nome": safe_get(comp_produto, 'nome'),
+"quantidade": safe_get(comp, 'quantidade')
+    })
+    
+results.append({
+    "sku": kit.get('sku'),
+    "nome": kit.get('nome'),
+    "estoque": kit.get('estoqueAtual'),
+    "tipo": "Kit",
+    "imagemURL": safe_get(kit, 'imagem', {}).get('link'),
+    "componentes": components
+})
+
             return jsonify(results[:10]) # Limita a 10 resultados
 
         @self.app.route('/api/kits')
@@ -1377,30 +1376,30 @@ class WebServer:
             
             with WebServer.webhook_lock:
                 try:
-                    # 1. Validação da Assinatura (Recomendado)
-                    # signature = request.headers.get('X-Bling-Signature')
-                    # if not self._validate_signature(request.data, signature):
-                    #     self.logger.error("Webhook com assinatura inválida.")
-                    #     return jsonify({"error": "Assinatura inválida"}), 403
-                        
-                    data = request.json
-                    tipo = safe_get(data, 'tipo')
-                    
-                    self.logger.info(f"🔔 Webhook recebido: Tipo={tipo}")
-                    
-                    # Exemplo de processamento: Forçar recálculo de KPIs em caso de novo pedido
-                    if tipo == 'pedidoVenda':
-                        self.logger.info("Webhook de Pedido de Venda recebido. Forçando recálculo de KPIs.")
-                        # Executa o recálculo em uma thread separada
-                        executor = ThreadPoolExecutor(max_workers=1)
-                        executor.submit(self.orchestrator.process_sales_orders)
-                        executor.shutdown(wait=False)
-                        
-                    return jsonify({"status": "ok", "message": f"Webhook {tipo} recebido e processado."}), 200
-                    
+# 1. Validação da Assinatura (Recomendado)
+# signature = request.headers.get('X-Bling-Signature')
+# if not self._validate_signature(request.data, signature):
+#     self.logger.error("Webhook com assinatura inválida.")
+#     return jsonify({"error": "Assinatura inválida"}), 403
+    
+data = request.json
+tipo = safe_get(data, 'tipo')
+
+self.logger.info(f"🔔 Webhook recebido: Tipo={tipo}")
+
+# Exemplo de processamento: Forçar recálculo de KPIs em caso de novo pedido
+if tipo == 'pedidoVenda':
+    self.logger.info("Webhook de Pedido de Venda recebido. Forçando recálculo de KPIs.")
+    # Executa o recálculo em uma thread separada
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor.submit(self.orchestrator.process_sales_orders)
+    executor.shutdown(wait=False)
+    
+return jsonify({"status": "ok", "message": f"Webhook {tipo} recebido e processado."}), 200
+
                 except Exception as e:
-                    self.logger.error(f"Erro no processamento do webhook: {e}")
-                    return jsonify({"error": "Erro interno do servidor"}), 500
+self.logger.error(f"Erro no processamento do webhook: {e}")
+return jsonify({"error": "Erro interno do servidor"}), 500
 
     def _setup_websockets(self):
         """Configura os WebSockets para logs e atualizações de KPI."""
@@ -1412,12 +1411,12 @@ class WebServer:
             # ✅ Callback seguro para este WebSocket específico
             def ws_callback(log_entry):
                 try:
-                    ws.send(json.dumps({"logs": [log_entry]}))
+ws.send(json.dumps({"logs": [log_entry]}))
                 except ConnectionClosed:
-                    raise  # Propaga para remoção automática
+raise  # Propaga para remoção automática
                 except Exception as e:
-                    self.logger.error(f"Erro enviando log via WS: {e}")
-                    raise ConnectionClosed() # Força desconexão
+self.logger.error(f"Erro enviando log via WS: {e}")
+raise ConnectionClosed() # Força desconexão
             
             try:
                 # Envia logs históricos
@@ -1427,8 +1426,8 @@ class WebServer:
                 memory_handler.add_ws_callback(ws_callback)
                 
                 while True:
-                    # Mantém a conexão aberta, esperando por mensagens (pode ser um ping/pong)
-                    ws.receive(timeout=60) 
+# Mantém a conexão aberta, esperando por mensagens (pode ser um ping/pong)
+ws.receive(timeout=60) 
             except ConnectionClosed:
                 pass
             finally:
@@ -1444,13 +1443,13 @@ class WebServer:
             # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
-                    ws.send(json.dumps(payload))
+ws.send(json.dumps(payload))
                 except ConnectionClosed:
-                    # ✅ ADICIONE: Sinaliza para remover este callback
-                    raise
+# ✅ ADICIONE: Sinaliza para remover este callback
+raise
                 except Exception as e:
-                    self.logger.error(f"Erro enviando via WS: {e}")
-                    raise ConnectionClosed()  # Força desconexão
+self.logger.error(f"Erro enviando via WS: {e}")
+raise ConnectionClosed()  # Força desconexão
                 
             # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
             try:
@@ -1467,15 +1466,15 @@ class WebServer:
                 
             try:
                 while True:
-                    # Mantém a conexão aberta
-                    ws.receive(timeout=60)
+# Mantém a conexão aberta
+ws.receive(timeout=60)
             except ConnectionClosed:
                 pass
             finally:
                 # 3. Remove o callback ao desconectar
                 with kpi_update_lock:
-                    if kpi_callback in kpi_update_callbacks:
-                        kpi_update_callbacks.remove(kpi_callback)
+if kpi_callback in kpi_update_callbacks:
+    kpi_update_callbacks.remove(kpi_callback)
                 self.logger.info("WebSocket KPI desconectado.")
 
 # ============================================================================ 
@@ -1510,20 +1509,20 @@ DASHBOARD_TEMPLATE = r"""
         <div class="row mb-4">
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-daily">
-                     <h5>Pedidos Diários (Últimas 24h)</h5>
-                     <h3 id="kpi-daily" class="text-primary">0</h3>
+ <h5>Pedidos Diários (Últimas 24h)</h5>
+ <h3 id="kpi-daily" class="text-primary">0</h3>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-weekly">
-                     <h5>Pedidos Semanais (Últimos 7 dias)</h5>
-                     <h3 id="kpi-weekly" class="text-warning">0</h3>
+ <h5>Pedidos Semanais (Últimos 7 dias)</h5>
+ <h3 id="kpi-weekly" class="text-warning">0</h3>
                  </div>
              </div>
              <div class="col-md-4">
                  <div class="card p-3 text-center kpi-card kpi-historic">
-                     <h5>Pedidos Históricos (Últimos 30 dias)</h5>
-                     <h3 id="kpi-historic" class="text-success">0</h3>
+ <h5>Pedidos Históricos (Últimos 30 dias)</h5>
+ <h3 id="kpi-historic" class="text-success">0</h3>
                  </div>
              </div>
              <small class="text-muted mt-2">
@@ -1552,8 +1551,8 @@ DASHBOARD_TEMPLATE = r"""
         <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
             <div class="tab-pane fade show active" id="search">
                 <div class="input-group mb-3">
-                    <input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
-                    <button class="btn btn-primary" id="btn-search">Buscar</button>
+<input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
+<button class="btn btn-primary" id="btn-search">Buscar</button>
                 </div>
                 <div id="search-results"></div>
             </div>
@@ -1566,51 +1565,51 @@ DASHBOARD_TEMPLATE = r"""
 
             <div class="tab-pane fade" id="kpi-chart">
                 <div class="row">
-                    <div class="col-md-8">
-                        <div class="card">
-                            <div class="card-header bg-primary text-white">
-                                <h5>📈 Evolução de Pedidos (Últimos 30 dias)</h5>
-                            </div>
-                            <div class="card-body" style="height: 400px;">
-                                <canvas id="salesChart"></canvas>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-md-4">
-                        <div class="card">
-                            <div class="card-header bg-success">
-                                <h5>🎯 Métricas Rápidas</h5>
-                            </div>
-                            <div class="card-body">
-                                <div class="metric-box mb-3">
-                                    <div class="metric-label">Média Diária</div>
-                                    <div class="metric-value" id="avg-daily">0</div>
-                                </div>
-                                <div class="metric-box mb-3">
-                                    <div class="metric-label">Crescimento Semanal</div>
-                                    <div class="metric-value text-success" id="growth-weekly">+0%</div>
-                                </div>
-                                <div class="metric-box">
-                                    <div class="metric-label">Tendência</div>
-                                    <div class="metric-value" id="trend-indicator">📊 Estável</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
+<div class="col-md-8">
+    <div class="card">
+<div class="card-header bg-primary text-white">
+    <h5>📈 Evolução de Pedidos (Últimos 30 dias)</h5>
+</div>
+<div class="card-body" style="height: 400px;">
+    <canvas id="salesChart"></canvas>
+</div>
+    </div>
+</div>
+<div class="col-md-4">
+    <div class="card">
+<div class="card-header bg-success">
+    <h5>🎯 Métricas Rápidas</h5>
+</div>
+<div class="card-body">
+    <div class="metric-box mb-3">
+        <div class="metric-label">Média Diária</div>
+        <div class="metric-value" id="avg-daily">0</div>
+    </div>
+    <div class="metric-box mb-3">
+        <div class="metric-label">Crescimento Semanal</div>
+        <div class="metric-value text-success" id="growth-weekly">+0%</div>
+    </div>
+    <div class="metric-box">
+        <div class="metric-label">Tendência</div>
+        <div class="metric-value" id="trend-indicator">📊 Estável</div>
+    </div>
+</div>
+    </div>
+</div>
                 </div>
             </div>
             
             <div class="tab-pane fade" id="component-usage">
                 <div class="card">
-                    <div class="card-header bg-warning">
-                        <h5>🔧 Consumo de Componentes por Vendas (Últimos 30 dias)</h5>
-                        <small>Atualizado conforme pedidos são processados</small>
-                    </div>
-                    <div class="card-body">
-                        <div id="component-usage-content">
-                            <p class="text-center text-muted">Carregando dados...</p>
-                        </div>
-                    </div>
+<div class="card-header bg-warning">
+    <h5>🔧 Consumo de Componentes por Vendas (Últimos 30 dias)</h5>
+    <small>Atualizado conforme pedidos são processados</small>
+</div>
+<div class="card-body">
+    <div id="component-usage-content">
+<p class="text-center text-muted">Carregando dados...</p>
+    </div>
+</div>
                 </div>
             </div>
         </div>
@@ -1730,10 +1729,10 @@ DASHBOARD_TEMPLATE = r"""
         const toastHtml = `
             <div class="toast align-items-center ${bgClass} ${textClass} border-0" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
                 <div class="d-flex">
-                    <div class="toast-body">
-                        <strong>${title}:</strong> ${message}
-                    </div>
-                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+<div class="toast-body">
+    <strong>${title}:</strong> ${message}
+</div>
+<button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
                 </div>
             </div>
         `;
@@ -1813,37 +1812,37 @@ DASHBOARD_TEMPLATE = r"""
                 
                 // 2. Atualiza KPIs
                 if (data.sales_stats) {
-                    updateKpis(data.sales_stats);
-                    
-                    // Animação de atualização
-                    const cards = document.querySelectorAll('.kpi-card');
-                    cards.forEach(card => {
-                        card.style.backgroundColor = '#e8f5e9';
-                        setTimeout(() => {
-                            card.style.backgroundColor = '';
-                        }, 500);
-                    });
+updateKpis(data.sales_stats);
+
+// Animação de atualização
+const cards = document.querySelectorAll('.kpi-card');
+cards.forEach(card => {
+    card.style.backgroundColor = '#e8f5e9';
+    setTimeout(() => {
+card.style.backgroundColor = '';
+    }, 500);
+});
                 }
                 
                 // 3. Atualiza Uso de Componentes
                 if (data.component_usage) {
-                    updateComponentUsage(data.component_usage);
+updateComponentUsage(data.component_usage);
                 }
                 
                 // 4. Trata botões de recálculo
                 const recalculateButton = document.getElementById('recalculate-button');
                 if (recalculateButton && recalculateButton.disabled) {
-                    recalculateButton.disabled = false;
-                    recalculateButton.textContent = '🔄 Forçar Recálculo';
-                    showToast('Sucesso', 'Recálculo de KPIs concluído.', 'success');
+recalculateButton.disabled = false;
+recalculateButton.textContent = '🔄 Forçar Recálculo';
+showToast('Sucesso', 'Recálculo de KPIs concluído.', 'success');
                 }
                 
                 const forceLoadButton = document.querySelector('#kits button.btn-warning');
                 if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
-                    forceLoadButton.disabled = false;
-                    forceLoadButton.textContent = '🔄 Forçar Recarregamento';
-                    loadKits(); // Recarrega a lista de kits após a confirmação do WS
-                    showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
+forceLoadButton.disabled = false;
+forceLoadButton.textContent = '🔄 Forçar Recarregamento';
+loadKits(); // Recarrega a lista de kits após a confirmação do WS
+showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
                 }
             }
         };
@@ -1880,47 +1879,47 @@ DASHBOARD_TEMPLATE = r"""
                 const data = await fetchAPI(`${API}/product/search?q=${q}`);
                 
                 if(!data.length) {
-                    div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
-                    return;
+div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
+return;
                 }
                 
                 let html = '<div class="list-group">';
 
                 data.forEach(p => {
-                    const imgHtml = p.imagemURL 
-                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">` 
-                        : '<span class="text-muted">-</span>';
+const imgHtml = p.imagemURL 
+    ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">` 
+    : '<span class="text-muted">-</span>';
 
-                    html += `
-                        <div class="list-group-item">
-                            <div class="d-flex">
-                                ${imgHtml}
-                                
-                                <div class="flex-grow-1">
-                                    <div class="d-flex w-100 justify-content-between">
-                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                        <small>${p.sku || 'N/D'}</small>
-                                    </div>
+html += `
+    <div class="list-group-item">
+<div class="d-flex">
+    ${imgHtml}
+    
+    <div class="flex-grow-1">
+        <div class="d-flex w-100 justify-content-between">
+            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+            <small>${p.sku || 'N/D'}</small>
+        </div>
 
-                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
+        <p class="mb-1">${p.descricaoCurta || ''}</p>
 
-                                    <small class="text-muted d-block">
-                                        <b>Estoque:</b> ${p.estoque}  
-                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
-                                    </small>
+        <small class="text-muted d-block">
+            <b>Estoque:</b> ${p.estoque}  
+            <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+        </small>
 
-                                    ${p.componentes && p.componentes.length > 0 ? `
-                                        <div class="mt-2">
-                                            <b>Componentes:</b><br>
-                                            ${p.componentes.map(c => 
-                                                `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
-                                            ).join("<br>")}
-                                        </div>
-                                    ` : ""}
-                                </div>
-                            </div>
-                        </div>
-                    `;
+        ${p.componentes && p.componentes.length > 0 ? `
+            <div class="mt-2">
+                <b>Componentes:</b><br>
+                ${p.componentes.map(c => 
+`${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
+                ).join("<br>")}
+            </div>
+        ` : ""}
+    </div>
+</div>
+    </div>
+`;
                 });
 
                 html += '</div>';
@@ -1953,52 +1952,52 @@ DASHBOARD_TEMPLATE = r"""
                 const kitsOnly = data.filter(p => p.tipo === 'Kit' || (p.componentes && p.componentes.length > 0));
                 
                 if (!kitsOnly || kitsOnly.length === 0) {
-                    div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
-                    return;
+div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
+return;
                 }
                 let html = `
                 <table class="table table-sm">
                 <thead>
                 <tr>
-                    <th>IMG</th>
-                    <th>SKU</th>
-                    <th>Nome</th>
-                    <th>Componentes / Tipo</th>
+<th>IMG</th>
+<th>SKU</th>
+<th>Nome</th>
+<th>Componentes / Tipo</th>
                 </tr>
                 </thead>
                 <tbody>
                 `;
 
                 kitsOnly.forEach(k => {
-                    const imgHtml = k.imagemURL 
-                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
-                        : '<span class="text-muted">-</span>';
+const imgHtml = k.imagemURL 
+    ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
+    : '<span class="text-muted">-</span>';
 
-                    let comps = '';
-                    if (k.componentes && k.componentes.length > 0) {
-                        const componentes_validos = k.componentes;
-                        
-                        if (componentes_validos.length > 0) {
-                            comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
-                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
-                                .join('<br>');
-                        } else {
-                            comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
-                        }
-                    } else {
-                        // ✅ 4. Frontend: ignorar “Produto simples / estoque”
-                        // Se não é kit, não renderiza a linha (o filter já removeu, mas para segurança)
-                        return; 
-                    }
+let comps = '';
+if (k.componentes && k.componentes.length > 0) {
+    const componentes_validos = k.componentes;
+    
+    if (componentes_validos.length > 0) {
+comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
+    .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+    .join('<br>');
+    } else {
+comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
+    }
+} else {
+    // ✅ 4. Frontend: ignorar “Produto simples / estoque”
+    // Se não é kit, não renderiza a linha (o filter já removeu, mas para segurança)
+    return; 
+}
 
-                    html += `
-                        <tr>
-                            <td style="width:60px">${imgHtml}</td>
-                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-                            <td>${k.nome || 'N/D'}</td>
-                            <td>${comps}</td>
-                        </tr>
-                    `;
+html += `
+    <tr>
+<td style="width:60px">${imgHtml}</td>
+<td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+<td>${k.nome || 'N/D'}</td>
+<td>${comps}</td>
+    </tr>
+`;
                 });
 
                 html += '</tbody></table>';
@@ -2021,10 +2020,8 @@ DASHBOARD_TEMPLATE = r"""
             
             try {
                 const data = await fetchAPI('/api/force-load', { method: 'POST' });
-                
-                showToast('Info', data.message || 'Recarregamento forçado com sucesso. Aguarde a atualização via WebSocket.', 'info');
-                
-                // Não precisa chamar loadKits() aqui, o WS fará isso
+     showToast('Info', data.message || 'Recarregamento forçado com sucesso. Aguarde a atualização via WebSocket.', 'info');
+     // Não precisa chamar loadKits() aqui, o WS fará isso
                 
             } catch(e) {
                 showToast('Erro', 'Erro ao forçar recarregamento: ' + e.message, 'danger');
@@ -2048,35 +2045,35 @@ DASHBOARD_TEMPLATE = r"""
             salesChart = new Chart(ctx, {
                 type: 'line',
                 data: {
-                    labels: data.labels,
-                    datasets: [{
-                        label: 'Pedidos Diários',
-                        data: data.daily,
-                        borderColor: '#0d6efd',
-                        backgroundColor: 'rgba(13, 110, 253, 0.1)',
-                        tension: 0.4,
-                        fill: true
-                    }, {
-                        label: 'Média Móvel (7 dias)',
-                        data: data.moving_avg,
-                        borderColor: '#ffc107',
-                        borderDash: [5, 5],
-                        tension: 0.4
-                    }]
+labels: data.labels,
+datasets: [{
+    label: 'Pedidos Diários',
+    data: data.daily,
+    borderColor: '#0d6efd',
+    backgroundColor: 'rgba(13, 110, 253, 0.1)',
+    tension: 0.4,
+    fill: true
+}, {
+    label: 'Média Móvel (7 dias)',
+    data: data.moving_avg,
+    borderColor: '#ffc107',
+    borderDash: [5, 5],
+    tension: 0.4
+}]
                 },
                 options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { position: 'top' },
-                        tooltip: {
-                            mode: 'index',
-                            intersect: false
-                        }
-                    },
-                    scales: {
-                        y: { beginAtZero: true }
-                    }
+responsive: true,
+maintainAspectRatio: false,
+plugins: {
+    legend: { position: 'top' },
+    tooltip: {
+mode: 'index',
+intersect: false
+    }
+},
+scales: {
+    y: { beginAtZero: true }
+}
                 }
             });
             
@@ -2111,11 +2108,11 @@ DASHBOARD_TEMPLATE = r"""
                 
                 // Se o conteúdo ainda for o "Carregando dados...", inicia o timeout
                 if (contentDiv.innerHTML.includes('Carregando dados...')) {
-                    setTimeout(() => {
-                        if (contentDiv.innerHTML.includes('Carregando dados...')) {
-                            contentDiv.innerHTML = '<div class="alert alert-danger">❌ Não foi possível carregar o uso de componentes em tempo hábil. Verifique a autenticação e os logs.</div>';
-                        }
-                    }, 8000); // 8 segundos de timeout
+setTimeout(() => {
+    if (contentDiv.innerHTML.includes('Carregando dados...')) {
+contentDiv.innerHTML = '<div class="alert alert-danger">❌ Não foi possível carregar o uso de componentes em tempo hábil. Verifique a autenticação e os logs.</div>';
+    }
+}, 8000); // 8 segundos de timeout
                 }
             });
         }
