@@ -1227,6 +1227,7 @@ class WebServer:
         self.orchestrator = orchestrator
         self.logger = logging.getLogger('bling_automacao')
         self.app = flask_app
+        self.app.orchestrator = orchestrator # ✅ Anexa o orchestrator ao objeto Flask para acesso global
         self.sock = Sock(self.app)
         self._setup_routes()
         self._setup_websockets()
@@ -2260,47 +2261,56 @@ contentDiv.innerHTML = '<div class="alert alert-danger">❌ Não foi possível c
 
 # ============================================================================ 
 # 10. EXECUÇÃO
+# ============================================================================ 
+# 10. EXECUÇÃO
 # ============================================================================
-
-# Variáveis globais necessárias para o create_app
-config = Config()
-auth_manager = AuthManager(config)
-api_client = BlingAPIClient(config, auth_manager)
-sales_manager = SalesManager(config, logger)
-orchestrator = Orchestrator(config, auth_manager, api_client, sales_manager)
 
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
-    global orchestrator # Garante que estamos usando o objeto global
     
+    # 1. Inicializa as dependências na ordem correta
+    config = Config()
+    
+    # A variável 'logger' é global (definida na linha 160)
+    
+    auth_manager = AuthManager(config)
+    api_client = BlingAPIClient(config, auth_manager)
+    sales_manager = SalesManager(config, logger)
+    
+    # 2. Inicializa o Orchestrator (Worker)
+    orchestrator = Orchestrator(
+        config=config,
+        auth_manager=auth_manager,
+        api_client=api_client,
+        sales_manager=sales_manager,
+    )
+    
+    # 3. Inicializa o Flask
     flask_app = Flask(__name__)
-    # Inicializa o WebServer com o Flask app e o Orchestrator
+    
+    # 4. Inicializa o WebServer (Rotas e WebSockets)
     WebServer(config, orchestrator, flask_app) 
     
-    # LÓGICA DE INÍCIO DO WORKER (DEVE RODAR APENAS UMA VEZ)
-    # Garante que o worker de fundo só inicie em UMA instância Gunicorn, usando o 
-    # ambiente (os.environ) como flag persistente através dos processos (forks).
-    if os.environ.get('BLING_WORKER_STARTED') is None:
-        try:
-            orchestrator.start_worker()
-            logger.info("✅ Worker de fundo iniciado via create_app (Singleton).")
-            
-            # ✅ Inicia o timer de limpeza de callbacks
-            start_cleanup_timer()
-            
-            # Marca a flag no ambiente para que outros processos Gunicorn não iniciem
-            os.environ['BLING_WORKER_STARTED'] = 'True' 
-        except Exception as e:
-            logger.exception("❌ Falha ao iniciar worker.")
-    else:
-        logger.info("ℹ️ Worker de fundo já iniciado em outro processo Gunicorn. Pulando...")
+    # 5. LÓGICA DE INÍCIO DO WORKER (REMOVIDA DO STARTUP)
+    # O worker não deve iniciar automaticamente no startup.
+    # Ele deve ser iniciado apenas após a autenticação ou sob demanda.
+    # A chamada para orchestrator.start() e start_cleanup_timer() foi removida daqui.
     
     return flask_app
 
-# 1. DEFINE A VARIÁVEL GLOBAL 'app' (Gunicorn OBRIGATORIAMENTE procura por esta linha)
-app = create_app() 
+# Ponto de entrada para Gunicorn/WSGI
+app = create_app()
 
 if __name__ == '__main__':
     # Apenas para testes locais
+    
+    # Lógica de worker para ambiente local (apenas 1 processo)
+    # Garante que o worker inicie no ambiente local
+    orchestrator = app.orchestrator # Acessa o orchestrator criado em create_app
+    if not orchestrator.is_running():
+        orchestrator.start()
+        start_cleanup_timer()
+        logger.info("✅ Worker de fundo iniciado em modo local.")
+        
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
