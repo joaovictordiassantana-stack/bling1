@@ -597,7 +597,9 @@ class AuthManager:
             'redirect_uri': self.config.REDIRECT_URI,
         }
         
-        return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"oken(self, code: str) -> bool:
+        return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"
+    
+    def exchange_code_for_token(self, code: str) -> bool:
         """Troca o código de autorização por tokens de acesso e refresh."""
         
         # A validação do state (CSRF) foi movida para a rota /callback (WebServer)
