@@ -35,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 from functools import wraps
-from collections import defaultdict
 
 import requests
 from requests.exceptions import RequestException
@@ -582,10 +581,15 @@ class AuthManager:
         return None
     
     def get_authorization_url(self) -> str:
-        """Retorna a URL local para iniciar o fluxo de autorização."""
-        # A URL real do Bling será construída na rota /auth
-        from flask import url_for
-        return url_for('auth')
+        """Retorna a URL de autenticação (sem usar url_for fora do contexto)."""
+        from flask import has_request_context, url_for
+        
+        if has_request_context():
+            # Se estiver em contexto de request, usa url_for
+            return url_for('auth', _external=False)
+        else:
+            # Se estiver fora do contexto (worker/thread), retorna URL hardcoded
+            return '/auth'
 
     def create_auth_flow(self, state: str) -> str:
         """Cria a URL de autorização do Bling, usando o state gerado na sessão do Flask."""
