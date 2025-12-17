@@ -808,7 +808,7 @@ class Orchestrator:
     do cache de produtos/kits.
     """
     
-    def __init__(self, config: Config, auth_manager: AuthManager, api_client: BlingAPIClient, sales_manager: SalesManager):
+    def __init__(self, config: "Config", auth_manager: "AuthManager", api_client: "BlingAPIClient", sales_manager: "SalesManager"):
         self.config = config
         self.auth = auth_manager
         self.api = api_client
@@ -1222,7 +1222,7 @@ class WebServer:
     used_codes = set()
     webhook_lock = Lock()
     
-    def __init__(self, config: Config, orchestrator: Orchestrator, flask_app: Flask):
+    def __init__(self, config: "Config", orchestrator: "Orchestrator", flask_app: Flask):
         self.config = config
         self.orchestrator = orchestrator
         self.logger = logging.getLogger('bling_automacao')
