@@ -1064,23 +1064,58 @@ class Orchestrator:
                 self.logger.info(f"Página {page} vazia. Fim da paginação.")
                 break
                 
-            for item in data:
-                # A API retorna {"produto": {...}}
-                produto = item.get('produto') if isinstance(item, dict) else item
-                if not produto or not isinstance(produto, dict):
+                    for item in data:
+                if not isinstance(item, dict):
                     continue
                 
-                tipo = produto.get('tipo')
-                sku = produto.get('sku') or produto.get('codigo')
+                # ✅ CORREÇÃO: API retorna os dados direto, sem nested "produto"
+                tipo = item.get('tipo')
+                sku = item.get('codigo')  # ✅ Campo correto na API Bling
+                nome = item.get('nome')
                 
-                # Valida que tem SKU e tipo válido
+                # Valida campos obrigatórios
                 if not sku or not tipo:
                     continue
                 
+                # ✅ Normaliza o item para o formato esperado
+                produto_normalizado = {
+                    'sku': sku,
+                    'codigo': sku,
+                    'nome': nome,
+                    'tipo': tipo,
+                    'id': item.get('id'),
+                    'preco': item.get('preco', 0),
+                    'precoCusto': item.get('precoCusto', 0),
+                    'estoque': item.get('estoque', {}),
+                    'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
+                    'situacao': item.get('situacao'),
+                    'formato': item.get('formato'),
+                    'descricaoCurta': item.get('descricaoCurta', ''),
+                    'imagemURL': item.get('imagemURL', ''),
+                    'imagem': {'link': item.get('imagemURL', '')}
+                }
+                
                 if tipo == 'P':  # Produto simples
-                    all_products.append(produto)
+                    all_products.append(produto_normalizado)
                 elif tipo == 'K':  # Kit
-                    all_kits.append(produto)
+                    # ✅ Processa componentes do kit
+                    componentes_raw = item.get('componentes', [])
+                    componentes_processados = []
+                    
+                    for comp in safe_iter(componentes_raw):
+                        comp_produto = safe_get(comp, 'produto', {})
+                        componentes_processados.append({
+                            'produto': {
+                                'codigo': safe_get(comp_produto, 'codigo'),
+                                'nome': safe_get(comp_produto, 'nome')
+                            },
+                            'sku': safe_get(comp_produto, 'codigo'),
+                            'nome': safe_get(comp_produto, 'nome'),
+                            'quantidade': safe_get(comp, 'quantidade', 0)
+                        })
+                    
+                    produto_normalizado['componentes'] = componentes_processados
+                    all_kits.append(produto_normalizado)                   all_kits.append(produto)
 
             self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
             
@@ -1462,7 +1497,9 @@ class WebServer:
             executor.shutdown(wait=False)
             
             return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 200
-        def api_product_search(token):
+        @self.app.route('/api/products/search')
+        @token_required
+        def api_products_search(token):
             """Busca produtos e kits no cache pelo SKU ou nome."""
             query = request.args.get('q', '').lower()
             if not query:
@@ -2077,7 +2114,7 @@ showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
             div.innerHTML = 'Buscando...';
             
             try {
-                const data = await fetchAPI(`${API}/product/search?q=${q}`);
+                const data = await fetchAPI(`${API}/products/search?q=${q}`);
                 
                 if(!data.length) {
 div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
