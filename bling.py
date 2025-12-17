@@ -90,7 +90,8 @@ class InMemoryLogHandler(logging.Handler):
                 for cb in self.ws_callbacks:
                     try:
                         cb(log_entry)
-                    except:
+                    except Exception:
+                        logger.exception("Erro ao notificar callback WebSocket")
                         dead_callbacks.append(cb)
                 
                 # Remove callbacks mortos
@@ -209,6 +210,11 @@ class Config:
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
+    # Rate Limiting (Configurável)
+    MAX_PAGES_PER_BATCH: int = 3 # Máximo de páginas antes da pausa
+    DELAY_BETWEEN_PAGES: float = 2.5 # Delay entre requisições de página (em segundos)
+    DELAY_BETWEEN_BATCHES: float = 8.0 # Pausa longa após o batch (em segundos)
+    
     # Automação
     
     
@@ -236,7 +242,7 @@ def load_tokens_safe(path: Path | str = "tokens.json"):
             data = json.load(f) or {}
             return data
     except Exception as e:
-        logger.error(f"Erro lendo {path.name}: {e}")
+        logger.exception(f"Erro lendo {path.name}.")
         return {}
 
 def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
@@ -246,7 +252,7 @@ def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
             json.dump(data, file, indent=4, ensure_ascii=False)
         logger.info("Tokens salvos com sucesso.")
     except Exception as e:
-        logger.error(f"Erro ao salvar tokens: {e}")
+        logger.exception("Erro ao salvar tokens.")
 
 def load_stats_safe(path: Path):
     """Carrega as estatísticas de vendas de forma segura."""
@@ -260,7 +266,7 @@ def load_stats_safe(path: Path):
                  data['last_recalculated'] = datetime.fromisoformat(data['last_recalculated'])
             return data
     except Exception as e:
-        logger.error(f"Erro lendo {path.name}: {e}")
+        logger.exception(f"Erro lendo {path.name}.")
         return None
 
 def save_stats(data: Dict[str, Any], path: Path):
@@ -275,7 +281,7 @@ def save_stats(data: Dict[str, Any], path: Path):
             json.dump(data_to_save, file, indent=4, ensure_ascii=False)
         logger.info("Estatísticas de KPIs salvas com sucesso.")
     except Exception as e:
-        logger.error(f"Erro ao salvar estatísticas de KPIs: {e}")
+        logger.exception("Erro ao salvar estatísticas de KPIs.")
 
 def safe_dict(data):
     """
@@ -327,7 +333,7 @@ def save_products_cache(cache_file, products, kits):
             json.dump(payload, f, ensure_ascii=False, indent=2)
         logger.info(f"Cache de produtos e kits salvo com sucesso. Total: {total_produtos}")
     except Exception as e:
-        logger.error(f"Erro ao salvar cache de produtos: {e}")
+        logger.exception("Erro ao salvar cache de produtos.")
 
 def safe_iter(data):
     """Garante que o dado é iterável (lista ou tupla), senão retorna lista vazia."""
@@ -358,10 +364,37 @@ def token_required(f):
     return decorated
 
 # ============================================================================ 
-# 4. BLING API CLIENT
+# 4. BLING# 4. API CLIENT
 # ============================================================================
 
-class BlingAPIClient:
+class MetricsManager:
+    """Gerencia métricas básicas de observabilidade."""
+    def __init__(self):
+        self.requests_total = 0
+        self.status_codes = defaultdict(int)
+        self.latency_sum = 0.0
+        self.latency_count = 0
+        self.lock = Lock()
+
+    def record_request(self, status_code: int, latency: float):
+        with self.lock:
+            self.requests_total += 1
+            self.status_codes[status_code] += 1
+            self.latency_sum += latency
+            self.latency_count += 1
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self.lock:
+            avg_latency = self.latency_sum / self.latency_count if self.latency_count > 0 else 0.0
+            return {
+                "requests_total": self.requests_total,
+                "status_codes": dict(self.status_codes),
+                "avg_latency_ms": round(avg_latency * 1000, 2),
+                "errors_401": self.status_codes[401],
+                "errors_429": self.status_codes[429],
+            }
+
+class ApiClient:
     """
     Cliente HTTP para a API Bling v3 com retry, rate limiting e refresh de token.
     """
@@ -370,6 +403,7 @@ class BlingAPIClient:
         self.config = config
         self.auth = auth_manager
         self.logger = logging.getLogger('bling_automacao')
+        self.metrics = MetricsManager() # Inicializa o gerenciador de métricas
         self.session = requests.Session()
         self.session.headers.update({
             'Content-Type': 'application/json',
@@ -390,8 +424,11 @@ class BlingAPIClient:
         headers = {'Authorization': f'Bearer {token}'}
         
         for attempt in range(self.config.MAX_RETRIES):
+            start_time = time.time()
             try:
                 response = self.session.request(method, url, headers=headers, timeout=self.config.REQUEST_TIMEOUT, **kwargs)
+                latency = time.time() - start_time
+                self.metrics.record_request(response.status_code, latency)
                 
                 if response.status_code == 401:
                     self.logger.warning(f"Token expirado ou inválido ao acessar {endpoint}. Tentando refresh...")
@@ -414,7 +451,7 @@ class BlingAPIClient:
                     return {} # Retorna vazio para 204 No Content, por exemplo
                 
             except requests.exceptions.HTTPError as e:
-                self.logger.error(f"Erro HTTP ao acessar {endpoint}: {e}")
+                self.logger.exception(f"Erro HTTP ao acessar {endpoint}.")
                 if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
 # ✅ Rate limit especial: aguarda mais tempo
                     if response.status_code == 429:
@@ -439,7 +476,7 @@ class BlingAPIClient:
                 else:
                     return None
             except RequestException as e:
-                self.logger.error(f"Erro de conexão ao acessar {endpoint}: {e}")
+                self.logger.exception(f"Erro de conexão ao acessar {endpoint}.")
                 return None
                 
         self.logger.error(f"Falha na requisição após {self.config.MAX_RETRIES} tentativas para {endpoint}.")
@@ -530,11 +567,16 @@ class AuthManager:
     def exchange_code_for_token(self, code: str, state: str) -> bool:
         """Troca o código de autorização por tokens de acesso e refresh."""
         
-        # Validação do state (medida de segurança)
+        # Validação do state (medida de segurança CSRF)
         saved_state = self._tokens.get('state')
         if saved_state and state != saved_state:
-            self.logger.info(f"ℹ️ State diferente detectado (Saved: {saved_state}, Received: {state}). Ignorando validação (ambiente WSGI).")
-            # Não retorna False, apenas avisa (conforme instrução)
+            self.logger.error(f"❌ State inválido detectado! CSRF potencial. Saved: {saved_state}, Received: {state}. Abortando.")
+            return False # CRÍTICO: Recusa se o state não bater
+        
+        # Limpa o state após o uso
+        if 'state' in self._tokens:
+            del self._tokens['state']
+            self._save_tokens()
         
         return self._perform_token_request(
             grant_type='authorization_code',
@@ -609,11 +651,12 @@ class AuthManager:
             return True
             
         except requests.exceptions.HTTPError as e:
-            self.logger.error(f"Erro HTTP na requisição de token: {e}. Resposta: {safe_dict(response.text)}")
+            self.logger.exception(f"Erro HTTP na requisição de token. Resposta: {safe_dict(response.text)}")
         except RequestException as e:
-            self.logger.error(f"Erro de conexão na requisição de token: {e}")
+            # Garante que 'response' não é acessado aqui
+            self.logger.exception(f"Erro de conexão na requisição de token.")
         except Exception as e:
-            self.logger.error(f"Erro inesperado na requisição de token: {e}")
+            self.logger.exception(f"Erro inesperado na requisição de token.")
             
         return False
 
@@ -642,7 +685,8 @@ class SalesManager:
     def __post_init__(self):
         # Carrega o estado persistido na inicialização
         self.lock = Lock()
-        self.recalculation_lock = Lock() 
+        self.recalculation_lock = Lock()
+        self._recalculation_running = False  # Flag de estado para controle de concorrência
         self._load_stats()
 
     def _load_stats(self):
@@ -800,6 +844,11 @@ class Orchestrator:
         with self._cache_lock:
             return list(self._kits_cache.values())
 
+    def is_cache_loaded(self) -> bool:
+        """Verifica se o cache de produtos/kits foi carregado (não está vazio)."""
+        with self._cache_lock:
+            return len(self._products_cache) > 0 or len(self._kits_cache) > 0
+
     def get_product_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
         """Busca um produto ou kit pelo SKU no cache."""
         with self._cache_lock:
@@ -813,6 +862,7 @@ class Orchestrator:
         """Inicia o worker de fundo para atualização de dados."""
         if not self._running:
             self._running = True
+            self._stop_event = Event() # Evento para sinalizar parada
             
             # ✅ ADICIONE: Verifica se é a primeira execução
             products_empty = len(self._products_cache) == 0
@@ -828,9 +878,13 @@ class Orchestrator:
     def stop_worker(self):
         """Para o worker de fundo."""
         self._running = False
-        if self._worker_thread:
+        if self._worker_thread and self._worker_thread.is_alive():
+            self._stop_event.set() # Sinaliza para o loop parar
             self._worker_thread.join(timeout=5)
-            self.logger.info("Worker de fundo parado.")
+            if self._worker_thread.is_alive():
+                self.logger.warning("Worker de fundo não parou em 5s. Forçando término.")
+            else:
+                self.logger.info("Worker de fundo parado com sucesso.")
 
     def is_running(self) -> bool:
         """Verifica se o worker está ativo."""
@@ -843,25 +897,28 @@ class Orchestrator:
             self.process_products_cache()
             self.logger.info("✅ Cache inicial carregado com sucesso!")
         except Exception as e:
-            self.logger.error(f"❌ Erro no carregamento inicial: {e}")
+            self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
         """Loop principal do worker de fundo."""
-        while self._running:
+        while not self._stop_event.is_set():
             
             self.process_sales_orders()
             self.process_products_cache()
             
             self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
-            time.sleep(600) # 10 minutos (600 segundos)
+            self._stop_event.wait(600) # 10 minutos (600 segundos) - Permite parada imediata
 
     
     def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
-        if not self.sales.recalculation_lock.acquire(blocking=False):
-            self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
-            return
+        # Verifica e marca o estado de recalculação dentro do lock
+        with self.sales.recalculation_lock:
+            if self.sales._recalculation_running:
+                self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
+                return
+            self.sales._recalculation_running = True
             
         try:
             # ✅ 1. Bloquear qualquer worker sem token
@@ -881,7 +938,7 @@ class Orchestrator:
             page = 1
             
             # ✅ Limita a 3 páginas por vez para evitar rate limit
-            MAX_PAGES_PER_BATCH = 3
+            MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
             batch_count = 0
             
             while True:
@@ -908,12 +965,12 @@ class Orchestrator:
                     break
 
                 page += 1
-                time.sleep(2.5) # ✅ Reduz risco de 429 para <5%
+                time.sleep(self.config.DELAY_BETWEEN_PAGES) # Delay configurável entre páginas
                 
                 batch_count += 1
                 if batch_count >= MAX_PAGES_PER_BATCH:
-                    self.logger.info(f"⏸️ Pausa de 8s após {batch_count} páginas (rate limit)")
-                    time.sleep(8)  # ✅ Garante recuperação completa do rate limit
+                    self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
+                    time.sleep(self.config.DELAY_BETWEEN_BATCHES) # Pausa configurável após o batch
                     batch_count = 0
                 
             self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
@@ -921,8 +978,12 @@ class Orchestrator:
             # Recalcula os KPIs
             self.sales.recalculate_from_orders(all_orders)
             
+        except Exception as e:
+            self.logger.exception(f"Erro durante recálculo de pedidos: {e}")
         finally:
-            self.sales.recalculation_lock.release()
+            # Libera a flag de estado dentro do lock
+            with self.sales.recalculation_lock:
+                self.sales._recalculation_running = False
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
@@ -939,7 +1000,7 @@ class Orchestrator:
         page = 1
         
         # ✅ Limita a 3 páginas por vez para evitar rate limit
-        MAX_PAGES_PER_BATCH = 3
+        MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
         batch_count = 0
         
         while True:
@@ -988,12 +1049,12 @@ class Orchestrator:
 
                 
             page += 1
-            time.sleep(2.5) # ✅ Reduz risco de 429 para <5%
+            time.sleep(self.config.DELAY_BETWEEN_PAGES) # Delay configurável entre páginas
             
             batch_count += 1
             if batch_count >= MAX_PAGES_PER_BATCH:
-                self.logger.info(f"⏸️ Pausa de 8s após {batch_count} páginas (rate limit)")
-                time.sleep(8)  # ✅ Garante recuperação completa do rate limit
+                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
+                time.sleep(self.config.DELAY_BETWEEN_BATCHES) # Pausa configurável após o batch
                 batch_count = 0
             
         self.logger.info(f"Busca de produtos finalizada. Total de produtos: {len(all_products)}, Total de kits: {len(all_kits)}")
@@ -1135,12 +1196,9 @@ class Orchestrator:
             stats_data['last_update'] = stats_data.pop('last_recalculated')
             payload["sales_stats"] = stats_data
             
-            # 3. Adiciona o uso de componentes (calculado sob demanda)
-            try:
-                usage_data = self.calculate_component_usage()
-                payload["component_usage"] = usage_data
-            except Exception as e:
-                self.logger.error(f"Erro ao calcular uso de componentes para WS: {e}")
+            # 3. Adiciona o uso de componentes (Calculado sob demanda via API /api/components/usage)
+            # NOTA: O cálculo é pesado e foi removido do fluxo de broadcast para evitar latência/rate limit.
+            self.logger.debug("Cálculo de uso de componentes omitido do broadcast para otimização.")
                 
         # 4. Envia o broadcast
         with kpi_update_lock:
@@ -1150,7 +1208,7 @@ class Orchestrator:
                 except ConnectionClosed:
                     self.logger.debug("Conexão WebSocket fechada ao tentar enviar full_update.")
                 except Exception as e:
-                    self.logger.error(f"Erro ao enviar full_update via callback: {e}")
+                    self.logger.exception("Erro ao enviar full_update via callback.")
 
 # ============================================================================ 
 # 8. WEB SERVER (FLASK)
@@ -1216,6 +1274,10 @@ class WebServer:
                 self.logger.info(f"Processando callback code...")
                 success = self.orchestrator.auth.exchange_code_for_token(code, state)
                 
+                if not success:
+                    self.logger.error("Falha na troca de token (CSRF ou erro de API). Redirecionando.")
+                    return redirect('/')
+                
                 # Após a autenticação, envia um full_update para o frontend
                 if success:
                     # ✅ 2. Após /callback, FORÇAR reload do cache e KPIs
@@ -1231,7 +1293,7 @@ class WebServer:
                 
                 return redirect('/')
             except Exception as e:
-                self.logger.error(f"Erro crítico no callback: {e}")
+                self.logger.exception("Erro crítico no callback.")
                 return redirect('/')
             finally:
                 token_exchange_lock.release()
@@ -1254,6 +1316,13 @@ class WebServer:
             
             return jsonify(stats)
         
+        @self.app.route("/api/metrics")
+        @token_required
+        def api_metrics(token):
+            """Retorna métricas de observabilidade da API."""
+            metrics = self.orchestrator.api.metrics.get_metrics()
+            return jsonify(metrics)
+
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
@@ -1300,20 +1369,21 @@ class WebServer:
         @token_required
         def api_recalculate(token):
             """Força o recálculo dos KPIs em uma thread separada."""
-            if self.orchestrator.sales.recalculation_lock.acquire(blocking=False):
-                self.orchestrator.sales.recalculation_lock.release()
+            
+            # Verifica e marca o estado de recalculação dentro do lock
+            with self.orchestrator.sales.recalculation_lock:
+                if self.orchestrator.sales._recalculation_running:
+                    self.logger.warning("Recálculo de KPIs já em andamento. Requisição ignorada.")
+                    return jsonify({"status": "already_running", "message": "Recálculo de KPIs já em andamento."}), 202
                 
-                # Executa o recálculo em uma thread separada para não bloquear a requisição HTTP
-                executor = ThreadPoolExecutor(max_workers=1)
-                executor.submit(self.orchestrator.process_sales_orders)
-                executor.shutdown(wait=False)
-                
-                return jsonify({"message": "Recálculo iniciado em segundo plano. Aguarde a atualização via WebSocket."}), 202
-            else:
-                return jsonify({"message": "Recálculo já em andamento. Por favor, aguarde."}), 429
+                self.orchestrator.sales._recalculation_running = True
 
-        @self.app.route('/api/product/search')
-        @token_required
+            # Executa o recálculo em uma thread separada para não bloquear a requisição HTTP
+            executor = ThreadPoolExecutor(max_workers=1)
+            executor.submit(self.orchestrator.process_sales_orders)
+            executor.shutdown(wait=False)
+            
+            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 200
         def api_product_search(token):
             """Busca produtos e kits no cache pelo SKU ou nome."""
             query = request.args.get('q', '').lower()
@@ -1372,11 +1442,28 @@ class WebServer:
             return jsonify(kits + products)
 
 
+        @self.app.route('/_health')
+        def health_check():
+            """Endpoint de health check para orquestradores."""
+            status = {
+                "status": "ok",
+                "worker_running": self.orchestrator.is_running(),
+                "auth_valid": self.orchestrator.auth.is_authenticated(),
+                "cache_loaded": self.orchestrator.is_cache_loaded()
+            }
+            return jsonify(status), 200
+
         @self.app.route('/api/force-load', methods=['POST'])
         @token_required
         def api_force_load(token):
             """Força o recarregamento do cache de produtos/kits em uma thread separada."""
             
+            # Verifica se o processamento já está em andamento sem alterar o estado do lock
+            if not self.orchestrator._cache_lock.acquire(blocking=False):
+                self.logger.warning("Recarregamento de cache já em andamento. Requisição ignorada.")
+                return jsonify({"message": "Recarregamento de cache já em andamento."}), 202
+            self.orchestrator._cache_lock.release() # Libera imediatamente (apenas para testar)
+
             # Executa o recarregamento em uma thread separada para não bloquear a requisição HTTP
             executor = ThreadPoolExecutor(max_workers=1)
             executor.submit(self.orchestrator.process_products_cache)
@@ -1423,7 +1510,7 @@ class WebServer:
                     return jsonify({"status": "ok", "message": f"Webhook {tipo} recebido e processado."}), 200
 
                 except Exception as e:
-                    self.logger.error(f"Erro no processamento do webhook: {e}")
+                    self.logger.exception("Erro no processamento do webhook.")
                     return jsonify({"error": "Erro interno do servidor"}), 500
 
     def _setup_websockets(self):
@@ -1433,6 +1520,11 @@ class WebServer:
         def ws_logs(ws):
             self.logger.info("📡 WebSocket logs conectado.")
             
+            # ✅ Limite de callbacks para evitar DoS acidental
+            if len(memory_handler.ws_callbacks) >= 10:
+                self.logger.warning("Limite de 10 conexões de log WS atingido. Conexão recusada.")
+                return
+
             # ✅ Callback seguro para este WebSocket específico
             def ws_callback(log_entry):
                 try:
@@ -1440,7 +1532,7 @@ class WebServer:
                 except ConnectionClosed:
                     raise  # Propaga para remoção automática
                 except Exception as e:
-                    self.logger.error(f"Erro enviando log via WS: {e}")
+                    self.logger.exception("Erro enviando log via WS.")
                     raise ConnectionClosed() # Força desconexão
             
             try:
@@ -1465,6 +1557,12 @@ class WebServer:
         def ws_kpi_updates(ws):
             self.logger.info("📡 WebSocket KPI conectado.")
             
+            # ✅ Limite de callbacks para evitar DoS acidental
+            global kpi_update_callbacks, kpi_update_lock
+            if len(kpi_update_callbacks) >= 10:
+                self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
+                return
+
             # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
@@ -1473,7 +1571,7 @@ class WebServer:
                     # ✅ ADICIONE: Sinaliza para remover este callback
                     raise
                 except Exception as e:
-                    self.logger.error(f"Erro enviando via WS: {e}")
+                    self.logger.exception("Erro enviando via WS.")
                     raise ConnectionClosed()  # Força desconexão
                 
             # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
@@ -1482,10 +1580,9 @@ class WebServer:
                 # O sales_stats é passado para garantir que os KPIs e o uso de componentes sejam calculados e enviados
                 self.orchestrator.broadcast_kpi_update(sales_stats=self.orchestrator.sales._get_state_for_save())
             except Exception as e:
-                self.logger.error(f"Erro ao enviar estado inicial via WS: {e}")
+                self.logger.exception("Erro ao enviar estado inicial via WS.")
                 
             # 2. Adiciona o callback à lista global
-            global kpi_update_callbacks, kpi_update_lock
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
                 
@@ -1515,7 +1612,7 @@ DASHBOARD_TEMPLATE = """
     <title>Painel Bling - Sw Móveis</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-    <style>body{background:#f8f9fa;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}.navbar{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.log-box{font-family:'Courier New',monospace;font-size:.85em;background:#1e1e1e;color:#d4d4d4;border-radius:.5rem;padding:1rem;max-height:400px;overflow-y:auto}.log-level-INFO{color:#4ec9b0}.log-level-WARNING{color:#dcdcaa}.log-level-ERROR{color:#f48771}.log-level-DEBUG{color:#569cd6}.hidden{display:none}.kpi-card{border-left:5px solid;transition:background-color .5s ease}.kpi-daily{border-left-color:#0d6efd}.kpi-weekly{border-left-color:#ffc107}.kpi-historic{border-left-color:#198754}footer{box-shadow:0 -1px 3px rgba(0,0,0,.05)}footer strong{color:#495057}footer p{margin-bottom:0}.metric-box{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:20px;border-radius:10px;color:white;text-align:center}.metric-label{font-size:.9em;opacity:.9;margin-bottom:5px}.metric-value{font-size:2em;font-weight:bold}.toast-container{z-index:1090}</style>
+    <style>body{background:#f8f9fa;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}.navbar{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.log-box{font-family:'Courier New',monospace;font-size:.85em;background:#1e1e1e;color:#d4d4d4;border-radius:.5rem;padding:1rem;max-height:400px;overflow-y:auto}.log-level-INFO{color:#4ec9b0}.log-level-WARNING{color:#dcdcaa}.log-level-ERROR{color:#f48771}.log-level-DEBUG{color:#569cd6}.hidden{display:none}.kpi-card{border-left:5px solid;transition:background-color .5s ease}.kpi-daily{border-left-color:#0d6efd}.kpi-weekly{border-left-color:#ffc107}.kpi-historic{border-left-color:#198754}footer{box-shadow:0 -1px 3px rgba(0,0,0,0.05)}footer strong{color:#495057}footer p{margin-bottom:0}.metric-box{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:20px;border-radius:10px;color:white;text-align:center}.metric-label{font-size:.9em;opacity:.9;margin-bottom:5px}.metric-value{font-size:2em;font-weight:bold}.toast-container{z-index:1090}</style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg">
@@ -1661,9 +1758,10 @@ DASHBOARD_TEMPLATE = """
             const response = await fetch(url, options);
 
             if (response.status === 401) {
-                // Sessão expirada ou não autenticado
-                // Não chama checkStatus, o WS fará o full_update
-                throw new Error("Sessão expirada. Por favor, autentique novamente.");
+                // Sessão expirada ou não autenticado. Força redirecionamento para reautenticar.
+                console.error("Sessão expirada (401). Redirecionando para autenticação.");
+                window.location.href = document.getElementById('auth-link').href;
+                throw new Error("Sessão expirada. Redirecionamento em curso.");
             }
 
             if (!response.ok) {
@@ -2193,7 +2291,7 @@ def create_app() -> Flask:
             # Marca a flag no ambiente para que outros processos Gunicorn não iniciem
             os.environ['BLING_WORKER_STARTED'] = 'True' 
         except Exception as e:
-            logger.error(f"❌ Falha ao iniciar worker: {e}")
+            logger.exception("❌ Falha ao iniciar worker.")
     else:
         logger.info("ℹ️ Worker de fundo já iniciado em outro processo Gunicorn. Pulando...")
     
