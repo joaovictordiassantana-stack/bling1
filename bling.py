@@ -604,7 +604,7 @@ class AuthManager:
         
         # A validação do state (CSRF) foi movida para a rota /callback (WebServer)
         
-        return self._perform_token_request(t(
+        return self._perform_token_request(
             grant_type='authorization_code',
             code=code,
             redirect_uri=self.config.REDIRECT_URI
