@@ -579,7 +579,10 @@ class AuthManager:
             if self.refresh_token():
                 return self._access_token
                 
-        return Non    def get_authorization_url(self) -> str:
+        return None
+
+
+def get_authorization_url(self) -> str:
         """Retorna a URL local para iniciar o fluxo de autorização."""
         # A URL real do Bling será construída na rota /auth
         from flask import url_for
