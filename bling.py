@@ -346,7 +346,9 @@ def safe_get(data, key, default=None):
     """Acesso seguro a chaves de dicionário."""
     if isinstance(data, dict):
         return data.get(key, default)
-    return defaultdef token_required(f):
+    return default
+
+def token_required(f):
     """Decorator para verificar se o token está ativo antes de acessar a rota."""
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -363,8 +365,7 @@ def safe_get(data, key, default=None):
             return jsonify({"error": "Token de acesso não encontrado"}), 401
             
         return f(*args, token=token, **kwargs)
-    return decorated========================================================================= 
-# 4. BLING# 4. API CLIENT
+    return decorated
 # ============================================================================
 
 class MetricsManager:
