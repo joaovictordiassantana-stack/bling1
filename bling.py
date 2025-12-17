@@ -501,6 +501,37 @@ class BlingAPIClient:
 class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
     
+    OAUTH_STATE_FILE: Path = Path('oauth_state.json')
+
+    def _save_oauth_state(self, state: str):
+        """Salva o state do OAuth de forma persistente em arquivo."""
+        try:
+            with open(self.OAUTH_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"state": state}, f)
+            self.logger.debug("State OAuth salvo em arquivo.")
+        except Exception as e:
+            self.logger.exception("Erro ao salvar state OAuth.")
+
+    def _load_oauth_state(self) -> Optional[str]:
+        """Carrega o state do OAuth do arquivo."""
+        if not self.OAUTH_STATE_FILE.exists():
+            return None
+        try:
+            with open(self.OAUTH_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("state")
+        except Exception as e:
+            self.logger.exception("Erro ao carregar state OAuth.")
+            return None
+
+    def _clean_oauth_state(self):
+        """Limpa o state do OAuth do arquivo."""
+        if self.OAUTH_STATE_FILE.exists():
+            try:
+                os.remove(self.OAUTH_STATE_FILE)
+                self.logger.debug("State OAuth limpo do arquivo.")
+            except Exception as e:
+                self.logger.exception("Erro ao limpar state OAuth.")
+    
     def __init__(self, config: Config):
         self.config = config
         self.logger = logging.getLogger('bling_automacao')
@@ -547,7 +578,9 @@ class AuthManager:
             if self.refresh_token():
                 return self._access_token
                 
-        return Non    def get_authorization_url(self) -> str:
+        return None
+    
+    def get_authorization_url(self) -> str:
         """Retorna a URL local para iniciar o fluxo de autorização."""
         # A URL real do Bling será construída na rota /auth
         from flask import url_for
@@ -1237,12 +1270,12 @@ class WebServer:
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
         @self.app.route('/auth')
         def auth():
-            from flask import session, redirect
+            from flask import redirect
             import secrets
             
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
-            session["oauth_state"] = state
+            self.orchestrator.auth._save_oauth_state(state)
             
             # 2. Constrói a URL de autorização usando o AuthManager
             auth_url = self.orchestrator.auth.create_auth_flow(state)
@@ -1252,19 +1285,21 @@ class WebServer:
         # Rota de Callback OAuth
         @self.app.route('/callback')
         def callback():
-            from flask import session, redirect
+            from flask import redirect
             
             code = request.args.get("code")
             received_state = request.args.get("state")
             
             # 1. VALIDAÇÃO DO STATE (CSRF)
-            saved_state = session.pop("oauth_state", None) # Limpa o state imediatamente
+            saved_state = self.orchestrator.auth._load_oauth_state()
             
             if not saved_state or saved_state != received_state:
                 self.logger.error(
                     f"❌ State inválido detectado! CSRF potencial. "
                     f"Saved: {saved_state}, Received: {received_state}"
                 )
+                # Limpa o state em caso de falha (boa prática)
+                self.orchestrator.auth._clean_oauth_state()
                 return redirect("/?error=csrf")
             
             if self.orchestrator.auth.is_authenticated():
@@ -1296,7 +1331,12 @@ class WebServer:
                 
                 if not success:
                     self.logger.error("Falha na troca de token (erro de API). Redirecionando.")
+                    # Limpa o state em caso de falha (boa prática)
+                    self.orchestrator.auth._clean_oauth_state()
                     return redirect('/')
+                
+                # 2. LIMPEZA DO STATE APÓS SUCESSO
+                self.orchestrator.auth._clean_oauth_state()
                 
                 # Após a autenticação, envia um full_update para o frontend
                 if success:
