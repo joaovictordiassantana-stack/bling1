@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from threading import Lock, Thread
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Callable
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import wraps
 
@@ -345,14 +346,15 @@ def safe_get(data, key, default=None):
     """Acesso seguro a chaves de dicionário."""
     if isinstance(data, dict):
         return data.get(key, default)
-    return default
-
-def token_required(f):
+    return defaultdef token_required(f):
     """Decorator para verificar se o token está ativo antes de acessar a rota."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        global orchestrator # Acessa a instância global
-        auth_manager = orchestrator.auth
+        from flask import current_app, jsonify
+        
+        # Acessa o orchestrator anexado ao objeto Flask
+        auth_manager = current_app.orchestrator.auth
+        
         if not auth_manager.is_authenticated():
             return jsonify({"error": "Não autenticado ou token expirado"}), 401
         
@@ -361,9 +363,7 @@ def token_required(f):
             return jsonify({"error": "Token de acesso não encontrado"}), 401
             
         return f(*args, token=token, **kwargs)
-    return decorated
-
-# ============================================================================ 
+    return decorated========================================================================= 
 # 4. BLING# 4. API CLIENT
 # ============================================================================
 
@@ -1045,8 +1045,18 @@ class Orchestrator:
                 self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
                 # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
                 break
+
+            # ✅ ADICIONE ESTE LOG TEMPORÁRIO PARA DEBUG:
+            if page == 1:  # Só loga a primeira página
+                import json
+                self.logger.info(f"🔍 DEBUG - Estrutura da resposta: {json.dumps(response, indent=2)[:500]}")
     
             data = safe_get(response, 'data', [])
+            
+            # ✅ ADICIONE ESTE LOG TAMBÉM:
+            if page == 1 and data:
+                import json
+                self.logger.info(f"🔍 DEBUG - Primeiro item: {json.dumps(data[0], indent=2)[:300]}")
             
             # Valida se retornou dados
             if not data or len(data) == 0:
