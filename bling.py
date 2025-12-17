@@ -1018,133 +1018,117 @@ class Orchestrator:
                 self.sales._recalculation_running = False
 
     def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos e kits."""
-        
-        # ✅ 1. Bloquear qualquer worker sem token
-        if not self.auth.is_authenticated():
-            self.logger.error("⛔ Worker abortado: token inexistente ou falha na renovação.")
-            return
-            
-        self.logger.info("Iniciando busca e cache de produtos e kits...")
-        
-        all_products = []
-        all_kits = []
-        page = 1
-        
-        # ✅ Limita a 3 páginas por vez para evitar rate limit
-        MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
-        batch_count = 0
-        
-        while True:
-            params = {
-                'pagina': page,
-                'tipo': 'produto,kit'
-            }
-            response = self.api.get('produtos', params=params)
-            
-            if response is None:
-                self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
-                # Se falhar, o loop é interrompido e o cache anterior será usado (pois não há save_products_cache)
-                break
-
-            # ✅ ADICIONE ESTE LOG TEMPORÁRIO PARA DEBUG:
-            if page == 1:  # Só loga a primeira página
-                import json
-                self.logger.info(f"🔍 DEBUG - Estrutura da resposta: {json.dumps(response, indent=2)[:500]}")
+    """Busca e armazena em cache todos os produtos e kits."""
     
-            data = safe_get(response, 'data', [])
-            
-            # ✅ ADICIONE ESTE LOG TAMBÉM:
-            if page == 1 and data:
-                import json
-                self.logger.info(f"🔍 DEBUG - Primeiro item: {json.dumps(data[0], indent=2)[:300]}")
-            
-            # Valida se retornou dados
-            if not data or len(data) == 0:
-                self.logger.info(f"Página {page} vazia. Fim da paginação.")
-                break
-                
-                    for item in data:
-                if not isinstance(item, dict):
-                    continue
-                
-                # ✅ CORREÇÃO: API retorna os dados direto, sem nested "produto"
-                tipo = item.get('tipo')
-                sku = item.get('codigo')  # ✅ Campo correto na API Bling
-                nome = item.get('nome')
-                
-                # Valida campos obrigatórios
-                if not sku or not tipo:
-                    continue
-                
-                # ✅ Normaliza o item para o formato esperado
-                produto_normalizado = {
-                    'sku': sku,
-                    'codigo': sku,
-                    'nome': nome,
-                    'tipo': tipo,
-                    'id': item.get('id'),
-                    'preco': item.get('preco', 0),
-                    'precoCusto': item.get('precoCusto', 0),
-                    'estoque': item.get('estoque', {}),
-                    'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
-                    'situacao': item.get('situacao'),
-                    'formato': item.get('formato'),
-                    'descricaoCurta': item.get('descricaoCurta', ''),
-                    'imagemURL': item.get('imagemURL', ''),
-                    'imagem': {'link': item.get('imagemURL', '')}
-                }
-                
-                if tipo == 'P':  # Produto simples
-                    all_products.append(produto_normalizado)
-                elif tipo == 'K':  # Kit
-                    # ✅ Processa componentes do kit
-                    componentes_raw = item.get('componentes', [])
-                    componentes_processados = []
-                    
-                    for comp in safe_iter(componentes_raw):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        componentes_processados.append({
-                            'produto': {
-                                'codigo': safe_get(comp_produto, 'codigo'),
-                                'nome': safe_get(comp_produto, 'nome')
-                            },
-                            'sku': safe_get(comp_produto, 'codigo'),
-                            'nome': safe_get(comp_produto, 'nome'),
-                            'quantidade': safe_get(comp, 'quantidade', 0)
-                        })
-                    
-                    produto_normalizado['componentes'] = componentes_processados
-                    all_kits.append(produto_normalizado)                   all_kits.append(produto)
-
-            self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
-            
-            # Se retornou menos que 100, é a última página
-            if len(data) < 100:
-                self.logger.info(f"Última página detectada ({len(data)} itens).")
-                break
-
-                
-            page += 1
-            time.sleep(self.config.DELAY_BETWEEN_PAGES) # Delay configurável entre páginas
-            
-            batch_count += 1
-            if batch_count >= MAX_PAGES_PER_BATCH:
-                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES) # Pausa configurável após o batch
-                batch_count = 0
-            
-        self.logger.info(f"Busca de produtos finalizada. Total de produtos: {len(all_products)}, Total de kits: {len(all_kits)}")
+    if not self.auth.is_authenticated():
+        self.logger.error("⛔ Worker abortado: token inexistente ou falha na renovação.")
+        return
         
-        # Salva o cache
-        with self._cache_lock:
-            self._products_cache = {p['sku']: p for p in all_products}
-            self._kits_cache = {k['sku']: k for k in all_kits}
-            # ✅ 3. Nunca salvar cache se produtos == 0 (proteção já implementada em save_products_cache)
-            save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+    self.logger.info("Iniciando busca e cache de produtos e kits...")
+    
+    all_products = []
+    all_kits = []
+    page = 1
+    
+    MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
+    batch_count = 0
+    
+    while True:
+        params = {
+            'pagina': page,
+            'tipo': 'P,K'
+        }
+        response = self.api.get('produtos', params=params)
+        
+        if response is None:
+            self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+            break
+
+        data = safe_get(response, 'data', [])
+        
+        if not data or len(data) == 0:
+            self.logger.info(f"Página {page} vazia. Fim da paginação.")
+            break
+        
+        # ✅ CORREÇÃO: Estrutura real da API Bling
+        for item in data:
+            if not isinstance(item, dict):
+                continue
             
-        # Notifica o frontend que o cache foi atualizado (e, por tabela, que o worker terminou)
-        self.broadcast_kpi_update(cache_updated=True)
+            # ✅ Acesso direto aos campos
+            tipo = item.get('tipo')
+            sku = item.get('codigo')
+            nome = item.get('nome')
+            
+            # Valida campos obrigatórios
+            if not sku or not tipo:
+                continue
+            
+            # ✅ Normaliza o item
+            produto_normalizado = {
+                'sku': sku,
+                'codigo': sku,
+                'nome': nome,
+                'tipo': tipo,
+                'id': item.get('id'),
+                'preco': item.get('preco', 0),
+                'precoCusto': item.get('precoCusto', 0),
+                'estoque': item.get('estoque', {}),
+                'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
+                'situacao': item.get('situacao'),
+                'formato': item.get('formato'),
+                'descricaoCurta': item.get('descricaoCurta', ''),
+                'imagemURL': item.get('imagemURL', ''),
+                'imagem': {'link': item.get('imagemURL', '')}
+            }
+            
+            if tipo == 'P':
+                all_products.append(produto_normalizado)
+            elif tipo == 'K':
+                # Processa componentes
+                componentes_raw = item.get('componentes', [])
+                componentes_processados = []
+                
+                for comp in safe_iter(componentes_raw):
+                    comp_produto = safe_get(comp, 'produto', {})
+                    componentes_processados.append({
+                        'produto': {
+                            'codigo': safe_get(comp_produto, 'codigo'),
+                            'nome': safe_get(comp_produto, 'nome')
+                        },
+                        'sku': safe_get(comp_produto, 'codigo'),
+                        'nome': safe_get(comp_produto, 'nome'),
+                        'quantidade': safe_get(comp, 'quantidade', 0)
+                    })
+                
+                produto_normalizado['componentes'] = componentes_processados
+                all_kits.append(produto_normalizado)
+
+        self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
+        
+        if len(data) < 100:
+            self.logger.info(f"Última página detectada ({len(data)} itens).")
+            break
+            
+        page += 1
+        time.sleep(self.config.DELAY_BETWEEN_PAGES)
+        
+        batch_count += 1
+        if batch_count >= MAX_PAGES_PER_BATCH:
+            self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
+            time.sleep(self.config.DELAY_BETWEEN_BATCHES)
+            batch_count = 0
+        
+    self.logger.info(f"Busca de produtos finalizada. Total de produtos: {len(all_products)}, Total de kits: {len(all_kits)}")
+    
+    # Salva o cache
+    with self._cache_lock:
+        self._products_cache = {p['sku']: p for p in all_products}
+        self._kits_cache = {k['sku']: k for k in all_kits}
+        save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+        
+    # Notifica o frontend
+    self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self) -> Dict[str, Any]:
         """
