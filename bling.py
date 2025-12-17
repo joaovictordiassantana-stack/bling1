@@ -35,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 from functools import wraps
+from collections import defaultdict
 
 import requests
 from requests.exceptions import RequestException
