@@ -502,6 +502,37 @@ class BlingAPIClient:
 class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
     
+    OAUTH_STATE_FILE: Path = Path('oauth_state.json')
+
+    def _save_oauth_state(self, state: str):
+        """Salva o state do OAuth de forma persistente em arquivo."""
+        try:
+            with open(self.OAUTH_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"state": state}, f)
+            self.logger.debug("State OAuth salvo em arquivo.")
+        except Exception as e:
+            self.logger.exception("Erro ao salvar state OAuth.")
+
+    def _load_oauth_state(self) -> Optional[str]:
+        """Carrega o state do OAuth do arquivo."""
+        if not self.OAUTH_STATE_FILE.exists():
+            return None
+        try:
+            with open(self.OAUTH_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f).get("state")
+        except Exception as e:
+            self.logger.exception("Erro ao carregar state OAuth.")
+            return None
+
+    def _clean_oauth_state(self):
+        """Limpa o state do OAuth do arquivo."""
+        if self.OAUTH_STATE_FILE.exists():
+            try:
+                os.remove(self.OAUTH_STATE_FILE)
+                self.logger.debug("State OAuth limpo do arquivo.")
+            except Exception as e:
+                self.logger.exception("Erro ao limpar state OAuth.")
+    
     def __init__(self, config: Config):
         self.config = config
         self.logger = logging.getLogger('bling_automacao')
@@ -548,38 +579,29 @@ class AuthManager:
             if self.refresh_token():
                 return self._access_token
                 
-        return None
+        return Non    def get_authorization_url(self) -> str:
+        """Retorna a URL local para iniciar o fluxo de autorização."""
+        # A URL real do Bling será construída na rota /auth
+        from flask import url_for
+        return url_for('auth')
 
-    def get_authorization_url(self) -> str:
-        """Gera a URL de autorização para o usuário."""
-        state = secrets.token_urlsafe(16)
-        # Salva o state para validação futura, se necessário
-        self._tokens['state'] = state
-        self._save_tokens()
+    def create_auth_flow(self, state: str) -> str:
+        """Cria a URL de autorização do Bling, usando o state gerado na sessão do Flask."""
+        from urllib.parse import urlencode
         
-        return (
-            f"https://www.bling.com.br/Api/v3/oauth/authorize?"
-            f"response_type=code&"
-            f"client_id={self.config.CLIENT_ID}&"
-            f"state={state}&"
-            f"redirect_uri={self.config.REDIRECT_URI}"
-        )
-
-    def exchange_code_for_token(self, code: str, state: str) -> bool:
+        params = {
+            'response_type': 'code',
+            'client_id': self.config.CLIENT_ID,
+            'state': state,
+            'redirect_uri': self.config.REDIRECT_URI,
+        }
+        
+        return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"oken(self, code: str) -> bool:
         """Troca o código de autorização por tokens de acesso e refresh."""
         
-        # Validação do state (medida de segurança CSRF)
-        saved_state = self._tokens.get('state')
-        if saved_state and state != saved_state:
-            self.logger.error(f"❌ State inválido detectado! CSRF potencial. Saved: {saved_state}, Received: {state}. Abortando.")
-            return False # CRÍTICO: Recusa se o state não bater
+        # A validação do state (CSRF) foi movida para a rota /callback (WebServer)
         
-        # Limpa o state após o uso
-        if 'state' in self._tokens:
-            del self._tokens['state']
-            self._save_tokens()
-        
-        return self._perform_token_request(
+        return self._perform_token_request(t(
             grant_type='authorization_code',
             code=code,
             redirect_uri=self.config.REDIRECT_URI
@@ -1244,22 +1266,51 @@ class WebServer:
             auth_url = self.orchestrator.auth.get_authorization_url()
             return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
 
+        # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
+        @self.app.route('/auth')
+        def auth():
+            from flask import redirect
+            import secrets
+            
+            # 1. GERAÇÃO DO STATE (REGRA DE OURO)
+            state = secrets.token_urlsafe(32)
+            self.orchestrator.auth._save_oauth_state(state)
+            
+            # 2. Constrói a URL de autorização usando o AuthManager
+            auth_url = self.orchestrator.auth.create_auth_flow(state)
+            
+            return redirect(auth_url)
+
         # Rota de Callback OAuth
         @self.app.route('/callback')
         def callback():
+            from flask import redirect
+            
             code = request.args.get("code")
-            state = request.args.get("state")
+            received_state = request.args.get("state")
+            
+            # 1. VALIDAÇÃO DO STATE (CSRF)
+            saved_state = self.orchestrator.auth._load_oauth_state()
+            
+            if not saved_state or saved_state != received_state:
+                self.logger.error(
+                    f"❌ State inválido detectado! CSRF potencial. "
+                    f"Saved: {saved_state}, Received: {received_state}"
+                )
+                # Limpa o state em caso de falha (boa prática)
+                self.orchestrator.auth._clean_oauth_state()
+                return redirect("/?error=csrf")
             
             if self.orchestrator.auth.is_authenticated():
                 self.logger.info("Callback ignorado: Usuário já autenticado.")
                 return redirect('/')
             
-            if not code or not state:
-                self.logger.error("Callback sem code ou state.")
+            if not code:
+                self.logger.error("Callback sem code.")
                 return redirect('/') 
             
             # ✅ ADICIONE logging detalhado:
-            self.logger.info(f"Callback recebido - Code: {code[:10]}..., State: {state}")
+            self.logger.info(f"Callback recebido - Code: {code[:10]}...")
             
             # NOTA: O uso de 'with' padrão bloquearia. A lógica abaixo garante a não-concorrência 
             # e a saída imediata, se o lock já estiver sendo usado.
@@ -1274,11 +1325,17 @@ class WebServer:
                     WebServer.used_codes.add(code)
                 
                 self.logger.info(f"Processando callback code...")
-                success = self.orchestrator.auth.exchange_code_for_token(code, state)
+                # O state não é mais passado para exchange_code_for_token, pois já foi validado
+                success = self.orchestrator.auth.exchange_code_for_token(code)
                 
                 if not success:
-                    self.logger.error("Falha na troca de token (CSRF ou erro de API). Redirecionando.")
+                    self.logger.error("Falha na troca de token (erro de API). Redirecionando.")
+                    # Limpa o state em caso de falha (boa prática)
+                    self.orchestrator.auth._clean_oauth_state()
                     return redirect('/')
+                
+                # 2. LIMPEZA DO STATE APÓS SUCESSO
+                self.orchestrator.auth._clean_oauth_state()
                 
                 # Após a autenticação, envia um full_update para o frontend
                 if success:
