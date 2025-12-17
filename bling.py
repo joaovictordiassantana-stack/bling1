@@ -394,7 +394,7 @@ class MetricsManager:
                 "errors_429": self.status_codes[429],
             }
 
-class ApiClient:
+class BlingAPIClient:
     """
     Cliente HTTP para a API Bling v3 com retry, rate limiting e refresh de token.
     """
