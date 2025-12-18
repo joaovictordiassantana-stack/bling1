@@ -2634,3 +2634,173 @@ if __name__ == '__main__':
         
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
+    def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
+        """
+        Calcula uso de componentes com breakdown diário.
+        """
+        now = datetime.now()
+        params = {
+            'dataEmissaoInicial': (now - timedelta(days=days)).strftime('%Y-%m-%d'),
+            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
+        }
+        
+        token = self.auth.get_access_token()
+        if not token:
+            self.logger.warning("Token indisponível para calcular uso de componentes.")
+            return {"components": [], "daily_breakdown": []}
+            
+        all_orders = []
+        page = 1
+        MAX_TOTAL_PAGES = 50
+        
+        while True:
+            params['pagina'] = page
+            response = self.api.get('pedidos/vendas', params=params)
+            if response is None:
+                break
+            data = safe_get(response, 'data', [])
+            if not data or len(data) == 0:
+                break
+            all_orders.extend(data)
+            if len(data) < 100:
+                break
+            page += 1
+            if page > MAX_TOTAL_PAGES:
+                break
+            time.sleep(2.0)
+            
+        # Rastreamento por dia E total
+        component_usage = {}  # Total do período
+        daily_usage = defaultdict(lambda: defaultdict(int))  # Por dia
+        
+        for order in all_orders:
+            # Extrai data
+            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
+            if not data_emissao_str:
+                continue
+            
+            try:
+                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+                day_key = order_date.strftime('%Y-%m-%d')
+            except:
+                continue
+            
+            itens = safe_get(order, 'itens', [])
+            for item in safe_iter(itens):
+                produto_sku = safe_get(item, 'codigo')
+                quantidade_vendida = safe_get(item, 'quantidade', 0)
+                
+                if not produto_sku or quantidade_vendida == 0:
+                    continue
+                
+                produto = self.get_product_by_sku(produto_sku)
+                
+                # Se é KIT, processa componentes
+                if produto and safe_get(produto, 'tipo') == 'K':
+                    componentes = safe_get(produto, 'componentes', [])
+                    for comp in safe_iter(componentes):
+                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
+                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
+                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
+                        
+                        if not comp_sku:
+                            continue
+                        
+                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
+                        
+                        # Atualiza total
+                        if comp_sku not in component_usage:
+                            component_usage[comp_sku] = {
+                                "sku": comp_sku,
+                                "nome": comp_nome,
+                                "quantidade": 0,
+                                "produtos": set()
+                            }
+                        component_usage[comp_sku]["quantidade"] += qtd_consumida
+                        component_usage[comp_sku]["produtos"].add(produto_sku)
+                        
+                        # Atualiza diário
+                        daily_usage[day_key][comp_sku] += qtd_consumida
+                
+                # Se é PRODUTO SIMPLES, conta também
+                else:
+                    if produto_sku not in component_usage:
+                        component_usage[produto_sku] = {
+                            "sku": produto_sku,
+                            "nome": safe_get(produto, 'nome', 'Produto'),
+                            "quantidade": 0,
+                            "produtos": set()
+                        }
+                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
+                    component_usage[produto_sku]["produtos"].add(produto_sku)
+                    
+                    daily_usage[day_key][produto_sku] += quantidade_vendida
+        
+        # Formata resultado
+        result = []
+        for sku, usage in component_usage.items():
+            result.append({
+                "sku": usage["sku"],
+                "nome": usage["nome"],
+                "quantidade": usage["quantidade"],
+                "produtos": sorted(list(usage["produtos"]))
+            })
+        
+        result.sort(key=lambda x: x['quantidade'], reverse=True)
+        
+        # Formata consumo diário
+        daily_breakdown = []
+        for day in sorted(daily_usage.keys(), reverse=True):
+            daily_breakdown.append({
+                "data": day,
+                "componentes": [
+                    {"sku": sku, "quantidade": qtd}
+                    for sku, qtd in daily_usage[day].items()
+                ]
+            })
+        
+        return {
+            "components": result,
+            "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
+        }
+
+    def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None):
+        """
+        Envia uma atualização completa de status via WebSocket para todos os clientes.
+        Inclui status de autenticação, KPIs e, se solicitado, uso de componentes.
+        """
+        global kpi_update_callbacks, kpi_update_lock
+        
+        # 1. Monta o payload base
+        payload = {
+            "type": "full_update",
+            "authenticated": self.auth.is_authenticated(),
+            "is_running": self.is_running(),
+            "cache_updated": cache_updated,
+            "auth_url": self.auth.get_authorization_url()
+        }
+        
+        # 2. Adiciona KPIs se fornecidos
+        if sales_stats:
+            # Converte a data de volta para ISO string para o WS
+            stats_data = sales_stats.copy()
+            if 'last_recalculated' in stats_data and isinstance(stats_data['last_recalculated'], datetime):
+                stats_data['last_recalculated'] = stats_data['last_recalculated'].isoformat()
+            if 'last_recalculated' in stats_data:
+                stats_data['last_update'] = stats_data.pop('last_recalculated')
+            payload["sales_stats"] = stats_data
+            
+        # 3. Adiciona o uso de componentes se fornecido
+        if component_usage:
+            payload["component_usage"] = component_usage
+            self.logger.debug("Uso de componentes incluído no broadcast.")
+                
+        # 4. Envia o broadcast
+        with kpi_update_lock:
+            for cb in kpi_update_callbacks:
+                try:
+                    cb(payload)
+                except ConnectionClosed:
+                    self.logger.debug("Conexão WebSocket fechada ao tentar enviar full_update.")
+                except Exception as e:
+                    self.logger.exception("Erro ao enviar full_update via callback.")
