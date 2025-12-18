@@ -1915,8 +1915,7 @@ class WebServer:
 # 9. DASHBOARD TEMPLATE (HTML/JS/CSS)
 # ============================================================================
 
-DASHBOARD_TEMPLATE = """
-<!DOCTYPE html>
+DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <html lang="pt-br">
 <head>
     <meta charset="utf-8">
@@ -1924,479 +1923,1015 @@ DASHBOARD_TEMPLATE = """
     <title>Painel Bling - Sw Móveis</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-    <style>body{background:#f8f9fa;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif}.navbar{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white}.log-box{font-family:'Courier New',monospace;font-size:.85em;background:#1e1e1e;color:#d4d4d4;border-radius:.5rem;padding:1rem;max-height:400px;overflow-y:auto}.log-level-INFO{color:#4ec9b0}.log-level-WARNING{color:#dcdcaa}.log-level-ERROR{color:#f48771}.log-level-DEBUG{color:#569cd6}.hidden{display:none}.kpi-card{border-left:5px solid;transition:background-color .5s ease}.kpi-daily{border-left-color:#0d6efd}.kpi-weekly{border-left-color:#ffc107}.kpi-historic{border-left-color:#198754}footer{box-shadow:0 -1px 3px rgba(0,0,0,0.05)}footer strong{color:#495057}footer p{margin-bottom:0}.metric-box{background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:20px;border-radius:10px;color:white;text-align:center}.metric-label{font-size:.9em;opacity:.9;margin-bottom:5px}.metric-value{font-size:2em;font-weight:bold}.toast-container{z-index:1090}</style>
+    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        /* ✅ DESIGN: Paleta Premium */
+        :root {
+            --primary: #0f172a;
+            --primary-light: #1e293b;
+            --accent: #6366f1;
+            --accent-light: #818cf8;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --bg-light: #f8fafc;
+            --border-color: #e2e8f0;
+            --text-muted: #64748b;
+        }
+
+        /* ✅ DESIGN: Tipografia e Base */
+        * {
+            transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+        }
+
+        body {
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            font-weight: 400;
+            line-height: 1.6;
+            letter-spacing: -0.01em;
+            color: var(--primary);
+        }
+
+        h1, h2, h3, h4, h5, h6 {
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            line-height: 1.2;
+        }
+
+        /* ✅ DESIGN: Navbar com Gradiente */
+        .navbar {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            color: white;
+            box-shadow: 0 4px 20px rgba(15, 23, 42, 0.1);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            animation: slideDown 0.4s ease-out;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .navbar-brand {
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        /* ✅ DESIGN: Status Badge com Animação */
+        #status-badge {
+            animation: pulse-badge 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            font-weight: 600;
+            padding: 0.4rem 0.8rem !important;
+            border-radius: 50px !important;
+        }
+
+        @keyframes pulse-badge {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.8; }
+        }
+
+        #status-badge.bg-success {
+            background: linear-gradient(135deg, var(--success) 0%, #059669 100%) !important;
+        }
+
+        #status-badge.bg-danger {
+            background: linear-gradient(135deg, var(--error) 0%, #dc2626 100%) !important;
+        }
+
+        /* ✅ DESIGN: Cards Premium */
+        .card {
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            background: #ffffff;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            animation: fadeInUp 0.4s ease-out;
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(16px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .card:hover {
+            border-color: var(--accent);
+            box-shadow: 0 12px 24px rgba(99, 102, 241, 0.15);
+            transform: translateY(-4px);
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            color: white;
+            border: none;
+            border-radius: 12px 12px 0 0;
+            font-weight: 600;
+            padding: 1.25rem;
+        }
+
+        /* ✅ DESIGN: KPI Cards */
+        .kpi-card {
+            border-left: 4px solid;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.5) 0%, transparent 100%);
+            pointer-events: none;
+        }
+
+        .kpi-daily {
+            border-left-color: var(--accent);
+        }
+
+        .kpi-weekly {
+            border-left-color: var(--warning);
+        }
+
+        .kpi-historic {
+            border-left-color: var(--success);
+        }
+
+        .kpi-card h5 {
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.75rem;
+        }
+
+        .kpi-card h3 {
+            font-size: 2rem;
+            font-weight: 700;
+            margin: 0;
+        }
+
+        .kpi-card.updating {
+            animation: pulse-update 0.6s ease-out;
+        }
+
+        @keyframes pulse-update {
+            0% {
+                background-color: #e8f5e9;
+            }
+            100% {
+                background-color: transparent;
+            }
+        }
+
+        /* ✅ DESIGN: Log Box */
+        .log-box {
+            font-family: 'Fira Code', monospace;
+            font-size: 0.8rem;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: #d4d4d4;
+            border-radius: 8px;
+            padding: 1rem;
+            max-height: 400px;
+            overflow-y: auto;
+            line-height: 1.5;
+        }
+
+        .log-box::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .log-box::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 3px;
+        }
+
+        .log-box::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 3px;
+        }
+
+        .log-box::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        .log-entry {
+            animation: slideInLog 0.3s ease-out;
+            padding: 0.25rem 0;
+        }
+
+        @keyframes slideInLog {
+            from {
+                opacity: 0;
+                transform: translateX(-12px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .log-level-INFO {
+            color: #4ec9b0;
+        }
+
+        .log-level-WARNING {
+            color: #dcdcaa;
+        }
+
+        .log-level-ERROR {
+            color: #f48771;
+        }
+
+        .log-level-DEBUG {
+            color: #569cd6;
+        }
+
+        /* ✅ DESIGN: Tabs */
+        .nav-tabs {
+            border-bottom: 2px solid var(--border-color);
+            gap: 0.5rem;
+        }
+
+        .nav-tabs .nav-link {
+            color: var(--text-muted);
+            border: none;
+            border-bottom: 3px solid transparent;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            position: relative;
+        }
+
+        .nav-tabs .nav-link:hover {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+
+        .nav-tabs .nav-link.active {
+            color: var(--accent);
+            background: none;
+            border-bottom-color: var(--accent);
+        }
+
+        .tab-content {
+            animation: fadeInTab 0.3s ease-out;
+        }
+
+        @keyframes fadeInTab {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
+        }
+
+        /* ✅ DESIGN: Botões */
+        .btn {
+            font-weight: 600;
+            border-radius: 8px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            border: none;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%);
+            color: white;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.4);
+            color: white;
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        .btn-outline-light {
+            border: 2px solid rgba(255, 255, 255, 0.5);
+            color: white;
+            font-weight: 600;
+        }
+
+        .btn-outline-light:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: white;
+            color: white;
+        }
+
+        /* ✅ DESIGN: Metric Box */
+        .metric-box {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%);
+            padding: 1.5rem;
+            border-radius: 12px;
+            color: white;
+            text-align: center;
+            box-shadow: 0 8px 16px rgba(99, 102, 241, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .metric-box:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 12px 24px rgba(99, 102, 241, 0.3);
+        }
+
+        .metric-label {
+            font-size: 0.875rem;
+            opacity: 0.9;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .metric-value {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+
+        /* ✅ DESIGN: Input e Search */
+        .form-control, .form-select {
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 0.75rem 1rem;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        /* ✅ DESIGN: List Group */
+        .list-group-item {
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+            transition: all 0.3s ease;
+            animation: fadeInUp 0.3s ease-out;
+        }
+
+        .list-group-item:hover {
+            border-color: var(--accent);
+            background: var(--bg-light);
+            transform: translateX(4px);
+        }
+
+        /* ✅ DESIGN: Toast */
+        .toast {
+            animation: slideInToast 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+            border-radius: 12px;
+            border: none;
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
+        }
+
+        @keyframes slideInToast {
+            from {
+                opacity: 0;
+                transform: translateX(400px);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .toast.hide {
+            animation: slideOutToast 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+        }
+
+        @keyframes slideOutToast {
+            from {
+                opacity: 1;
+                transform: translateX(0);
+            }
+            to {
+                opacity: 0;
+                transform: translateX(400px);
+            }
+        }
+
+        /* ✅ DESIGN: Alerts */
+        .alert {
+            border: none;
+            border-radius: 12px;
+            border-left: 4px solid;
+            animation: fadeInUp 0.4s ease-out;
+        }
+
+        .alert-warning {
+            background: linear-gradient(135deg, #fef3c7 0%, #fef08a 100%);
+            border-left-color: var(--warning);
+            color: #92400e;
+        }
+
+        .alert-info {
+            background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
+            border-left-color: var(--accent);
+            color: #0c4a6e;
+        }
+
+        .alert-danger {
+            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+            border-left-color: var(--error);
+            color: #7f1d1d;
+        }
+
+        /* ✅ DESIGN: Table */
+        .table {
+            border-collapse: collapse;
+        }
+
+        .table thead th {
+            background: var(--bg-light);
+            border: none;
+            font-weight: 600;
+            color: var(--primary);
+            padding: 1rem;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+        }
+
+        .table tbody tr {
+            border-bottom: 1px solid var(--border-color);
+            transition: all 0.2s ease;
+        }
+
+        .table tbody tr:hover {
+            background: var(--bg-light);
+        }
+
+        .table td {
+            padding: 1rem;
+            vertical-align: middle;
+        }
+
+        /* ✅ DESIGN: Badge */
+        .badge {
+            font-weight: 600;
+            padding: 0.4rem 0.8rem;
+            border-radius: 50px;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .badge.bg-success {
+            background: linear-gradient(135deg, var(--success) 0%, #059669 100%) !important;
+        }
+
+        .badge.bg-info {
+            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%) !important;
+        }
+
+        /* ✅ DESIGN: Accordion */
+        .accordion-button {
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+
+        .accordion-button:not(.collapsed) {
+            background: linear-gradient(135deg, var(--bg-light) 0%, #f1f5f9 100%);
+            color: var(--accent);
+            box-shadow: none;
+        }
+
+        .accordion-button:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        /* ✅ DESIGN: Hidden */
+        .hidden {
+            display: none;
+        }
+
+        /* ✅ DESIGN: Responsivo */
+        @media (max-width: 768px) {
+            .kpi-card h3 {
+                font-size: 1.5rem;
+            }
+
+            .metric-value {
+                font-size: 1.5rem;
+            }
+
+            .log-box {
+                max-height: 300px;
+            }
+        }
+    </style>
 </head>
 <body>
+    <!-- ✅ DESIGN: Navbar Premium -->
     <nav class="navbar navbar-expand-lg">
-        <div class="container-fluid">
-            <a class="navbar-brand text-white" href="#">Bling Automação</a>
-            <div class="d-flex">
-                <span id="status-badge" class="badge bg-secondary me-2">Carregando...</span>
-                
+        <div class="container-fluid px-4">
+            <a class="navbar-brand text-white" href="#">
+                <span style="font-size: 1.25rem; margin-right: 0.5rem;">📊</span>Bling Automação
+            </a>
+            <div class="d-flex align-items-center gap-3">
+                <span id="status-badge" class="badge bg-secondary">Carregando...</span>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
             </div>
         </div>
     </nav>
 
-    <div class="container mt-4">
-        <h2>📊 Pedidos de Venda (Abertos e Fechados)</h2>
-        <div class="row mb-4">
-             <div class="col-md-4">
-                 <div class="card p-3 text-center kpi-card kpi-daily">
- <h5>Pedidos Diários (Últimas 24h)</h5>
- <h3 id="kpi-daily" class="text-primary">0</h3>
-                 </div>
-             </div>
-             <div class="col-md-4">
-                 <div class="card p-3 text-center kpi-card kpi-weekly">
- <h5>Pedidos Semanais (Últimos 7 dias)</h5>
- <h3 id="kpi-weekly" class="text-warning">0</h3>
-                 </div>
-             </div>
-             <div class="col-md-4">
-                 <div class="card p-3 text-center kpi-card kpi-historic">
- <h5>Pedidos Históricos (Últimos 30 dias)</h5>
- <h3 id="kpi-historic" class="text-success">0</h3>
-                 </div>
-             </div>
-             <small class="text-muted mt-2">
-                Último Recalculo de KPIs: <span id="last-recalculated">N/D</span>
-            </small>
-        </div>
-
-        <div class="card mb-4">
-            <div class="card-header">Logs em Tempo Real</div>
-            <div class="card-body bg-dark p-0">
-                <div id="logs-content" class="log-box"></div>
+    <!-- ✅ DESIGN: Container Principal -->
+    <div class="container-fluid px-4 py-5">
+        <div class="row mb-5">
+            <div class="col-12">
+                <h2 class="mb-1" style="font-weight: 700;">📊 Pedidos de Venda</h2>
+                <p class="text-muted mb-4">Acompanhe os pedidos abertos e fechados em tempo real</p>
             </div>
         </div>
 
-        <ul class="nav nav-tabs" id="myTab" role="tablist">
-            <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#search">Busca</button></li>
-            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kits">Todos Produtos</button></li>
-            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#kpi-chart">📊 Dashboard KPI</button></li>
-            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#component-usage">🔧 Componentes</button></li>
-        </ul>
-
-        <div id="auth-required-tabs" class="alert alert-warning hidden">
-            É necessário autenticar com o Bling para visualizar o conteúdo.
-        </div>
-
-        <div id="content-tabs" class="tab-content p-3 bg-white border border-top-0 rounded-bottom hidden">
-            <div class="tab-pane fade show active" id="search">
-                <div class="input-group mb-3">
-<input type="text" class="form-control" id="search-input" placeholder="SKU ou Nome...">
-<button class="btn btn-primary" id="btn-search">Buscar</button>
-                </div>
-                <div id="search-results"></div>
-            </div>
-
-            <div class="tab-pane fade" id="kits">
-                <button class="btn btn-sm btn-primary mb-3" onclick="forceAndReloadKits(event)">🔄 Recarregar Lista</button>
-                <small class="text-muted d-block mb-3">⚠️ Carregamento pode levar 2-5 minutos. Aguarde a notificação do WebSocket.</small>
-                <div id="kits-list"></div>
-            </div>
-
-            <div class="tab-pane fade" id="kpi-chart">
-                <div class="row">
-<div class="col-md-8">
-    <div class="card">
-<div class="card-header bg-primary text-white">
-    <h5>📈 Evolução de Pedidos (Últimos 30 dias)</h5>
-</div>
-<div class="card-body" style="height: 400px;">
-    <canvas id="salesChart"></canvas>
-</div>
-    </div>
-</div>
-<div class="col-md-4">
-    <div class="card">
-<div class="card-header bg-success">
-    <h5>🎯 Métricas Rápidas</h5>
-</div>
-<div class="card-body">
-    <div class="metric-box mb-3">
-        <div class="metric-label">Média Diária</div>
-        <div class="metric-value" id="avg-daily">0</div>
-    </div>
-    <div class="metric-box mb-3">
-        <div class="metric-label">Crescimento Semanal</div>
-        <div class="metric-value text-success" id="growth-weekly">+0%</div>
-    </div>
-    <div class="metric-box">
-        <div class="metric-label">Tendência</div>
-        <div class="metric-value" id="trend-indicator">📊 Estável</div>
-    </div>
-</div>
-    </div>
-</div>
+        <!-- ✅ DESIGN: KPI Cards -->
+        <div class="row mb-5">
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-daily text-center">
+                    <h5>Pedidos Diários</h5>
+                    <h3 id="kpi-daily" class="text-primary">0</h3>
+                    <small class="text-muted">Últimas 24h</small>
                 </div>
             </div>
-            
-            <div class="tab-pane fade" id="component-usage">
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-weekly text-center">
+                    <h5>Pedidos Semanais</h5>
+                    <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
+                    <small class="text-muted">Últimos 7 dias</small>
+                </div>
+            </div>
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-historic text-center">
+                    <h5>Pedidos Históricos</h5>
+                    <h3 id="kpi-historic" style="color: var(--success);">0</h3>
+                    <small class="text-muted">Últimos 30 dias</small>
+                </div>
+            </div>
+        </div>
+
+        <!-- ✅ DESIGN: Último Recalcul -->
+        <div class="row mb-5">
+            <div class="col-12">
+                <small class="text-muted">
+                    ⏱️ Último Recálculo: <span id="last-recalculated" style="font-weight: 600;">N/D</span>
+                </small>
+            </div>
+        </div>
+
+        <!-- ✅ DESIGN: Logs em Tempo Real -->
+        <div class="row mb-5">
+            <div class="col-12">
                 <div class="card">
-<div class="card-header bg-warning">
-    <h5>🔧 Consumo de Componentes por Vendas (Últimos 30 dias)</h5>
-    <small>Atualizado conforme pedidos são processados</small>
-</div>
-<div class="card-body">
-    <div id="component-usage-content">
-<p class="text-center text-muted">Carregando dados...</p>
-    </div>
-</div>
+                    <div class="card-header">
+                        <h5 class="mb-0">📋 Logs em Tempo Real</h5>
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="logs-content" class="log-box"></div>
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-    
-    <!-- Container para Toast Notifications -->
-    <div class="toast-container position-fixed bottom-0 end-0 p-3">
-        <!-- Toasts serão injetados aqui -->
-    </div>
-    <script>
-    const API = '/api';
-    
-    /**
-     * Função auxiliar para centralizar chamadas de API, tratamento de erros e verificação de status.
-     * @param {string} url - URL da API.
-     * @param {object} [options={}] - Opções para a chamada fetch.
-     * @returns {Promise<object>} - O corpo da resposta JSON.
-     * @throws {Error} - Se a resposta não for OK ou se houver um erro de rede.
-     */
-    async function fetchAPI(url, options = {}) {
-        try {
-            const response = await fetch(url, options);
+        <!-- ✅ DESIGN: Tabs com Navegação -->
+        <div class="row">
+            <div class="col-12">
+                <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search" type="button">🔍 Busca</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits" type="button">📦 Produtos</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🔧 Componentes</button>
+                    </li>
+                </ul>
 
-            if (response.status === 401) {
-                // Sessão expirada ou não autenticado. Força redirecionamento para reautenticar.
-                console.error("Sessão expirada (401). Redirecionando para autenticação.");
-                window.location.href = document.getElementById('auth-link').href;
-                throw new Error("Sessão expirada. Redirecionamento em curso.");
-            }
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                throw new Error(`Erro na API (${response.status}): ${errorText}`);
-            }
-
-            // Tenta retornar JSON, se falhar, retorna um objeto vazio ou um indicador de sucesso
-            try {
-                return await response.json();
-            } catch (e) {
-                // Pode ser uma resposta 204 No Content ou um JSON vazio
-                return {}; 
-            }
-
-        } catch (error) {
-            console.error("Erro em fetchAPI:", error);
-            throw error; // Re-lança o erro para ser tratado pela função chamadora
-        }
-    }
-
-    async function forceRecalculate(event) {
-        if (!isAuthenticated) {
-            showToast('Aviso', 'Faça login primeiro!', 'warning');
-            return;
-        }
-        
-        const btn = event.target;
-        btn.disabled = true;
-        btn.textContent = '⏳ Recalculando... Aguarde o WebSocket';
-        
-        try {
-            // 1. Força o recálculo no servidor
-            const data = await fetchAPI('/api/recalculate', { method: 'POST' });
-            
-            // 2. Não usa alert bloqueante, aguarda o WebSocket
-            showToast('Info', data.message, 'info');
-            
-        } catch(e) {
-            showToast('Erro', 'Erro ao forçar recálculo: ' + e.message, 'danger');
-            btn.disabled = false;
-            btn.textContent = '🔄 Forçar Recálculo';
-        }
-        // O botão é reabilitado pelo WebSocket (wsKpi.onmessage)
-        
-    }
-
-    function formatLog(log) {
-        const levelClass = `log-level-${log.level}`;
-        return `<div class="${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
-    }
-    
-    function formatDateTime(isoString) {
-        if (!isoString || isoString === 'N/D') return 'N/D';
-        try {
-             const date = new Date(isoString);
-             const now = new Date();
-             const isToday = date.toDateString() === now.toDateString();
-             
-             if (isToday) {
-                 return date.toLocaleTimeString('pt-BR'); 
-             } else {
-                 return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }); 
-             }
-        } catch (e) {
-            return 'N/D';
-        }
-    }
-
-    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
-    ws.onmessage = (e) => {
-        const data = JSON.parse(e.data);
-        const box = document.getElementById('logs-content');
-        if(data.logs) {
-            data.logs.forEach(l => box.innerHTML += formatLog(l));
-            box.scrollTop = box.scrollHeight;
-        }
-    }
-    
-    let isAuthenticated = false;
-    
-    function showToast(title, message, type = 'info') {
-        const toastContainer = document.querySelector('.toast-container');
-        const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
-        const textClass = type === 'warning' ? 'text-dark' : 'text-white';
-        
-        const toastHtml = `
-            <div class="toast align-items-center ${bgClass} ${textClass} border-0" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
-                <div class="d-flex">
-<div class="toast-body">
-    <strong>${title}:</strong> ${message}
-</div>
-<button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                <!-- ✅ DESIGN: Auth Required Message -->
+                <div id="auth-required-tabs" class="alert alert-warning hidden mb-4">
+                    🔐 É necessário autenticar com o Bling para visualizar o conteúdo.
                 </div>
-            </div>
-        `;
-        
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = toastHtml;
-        const toastElement = tempDiv.firstChild;
-        
-        toastContainer.appendChild(toastElement);
-        
-        const toast = new bootstrap.Toast(toastElement);
-        toast.show();
-        
-        toastElement.addEventListener('hidden.bs.toast', () => {
-            toastElement.remove();
-        });
-    }
-    
-    function updateAuthStatus(authenticated, authUrl) {
-        const badge = document.getElementById('status-badge');
-        isAuthenticated = authenticated;
-        
-        if(isAuthenticated) {
-            badge.className = 'badge bg-success me-2';
-            badge.textContent = 'Online';
-            document.getElementById('auth-link').classList.add('d-none');
-            document.getElementById('content-tabs').classList.remove('hidden');
-            document.getElementById('auth-required-tabs').classList.add('hidden');
-        } else {
-            badge.className = 'badge bg-danger me-2';
-            badge.textContent = 'Offline';
-            document.getElementById('auth-link').classList.remove('d-none');
-            document.getElementById('content-tabs').classList.add('hidden');
-            document.getElementById('auth-required-tabs').classList.remove('hidden');
-        }
-        document.getElementById('auth-link').href = authUrl;
-    }
-    
-    function updateKpis(dSalesStats) {
-        document.getElementById('kpi-daily').textContent = dSalesStats.daily;
-        document.getElementById('kpi-weekly').textContent = dSalesStats.weekly;
-        document.getElementById('kpi-historic').textContent = dSalesStats.historic;
-        document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
-    }
-    
-    function updateComponentUsage(usageData) {
-        const div = document.getElementById('component-usage-content');
-        
-        if (!usageData.components || usageData.components.length === 0) {
-            div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
-            return;
-        }
-        
-        let html = '<h5>📊 Consumo Total (30 dias)</h5>';
-        html += '<table class="table table-striped"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Total</th><th>Produtos</th></tr></thead><tbody>';
-        
-        let total = 0;
-        usageData.components.forEach(comp => {
-            total += comp.quantidade;
-            html += `<tr><td><strong>${comp.nome}</strong></td><td><code>${comp.sku}</code></td><td><span class="badge bg-success">${comp.quantidade}x</span></td><td><small>${comp.produtos.join(', ')}</small></td></tr>`;
-        });
-        
-        html += '</tbody></table>';
-        html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
-        
-        // NOVO: Breakdown diário
-        if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
-            html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
-            html += '<div class="accordion" id="dailyAccordion">';
-            
-            usageData.daily_breakdown.forEach((day, idx) => {
-                const date = new Date(day.data);
-                const dateStr = date.toLocaleDateString('pt-BR');
-                const totalDay = day.componentes.reduce((sum, c) => sum + c.quantidade, 0);
-                
-                html += `
-                    <div class="accordion-item">
-                        <h2 class="accordion-header">
-                            <button class="accordion-button ${idx > 0 ? 'collapsed' : ''}" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
-                                ${dateStr} - <span class="badge bg-info ms-2">${totalDay} itens</span>
-                            </button>
-                        </h2>
-                        <div id="day${idx}" class="accordion-collapse collapse ${idx === 0 ? 'show' : ''}" data-bs-parent="#dailyAccordion">
-                            <div class="accordion-body">
-                                <ul class="list-group">
-                                    ${day.componentes.map(c => `<li class="list-group-item d-flex justify-content-between"><span>${c.sku}</span><span class="badge bg-secondary">${c.quantidade}x</span></li>`).join('')}
-                                </ul>
+
+                <!-- ✅ DESIGN: Tab Content -->
+                <div id="content-tabs" class="tab-content hidden">
+                    <!-- Tab: Busca -->
+                    <div class="tab-pane fade show active" id="search" role="tabpanel">
+                        <div class="row mb-4">
+                            <div class="col-12">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" id="search-input" placeholder="Digite SKU ou nome do produto..." style="padding: 0.75rem 1rem; font-weight: 500;">
+                                    <button class="btn btn-primary" id="btn-search" type="button">Buscar</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="search-results"></div>
+                    </div>
+
+                    <!-- Tab: Produtos -->
+                    <div class="tab-pane fade" id="kits" role="tabpanel">
+                        <div class="mb-4">
+                            <button class="btn btn-primary btn-sm" onclick="forceAndReloadKits(event)">🔄 Recarregar Lista</button>
+                            <small class="text-muted d-block mt-2">⚠️ Carregamento pode levar 2-5 minutos. Aguarde a notificação do WebSocket.</small>
+                        </div>
+                        <div id="kits-list"></div>
+                    </div>
+
+                    <!-- Tab: Dashboard KPI -->
+                    <div class="tab-pane fade" id="kpi-chart" role="tabpanel">
+                        <div class="row">
+                            <div class="col-lg-8 mb-4">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">📈 Evolução de Pedidos (Últimos 30 dias)</h5>
+                                    </div>
+                                    <div class="card-body" style="height: 400px;">
+                                        <canvas id="salesChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-4">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">🎯 Métricas Rápidas</h5>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="metric-box mb-3">
+                                            <div class="metric-label">Média Diária</div>
+                                            <div class="metric-value" id="avg-daily">0</div>
+                                        </div>
+                                        <div class="metric-box mb-3">
+                                            <div class="metric-label">Crescimento Semanal</div>
+                                            <div class="metric-value" id="growth-weekly">+0%</div>
+                                        </div>
+                                        <div class="metric-box">
+                                            <div class="metric-label">Tendência</div>
+                                            <div class="metric-value" id="trend-indicator">📊 Estável</div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>
-                `;
-            });
-            
-            html += '</div>';
-        }
-        
-        div.innerHTML = html;
-    }
-    
-    const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
-    
-    function setupKpiWebSocket() {
-        wsKpi.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            
-            if (data.type === 'full_update') {
-                // 1. Atualiza Status de Autenticação
-                updateAuthStatus(data.authenticated, data.auth_url);
-                
-                // 2. Atualiza KPIs
-                if (data.sales_stats) {
-updateKpis(data.sales_stats);
 
-// Animação de atualização
-const cards = document.querySelectorAll('.kpi-card');
-cards.forEach(card => {
-    card.style.backgroundColor = '#e8f5e9';
-    setTimeout(() => {
-card.style.backgroundColor = '';
-    }, 500);
-});
+                    <!-- Tab: Componentes -->
+                    <div class="tab-pane fade" id="component-usage" role="tabpanel">
+                        <div class="card">
+                            <div class="card-header">
+                                <h5 class="mb-0">🔧 Consumo de Componentes (Últimos 30 dias)</h5>
+                                <small class="text-white-50">Atualizado conforme pedidos são processados</small>
+                            </div>
+                            <div class="card-body">
+                                <div id="component-usage-content">
+                                    <p class="text-center text-muted">⏳ Carregando dados...</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ✅ DESIGN: Toast Container -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-4"></div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    
+    <script>
+        const API = '/api';
+        let isAuthenticated = false;
+        let salesChart = null;
+
+        /* ✅ DESIGN: Fetch API com Tratamento */
+        async function fetchAPI(url, options = {}) {
+            try {
+                const response = await fetch(url, options);
+
+                if (response.status === 401) {
+                    console.error("Sessão expirada (401). Redirecionando para autenticação.");
+                    window.location.href = document.getElementById('auth-link').href;
+                    throw new Error("Sessão expirada. Redirecionamento em curso.");
                 }
-                
-                // 3. Atualiza Uso de Componentes
-                if (data.component_usage) {
-updateComponentUsage(data.component_usage);
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    throw new Error(`Erro na API (${response.status}): ${errorText}`);
                 }
-                
-                // 4. Trata botões de recálculo
-                const recalculateButton = document.getElementById('recalculate-button');
-                if (recalculateButton && recalculateButton.disabled) {
-recalculateButton.disabled = false;
-recalculateButton.textContent = '🔄 Forçar Recálculo';
-showToast('Sucesso', 'Recálculo de KPIs concluído.', 'success');
+
+                try {
+                    return await response.json();
+                } catch (e) {
+                    return {};
                 }
-                
-                const forceLoadButton = document.querySelector('#kits button.btn-primary');
-                if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
-forceLoadButton.disabled = false;
-forceLoadButton.textContent = '🔄 Forçar Recarregamento';
-loadKits(); // Recarrega a lista de kits após a confirmação do WS
-showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
-                }
+
+            } catch (error) {
+                console.error("Erro em fetchAPI:", error);
+                throw error;
             }
-        };
-        
-        wsKpi.onerror = (e) => {
-            console.error("Erro WebSocket KPI:", e);
-            showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
-        };
-        
-        wsKpi.onclose = () => {
-            console.log("🔌 WebSocket KPI desconectado. Reconectando...");
-            setTimeout(() => {
-                const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
-                setupKpiWebSocket();
-            }, 3000);
-        };
-    }
-    
-    setupKpiWebSocket();
+        }
 
-    const btnSearch = document.getElementById('btn-search');
-    btnSearch.onclick = async () => {
+        /* ✅ DESIGN: Toast com Animação */
+        function showToast(title, message, type = 'info') {
+            const toastContainer = document.querySelector('.toast-container');
+            const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
+            const textClass = type === 'warning' ? 'text-dark' : 'text-white';
+
+            const toastHtml = `
+                <div class="toast align-items-center ${bgClass} ${textClass} border-0" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
+                    <div class="d-flex">
+                        <div class="toast-body fw-600">
+                            <strong>${title}:</strong> ${message}
+                        </div>
+                        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                    </div>
+                </div>
+            `;
+
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = toastHtml;
+            const toastElement = tempDiv.firstChild;
+
+            toastContainer.appendChild(toastElement);
+
+            const toast = new bootstrap.Toast(toastElement);
+            toast.show();
+
+            toastElement.addEventListener('hidden.bs.toast', () => {
+                toastElement.remove();
+            });
+        }
+
+        /* ✅ DESIGN: Formatação de Logs */
+        function formatLog(log) {
+            const levelClass = `log-level-${log.level}`;
+            return `<div class="log-entry ${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
+        }
+
+        /* ✅ DESIGN: Formatação de Data/Hora */
+        function formatDateTime(isoString) {
+            if (!isoString || isoString === 'N/D') return 'N/D';
+            try {
+                const date = new Date(isoString);
+                const now = new Date();
+                const isToday = date.toDateString() === now.toDateString();
+
+                if (isToday) {
+                    return date.toLocaleTimeString('pt-BR');
+                } else {
+                    return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                }
+            } catch (e) {
+                return 'N/D';
+            }
+        }
+
+        /* ✅ DESIGN: WebSocket Logs */
+        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            const box = document.getElementById('logs-content');
+            if(data.logs) {
+                data.logs.forEach(l => box.innerHTML += formatLog(l));
+                box.scrollTop = box.scrollHeight;
+            }
+        }
+
+        /* ✅ DESIGN: Atualizar Status de Autenticação */
+        function updateAuthStatus(authenticated, authUrl) {
+            const badge = document.getElementById('status-badge');
+            isAuthenticated = authenticated;
+
+            if(isAuthenticated) {
+                badge.className = 'badge bg-success';
+                badge.textContent = '🟢 Online';
+                document.getElementById('auth-link').classList.add('d-none');
+                document.getElementById('content-tabs').classList.remove('hidden');
+                document.getElementById('auth-required-tabs').classList.add('hidden');
+            } else {
+                badge.className = 'badge bg-danger';
+                badge.textContent = '🔴 Offline';
+                document.getElementById('auth-link').classList.remove('d-none');
+                document.getElementById('content-tabs').classList.add('hidden');
+                document.getElementById('auth-required-tabs').classList.remove('hidden');
+            }
+            document.getElementById('auth-link').href = authUrl;
+        }
+
+        /* ✅ DESIGN: Atualizar KPIs com Animação */
+        function updateKpis(dSalesStats) {
+            const kpiDaily = document.getElementById('kpi-daily');
+            const kpiWeekly = document.getElementById('kpi-weekly');
+            const kpiHistoric = document.getElementById('kpi-historic');
+
+            kpiDaily.textContent = dSalesStats.daily;
+            kpiWeekly.textContent = dSalesStats.weekly;
+            kpiHistoric.textContent = dSalesStats.historic;
+            document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+
+            // Animação de atualização
+            const cards = document.querySelectorAll('.kpi-card');
+            cards.forEach(card => {
+                card.classList.add('updating');
+                setTimeout(() => {
+                    card.classList.remove('updating');
+                }, 600);
+            });
+        }
+
+        /* ✅ DESIGN: Atualizar Componentes */
+        function updateComponentUsage(usageData) {
+            const div = document.getElementById('component-usage-content');
+
+            if (!usageData.components || usageData.components.length === 0) {
+                div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
+                return;
+            }
+
+            let html = '<h5>📊 Consumo Total (30 dias)</h5>';
+            html += '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Total</th><th>Produtos</th></tr></thead><tbody>';
+
+            let total = 0;
+            usageData.components.forEach(comp => {
+                total += comp.quantidade;
+                html += `<tr><td><strong>${comp.nome}</strong></td><td><code>${comp.sku}</code></td><td><span class="badge bg-success">${comp.quantidade}x</span></td><td><small>${comp.produtos.join(', ')}</small></td></tr>`;
+            });
+
+            html += '</tbody></table></div>';
+            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
+
+            if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
+                html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
+                html += '<div class="accordion" id="dailyAccordion">';
+
+                usageData.daily_breakdown.forEach((day, idx) => {
+                    const date = new Date(day.data);
+                    const dateStr = date.toLocaleDateString('pt-BR');
+                    const totalDay = day.componentes.reduce((sum, c) => sum + c.quantidade, 0);
+
+                    html += `
+                        <div class="accordion-item">
+                            <h2 class="accordion-header">
+                                <button class="accordion-button ${idx > 0 ? 'collapsed' : ''}" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
+                                    ${dateStr} - <span class="badge bg-info ms-2">${totalDay} itens</span>
+                                </button>
+                            </h2>
+                            <div id="day${idx}" class="accordion-collapse collapse ${idx === 0 ? 'show' : ''}" data-bs-parent="#dailyAccordion">
+                                <div class="accordion-body">
+                                    <ul class="list-group">
+                                        ${day.componentes.map(c => `<li class="list-group-item d-flex justify-content-between"><span>${c.sku}</span><span class="badge bg-secondary">${c.quantidade}x</span></li>`).join('')}
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                html += '</div>';
+            }
+
+            div.innerHTML = html;
+        }
+
+        /* ✅ DESIGN: WebSocket KPI */
+        const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+
+        function setupKpiWebSocket() {
+            wsKpi.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+
+                if (data.type === 'full_update') {
+                    updateAuthStatus(data.authenticated, data.auth_url);
+
+                    if (data.sales_stats) {
+                        updateKpis(data.sales_stats);
+                    }
+
+                    if (data.component_usage) {
+                        updateComponentUsage(data.component_usage);
+                    }
+
+                    const forceLoadButton = document.querySelector('#kits button.btn-primary');
+                    if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
+                        forceLoadButton.disabled = false;
+                        forceLoadButton.textContent = '🔄 Recarregar Lista';
+                        loadKits();
+                        showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
+                    }
+                }
+            };
+
+            wsKpi.onerror = (e) => {
+                console.error("Erro WebSocket KPI:", e);
+                showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
+            };
+
+            wsKpi.onclose = () => {
+                console.log("WebSocket KPI desconectado. Reconectando...");
+                setTimeout(() => {
+                    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                    wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
+                    setupKpiWebSocket();
+                }, 3000);
+            };
+        }
+
+        setupKpiWebSocket();
+
+        /* ✅ DESIGN: Busca de Produtos */
+        const btnSearch = document.getElementById('btn-search');
+        btnSearch.onclick = async () => {
             if (!isAuthenticated) {
                 document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o Bling para realizar buscas.</div>';
                 return;
             }
-            
+
             const q = document.getElementById('search-input').value;
             const div = document.getElementById('search-results');
-            div.innerHTML = 'Buscando...';
-            
+            div.innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm text-primary" role="status"><span class="visually-hidden">Buscando...</span></div></div>';
+
             try {
                 const data = await fetchAPI(`${API}/products/search?q=${q}`);
-                
+
                 if(!data.length) {
-div.innerHTML = '<div class="alert alert-warning">Nenhum resultado.</div>';
-return;
+                    div.innerHTML = '<div class="alert alert-warning">Nenhum resultado encontrado.</div>';
+                    return;
                 }
-                
+
                 let html = '<div class="list-group">';
 
                 data.forEach(p => {
-const imgHtml = p.imagemURL 
-    ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">` 
-    : '<span class="text-muted">-</span>';
+                    const imgHtml = p.imagemURL
+                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
+                        : '<span class="text-muted">-</span>';
 
-html += `
-    <div class="list-group-item">
-<div class="d-flex">
-    ${imgHtml}
-    
-    <div class="flex-grow-1">
-        <div class="d-flex w-100 justify-content-between">
-            <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-            <small>${p.sku || 'N/D'}</small>
-        </div>
+                    html += `
+                        <div class="list-group-item">
+                            <div class="d-flex">
+                                ${imgHtml}
 
-        <p class="mb-1">${p.descricaoCurta || ''}</p>
+                                <div class="flex-grow-1">
+                                    <div class="d-flex w-100 justify-content-between">
+                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                        <small>${p.sku || 'N/D'}</small>
+                                    </div>
 
-        <small class="text-muted d-block">
-            <b>Estoque:</b> ${p.estoque}  
-            <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
-        </small>
+                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
 
-	        ${p.tipo === 'Kit' && p.componentes && p.componentes.length > 0 ? `
-	            <div class="mt-2 p-2 bg-light rounded">
-	                <b>🔧 Componentes deste Kit:</b><br>
-	                ${p.componentes.map(c => 
-	                    `• ${c.quantidade}x <b>${c.nome || 'Sem nome'}</b> (SKU: ${c.sku || 'N/D'})`
-	                ).join("<br>")}
-	            </div>
-	        ` : ""}
-	        
-	        ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
-	            <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
-	                <b>📦 Este componente é usado em:</b><br>
-	                ${p.usado_em.map(u => 
-	                    `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
-	                ).join("<br>")}
-	            </div>
-	        ` : ""}
-	    </div>
-	</div>
-	    </div>
-	`;
+                                    <small class="text-muted d-block">
+                                        <b>Estoque:</b> ${p.estoque}
+                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                    </small>
+
+                                    ${p.tipo === 'Kit' && p.componentes && p.componentes.length > 0 ? `
+                                        <div class="mt-2 p-2 bg-light rounded">
+                                            <b>🔧 Componentes deste Kit:</b><br>
+                                            ${p.componentes.map(c =>
+                                                `• ${c.quantidade}x <b>${c.nome || 'Sem nome'}</b> (SKU: ${c.sku || 'N/D'})`
+                                            ).join("<br>")}
+                                        </div>
+                                    ` : ""}
+
+                                    ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
+                                        <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
+                                            <b>📦 Este componente é usado em:</b><br>
+                                            ${p.usado_em.map(u =>
+                                                `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
+                                            ).join("<br>")}
+                                        </div>
+                                    ` : ""}
+                                </div>
+                            </div>
+                        </div>
+                    `;
                 });
 
                 html += '</div>';
@@ -2407,69 +2942,69 @@ html += `
             }
         };
 
-
+        /* ✅ DESIGN: Carregar Kits */
         async function loadKits() {
             const div = document.getElementById('kits-list');
             const authRequiredDiv = document.getElementById('auth-required-tabs');
-            
+
             if (!isAuthenticated) {
                 div.innerHTML = '';
                 authRequiredDiv.classList.remove('hidden');
                 return;
             }
-            
+
             authRequiredDiv.classList.add('hidden');
             div.innerHTML = '<div class="alert alert-info">⏳ Carregando dados. O worker em segundo plano atualiza o cache a cada 10 minutos. Se a lista estiver vazia, aguarde até 10 minutos e recarregue a página.</div>';
-            
+
             try {
-                const data = await fetchAPI(`${API}/kits`); 
-                
-                // CORREÇÃO 2: Mostrar produtos E kits
+                const data = await fetchAPI(`${API}/kits`);
+
                 if (!data || data.length === 0) {
-div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Produto/Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
-return;
+                    div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Produto/Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
+                    return;
                 }
+
                 let html = `
+                <div class="table-responsive">
                 <table class="table table-sm">
                 <thead>
                 <tr>
-<th>IMG</th>
-<th>SKU</th>
-<th>Nome</th>
-<th>Componentes / Tipo</th>
+                    <th>IMG</th>
+                    <th>SKU</th>
+                    <th>Nome</th>
+                    <th>Componentes / Tipo</th>
                 </tr>
                 </thead>
                 <tbody>
                 `;
 
                 data.forEach(k => {
-const imgHtml = k.imagemURL 
-    ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
-    : '<span class="text-muted">-</span>';
+                    const imgHtml = k.imagemURL
+                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
+                        : '<span class="text-muted">-</span>';
 
-let comps = '';
-if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
-    comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
-        .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
-        .join('<br>');
-} else if (k.tipo === 'P') {
-    comps = `<span class="badge bg-info">Produto Simples</span><br><small>Estoque: ${k.estoqueAtual || 0}</small>`;
-} else {
-    // Caso de produto sem tipo ou sem componentes (deve ser raro)
-    comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
-}
+                    let comps = '';
+                    if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
+                        comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
+                            .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                            .join('<br>');
+                    } else if (k.tipo === 'P') {
+                        comps = `<span class="badge bg-info">Produto Simples</span><br><small>Estoque: ${k.estoqueAtual || 0}</small>`;
+                    } else {
+                        comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
+                    }
 
-html += `
-    <tr>
-<td style="width:60px">${imgHtml}</td>
-<td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-<td>${k.nome || 'N/D'}</td>
-<td>${comps}</td>
-    </tr>
-`;
+                    html += `
+                        <tr>
+                            <td style="width:60px">${imgHtml}</td>
+                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                            <td>${k.nome || 'N/D'}</td>
+                            <td>${comps}</td>
+                        </tr>
+                    `;
                 });
 
-                html += '</tbody></table>';
+                html += '</tbody></table></div>';
                 div.innerHTML = html;
 
             } catch(e) {
@@ -2477,16 +3012,17 @@ html += `
             }
         }
 
+        /* ✅ DESIGN: Forçar Recarregamento */
         async function forceAndReloadKits(event) {
             if (!isAuthenticated) {
                 showToast('Aviso', 'Faça login primeiro!', 'warning');
                 return;
             }
-            
+
             const btn = event.target;
             btn.disabled = true;
             btn.innerHTML = '⏳ Carregando cache... (pode levar 2-5 minutos)';
-            
+
             try {
                 const data = await fetchAPI('/api/force-load', { method: 'POST' });
                 showToast('Info', 'Cache sendo atualizado. Aguarde a notificação do WebSocket.', 'info');
@@ -2496,128 +3032,88 @@ html += `
                 btn.innerHTML = '🔄 Recarregar Lista';
             }
         }
-    
-    // Função para carregar o gráfico KPI
-    let salesChart = null;
-    
-    async function loadKPIChart() {
-        try {
-            const data = await fetchAPI('/api/sales/history');
-            
-            const ctx = document.getElementById('salesChart').getContext('2d');
-            
-            if (salesChart) salesChart.destroy();
-            
-            salesChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-labels: data.labels,
-datasets: [{
-    label: 'Pedidos Diários',
-    data: data.daily,
-    borderColor: '#0d6efd',
-    backgroundColor: 'rgba(13, 110, 253, 0.1)',
-    tension: 0.4,
-    fill: true
-}, {
-    label: 'Média Móvel (7 dias)',
-    data: data.moving_avg,
-    borderColor: '#ffc107',
-    borderDash: [5, 5],
-    tension: 0.4
-}]
-                },
-                options: {
-responsive: true,
-maintainAspectRatio: false,
-plugins: {
-    legend: { position: 'top' },
-    tooltip: {
-mode: 'index',
-intersect: false
-    }
-},
-scales: {
-    y: { beginAtZero: true }
-}
-                }
-            });
-            
-            // Atualizar métricas
-            document.getElementById('avg-daily').textContent = data.avg_daily.toFixed(1);
-            document.getElementById('growth-weekly').textContent = 
-                (data.growth > 0 ? '+' : '') + data.growth.toFixed(1) + '%';
-            document.getElementById('trend-indicator').textContent = 
-                data.growth > 10 ? '📈 Crescendo' : data.growth < -10 ? '📉 Caindo' : '📊 Estável';
-        } catch(e) {
-            console.error('Erro ao carregar gráfico KPI:', e);
-        }
-    }
-    
-    // A função loadComponentUsage não é mais necessária, pois os dados vêm do WS.
-    // A função updateComponentUsage foi criada para receber os dados do WS.
-    
-    document.addEventListener('DOMContentLoaded', () => {
-        loadKits();
-        
-        // Adicionar event listener para carregar o gráfico quando a aba for ativada
-        const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
-        if (kpiTab) {
-            kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
-        }
-        
-// ✅ 5. Componentes: timeout + erro visível
-        const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
-        if (componentUsageTab) {
-            componentUsageTab.addEventListener('shown.bs.tab', () => {
-                const contentDiv = document.getElementById('component-usage-content');
-                
-                // Se o conteúdo ainda for o "Carregando dados...", inicia o timeout
-                if (contentDiv.innerHTML.includes('Carregando dados...')) {
-                    // Aumenta timeout para 30s (cálculo pode demorar)
-                    setTimeout(() => {
-                        if (contentDiv.innerHTML.includes('Carregando dados...')) {
-                            contentDiv.innerHTML = `
-                                <div class="alert alert-warning">
-                                    ⚠️ Dados ainda não carregados. 
-                                    <button class="btn btn-sm btn-primary mt-2" onclick="forceLoadComponents()">
-                                        🔄 Forçar Recálculo
-                                    </button>
-                                </div>
-                            `;
-                        }
-                    }, 30000); // 30 segundos
-                }
-            });
-        }
 
-        // Função para forçar recálculo manual
-        async function forceLoadComponents() {
-            const contentDiv = document.getElementById('component-usage-content');
-            contentDiv.innerHTML = '<div class="alert alert-info">🔄 Recalculando componentes... Aguarde até 2 minutos.</div>';
-            
+        /* ✅ DESIGN: Gráfico KPI */
+        async function loadKPIChart() {
             try {
-                const data = await fetchAPI('/api/components/usage');
-                updateComponentUsage(data);
+                const data = await fetchAPI('/api/sales/history');
+
+                const ctx = document.getElementById('salesChart').getContext('2d');
+
+                if (salesChart) salesChart.destroy();
+
+                salesChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: data.labels,
+                        datasets: [{
+                            label: 'Pedidos Diários',
+                            data: data.daily,
+                            borderColor: '#6366f1',
+                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                            tension: 0.4,
+                            fill: true,
+                            borderWidth: 2
+                        }, {
+                            label: 'Média Móvel (7 dias)',
+                            data: data.moving_avg,
+                            borderColor: '#f59e0b',
+                            borderDash: [5, 5],
+                            tension: 0.4,
+                            borderWidth: 2
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'top' },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            y: { beginAtZero: true }
+                        }
+                    }
+                });
+
+                document.getElementById('avg-daily').textContent = data.avg_daily.toFixed(1);
+                document.getElementById('growth-weekly').textContent =
+                    (data.growth > 0 ? '+' : '') + data.growth.toFixed(1) + '%';
+                document.getElementById('trend-indicator').textContent =
+                    data.growth > 10 ? '📈 Crescendo' : data.growth < -10 ? '📉 Caindo' : '📊 Estável';
             } catch(e) {
-                contentDiv.innerHTML = `<div class="alert alert-danger">❌ Erro: ${e.message}</div>`;
+                console.error('Erro ao carregar gráfico KPI:', e);
             }
         }
-    });
+
+        /* ✅ DESIGN: Inicialização */
+        document.addEventListener('DOMContentLoaded', () => {
+            loadKits();
+
+            const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
+            if (kpiTab) {
+                kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
+            }
+
+            const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
+            if (componentUsageTab) {
+                componentUsageTab.addEventListener('shown.bs.tab', () => {
+                    const contentDiv = document.getElementById('component-usage-content');
+
+                    if (contentDiv.innerHTML.includes('Carregando dados...')) {
+                        setTimeout(() => {
+                            if (contentDiv.innerHTML.includes('Carregando dados...')) {
+                                contentDiv.innerHTML = '<div class="alert alert-danger">⚠️ Tempo limite excedido. O cálculo de componentes pode estar demorando. Verifique os logs.</div>';
+                            }
+                        }, 30000);
+                    }
+                });
+            }
+        });
     </script>
-    
-    <!-- Assinatura do Desenvolvedor -->
-    <footer style="background-color: #f8f9fa; border-top: 1px solid #dee2e6; margin-top: 3rem; padding: 1.5rem 0; text-align: center; color: #6c757d; font-size: 0.85rem;">
-        <div class="container">
-            <p style="margin: 0; font-weight: 500;">
-                <span style="opacity: 0.7;">Desenvolvido por</span> 
-                <strong>João Victor Dias Santana</strong>
-            </p>
-            <p style="margin: 0.25rem 0 0 0; opacity: 0.6; font-size: 0.8rem;">
-                &copy; 2025 • Bling Automação Dashboard
-            </p>
-        </div>
-    </footer>
 </body>
 </html>
 """
