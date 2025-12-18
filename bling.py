@@ -211,10 +211,10 @@ class Config:
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
-    # Rate Limiting (Configurável)
-    MAX_PAGES_PER_BATCH: int = 3 # Máximo de páginas antes da pausa
-    DELAY_BETWEEN_PAGES: float = 2.5 # Delay entre requisições de página (em segundos)
-    DELAY_BETWEEN_BATCHES: float = 8.0 # Pausa longa após o batch (em segundos)
+    # Rate Limiting (Configurável) - ✅ OTIMIZADO PARA EVITAR 429
+    MAX_PAGES_PER_BATCH: int = 2  # ✅ Reduz de 3 para 2 (mais conservador)
+    DELAY_BETWEEN_PAGES: float = 4.0  # ✅ Aumenta de 2.5s para 4s
+    DELAY_BETWEEN_BATCHES: float = 15.0  # ✅ Aumenta de 8s para 15s (pausa longa)
     
     # Automação
     
@@ -456,9 +456,9 @@ class BlingAPIClient:
                 if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
 # ✅ Rate limit especial: aguarda mais tempo
                     if response.status_code == 429:
-                        # Prioriza Retry-After, senão usa backoff exponencial (5s, 10s, 20s...)
+                        # ✅ Backoff mais agressivo: 10s, 30s, 90s
                         retry_after = response.headers.get('Retry-After')
-                        wait_time = 5.0 * (2 ** attempt)
+                        wait_time = 10.0 * (3 ** attempt)  # ✅ Mudou de 5*2^n para 10*3^n
                         if retry_after:
                             try:
                                 wait_time = max(wait_time, float(retry_after))
@@ -926,24 +926,36 @@ class Orchestrator:
             
     def _worker_loop(self):
         """Loop principal do worker."""
+        cycle_count = 0  # ✅ Contador de ciclos
+        
         while not self._stop_event.is_set():
-            self.process_sales_orders()
-            self.process_products_cache()
+            cycle_count += 1
             
-            # NOVO: Calcula uso de componentes periodicamente
-            try:
-                self.logger.info("Calculando uso de componentes...")
-                usage = self.calculate_component_usage()
-                if usage and (usage.get('components') or usage.get('daily_breakdown')):
-                    self._component_usage_cache = usage  # Armazena em cache
-                    self.logger.info(f"✅ Uso de componentes calculado: {len(usage.get('components', []))} itens")
-                    self.broadcast_kpi_update(component_usage=usage)
-                else:
-                    self.logger.warning("⚠️ Cálculo de componentes retornou vazio")
-            except Exception as e:
-                self.logger.exception("Erro ao calcular componentes.")
+            # ✅ ESTRATÉGIA: Alterna tarefas pesadas a cada 2 ciclos (20 min)
+            if cycle_count % 2 == 1:
+                # Ciclo ímpar: Atualiza KPIs (pedidos)
+                self.logger.info("🔄 Ciclo #%d: Atualizando KPIs (pedidos)", cycle_count)
+                self.process_sales_orders()
+            else:
+                # Ciclo par: Atualiza cache de produtos
+                self.logger.info("🔄 Ciclo #%d: Atualizando cache (produtos)", cycle_count)
+                self.process_products_cache()
             
-            self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
+            # ✅ Componentes: calcula apenas a cada 4 ciclos (40 min)
+            if cycle_count % 4 == 0:
+                try:
+                    self.logger.info("🔄 Ciclo #%d: Calculando uso de componentes...", cycle_count)
+                    usage = self.calculate_component_usage()
+                    if usage and (usage.get('components') or usage.get('daily_breakdown')):
+                        self._component_usage_cache = usage
+                        self.logger.info(f"✅ Uso de componentes calculado: {len(usage.get('components', []))} itens")
+                        self.broadcast_kpi_update(component_usage=usage)
+                    else:
+                        self.logger.warning("⚠️ Cálculo de componentes retornou vazio")
+                except Exception as e:
+                    self.logger.exception("Erro ao calcular componentes.")
+            
+            self.logger.info("✅ Worker finalizado. Próxima execução em 10 minutos.")
             self._stop_event.wait(600)
 
     
@@ -974,9 +986,16 @@ class Orchestrator:
             all_orders = []
             page = 1
             
-            # ✅ Limita a 3 páginas por vez para evitar rate limit
-            MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
-            batch_count = 0
+            # ✅ ADICIONE: Limite absoluto de páginas
+            MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
+       page = 1
+        
+        # ✅ ADICIONE: Limite absoluto de páginas
+        MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
+        
+        # ✅ Limita a 3 páginas por vez para evitar rate limit
+        MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
+        batch_count = 0
             
             while True:
                 params['pagina'] = page
@@ -1112,25 +1131,45 @@ class Orchestrator:
             self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
             
             if len(data) < 100:
-                self.logger.info(f"Última página detectada ({len(data)} itens).")
-                break
+                self.logger.info(f"Últpage += 1
                 
-            page += 1
+                # ✅ ADICIONE: Proteção contra loops infinitos
+                if page > MAX_TOTAL_PAGES:
+                    self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
+                    break
+         page += 1
+            
+            # ✅ ADICIONE: Proteção contra loops infinitos
+            if page > MAX_TOTAL_PAGES:
+                self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
+                break
+            
+            # ✅ Pausa entre requisições
             time.sleep(self.config.DELAY_BETWEEN_PAGES)
             
             batch_count += 1
             if batch_count >= MAX_PAGES_PER_BATCH:
-                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
+                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {MAX_PAGES_PER_BATCH} páginas (rate limit)")
                 time.sleep(self.config.DELAY_BETWEEN_BATCHES)
-                batch_count = 0
-            
-        self.logger.info(f"Busca de produtos finalizada. Total de produtos: {len(all_products)}, Total de kits: {len(all_kits)}")
-        
-        # Salva o cache
-        with self._cache_lock:
-            self._products_cache = {p['sku']: p for p in all_products}
-            self._kits_cache = {k['sku']: k for k in all_kits}
-            save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+                batch_count = 0  batch_count = 0           
+        # ✅ PROTEÇÃO: Só atualiza cache se houver mudanças significativas
+        if len(all_products) > 0 or len(all_kits) > 0:
+            with self._cache_lock:
+                old_count = len(self._products_cache) + len(self._kits_cache)
+                new_count = len(all_products) + len(all_kits)
+                
+                # Se diferença for < 5%, pula atualização (evita sobrescrever cache bom)
+                if old_count > 0 and abs(new_count - old_count) / old_count < 0.05:
+                    self.logger.info(f"⏭️ Cache estável ({old_count} → {new_count}). Pulando atualização.")
+                    return
+                
+                self.logger.info(f"Busca de produtos finalizada. Total: {new_count} ({old_count} anterior)")
+                
+                self._products_cache = {p['sku']: p for p in all_products}
+                self._kits_cache = {k['sku']: k for k in all_kits}
+                save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+        else:
+            self.logger.warning("⚠️ Nenhum produto/kit retornado. Mantendo cache anterior.")
             
         # Notifica o frontend
         self.broadcast_kpi_update(cache_updated=True)
@@ -1164,7 +1203,7 @@ class Orchestrator:
             if len(data) < 100:
                 break
             page += 1
-            time.sleep(0.1)
+            time.sleep(2.0)  # ✅ Aumenta de 0.1s para 2s (evita saturar API)
             
         # Rastreamento por dia E total
         component_usage = {}  # Total do período
