@@ -48,7 +48,31 @@ except ImportError:
     class ConnectionClosed(Exception): pass
 
 # ============================================================================ 
-# 0. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
+# 0. RATE LIMITER GLOBAL (NÍVEL PRODUÇÃO)
+# ============================================================================
+
+class RateLimiter:
+    """Limitador de taxa centralizado para evitar 429 da API Bling.
+    
+    Garante intervalo mínimo entre requisições, thread-safe.
+    Taxa segura: ~2.5 req/s (min_interval=0.4s)
+    """
+    def __init__(self, min_interval=0.4):
+        self.min_interval = min_interval
+        self.lock = Lock()
+        self.last_call = 0.0
+
+    def wait(self):
+        """Bloqueia até que o intervalo mínimo desde a última chamada tenha passado."""
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_call = time.time()
+
+# ============================================================================ 
+# 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
 # ============================================================================
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
@@ -405,6 +429,7 @@ class BlingAPIClient:
         self.auth = auth_manager
         self.logger = logging.getLogger('bling_automacao')
         self.metrics = MetricsManager() # Inicializa o gerenciador de métricas
+        self.rate_limiter = RateLimiter(min_interval=0.4)  # ✅ Rate limiter global: ~2.5 req/s
         self.session = requests.Session()
         self.session.headers.update({
             'Content-Type': 'application/json',
@@ -425,6 +450,9 @@ class BlingAPIClient:
         headers = {'Authorization': f'Bearer {token}'}
         
         for attempt in range(self.config.MAX_RETRIES):
+            # ✅ RATE LIMITER: Garante intervalo mínimo entre requisições
+            self.rate_limiter.wait()
+            
             start_time = time.time()
             try:
                 response = self.session.request(method, url, headers=headers, timeout=self.config.REQUEST_TIMEOUT, **kwargs)
@@ -452,27 +480,16 @@ class BlingAPIClient:
                     return {} # Retorna vazio para 204 No Content, por exemplo
                 
             except requests.exceptions.HTTPError as e:
+                # ✅ TRATAMENTO 429: Aborta imediatamente sem retry
+                if response.status_code == 429:
+                    self.logger.warning(f"🛑 Rate limit atingido (429) em {endpoint}. Abortando ciclo.")
+                    raise  # ✅ Propaga o erro para permitir break no loop de paginação
+                
                 self.logger.exception(f"Erro HTTP ao acessar {endpoint}.")
-                if response.status_code in [429, 500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
-# ✅ Rate limit especial: aguarda mais tempo
-                    if response.status_code == 429:
-                        # ✅ Backoff mais agressivo: 10s, 30s, 90s
-                        retry_after = response.headers.get('Retry-After')
-                        wait_time = 10.0 * (3 ** attempt)  # ✅ Mudou de 5*2^n para 10*3^n
-                        if retry_after:
-                            try:
-                                wait_time = max(wait_time, float(retry_after))
-                                self.logger.warning(f"⚠️ Status 429. Bling sugeriu Retry-After: {wait_time:.2f}s. Aguardando...")
-                            except ValueError:
-                                self.logger.warning(f"⚠️ Status 429. Retry-After inválido. Usando backoff: {wait_time:.2f}s.")
-                        else:
-                            self.logger.warning(f"⚠️ Status 429. Retry-After ausente. Usando backoff: {wait_time:.2f}s.")
-                        delay = wait_time
-                    else:
-                        delay = self.config.BASE_DELAY * (2 ** attempt)
-
-                    if response.status_code != 429:
-                        self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
+                if response.status_code in [500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
+                    # Retry apenas para erros de servidor
+                    delay = self.config.BASE_DELAY * (2 ** attempt)
+                    self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
                     time.sleep(delay)
                 else:
                     return None
@@ -993,7 +1010,15 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
-                response = self.api.get('pedidos/vendas', params=params)
+                
+                # ✅ TRATAMENTO 429: Captura e aborta o loop
+                try:
+                    response = self.api.get('pedidos/vendas', params=params)
+                except requests.exceptions.HTTPError as e:
+                    if e.response and e.response.status_code == 429:
+                        self.logger.warning("🛑 Rate limit (429) detectado. Abortando busca de pedidos.")
+                        break
+                    raise
                 
                 if response is None:
                     self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
@@ -1020,6 +1045,9 @@ class Orchestrator:
                 if page > MAX_TOTAL_PAGES:
                     self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
                     break
+                
+                # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
+                time.sleep(1.2)
         
         except Exception as e:
             self.logger.exception("Erro ao processar pedidos de venda.")
@@ -1051,7 +1079,15 @@ class Orchestrator:
                 'pagina': page,
                 'tipo': 'P,K'
             }
-            response = self.api.get('produtos', params=params)
+            
+            # ✅ TRATAMENTO 429: Captura e aborta o loop
+            try:
+                response = self.api.get('produtos', params=params)
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 429:
+                    self.logger.warning("🛑 Rate limit (429) detectado. Abortando busca de produtos.")
+                    break
+                raise
             
             if response is None:
                 self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
@@ -1130,8 +1166,8 @@ class Orchestrator:
                 self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
                 break
             
-            # ✅ Pausa entre requisições
-            time.sleep(self.config.DELAY_BETWEEN_PAGES)
+            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
+            time.sleep(1.2)
             
             batch_count += 1
             if batch_count >= MAX_PAGES_PER_BATCH:
@@ -1180,7 +1216,16 @@ class Orchestrator:
         page = 1
         while True:
             params['pagina'] = page
-            response = self.api.get('pedidos/vendas', params=params)
+            
+            # ✅ TRATAMENTO 429: Captura e aborta o loop
+            try:
+                response = self.api.get('pedidos/vendas', params=params)
+            except requests.exceptions.HTTPError as e:
+                if e.response and e.response.status_code == 429:
+                    self.logger.warning("🛑 Rate limit (429) detectado. Abortando cálculo de componentes.")
+                    break
+                raise
+            
             if response is None:
                 break
             data = safe_get(response, 'data', [])
@@ -1190,7 +1235,9 @@ class Orchestrator:
             if len(data) < 100:
                 break
             page += 1
-            time.sleep(2.0)  # ✅ Aumenta de 0.1s para 2s (evita saturar API)
+            
+            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
+            time.sleep(1.2)
             
         # Rastreamento por dia E total
         component_usage = {}  # Total do período
@@ -1497,7 +1544,16 @@ class WebServer:
             page = 1
             while True:
                 params['pagina'] = page
-                response = self.orchestrator.api.get('pedidos/vendas', params=params)
+                
+                # ✅ TRATAMENTO 429: Captura e aborta o loop
+                try:
+                    response = self.orchestrator.api.get('pedidos/vendas', params=params)
+                except requests.exceptions.HTTPError as e:
+                    if e.response and e.response.status_code == 429:
+                        self.orchestrator.logger.warning("🛑 Rate limit (429) detectado. Abortando histórico de vendas.")
+                        break
+                    raise
+                
                 if response is None:
                     break
                 data = safe_get(response, 'data', [])
@@ -1507,7 +1563,9 @@ class WebServer:
                 if len(data) < 100:
                     break
                 page += 1
-                time.sleep(0.5)
+                
+                # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
+                time.sleep(1.2)
             
             # Agrupa pedidos por dia
             daily_counts = defaultdict(int)
