@@ -958,7 +958,7 @@ class Orchestrator:
             self.logger.info("✅ Worker finalizado. Próxima execução em 10 minutos.")
             self._stop_event.wait(600)
 
-        def process_sales_orders(self):
+    def process_sales_orders(self):
         """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
         # Verifica e marca o estado de recalculação dentro do lock
@@ -998,7 +998,7 @@ class Orchestrator:
                 if response is None:
                     self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
                     break
-
+    
                 data = safe_get(response, 'data', [])
                 
                 # Valida se retornou dados
@@ -1013,7 +1013,7 @@ class Orchestrator:
                 if len(data) < 100:
                     self.logger.info(f"Última página detectada ({len(data)} itens).")
                     break
-
+    
                 page += 1
                 
                 # ✅ ADICIONE: Proteção contra loops infinitos
@@ -1021,25 +1021,9 @@ class Orchestrator:
                     self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
                     break
                 
-                time.sleep(self.config.DELAY_BETWEEN_PAGES)  # Delay configurável entre páginas
+
                 
-                batch_count += 1
-                if batch_count >= MAX_PAGES_PER_BATCH:
-                    self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
-                    time.sleep(self.config.DELAY_BETWEEN_BATCHES)  # Pausa configurável após o batch
-                    batch_count = 0
-                
-            self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
-            
-            # Recalcula os KPIs
-            self.sales.recalculate_from_orders(all_orders)
-            
-        except Exception as e:
-            self.logger.exception(f"Erro durante recálculo de pedidos: {e}")
-        finally:
-            # Libera a flag de estado dentro do lock
-            with self.sales.recalculation_lock:
-                self.sales._recalculation_running = False
+
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
