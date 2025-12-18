@@ -958,89 +958,88 @@ class Orchestrator:
             self.logger.info("✅ Worker finalizado. Próxima execução em 10 minutos.")
             self._stop_event.wait(600)
 
-    
-def process_sales_orders(self):
-    """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
-    
-    # Verifica e marca o estado de recalculação dentro do lock
-    with self.sales.recalculation_lock:
-        if self.sales._recalculation_running:
-            self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
-            return
-        self.sales._recalculation_running = True
+        def process_sales_orders(self):
+        """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
         
-    try:
-        # ✅ 1. Bloquear qualquer worker sem token
-        if not self.auth.is_authenticated():
-            self.logger.warning("⛔ Worker abortado: token inexistente.")
-            return
-            
-        self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
-        now = datetime.now()
-        params = {
-            'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
-            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-        }
-        
-        all_orders = []
-        page = 1
-        
-        # ✅ ADICIONE: Limite absoluto de páginas
-        MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
-        
-        # ✅ Limita a 3 páginas por vez para evitar rate limit
-        MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
-        batch_count = 0
-        
-        while True:
-            params['pagina'] = page
-            response = self.api.get('pedidos/vendas', params=params)
-            
-            if response is None:
-                self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
-                break
-
-            data = safe_get(response, 'data', [])
-            
-            # Valida se retornou dados
-            if not data or len(data) == 0:
-                self.logger.info(f"Página {page} vazia. Fim da paginação.")
-                break
-            
-            all_orders.extend(data)
-            self.logger.info(f"Página {page} processada. Total acumulado: {len(all_orders)} | Taxa: {len(data)} itens/página")
-            
-            # Se retornou menos que 100, é a última página
-            if len(data) < 100:
-                self.logger.info(f"Última página detectada ({len(data)} itens).")
-                break
-
-            page += 1
-            
-            # ✅ ADICIONE: Proteção contra loops infinitos
-            if page > MAX_TOTAL_PAGES:
-                self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
-                break
-            
-            time.sleep(self.config.DELAY_BETWEEN_PAGES)  # Delay configurável entre páginas
-            
-            batch_count += 1
-            if batch_count >= MAX_PAGES_PER_BATCH:
-                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES)  # Pausa configurável após o batch
-                batch_count = 0
-            
-        self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
-        
-        # Recalcula os KPIs
-        self.sales.recalculate_from_orders(all_orders)
-        
-    except Exception as e:
-        self.logger.exception(f"Erro durante recálculo de pedidos: {e}")
-    finally:
-        # Libera a flag de estado dentro do lock
+        # Verifica e marca o estado de recalculação dentro do lock
         with self.sales.recalculation_lock:
-            self.sales._recalculation_running = False
+            if self.sales._recalculation_running:
+                self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
+                return
+            self.sales._recalculation_running = True
+            
+        try:
+            # ✅ 1. Bloquear qualquer worker sem token
+            if not self.auth.is_authenticated():
+                self.logger.warning("⛔ Worker abortado: token inexistente.")
+                return
+                
+            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
+            now = datetime.now()
+            params = {
+                'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+                'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
+            }
+            
+            all_orders = []
+            page = 1
+            
+            # ✅ ADICIONE: Limite absoluto de páginas
+            MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
+            
+            # ✅ Limita a 3 páginas por vez para evitar rate limit
+            MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
+            batch_count = 0
+            
+            while True:
+                params['pagina'] = page
+                response = self.api.get('pedidos/vendas', params=params)
+                
+                if response is None:
+                    self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
+                    break
+
+                data = safe_get(response, 'data', [])
+                
+                # Valida se retornou dados
+                if not data or len(data) == 0:
+                    self.logger.info(f"Página {page} vazia. Fim da paginação.")
+                    break
+                
+                all_orders.extend(data)
+                self.logger.info(f"Página {page} processada. Total acumulado: {len(all_orders)} | Taxa: {len(data)} itens/página")
+                
+                # Se retornou menos que 100, é a última página
+                if len(data) < 100:
+                    self.logger.info(f"Última página detectada ({len(data)} itens).")
+                    break
+
+                page += 1
+                
+                # ✅ ADICIONE: Proteção contra loops infinitos
+                if page > MAX_TOTAL_PAGES:
+                    self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
+                    break
+                
+                time.sleep(self.config.DELAY_BETWEEN_PAGES)  # Delay configurável entre páginas
+                
+                batch_count += 1
+                if batch_count >= MAX_PAGES_PER_BATCH:
+                    self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
+                    time.sleep(self.config.DELAY_BETWEEN_BATCHES)  # Pausa configurável após o batch
+                    batch_count = 0
+                
+            self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
+            
+            # Recalcula os KPIs
+            self.sales.recalculate_from_orders(all_orders)
+            
+        except Exception as e:
+            self.logger.exception(f"Erro durante recálculo de pedidos: {e}")
+        finally:
+            # Libera a flag de estado dentro do lock
+            with self.sales.recalculation_lock:
+                self.sales._recalculation_running = False
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
