@@ -1020,10 +1020,12 @@ class Orchestrator:
                 if page > MAX_TOTAL_PAGES:
                     self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
                     break
-                
-
-                
-
+        
+        except Exception as e:
+            self.logger.exception("Erro ao processar pedidos de venda.")
+        finally:
+            with self.sales.recalculation_lock:
+                self.sales._recalculation_running = False
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
