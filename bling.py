@@ -959,36 +959,31 @@ class Orchestrator:
             self._stop_event.wait(600)
 
     
-    def process_sales_orders(self):
-        """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
+def process_sales_orders(self):
+    """Busca pedidos de venda faturados/em andamento dos últimos 30 dias e ATUALIZA O SALES_MANAGER POR RECALCULO."""
+    
+    # Verifica e marca o estado de recalculação dentro do lock
+    with self.sales.recalculation_lock:
+        if self.sales._recalculation_running:
+            self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
+            return
+        self.sales._recalculation_running = True
         
-        # Verifica e marca o estado de recalculação dentro do lock
-        with self.sales.recalculation_lock:
-            if self.sales._recalculation_running:
-                self.logger.info("Recálculo de pedidos já em andamento. Pulando esta iteração.")
-                return
-            self.sales._recalculation_running = True
+    try:
+        # ✅ 1. Bloquear qualquer worker sem token
+        if not self.auth.is_authenticated():
+            self.logger.warning("⛔ Worker abortado: token inexistente.")
+            return
             
-        try:
-            # ✅ 1. Bloquear qualquer worker sem token
-            if not self.auth.is_authenticated():
-                self.logger.warning("⛔ Worker abortado: token inexistente.")
-                return
-                
-            
-            self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
-            now = datetime.now()
-            params = {
-                'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
-                'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-            }
-            
-            all_orders = []
-            page = 1
-            
-            # ✅ ADICIONE: Limite absoluto de páginas
-            MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
-       page = 1
+        self.logger.info("Iniciando busca COMPLETA de pedidos de venda para recalcular os KPIs (Últimos 30 dias)...")
+        now = datetime.now()
+        params = {
+            'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
+        }
+        
+        all_orders = []
+        page = 1
         
         # ✅ ADICIONE: Limite absoluto de páginas
         MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
@@ -996,183 +991,190 @@ class Orchestrator:
         # ✅ Limita a 3 páginas por vez para evitar rate limit
         MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
         batch_count = 0
-            
-            while True:
-                params['pagina'] = page
-                response = self.api.get('pedidos/vendas', params=params)
-                
-                if response is None:
-                    self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
-                    break
-
-                data = safe_get(response, 'data', [])
-                
-                # Valida se retornou dados
-                if not data or len(data) == 0:
-                    self.logger.info(f"Página {page} vazia. Fim da paginação.")
-                    break
-                
-                all_orders.extend(data)
-                self.logger.info(f"Página {page} processada. Total acumulado: {len(all_orders)} | Taxa: {len(data)} itens/página")
-                
-                # Se retornou menos que 100, é a última página
-                if len(data) < 100:
-                    self.logger.info(f"Última página detectada ({len(data)} itens).")
-                    break
-
-                page += 1
-                time.sleep(self.config.DELAY_BETWEEN_PAGES) # Delay configurável entre páginas
-                
-                batch_count += 1
-                if batch_count >= MAX_PAGES_PER_BATCH:
-                    self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
-                    time.sleep(self.config.DELAY_BETWEEN_BATCHES) # Pausa configurável após o batch
-                    batch_count = 0
-                
-            self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
-            
-            # Recalcula os KPIs
-            self.sales.recalculate_from_orders(all_orders)
-            
-        except Exception as e:
-            self.logger.exception(f"Erro durante recálculo de pedidos: {e}")
-        finally:
-            # Libera a flag de estado dentro do lock
-            with self.sales.recalculation_lock:
-                self.sales._recalculation_running = False
-
-    def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos e kits."""
-        
-        if not self.auth.is_authenticated():
-            self.logger.error("⛔ Worker abortado: token inexistente ou falha na renovação.")
-            return
-            
-        self.logger.info("Iniciando busca e cache de produtos e kits...")
-        
-        all_products = []
-        all_kits = []
-        page = 1
-        
-        MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
-        batch_count = 0
         
         while True:
-            params = {
-                'pagina': page,
-                'tipo': 'P,K'
-            }
-            response = self.api.get('produtos', params=params)
+            params['pagina'] = page
+            response = self.api.get('pedidos/vendas', params=params)
             
             if response is None:
-                self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+                self.logger.error("Falha ao buscar pedidos na API. Tentando usar cache anterior.")
                 break
 
             data = safe_get(response, 'data', [])
             
+            # Valida se retornou dados
             if not data or len(data) == 0:
                 self.logger.info(f"Página {page} vazia. Fim da paginação.")
                 break
             
-            # ✅ CORREÇÃO: Estrutura real da API Bling
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                
-                # ✅ Acesso direto aos campos
-                tipo = item.get('tipo')
-                sku = item.get('codigo')
-                nome = item.get('nome')
-                
-                # Valida campos obrigatórios
-                if not sku or not tipo:
-                    continue
-                
-                # ✅ Normaliza o item
-                produto_normalizado = {
-                    'sku': sku,
-                    'codigo': sku,
-                    'nome': nome,
-                    'tipo': tipo,
-                    'id': item.get('id'),
-                    'preco': item.get('preco', 0),
-                    'precoCusto': item.get('precoCusto', 0),
-                    'estoque': item.get('estoque', {}),
-                    'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
-                    'situacao': item.get('situacao'),
-                    'formato': item.get('formato'),
-                    'descricaoCurta': item.get('descricaoCurta', ''),
-                    'imagemURL': item.get('imagemURL', ''),
-                    'imagem': {'link': item.get('imagemURL', '')}
-                }
-                
-                if tipo == 'P':
-                    all_products.append(produto_normalizado)
-                elif tipo == 'K':
-                    # Processa componentes
-                    componentes_raw = item.get('componentes', [])
-                    componentes_processados = []
-                    
-                    for comp in safe_iter(componentes_raw):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        componentes_processados.append({
-                            'produto': {
-                                'codigo': safe_get(comp_produto, 'codigo'),
-                                'nome': safe_get(comp_produto, 'nome')
-                            },
-                            'sku': safe_get(comp_produto, 'codigo'),
-                            'nome': safe_get(comp_produto, 'nome'),
-                            'quantidade': safe_get(comp, 'quantidade', 0)
-                        })
-                    
-                    produto_normalizado['componentes'] = componentes_processados
-                    all_kits.append(produto_normalizado)
-
-            self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
+            all_orders.extend(data)
+            self.logger.info(f"Página {page} processada. Total acumulado: {len(all_orders)} | Taxa: {len(data)} itens/página")
             
+            # Se retornou menos que 100, é a última página
             if len(data) < 100:
-                self.logger.info(f"Últpage += 1
-                
-                # ✅ ADICIONE: Proteção contra loops infinitos
-                if page > MAX_TOTAL_PAGES:
-                    self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
-                    break
-         page += 1
+                self.logger.info(f"Última página detectada ({len(data)} itens).")
+                break
+
+            page += 1
             
             # ✅ ADICIONE: Proteção contra loops infinitos
             if page > MAX_TOTAL_PAGES:
                 self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
                 break
             
-            # ✅ Pausa entre requisições
-            time.sleep(self.config.DELAY_BETWEEN_PAGES)
+            time.sleep(self.config.DELAY_BETWEEN_PAGES)  # Delay configurável entre páginas
             
             batch_count += 1
             if batch_count >= MAX_PAGES_PER_BATCH:
-                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {MAX_PAGES_PER_BATCH} páginas (rate limit)")
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
-                batch_count = 0  batch_count = 0           
-        # ✅ PROTEÇÃO: Só atualiza cache se houver mudanças significativas
-        if len(all_products) > 0 or len(all_kits) > 0:
-            with self._cache_lock:
-                old_count = len(self._products_cache) + len(self._kits_cache)
-                new_count = len(all_products) + len(all_kits)
-                
-                # Se diferença for < 5%, pula atualização (evita sobrescrever cache bom)
-                if old_count > 0 and abs(new_count - old_count) / old_count < 0.05:
-                    self.logger.info(f"⏭️ Cache estável ({old_count} → {new_count}). Pulando atualização.")
-                    return
-                
-                self.logger.info(f"Busca de produtos finalizada. Total: {new_count} ({old_count} anterior)")
-                
-                self._products_cache = {p['sku']: p for p in all_products}
-                self._kits_cache = {k['sku']: k for k in all_kits}
-                save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
-        else:
-            self.logger.warning("⚠️ Nenhum produto/kit retornado. Mantendo cache anterior.")
+                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {batch_count} páginas (rate limit)")
+                time.sleep(self.config.DELAY_BETWEEN_BATCHES)  # Pausa configurável após o batch
+                batch_count = 0
             
-        # Notifica o frontend
-        self.broadcast_kpi_update(cache_updated=True)
+        self.logger.info(f"Busca de pedidos finalizada. Total de pedidos: {len(all_orders)}")
+        
+        # Recalcula os KPIs
+        self.sales.recalculate_from_orders(all_orders)
+        
+    except Exception as e:
+        self.logger.exception(f"Erro durante recálculo de pedidos: {e}")
+    finally:
+        # Libera a flag de estado dentro do lock
+        with self.sales.recalculation_lock:
+            self.sales._recalculation_running = False
+
+    def process_products_cache(self):
+    """Busca e armazena em cache todos os produtos e kits."""
+    
+    if not self.auth.is_authenticated():
+        self.logger.error("⛔ Worker abortado: token inexistente ou falha na renovação.")
+        return
+        
+    self.logger.info("Iniciando busca e cache de produtos e kits...")
+    
+    all_products = []
+    all_kits = []
+    page = 1
+    
+    # ✅ ADICIONE: Limite absoluto de páginas
+    MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
+    
+    MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
+    batch_count = 0
+    
+    while True:
+        params = {
+            'pagina': page,
+            'tipo': 'P,K'
+        }
+        response = self.api.get('produtos', params=params)
+        
+        if response is None:
+            self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+            break
+
+        data = safe_get(response, 'data', [])
+        
+        if not data or len(data) == 0:
+            self.logger.info(f"Página {page} vazia. Fim da paginação.")
+            break
+        
+        # ✅ CORREÇÃO: Estrutura real da API Bling
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            
+            # ✅ Acesso direto aos campos
+            tipo = item.get('tipo')
+            sku = item.get('codigo')
+            nome = item.get('nome')
+            
+            # Valida campos obrigatórios
+            if not sku or not tipo:
+                continue
+            
+            # ✅ Normaliza o item
+            produto_normalizado = {
+                'sku': sku,
+                'codigo': sku,
+                'nome': nome,
+                'tipo': tipo,
+                'id': item.get('id'),
+                'preco': item.get('preco', 0),
+                'precoCusto': item.get('precoCusto', 0),
+                'estoque': item.get('estoque', {}),
+                'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
+                'situacao': item.get('situacao'),
+                'formato': item.get('formato'),
+                'descricaoCurta': item.get('descricaoCurta', ''),
+                'imagemURL': item.get('imagemURL', ''),
+                'imagem': {'link': item.get('imagemURL', '')}
+            }
+            
+            if tipo == 'P':
+                all_products.append(produto_normalizado)
+            elif tipo == 'K':
+                # Processa componentes
+                componentes_raw = item.get('componentes', [])
+                componentes_processados = []
+                
+                for comp in safe_iter(componentes_raw):
+                    comp_produto = safe_get(comp, 'produto', {})
+                    componentes_processados.append({
+                        'produto': {
+                            'codigo': safe_get(comp_produto, 'codigo'),
+                            'nome': safe_get(comp_produto, 'nome')
+                        },
+                        'sku': safe_get(comp_produto, 'codigo'),
+                        'nome': safe_get(comp_produto, 'nome'),
+                        'quantidade': safe_get(comp, 'quantidade', 0)
+                    })
+                
+                produto_normalizado['componentes'] = componentes_processados
+                all_kits.append(produto_normalizado)
+
+        self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
+        
+        if len(data) < 100:
+            self.logger.info(f"Última página detectada ({len(data)} itens).")
+            break
+        
+        page += 1
+        
+        # ✅ ADICIONE: Proteção contra loops infinitos
+        if page > MAX_TOTAL_PAGES:
+            self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
+            break
+        
+        # ✅ Pausa entre requisições
+        time.sleep(self.config.DELAY_BETWEEN_PAGES)
+        
+        batch_count += 1
+        if batch_count >= MAX_PAGES_PER_BATCH:
+            self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {MAX_PAGES_PER_BATCH} páginas (rate limit)")
+            time.sleep(self.config.DELAY_BETWEEN_BATCHES)
+            batch_count = 0
+            
+    # ✅ PROTEÇÃO: Só atualiza cache se houver mudanças significativas
+    if len(all_products) > 0 or len(all_kits) > 0:
+        with self._cache_lock:
+            old_count = len(self._products_cache) + len(self._kits_cache)
+            new_count = len(all_products) + len(all_kits)
+            
+            # Se diferença for < 5%, pula atualização (evita sobrescrever cache bom)
+            if old_count > 0 and abs(new_count - old_count) / old_count < 0.05:
+                self.logger.info(f"⭐️ Cache estável ({old_count} → {new_count}). Pulando atualização.")
+                return
+            
+            self.logger.info(f"Busca de produtos finalizada. Total: {new_count} ({old_count} anterior)")
+            
+            self._products_cache = {p['sku']: p for p in all_products}
+            self._kits_cache = {k['sku']: k for k in all_kits}
+            save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+    else:
+        self.logger.warning("⚠️ Nenhum produto/kit retornado. Mantendo cache anterior.")
+        
+    # Notifica o frontend
+    self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
         """
