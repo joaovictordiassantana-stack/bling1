@@ -864,6 +864,10 @@ class Orchestrator:
         # ✅ ADICIONE ESTAS LINHAS:
         self._component_usage_cache = None  # Inicializa o cache de componentes
         self.logger.debug("Orchestrator inicializado com cache de componentes vazio")
+        
+        # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
+        self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
+        self.process_products_cache()
 
     def _load_cache(self):
         """Carrega o cache de produtos/kits do disco."""
@@ -949,14 +953,14 @@ class Orchestrator:
             cycle_count += 1
             
             # ✅ ESTRATÉGIA: Alterna tarefas pesadas a cada 2 ciclos (20 min)
-            if cycle_count % 2 == 1:
-                # Ciclo ímpar: Atualiza KPIs (pedidos)
-                self.logger.info("🔄 Ciclo #%d: Atualizando KPIs (pedidos)", cycle_count)
-                self.process_sales_orders()
-            else:
-                # Ciclo par: Atualiza cache de produtos
-                self.logger.info("🔄 Ciclo #%d: Atualizando cache (produtos)", cycle_count)
+            # ✅ CORREÇÃO: Atualiza produtos a cada 3 ciclos (30 minutos)
+            if cycle_count % 3 == 0:
+                self.logger.info("🔄 Ciclo #%d: Atualizando cache (produtos) - A cada 30 min", cycle_count)
                 self.process_products_cache()
+            
+            # Ciclo ímpar: Atualiza KPIs (pedidos)
+            self.logger.info("🔄 Ciclo #%d: Atualizando KPIs (pedidos)", cycle_count)
+            self.process_sales_orders()
             
             # ✅ Componentes: calcula apenas a cada 4 ciclos (40 min)
             if cycle_count % 4 == 0:
@@ -1117,8 +1121,8 @@ class Orchestrator:
                 produto_normalizado = {
                     'sku': sku,
                     'codigo': sku,
-                    'nome': nome,
-                    'tipo': tipo,
+                    'nome': item.get('descricao') or nome, # ✅ CORREÇÃO: Usa 'descricao' se existir, senão 'nome'
+                    'tipo': "COMPOSTO" if tipo == 'K' else "SIMPLES", # ✅ PADRONIZAÇÃO: Usa string literal COMPOSTO/SIMPLES
                     'id': item.get('id'),
                     'preco': item.get('preco', 0),
                     'precoCusto': item.get('precoCusto', 0),
@@ -1127,13 +1131,16 @@ class Orchestrator:
                     'situacao': item.get('situacao'),
                     'formato': item.get('formato'),
                     'descricaoCurta': item.get('descricaoCurta', ''),
-                    'imagemURL': item.get('imagemURL', ''),
-                    'imagem': {'link': item.get('imagemURL', '')}
+                    # ✅ NORMALIZAÇÃO DE IMAGEM: O HTML espera 'imagem' com a URL
+                    'imagem': safe_get(item.get('imagem'), 'link', ''), # ✅ NORMALIZAÇÃO: Garante a URL da imagem
+                    'componentes': [] # ✅ PADRONIZAÇÃO: Produto simples começa com lista vazia
                 }
                 
                 if tipo == 'P':
                     all_products.append(produto_normalizado)
                 elif tipo == 'K':
+                    # ✅ PADRONIZAÇÃO: Kits já tem 'componentes': [] do produto_normalizado, será sobrescrito abaixo.
+                    # ✅ PADRONIZAÇÃO: Kits já tem 'componentes': [] do produto_normalizado, será sobrescrito abaixo.
                     # Processa componentes
                     componentes_raw = item.get('componentes', [])
                     componentes_processados = []
@@ -1141,13 +1148,9 @@ class Orchestrator:
                     for comp in safe_iter(componentes_raw):
                         comp_produto = safe_get(comp, 'produto', {})
                         componentes_processados.append({
-                            'produto': {
-                                'codigo': safe_get(comp_produto, 'codigo'),
-                                'nome': safe_get(comp_produto, 'nome')
-                            },
-                            'sku': safe_get(comp_produto, 'codigo'),
-                            'nome': safe_get(comp_produto, 'nome'),
-                            'quantidade': safe_get(comp, 'quantidade', 0)
+                            "nome": safe_get(comp_produto, 'nome'), # ✅ CORREÇÃO: Usa 'nome' do componente
+                            "sku": safe_get(comp_produto, 'codigo'),
+                            "quantidade": safe_get(comp, 'quantidade', 1) # ✅ CORREÇÃO: Quantidade padrão 1
                         })
                     
                     produto_normalizado['componentes'] = componentes_processados
@@ -1187,6 +1190,13 @@ class Orchestrator:
                     return
                 
                 self.logger.info(f"Busca de produtos finalizada. Total: {new_count} ({old_count} anterior)")
+                
+                # ✅ LOG DE VALIDAÇÃO (Passo 5 - Parte 1)
+                all_normalized = all_products + all_kits
+                self.logger.info(
+                    f"📦 Cache produtos | total={len(all_normalized)} | "
+                    f"compostos={sum(1 for p in all_normalized if p.get('componentes') and len(p['componentes']) > 0)}"
+                )
                 
                 self._products_cache = {p['sku']: p for p in all_products}
                 self._kits_cache = {k['sku']: k for k in all_kits}
@@ -1648,53 +1658,28 @@ class WebServer:
             results = []
             
             # Busca em produtos simples
-            for product in self.orchestrator.get_all_products():
-                name = safe_get(product, 'nome', '').lower()
-                sku = safe_get(product, 'sku', '').lower()
+            # ✅ CORREÇÃO CRÍTICA (Passo 3): Usa o cache completo e padronizado
+            all_products = self.orchestrator.get_all_products() + self.orchestrator.get_all_kits()
+            
+            for p in all_products:
+                name = safe_get(p, 'nome', '').lower()
+                sku = safe_get(p, 'sku', '').lower()
+                
                 if query in name or query in sku:
-                    # Busca onde esse produto é usado como componente
-                    componentes_que_usam = []
-                    for kit in self.orchestrator.get_all_kits():
-                        for comp in safe_iter(safe_get(kit, 'componentes')):
-                            if safe_get(comp, 'sku') == product.get('sku'):
-                                componentes_que_usam.append({
-                                    "kit_sku": kit.get('sku'),
-                                    "kit_nome": kit.get('nome'),
-                                    "quantidade": safe_get(comp, 'quantidade')
-                                })
-                    
+                    # ✅ Usa o modelo padronizado do cache
                     results.append({
-                        "sku": product.get('sku'),
-                        "nome": product.get('nome'),
-                        "estoque": product.get('estoqueAtual'),
-                        "tipo": "Produto",
-                        "imagemURL": safe_get(product, 'imagem', {}).get('link'),
-                        "usado_em": componentes_que_usam  # NOVO CAMPO
+                        "id": p.get("id"),
+                        "nome": p.get("nome"),
+                        "sku": p.get("sku"),
+                        "tipo": p.get("tipo"),
+                        "imagem": p.get("imagem"), # Já normalizado
+                        "componentes": p.get("componentes", []) # Já padronizado
                     })
 
-            # Busca em kits
-            for kit in self.orchestrator.get_all_kits():
-                name = safe_get(kit, 'nome', '').lower()
-                sku = safe_get(kit, 'sku', '').lower()
-                if query in name or query in sku:
-                    components = []
-                    for comp in safe_iter(safe_get(kit, 'componentes')):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        components.append({
-                            "sku": safe_get(comp_produto, 'codigo'),
-                            "nome": safe_get(comp_produto, 'nome'),
-                            "quantidade": safe_get(comp, 'quantidade')
-                        })
-                        
-                    results.append({
-                        "sku": kit.get('sku'),
-                        "nome": kit.get('nome'),
-                        "estoque": kit.get('estoqueAtual'),
-                        "tipo": "Kit",
-                        "imagemURL": safe_get(kit, 'imagem', {}).get('link'),
-                        "componentes": components
-                    })
-
+            self.logger.info(
+                f"🔍 Busca | resultados={len(results)} | com_componentes="
+                f"{sum(1 for r in results if r.get('componentes') and len(r['componentes']) > 0)}"
+            )
             return jsonify(results[:10]) # Limita a 10 resultados
 
         @self.app.route('/api/kits')
@@ -2947,12 +2932,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                         <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
                                     </small>
 
-                                    ${p.tipo === 'Kit' && p.componentes && p.componentes.length > 0 ? `
-                                        <div class="mt-2 p-2 bg-light rounded">
-                                            <b>🔧 Componentes deste Kit:</b><br>
-                                            ${p.componentes.map(c =>
-                                                `• ${c.quantidade}x <b>${c.nome || 'Sem nome'}</b> (SKU: ${c.sku || 'N/D'})`
-                                            ).join("<br>")}
+                                    ${p.componentes && p.componentes.length > 0 ? `
+                                        <div class="componentes mt-2 p-2 bg-light rounded">
+                                            <small>Componentes:</small>
+                                            <ul>
+                                                ${p.componentes.map(c =>
+                                                    `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
+                                                ).join("")}
+                                            </ul>
                                         </div>
                                     ` : ""}
 
