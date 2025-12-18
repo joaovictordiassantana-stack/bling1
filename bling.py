@@ -1525,8 +1525,6 @@ class WebServer:
         @token_required
         def api_sales_stats(token):
             """Retorna os contadores Diário, Semanal e Histórico."""
-                        # ✅ CORREÇÃO CRÍTICA (PONTO 1): Força o recálculo para evitar cache antigo
-            self.orchestrator.process_sales_orders()
             stats = self.orchestrator.sales.get_stats()
             
             
@@ -1579,40 +1577,55 @@ class WebServer:
                 # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
                 time.sleep(1.2)
             
-            # ✅ CORREÇÃO CRÍTICA (PONTO 2): Formato de retorno para o gráfico
-            # O código original fazia um processamento complexo de média móvel e crescimento.
-            # A instrução é retornar uma lista simples de data e total.
-            
-            # Agrupa pedidos por dia e soma o total
-            daily_totals = defaultdict(float)
+            # Agrupa pedidos por dia
+            daily_counts = defaultdict(int)
             for order in all_orders:
                 data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
-                total_venda = safe_get(order, 'total', 0.0)
-                
                 if not data_emissao_str:
                     continue
                 try:
                     order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
                     day_key = order_date.strftime('%Y-%m-%d')
                     
-                    daily_totals[day_key] += float(total_venda)
+                    # CONTA QUANTIDADE DE ITENS, NÃO PEDIDOS
+                    itens = safe_get(order, 'itens', [])
+                    for item in safe_iter(itens):
+                        quantidade = safe_get(item, 'quantidade', 0)
+                        daily_counts[day_key] += quantidade
                 except:
                     continue
             
-            # Cria a lista final no formato esperado pelo Front-end
-            # Garante que todos os dias dos últimos 30 dias estejam presentes, mesmo que com total 0
-            history_data = []
+            # Gera labels e valores para os últimos 30 dias
+            labels = []
+            daily = []
             for i in range(30):
                 date = now - timedelta(days=29-i)
                 day_key = date.strftime('%Y-%m-%d')
-                
-                history_data.append({
-                    "data": day_key,
-                    "total": round(daily_totals.get(day_key, 0.0), 2)
-                })
+                labels.append(date.strftime('%d/%m'))
+                daily.append(daily_counts.get(day_key, 0))
             
-            # Retorna a lista no formato: [{"data": "YYYY-MM-DD", "total": 123.45}, ...]
-            return jsonify(history_data)
+            # Calcula média móvel (7 dias)
+            moving_avg = []
+            for i in range(len(daily)):
+                if i < 6:
+                    moving_avg.append(None)
+                else:
+                    avg = sum(daily[i-6:i+1]) / 7
+                    moving_avg.append(round(avg, 1))
+            
+            # Crescimento semanal
+            last_week_sum = sum(daily[-7:])
+            prev_week_sum = sum(daily[-14:-7])
+            growth = ((last_week_sum - prev_week_sum) / prev_week_sum * 100) if prev_week_sum > 0 else 0
+            avg_daily = sum(daily) / len(daily)
+            
+            return jsonify({
+                "labels": labels,
+                "daily": daily,
+                "moving_avg": moving_avg,
+                "growth": round(growth, 1),
+                "avg_daily": round(avg_daily, 1)
+            })
 
 
         @self.app.route('/api/recalculate', methods=['POST'])
