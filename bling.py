@@ -30,7 +30,7 @@ import hashlib
 
 from pathlib import Path
 from datetime import datetime, timedelta
-from threading import Lock, Thread
+from threading import Lock, Thread, Event
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Callable
 from collections import defaultdict
@@ -1527,18 +1527,7 @@ class WebServer:
                 "growth": round(growth, 1),
                 "avg_daily": round(avg_daily, 1)
             })
-            else:
-                growth = 0
-                
-            avg_daily = sum(daily) / len(daily)
-            
-            return jsonify({
-                "labels": labels,
-                "daily": daily,
-                "moving_avg": moving_avg,
-                "growth": round(growth, 1),
-                "avg_daily": round(avg_daily, 1)
-            })
+
 
         @self.app.route('/api/recalculate', methods=['POST'])
         @token_required
