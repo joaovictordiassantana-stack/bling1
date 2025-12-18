@@ -756,11 +756,11 @@ class SalesManager:
 
     
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
-        """Calcula KPIs baseando-se em QUANTIDADE DE PRODUTOS vendidos."""
+        """Calcula KPIs: QUANTIDADE DE PRODUTOS vendidos em 24h, 7 dias e 30 dias."""
         now = datetime.now()
-        yesterday = now - timedelta(hours=24)
-        last_week = now - timedelta(days=7)
-        last_month = now - timedelta(days=30)
+        last_24h = now - timedelta(hours=24)
+        last_7d = now - timedelta(days=7)
+        last_30d = now - timedelta(days=30)
         
         daily = 0
         weekly = 0
@@ -770,25 +770,18 @@ class SalesManager:
             if not isinstance(order, dict):
                 continue
             
-            # Extrai data de emissão
-            data_emissao_str = None
-            data_obj = order.get('data')
-            if isinstance(data_obj, dict):
-                data_emissao_str = data_obj.get('dataEmissao')
-                hora_emissao = data_obj.get('horaEmissao')
-            elif isinstance(data_obj, str):
-                data_emissao_str = data_obj
-                hora_emissao = None
+            # Extrai data
+            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
+            hora_emissao = safe_get(safe_get(order, 'data', {}), 'horaEmissao')
             
             if not data_emissao_str:
-                data_emissao_str = order.get('dataEmissao') or order.get('dataHora', '').split('T')[0]
-                if not data_emissao_str:
-                    continue
+                continue
             
             try:
                 order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
                 
-                if hora_emissao and isinstance(hora_emissao, str):
+                # Adiciona hora se disponível
+                if hora_emissao:
                     try:
                         parts = hora_emissao.split(':')
                         if len(parts) == 3:
@@ -797,27 +790,24 @@ class SalesManager:
                     except:
                         pass
             except Exception as e:
-                self.logger.warning(f"Erro ao parsear data '{data_emissao_str}': {e}")
+                self.logger.warning(f"Data inválida '{data_emissao_str}': {e}")
                 continue
             
-            # SOMA QUANTIDADE DE ITENS DO PEDIDO
+            # CONTA PRODUTOS
             itens = safe_get(order, 'itens', [])
-            total_items = 0
-            for item in safe_iter(itens):
-                quantidade = safe_get(item, 'quantidade', 0)
-                total_items += quantidade
+            total_items = sum(safe_get(item, 'quantidade', 0) for item in safe_iter(itens))
             
-            # Acumula nos períodos corretos
-            if order_date >= last_month:
-                historic += total_items
+            # Acumula por período (NÃO sobreposto)
+            if order_date >= last_24h:
+                daily += total_items
             
-            if order_date >= last_week:
+            if order_date >= last_7d:
                 weekly += total_items
             
-            if order_date >= yesterday:
-                daily += total_items
+            if order_date >= last_30d:
+                historic += total_items
         
-        # ATUALIZAÇÃO E PERSISTÊNCIA (mantém o mesmo)
+        # Salva
         with self.lock:
             self.daily_count = daily
             self.weekly_count = weekly
@@ -1417,6 +1407,12 @@ class WebServer:
                     executor.shutdown(wait=False)
 
                     # O broadcast será feito no final de process_products_cache
+                    
+                    # CORREÇÃO PROBLEMA 1: Iniciar worker após autenticação
+                    if not self.orchestrator.is_running():
+                        self.orchestrator.start_worker()
+                        start_cleanup_timer()
+                        self.logger.info("✅ Worker iniciado após autenticação bem-sucedida.")
                 
                 return redirect('/')
             except Exception as e:
@@ -1662,37 +1658,43 @@ class WebServer:
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
-            """Recebe webhooks do Bling (ex: atualização de estoque)."""
-            
-            # A implementação completa de webhook requer validação de assinatura (HMAC)
-            # e processamento assíncrono. Aqui, apenas um esqueleto.
+            """Recebe webhooks do Bling com validação HMAC."""
             
             with WebServer.webhook_lock:
                 try:
-                    # 1. Validação da Assinatura (Recomendado)
-                    # signature = request.headers.get('X-Bling-Signature')
-                    # if not self._validate_signature(request.data, signature):
-                    #     self.logger.error("Webhook com assinatura inválida.")
-                    #     return jsonify({"error": "Assinatura inválida"}), 403
+                    # 1. Valida assinatura
+                    signature = request.headers.get('X-Bling-Signature')
+                    if not signature:
+                        self.logger.error("❌ Webhook sem assinatura X-Bling-Signature")
+                        return jsonify({"error": "Assinatura ausente"}), 403
                     
+                    # Gera HMAC esperado
+                    secret = self.config.CLIENT_SECRET.encode()
+                    expected = hmac.new(secret, request.data, hashlib.sha256).hexdigest()
+                    
+                    if not hmac.compare_digest(signature, expected):
+                        self.logger.error(f"❌ Assinatura inválida. Esperado: {expected[:10]}...")
+                        return jsonify({"error": "Assinatura inválida"}), 403
+                    
+                    # 2. Processa webhook
                     data = request.json
                     tipo = safe_get(data, 'tipo')
+                    evento = safe_get(data, 'evento')
 
-                    self.logger.info(f"🔔 Webhook recebido: Tipo={tipo}")
+                    self.logger.info(f"📩 Webhook válido: {tipo}.{evento}")
 
-                    # Exemplo de processamento: Forçar recálculo de KPIs em caso de novo pedido
-                    if tipo == 'pedidoVenda':
-                        self.logger.info("Webhook de Pedido de Venda recebido. Forçando recálculo de KPIs.")
-                        # Executa o recálculo em uma thread separada
+                    # 3. Força recálculo de KPIs para pedidos
+                    if tipo == 'pedidoVenda' and evento in ['criado', 'alterado', 'faturado']:
+                        self.logger.info("🔄 Webhook acionou recálculo de KPIs")
                         executor = ThreadPoolExecutor(max_workers=1)
                         executor.submit(self.orchestrator.process_sales_orders)
                         executor.shutdown(wait=False)
                         
-                    return jsonify({"status": "ok", "message": f"Webhook {tipo} recebido e processado."}), 200
+                    return jsonify({"status": "ok", "message": f"Webhook {tipo}.{evento} processado"}), 200
 
                 except Exception as e:
-                    self.logger.exception("Erro no processamento do webhook.")
-                    return jsonify({"error": "Erro interno do servidor"}), 500
+                    self.logger.exception("❌ Erro no webhook")
+                    return jsonify({"error": "Erro interno"}), 500
 
     def _setup_websockets(self):
         """Configura os WebSockets para logs e atualizações de KPI."""
@@ -1861,8 +1863,8 @@ DASHBOARD_TEMPLATE = """
             </div>
 
             <div class="tab-pane fade" id="kits">
-                <button class="btn btn-sm btn-warning mb-3" onclick="forceAndReloadKits(event)">🔄 Forçar Recarregamento</button>
-                <p class="text-muted">Aguarde o carregamento completo. Kits (Produtos com Componentes) podem demorar mais para carregar os detalhes.</p>
+                <button class="btn btn-sm btn-primary mb-3" onclick="forceAndReloadKits(event)">🔄 Recarregar Lista</button>
+                <small class="text-muted d-block mb-3">⚠️ Carregamento pode levar 2-5 minutos. Aguarde a notificação do WebSocket.</small>
                 <div id="kits-list"></div>
             </div>
 
@@ -2174,7 +2176,7 @@ recalculateButton.textContent = '🔄 Forçar Recálculo';
 showToast('Sucesso', 'Recálculo de KPIs concluído.', 'success');
                 }
                 
-                const forceLoadButton = document.querySelector('#kits button.btn-warning');
+                const forceLoadButton = document.querySelector('#kits button.btn-primary');
                 if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
 forceLoadButton.disabled = false;
 forceLoadButton.textContent = '🔄 Forçar Recarregamento';
@@ -2245,18 +2247,18 @@ html += `
             <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
         </small>
 
-        ${p.componentes && p.componentes.length > 0 ? `
-            <div class="mt-2">
-                <b>Componentes:</b><br>
-                ${p.componentes.map(c => 
-`${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
-                ).join("<br>")}
-            </div>
+	        ${p.tipo === 'Kit' && p.componentes && p.componentes.length > 0 ? `
+	            <div class="mt-2 p-2 bg-light rounded">
+	                <b>🔧 Componentes deste Kit:</b><br>
+	                ${p.componentes.map(c => 
+	                    `• ${c.quantidade}x <b>${c.nome || 'Sem nome'}</b> (SKU: ${c.sku || 'N/D'})`
+	                ).join("<br>")}
+	            </div>
 	        ` : ""}
 	        
-	        ${p.usado_em && p.usado_em.length > 0 ? `
-	            <div class="mt-2">
-	                <b>Usado em:</b><br>
+	        ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
+	            <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
+	                <b>📦 Este componente é usado em:</b><br>
 	                ${p.usado_em.map(u => 
 	                    `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
 	                ).join("<br>")}
@@ -2354,18 +2356,15 @@ html += `
             
             const btn = event.target;
             btn.disabled = true;
-            btn.textContent = '⏳ Forçando Recarregamento...';
+            btn.innerHTML = '⏳ Carregando cache... (pode levar 2-5 minutos)';
             
             try {
                 const data = await fetchAPI('/api/force-load', { method: 'POST' });
-     showToast('Info', data.message || 'Recarregamento forçado com sucesso. Aguarde a atualização via WebSocket.', 'info');
-     // Não precisa chamar loadKits() aqui, o WS fará isso
-                
+                showToast('Info', 'Cache sendo atualizado. Aguarde a notificação do WebSocket.', 'info');
             } catch(e) {
-                showToast('Erro', 'Erro ao forçar recarregamento: ' + e.message, 'danger');
-            } finally {
+                showToast('Erro', 'Erro: ' + e.message, 'danger');
                 btn.disabled = false;
-                btn.textContent = '🔄 Forçar Recarregamento';
+                btn.innerHTML = '🔄 Recarregar Lista';
             }
         }
     
@@ -2522,7 +2521,7 @@ if __name__ == '__main__':
     # Garante que o worker inicie no ambiente local
     orchestrator = app.orchestrator # Acessa o orchestrator criado em create_app
     if not orchestrator.is_running():
-        orchestrator.start()
+        orchestrator.start_worker()
         start_cleanup_timer()
         logger.info("✅ Worker de fundo iniciado em modo local.")
         
