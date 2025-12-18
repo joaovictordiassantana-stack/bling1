@@ -843,6 +843,10 @@ class Orchestrator:
         self._kits_cache = {}
         self._load_cache()
         self._cache_lock = Lock()
+        
+        # ✅ ADICIONE ESTAS LINHAS:
+        self._component_usage_cache = None  # Inicializa o cache de componentes
+        self.logger.debug("Orchestrator inicializado com cache de componentes vazio")
 
     def _load_cache(self):
         """Carrega o cache de produtos/kits do disco."""
@@ -930,8 +934,12 @@ class Orchestrator:
             try:
                 self.logger.info("Calculando uso de componentes...")
                 usage = self.calculate_component_usage()
-                self._component_usage_cache = usage  # Armazena em cache
-                self.broadcast_kpi_update(component_usage=usage)
+                if usage and (usage.get('components') or usage.get('daily_breakdown')):
+                    self._component_usage_cache = usage  # Armazena em cache
+                    self.logger.info(f"✅ Uso de componentes calculado: {len(usage.get('components', []))} itens")
+                    self.broadcast_kpi_update(component_usage=usage)
+                else:
+                    self.logger.warning("⚠️ Cálculo de componentes retornou vazio")
             except Exception as e:
                 self.logger.exception("Erro ao calcular componentes.")
             
@@ -1253,7 +1261,7 @@ class Orchestrator:
             "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
         }
 
-    def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False):
+    def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None):
         """
         Envia uma atualização completa de status via WebSocket para todos os clientes.
         Inclui status de autenticação, KPIs e, se solicitado, uso de componentes.
@@ -1277,9 +1285,10 @@ class Orchestrator:
             stats_data['last_update'] = stats_data.pop('last_recalculated')
             payload["sales_stats"] = stats_data
             
-            # 3. Adiciona o uso de componentes (Calculado sob demanda via API /api/components/usage)
-            # NOTA: O cálculo é pesado e foi removido do fluxo de broadcast para evitar latência/rate limit.
-            self.logger.debug("Cálculo de uso de componentes omitido do broadcast para otimização.")
+        # 3. Adiciona o uso de componentes se fornecido
+        if component_usage:
+            payload["component_usage"] = component_usage
+            self.logger.debug("Uso de componentes incluído no broadcast.")
                 
         # 4. Envia o broadcast
         with kpi_update_lock:
@@ -1649,12 +1658,30 @@ class WebServer:
         @token_required
         def api_component_usage(token):
             """Retorna uso de componentes (do cache do worker)."""
-            # Retorna cache se disponível, senão calcula
-            if hasattr(self.orchestrator, '_component_usage_cache'):
-                return jsonify(self.orchestrator._component_usage_cache)
-            else:
+            try:
+                # Retorna cache se disponível E não vazio
+                cache = getattr(self.orchestrator, '_component_usage_cache', None)
+                
+                if cache and (cache.get('components') or cache.get('daily_breakdown')):
+                    self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
+                    return jsonify(cache)
+                
+                # Calcula sob demanda
+                self.logger.info("🔄 Cache vazio. Calculando componentes sob demanda...")
                 usage_data = self.orchestrator.calculate_component_usage()
+                
+                # Armazena no cache para reutilizar
+                self.orchestrator._component_usage_cache = usage_data
+                
                 return jsonify(usage_data)
+                
+            except Exception as e:
+                self.logger.exception("Erro ao processar /api/components/usage")
+                return jsonify({
+                    "error": str(e),
+                    "components": [],
+                    "daily_breakdown": []
+                }), 500
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
@@ -1758,10 +1785,28 @@ class WebServer:
                     raise ConnectionClosed()  # Força desconexão
                 
             # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
+            # 1. Envia o estado inicial completo
             try:
-                # O broadcast_kpi_update é usado para enviar o estado inicial
-                # O sales_stats é passado para garantir que os KPIs e o uso de componentes sejam calculados e enviados
-                self.orchestrator.broadcast_kpi_update(sales_stats=self.orchestrator.sales._get_state_for_save())
+                sales_stats = self.orchestrator.sales._get_state_for_save()
+                
+                # Tenta usar cache se disponível
+                component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
+                
+                if not component_usage:
+                    self.logger.info("🔄 Cache de componentes vazio. Calculando...")
+                    try:
+                        component_usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = component_usage
+                    except Exception as calc_error:
+                        self.logger.error(f"Falha ao calcular componentes: {calc_error}")
+                        component_usage = {"components": [], "daily_breakdown": []}
+                
+                self.orchestrator.broadcast_kpi_update(
+                    sales_stats=sales_stats,
+                    component_usage=component_usage
+                )
+                self.logger.info("✅ Estado inicial enviado ao WebSocket")
+                
             except Exception as e:
                 self.logger.exception("Erro ao enviar estado inicial via WS.")
                 
@@ -2437,7 +2482,7 @@ scales: {
             kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
         }
         
-        // ✅ 5. Componentes: timeout + erro visível
+// ✅ 5. Componentes: timeout + erro visível
         const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
         if (componentUsageTab) {
             componentUsageTab.addEventListener('shown.bs.tab', () => {
@@ -2445,13 +2490,34 @@ scales: {
                 
                 // Se o conteúdo ainda for o "Carregando dados...", inicia o timeout
                 if (contentDiv.innerHTML.includes('Carregando dados...')) {
-setTimeout(() => {
-    if (contentDiv.innerHTML.includes('Carregando dados...')) {
-contentDiv.innerHTML = '<div class="alert alert-danger">❌ Não foi possível carregar o uso de componentes em tempo hábil. Verifique a autenticação e os logs.</div>';
-    }
-}, 8000); // 8 segundos de timeout
+                    // Aumenta timeout para 30s (cálculo pode demorar)
+                    setTimeout(() => {
+                        if (contentDiv.innerHTML.includes('Carregando dados...')) {
+                            contentDiv.innerHTML = `
+                                <div class="alert alert-warning">
+                                    ⚠️ Dados ainda não carregados. 
+                                    <button class="btn btn-sm btn-primary mt-2" onclick="forceLoadComponents()">
+                                        🔄 Forçar Recálculo
+                                    </button>
+                                </div>
+                            `;
+                        }
+                    }, 30000); // 30 segundos
                 }
             });
+        }
+
+        // Função para forçar recálculo manual
+        async function forceLoadComponents() {
+            const contentDiv = document.getElementById('component-usage-content');
+            contentDiv.innerHTML = '<div class="alert alert-info">🔄 Recalculando componentes... Aguarde até 2 minutos.</div>';
+            
+            try {
+                const data = await fetchAPI('/api/components/usage');
+                updateComponentUsage(data);
+            } catch(e) {
+                contentDiv.innerHTML = `<div class="alert alert-danger">❌ Erro: ${e.message}</div>`;
+            }
         }
     });
     </script>
