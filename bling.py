@@ -756,9 +756,9 @@ class SalesManager:
 
     
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
-        """Calcula KPIs baseando-se na data/hora de emissão dos pedidos."""
+        """Calcula KPIs baseando-se em QUANTIDADE DE PRODUTOS vendidos."""
         now = datetime.now()
-        yesterday = now - timedelta(hours=24) 
+        yesterday = now - timedelta(hours=24)
         last_week = now - timedelta(days=7)
         last_month = now - timedelta(days=30)
         
@@ -766,14 +766,12 @@ class SalesManager:
         weekly = 0
         historic = 0
         
-        # O cálculo é feito fora do lock.
         for order in orders:
             if not isinstance(order, dict):
-                self.logger.warning(f"Item inesperado encontrado na lista de pedidos de venda, ignorando: {order}")
                 continue
             
+            # Extrai data de emissão
             data_emissao_str = None
-
             data_obj = order.get('data')
             if isinstance(data_obj, dict):
                 data_emissao_str = data_obj.get('dataEmissao')
@@ -781,54 +779,55 @@ class SalesManager:
             elif isinstance(data_obj, str):
                 data_emissao_str = data_obj
                 hora_emissao = None
-
+            
             if not data_emissao_str:
-                # Caminho 3: Tenta estrutura alternativa
                 data_emissao_str = order.get('dataEmissao') or order.get('dataHora', '').split('T')[0]
                 if not data_emissao_str:
-                    self.logger.debug(f"Pedido {order.get('id')} sem dataEmissao. Estrutura: {order.keys()}")
                     continue
-
+            
             try:
                 order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-        
+                
                 if hora_emissao and isinstance(hora_emissao, str):
                     try:
                         parts = hora_emissao.split(':')
                         if len(parts) == 3:
                             h, m, s = map(int, parts)
                             order_date = order_date.replace(hour=h, minute=m, second=s)
-                    except (ValueError, AttributeError):
+                    except:
                         pass
             except Exception as e:
-                self.logger.warning(f"Erro ao parsear data '{data_emissao_str}' do pedido {order.get('id')}: {e}")
+                self.logger.warning(f"Erro ao parsear data '{data_emissao_str}': {e}")
                 continue
-
+            
+            # SOMA QUANTIDADE DE ITENS DO PEDIDO
+            itens = safe_get(order, 'itens', [])
+            total_items = 0
+            for item in safe_iter(itens):
+                quantidade = safe_get(item, 'quantidade', 0)
+                total_items += quantidade
+            
+            # Acumula nos períodos corretos
             if order_date >= last_month:
-                historic += 1 
-
+                historic += total_items
+            
             if order_date >= last_week:
-                weekly += 1
-
+                weekly += total_items
+            
             if order_date >= yesterday:
-                daily += 1 
-
-        # ATUALIZAÇÃO E PERSISTÊNCIA DENTRO DO LOCK
+                daily += total_items
+        
+        # ATUALIZAÇÃO E PERSISTÊNCIA (mantém o mesmo)
         with self.lock:
-            # Atualiza todos os contadores de uma vez
             self.daily_count = daily
             self.weekly_count = weekly
             self.historic_count = historic
-            self.last_recalculated = now # Atualiza o tempo de processamento
+            self.last_recalculated = now
             
-            # PERSISTE O ESTADO ATUAL
             save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
             
-            # Notifica subscribers sobre a mudança
             if self.orchestrator:
                 self.orchestrator.broadcast_kpi_update(sales_stats=self._get_state_for_save())
-            else:
-                self.logger.warning("Orchestrator não configurado no SalesManager. Não foi possível notificar via WS.")
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -932,14 +931,22 @@ class Orchestrator:
             self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
-        """Loop principal do worker de fundo."""
+        """Loop principal do worker."""
         while not self._stop_event.is_set():
-            
             self.process_sales_orders()
             self.process_products_cache()
             
+            # NOVO: Calcula uso de componentes periodicamente
+            try:
+                self.logger.info("Calculando uso de componentes...")
+                usage = self.calculate_component_usage()
+                self._component_usage_cache = usage  # Armazena em cache
+                self.broadcast_kpi_update(component_usage=usage)
+            except Exception as e:
+                self.logger.exception("Erro ao calcular componentes.")
+            
             self.logger.info("Worker finalizado. Próxima execução em 10 minutos.")
-            self._stop_event.wait(600) # 10 minutos (600 segundos) - Permite parada imediata
+            self._stop_event.wait(600)
 
     
     def process_sales_orders(self):
@@ -1130,60 +1137,53 @@ class Orchestrator:
         # Notifica o frontend
         self.broadcast_kpi_update(cache_updated=True)
 
-    def calculate_component_usage(self) -> Dict[str, Any]:
+    def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
         """
-        Calcula o uso de componentes com base nos pedidos dos últimos 30 dias.
+        Calcula uso de componentes com breakdown diário.
         """
-        
-        # 1. Obter a lista de pedidos dos últimos 30 dias (já processados pelo SalesManager)
-        # Como o SalesManager não armazena os pedidos, vamos re-buscar (ou idealmente, o SalesManager
-        # deveria ter um cache de pedidos, mas seguindo a estrutura atual, re-buscamos).
-        
-        # Simplificação: Usar a lista de pedidos do último recalculo do SalesManager.
-        # Como não temos acesso direto, vamos re-buscar (com a ressalva de que é ineficiente).
+        now = datetime.now()
+        params = {
+            'dataEmissaoInicial': (now - timedelta(days=days)).strftime('%Y-%m-%d'),
+            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
+        }
         
         token = self.auth.get_access_token()
         if not token:
             self.logger.warning("Token indisponível para calcular uso de componentes.")
-            return {"components": []}
+            return {"components": [], "daily_breakdown": []}
             
-        now = datetime.now()
-        params = {
-            'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
-            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-        }
-        
         all_orders = []
         page = 1
         while True:
             params['pagina'] = page
             response = self.api.get('pedidos/vendas', params=params)
-            
             if response is None:
                 break
-                
             data = safe_get(response, 'data', [])
-            
-            # Valida se retornou dados
             if not data or len(data) == 0:
-                self.logger.info(f"Página {page} vazia. Fim da paginação.")
                 break
-                
             all_orders.extend(data)
-            self.logger.info(f"Página {page} processada. Total acumulado: {len(all_orders)} | Taxa: {len(data)} itens/página")
-            
-            # Se retornou menos que 100, é a última página
             if len(data) < 100:
-                self.logger.info(f"Última página detectada ({len(data)} itens).")
                 break
-                
             page += 1
-            time.sleep(0.1) # Pequeno delay
+            time.sleep(0.1)
             
-        # 2. Processar os pedidos para calcular o uso de componentes
-        component_usage = {}
+        # Rastreamento por dia E total
+        component_usage = {}  # Total do período
+        daily_usage = defaultdict(lambda: defaultdict(int))  # Por dia
         
         for order in all_orders:
+            # Extrai data
+            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
+            if not data_emissao_str:
+                continue
+            
+            try:
+                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+                day_key = order_date.strftime('%Y-%m-%d')
+            except:
+                continue
+            
             itens = safe_get(order, 'itens', [])
             for item in safe_iter(itens):
                 produto_sku = safe_get(item, 'codigo')
@@ -1191,34 +1191,51 @@ class Orchestrator:
                 
                 if not produto_sku or quantidade_vendida == 0:
                     continue
-
-                # Verificar se é um kit
-                kit = self.get_product_by_sku(produto_sku)
-                if kit and safe_get(kit, 'tipo') == 'K':
-                    componentes = safe_get(kit, 'componentes', [])
+                
+                produto = self.get_product_by_sku(produto_sku)
+                
+                # Se é KIT, processa componentes
+                if produto and safe_get(produto, 'tipo') == 'K':
+                    componentes = safe_get(produto, 'componentes', [])
                     for comp in safe_iter(componentes):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        comp_sku = safe_get(comp_produto, 'codigo')
-                        comp_nome = safe_get(comp_produto, 'nome')
-                        comp_quantidade_por_kit = safe_get(comp, 'quantidade', 0)
+                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
+                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
+                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
                         
-                        if not comp_sku or comp_quantidade_por_kit == 0:
+                        if not comp_sku:
                             continue
-
-                        quantidade_total_consumida = quantidade_vendida * comp_quantidade_por_kit
                         
+                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
+                        
+                        # Atualiza total
                         if comp_sku not in component_usage:
                             component_usage[comp_sku] = {
                                 "sku": comp_sku,
                                 "nome": comp_nome,
                                 "quantidade": 0,
-                                "produtos": set() # Usar set para evitar duplicatas
+                                "produtos": set()
                             }
-
-                        component_usage[comp_sku]["quantidade"] += quantidade_total_consumida
+                        component_usage[comp_sku]["quantidade"] += qtd_consumida
                         component_usage[comp_sku]["produtos"].add(produto_sku)
-    
-        # 3. Formatar a saída
+                        
+                        # Atualiza diário
+                        daily_usage[day_key][comp_sku] += qtd_consumida
+                
+                # Se é PRODUTO SIMPLES, conta também
+                else:
+                    if produto_sku not in component_usage:
+                        component_usage[produto_sku] = {
+                            "sku": produto_sku,
+                            "nome": safe_get(produto, 'nome', 'Produto'),
+                            "quantidade": 0,
+                            "produtos": set()
+                        }
+                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
+                    component_usage[produto_sku]["produtos"].add(produto_sku)
+                    
+                    daily_usage[day_key][produto_sku] += quantidade_vendida
+        
+        # Formata resultado
         result = []
         for sku, usage in component_usage.items():
             result.append({
@@ -1227,11 +1244,24 @@ class Orchestrator:
                 "quantidade": usage["quantidade"],
                 "produtos": sorted(list(usage["produtos"]))
             })
-            
-        # Ordenar por quantidade consumida
+        
         result.sort(key=lambda x: x['quantidade'], reverse=True)
         
-        return {"components": result}
+        # Formata consumo diário
+        daily_breakdown = []
+        for day in sorted(daily_usage.keys(), reverse=True):
+            daily_breakdown.append({
+                "data": day,
+                "componentes": [
+                    {"sku": sku, "quantidade": qtd}
+                    for sku, qtd in daily_usage[day].items()
+                ]
+            })
+        
+        return {
+            "components": result,
+            "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
+        }
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False):
         """
@@ -1423,18 +1453,59 @@ class WebServer:
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
-            """Retorna o histórico de pedidos dos últimos 30 dias para o gráfico."""
+            """Retorna o histórico REAL de pedidos dos últimos 30 dias."""
             
-            # A lógica de histórico de vendas está dentro do SalesManager, mas não exposta.
-            # Para fins de demonstração, vamos retornar dados mockados ou a lógica de cálculo
-            # precisaria ser refatorada para retornar o histórico diário.
-            
-            # Simplificação: Retorna dados mockados para o gráfico.
             now = datetime.now()
-            labels = [(now - timedelta(days=i)).strftime('%d/%m') for i in range(30)][::-1]
-            daily = [20, 22, 18, 25, 30, 28, 24, 21, 23, 26, 29, 31, 27, 25, 22, 20, 19, 21, 24, 27, 30, 32, 35, 33, 31, 28, 25, 23, 20, 18][::-1]
+            params = {
+                'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+                'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
+            }
             
-            # Cálculo de média móvel simples (7 dias)
+            # Busca todos os pedidos (reutiliza lógica do worker)
+            all_orders = []
+            page = 1
+            while True:
+                params['pagina'] = page
+                response = self.orchestrator.api.get('pedidos/vendas', params=params)
+                if response is None:
+                    break
+                data = safe_get(response, 'data', [])
+                if not data or len(data) == 0:
+                    break
+                all_orders.extend(data)
+                if len(data) < 100:
+                    break
+                page += 1
+                time.sleep(0.5)
+            
+            # Agrupa pedidos por dia
+            daily_counts = defaultdict(int)
+            for order in all_orders:
+                data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
+                if not data_emissao_str:
+                    continue
+                try:
+                    order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+                    day_key = order_date.strftime('%Y-%m-%d')
+                    
+                    # CONTA QUANTIDADE DE ITENS, NÃO PEDIDOS
+                    itens = safe_get(order, 'itens', [])
+                    for item in safe_iter(itens):
+                        quantidade = safe_get(item, 'quantidade', 0)
+                        daily_counts[day_key] += quantidade
+                except:
+                    continue
+            
+            # Gera labels e valores para os últimos 30 dias
+            labels = []
+            daily = []
+            for i in range(30):
+                date = now - timedelta(days=29-i)
+                day_key = date.strftime('%Y-%m-%d')
+                labels.append(date.strftime('%d/%m'))
+                daily.append(daily_counts.get(day_key, 0))
+            
+            # Calcula média móvel (7 dias)
             moving_avg = []
             for i in range(len(daily)):
                 if i < 6:
@@ -1442,13 +1513,20 @@ class WebServer:
                 else:
                     avg = sum(daily[i-6:i+1]) / 7
                     moving_avg.append(round(avg, 1))
-
-            # Cálculo de crescimento (últimos 7 dias vs 7 dias anteriores)
+            
+            # Crescimento semanal
             last_week_sum = sum(daily[-7:])
             prev_week_sum = sum(daily[-14:-7])
+            growth = ((last_week_sum - prev_week_sum) / prev_week_sum * 100) if prev_week_sum > 0 else 0
+            avg_daily = sum(daily) / len(daily)
             
-            if prev_week_sum > 0:
-                growth = ((last_week_sum - prev_week_sum) / prev_week_sum) * 100
+            return jsonify({
+                "labels": labels,
+                "daily": daily,
+                "moving_avg": moving_avg,
+                "growth": round(growth, 1),
+                "avg_daily": round(avg_daily, 1)
+            })
             else:
                 growth = 0
                 
@@ -1496,12 +1574,24 @@ class WebServer:
                 name = safe_get(product, 'nome', '').lower()
                 sku = safe_get(product, 'sku', '').lower()
                 if query in name or query in sku:
+                    # Busca onde esse produto é usado como componente
+                    componentes_que_usam = []
+                    for kit in self.orchestrator.get_all_kits():
+                        for comp in safe_iter(safe_get(kit, 'componentes')):
+                            if safe_get(comp, 'sku') == product.get('sku'):
+                                componentes_que_usam.append({
+                                    "kit_sku": kit.get('sku'),
+                                    "kit_nome": kit.get('nome'),
+                                    "quantidade": safe_get(comp, 'quantidade')
+                                })
+                    
                     results.append({
                         "sku": product.get('sku'),
                         "nome": product.get('nome'),
                         "estoque": product.get('estoqueAtual'),
                         "tipo": "Produto",
-                        "imagemURL": safe_get(product, 'imagem', {}).get('link')
+                        "imagemURL": safe_get(product, 'imagem', {}).get('link'),
+                        "usado_em": componentes_que_usam  # NOVO CAMPO
                     })
 
             # Busca em kits
@@ -1573,10 +1663,13 @@ class WebServer:
         @self.app.route('/api/components/usage')
         @token_required
         def api_component_usage(token):
-            """Retorna o uso de componentes nos últimos 30 dias."""
-            
-            usage_data = self.orchestrator.calculate_component_usage()
-            return jsonify(usage_data)
+            """Retorna uso de componentes (do cache do worker)."""
+            # Retorna cache se disponível, senão calcula
+            if hasattr(self.orchestrator, '_component_usage_cache'):
+                return jsonify(self.orchestrator._component_usage_cache)
+            else:
+                usage_data = self.orchestrator.calculate_component_usage()
+                return jsonify(usage_data)
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
@@ -2008,15 +2101,48 @@ DASHBOARD_TEMPLATE = """
             return;
         }
         
-        let html = '<table class="table table-striped"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Utilizada</th><th>Produtos que Usam</th></tr></thead><tbody>';
+        let html = '<h5>📊 Consumo Total (30 dias)</h5>';
+        html += '<table class="table table-striped"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Total</th><th>Produtos</th></tr></thead><tbody>';
         
         let total = 0;
         usageData.components.forEach(comp => {
             total += comp.quantidade;
-            html += '<tr><td><strong>' + comp.nome + '</strong></td><td><code>' + comp.sku + '</code></td><td><span class="badge bg-success">' + comp.quantidade + 'x</span></td><td><small>' + comp.produtos.join(', ') + '</small></td></tr>';
+            html += `<tr><td><strong>${comp.nome}</strong></td><td><code>${comp.sku}</code></td><td><span class="badge bg-success">${comp.quantidade}x</span></td><td><small>${comp.produtos.join(', ')}</small></td></tr>`;
         });
         
-        html += '</tbody></table><div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos Consumidos: <span class="badge bg-primary fs-5">' + total + '</span></h6></div>';
+        html += '</tbody></table>';
+        html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
+        
+        // NOVO: Breakdown diário
+        if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
+            html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
+            html += '<div class="accordion" id="dailyAccordion">';
+            
+            usageData.daily_breakdown.forEach((day, idx) => {
+                const date = new Date(day.data);
+                const dateStr = date.toLocaleDateString('pt-BR');
+                const totalDay = day.componentes.reduce((sum, c) => sum + c.quantidade, 0);
+                
+                html += `
+                    <div class="accordion-item">
+                        <h2 class="accordion-header">
+                            <button class="accordion-button ${idx > 0 ? 'collapsed' : ''}" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
+                                ${dateStr} - <span class="badge bg-info ms-2">${totalDay} itens</span>
+                            </button>
+                        </h2>
+                        <div id="day${idx}" class="accordion-collapse collapse ${idx === 0 ? 'show' : ''}" data-bs-parent="#dailyAccordion">
+                            <div class="accordion-body">
+                                <ul class="list-group">
+                                    ${day.componentes.map(c => `<li class="list-group-item d-flex justify-content-between"><span>${c.sku}</span><span class="badge bg-secondary">${c.quantidade}x</span></li>`).join('')}
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            html += '</div>';
+        }
         
         div.innerHTML = html;
     }
@@ -2137,11 +2263,20 @@ html += `
 `${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})`
                 ).join("<br>")}
             </div>
-        ` : ""}
-    </div>
-</div>
-    </div>
-`;
+	        ` : ""}
+	        
+	        ${p.usado_em && p.usado_em.length > 0 ? `
+	            <div class="mt-2">
+	                <b>Usado em:</b><br>
+	                ${p.usado_em.map(u => 
+	                    `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
+	                ).join("<br>")}
+	            </div>
+	        ` : ""}
+	    </div>
+	</div>
+	    </div>
+	`;
                 });
 
                 html += '</div>';
@@ -2169,12 +2304,9 @@ html += `
             try {
                 const data = await fetchAPI(`${API}/kits`); 
                 
-                // ADICIONE ESTA VALIDAÇÃO
-                // ✅ 4. Frontend: ignorar “Produto simples / estoque”
-                const kitsOnly = data.filter(p => p.tipo === 'Kit' || (p.componentes && p.componentes.length > 0));
-                
-                if (!kitsOnly || kitsOnly.length === 0) {
-div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
+                // CORREÇÃO 2: Mostrar produtos E kits
+                if (!data || data.length === 0) {
+div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Produto/Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
 return;
                 }
                 let html = `
@@ -2190,26 +2322,21 @@ return;
                 <tbody>
                 `;
 
-                kitsOnly.forEach(k => {
+                data.forEach(k => {
 const imgHtml = k.imagemURL 
     ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">` 
     : '<span class="text-muted">-</span>';
 
 let comps = '';
-if (k.componentes && k.componentes.length > 0) {
-    const componentes_validos = k.componentes;
-    
-    if (componentes_validos.length > 0) {
-comps = `<b>KIT (${componentes_validos.length} itens):</b><br>` + componentes_validos
-    .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
-    .join('<br>');
-    } else {
-comps = '<span class="text-info" style="font-size:0.8em">KIT sem componentes detalhados.</span>';
-    }
+if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
+    comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
+        .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+        .join('<br>');
+} else if (k.tipo === 'P') {
+    comps = `<span class="badge bg-info">Produto Simples</span><br><small>Estoque: ${k.estoqueAtual || 0}</small>`;
 } else {
-    // ✅ 4. Frontend: ignorar “Produto simples / estoque”
-    // Se não é kit, não renderiza a linha (o filter já removeu, mas para segurança)
-    return; 
+    // Caso de produto sem tipo ou sem componentes (deve ser raro)
+    comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
 }
 
 html += `
