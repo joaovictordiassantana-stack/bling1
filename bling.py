@@ -1327,10 +1327,18 @@ class Orchestrator:
         
         # 2. Adiciona KPIs se fornecidos
         if sales_stats:
-            # Converte a data de volta para ISO string para o WS
+            # Converte a data de volta para ISO string para o WS (se já não for string)
             stats_data = sales_stats.copy()
-            stats_data['last_recalculated'] = stats_data['last_recalculated'].isoformat()
-            stats_data['last_update'] = stats_data.pop('last_recalculated')
+            last_recalc = stats_data.get('last_recalculated')
+            
+            if isinstance(last_recalc, datetime):
+                stats_data['last_update'] = last_recalc.isoformat()
+            else:
+                stats_data['last_update'] = str(last_recalc)
+                
+            if 'last_recalculated' in stats_data:
+                stats_data.pop('last_recalculated')
+                
             payload["sales_stats"] = stats_data
             
         # 3. Adiciona o uso de componentes se fornecido
