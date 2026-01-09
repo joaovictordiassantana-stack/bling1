@@ -39,6 +39,8 @@ from functools import wraps
 
 import requests
 from requests.exceptions import RequestException
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
 # Importação necessária para tratamento correto do WebSocket
@@ -421,84 +423,95 @@ class MetricsManager:
 
 class BlingAPIClient:
     """
-    Cliente HTTP para a API Bling v3 com retry, rate limiting e refresh de token.
+    Cliente HTTP blindado contra quedas de conexão (Errno 104) e Timeouts.
     """
     
     def __init__(self, config: Config, auth_manager):
         self.config = config
         self.auth = auth_manager
         self.logger = logging.getLogger('bling_automacao')
-        self.metrics = MetricsManager() # Inicializa o gerenciador de métricas
-        self.rate_limiter = RateLimiter(min_interval=0.4)  # ✅ Rate limiter global: ~2.5 req/s
+        self.metrics = MetricsManager()
+        self.rate_limiter = RateLimiter(min_interval=0.4)
+        
+        # Configuração de Sessão com Retry Automático
         self.session = requests.Session()
+        
+        # Estratégia de Retry: Tenta 3 vezes em caso de falha de conexão, reset ou 50x
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,  # Espera 1s, 2s, 4s
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST", "PUT", "DELETE"],
+            raise_on_status=False
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
         self.session.headers.update({
             'Content-Type': 'application/json',
-            'Accept': 'application/json'
+            'Accept': 'application/json',
+            'User-Agent': 'SWMoveis/4.6 (Integracao Bling)'  # Boa prática
         })
         
     def _request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict[str, Any]]:
-        """
-        Executa uma requisição HTTP com retry e tratamento de token.
-        """
         url = f"{self.config.BLING_API_URL}/{endpoint}"
         token = self.auth.get_access_token()
         
         if not token:
-            self.logger.error(f"⛔ Token de acesso ausente para {endpoint}. Abortando requisição.")
+            # Silencia erro se for apenas check de startup
+            if endpoint != 'pedidos/vendas':
+                self.logger.warning(f"Token ausente para {endpoint}.")
             return None
             
-        headers = {'Authorization': f'Bearer {token}'}
+        # Garante header de auth atualizado
+        kwargs.setdefault('headers', {})
+        kwargs['headers']['Authorization'] = f'Bearer {token}'
         
-        for attempt in range(self.config.MAX_RETRIES):
-            # ✅ RATE LIMITER: Garante intervalo mínimo entre requisições
-            self.rate_limiter.wait()
-            
+        # Rate Limiter
+        self.rate_limiter.wait()
+        
+        try:
             start_time = time.time()
-            try:
-                response = self.session.request(method, url, headers=headers, timeout=self.config.REQUEST_TIMEOUT, **kwargs)
-                latency = time.time() - start_time
-                self.metrics.record_request(response.status_code, latency)
-                
-                if response.status_code == 401:
-                    self.logger.warning(f"Token expirado ou inválido ao acessar {endpoint}. Tentando refresh...")
-                    if self.auth.refresh_token():
-                        token = self.auth.get_access_token()
-                        headers['Authorization'] = f'Bearer {token}'
-                        self.logger.info("Token renovado com sucesso. Tentando novamente a requisição.")
-                        continue # Tenta novamente com o novo token
-                    else:
-                        self.logger.error("Falha ao renovar o token. Requer autenticação manual.")
-                        return None
-                
-                response.raise_for_status()
-                
-                # Tenta retornar JSON, se falhar, retorna um objeto vazio ou um indicador de sucesso
-                try:
-                    return response.json()
-                except requests.exceptions.JSONDecodeError:
-                    self.logger.debug(f"Resposta não é JSON para {endpoint}. Status: {response.status_code}")
-                    return {} # Retorna vazio para 204 No Content, por exemplo
-                
-            except requests.exceptions.HTTPError as e:
-                # ✅ TRATAMENTO 429: Aborta imediatamente sem retry
-                if response.status_code == 429:
-                    self.logger.warning(f"🛑 Rate limit atingido (429) em {endpoint}. Abortando ciclo.")
-                    raise  # ✅ Propaga o erro para permitir break no loop de paginação
-                
-                self.logger.exception(f"Erro HTTP ao acessar {endpoint}.")
-                if response.status_code in [500, 502, 503, 504] and attempt < self.config.MAX_RETRIES - 1:
-                    # Retry apenas para erros de servidor
-                    delay = self.config.BASE_DELAY * (2 ** attempt)
-                    self.logger.warning(f"⚠️ Status {response.status_code}. Aguardando {delay:.2f}s antes de retry {attempt + 2}/{self.config.MAX_RETRIES}")
-                    time.sleep(delay)
+            # Timeout aumentado para evitar quedas em queries lentas do Bling
+            response = self.session.request(method, url, timeout=45, **kwargs)
+            latency = time.time() - start_time
+            
+            self.metrics.record_request(response.status_code, latency)
+            
+            # Tratamento de Token Expirado (401)
+            if response.status_code == 401:
+                self.logger.warning(f"Token 401 em {endpoint}. Tentando refresh...")
+                if self.auth.refresh_token():
+                    new_token = self.auth.get_access_token()
+                    kwargs['headers']['Authorization'] = f'Bearer {new_token}'
+                    # Tenta novamente (apenas 1 vez para evitar loop infinito)
+                    response = self.session.request(method, url, timeout=45, **kwargs)
                 else:
                     return None
-            except RequestException as e:
-                self.logger.exception(f"Erro de conexão ao acessar {endpoint}.")
-                return None
-                
-        self.logger.error(f"Falha na requisição após {self.config.MAX_RETRIES} tentativas para {endpoint}.")
-        return None
+
+            if response.status_code == 429:
+                self.logger.warning(f"Rate limit (429) em {endpoint}.")
+                raise requests.exceptions.HTTPError(response=response)
+
+            response.raise_for_status()
+            
+            try:
+                return response.json()
+            except json.JSONDecodeError:
+                return {}
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+            self.logger.error(f"Erro de Conexão (Reset/Queda) em {endpoint}: {str(e)}")
+            # Força recriação da sessão no próximo uso se a conexão estiver corrompida
+            self.session.close()
+            self.session = requests.Session()
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Erro genérico em {endpoint}: {str(e)}")
+            return None
 
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return self._request('GET', endpoint, params=params)
@@ -946,37 +959,41 @@ class Orchestrator:
             self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
-        """Loop principal do worker."""
-        cycle_count = 0  # ✅ Contador de ciclos
+        cycle_count = 0
         
         while not self._stop_event.is_set():
             cycle_count += 1
             
-            # ✅ ESTRATÉGIA: Alterna tarefas pesadas a cada 2 ciclos (20 min)
-            # ✅ CORREÇÃO: Atualiza produtos a cada 3 ciclos (30 minutos)
-            if cycle_count % 3 == 0:
-                self.logger.info("🔄 Ciclo #%d: Atualizando cache (produtos) - A cada 30 min", cycle_count)
-                self.process_products_cache()
-            
-            # Ciclo ímpar: Atualiza KPIs (pedidos)
-            self.logger.info("🔄 Ciclo #%d: Atualizando KPIs (pedidos)", cycle_count)
-            self.process_sales_orders()
-            
-            # ✅ Componentes: calcula apenas a cada 4 ciclos (40 min)
-            if cycle_count % 4 == 0:
-                try:
-                    self.logger.info("🔄 Ciclo #%d: Calculando uso de componentes...", cycle_count)
+            # Verifica autenticação antes de tudo
+            if not self.auth.is_authenticated():
+                self.logger.info("Aguardando autenticação para iniciar ciclos...")
+                self._stop_event.wait(60)
+                continue
+
+            try:
+                # Ciclo de Produtos (Cache Pesado)
+                if cycle_count % 3 == 0:
+                    self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
+                    self.process_products_cache()
+                
+                # Ciclo de Vendas (KPIs)
+                self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
+                self.process_sales_orders()
+                
+                # Ciclo de Componentes
+                if cycle_count % 4 == 0:
+                    self.logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
                     usage = self.calculate_component_usage()
-                    if usage and (usage.get('components') or usage.get('daily_breakdown')):
+                    if usage.get('components'):
                         self._component_usage_cache = usage
-                        self.logger.info(f"✅ Uso de componentes calculado: {len(usage.get('components', []))} itens")
                         self.broadcast_kpi_update(component_usage=usage)
-                    else:
-                        self.logger.warning("⚠️ Cálculo de componentes retornou vazio")
-                except Exception as e:
-                    self.logger.exception("Erro ao calcular componentes.")
-            
-            self.logger.info("✅ Worker finalizado. Próxima execução em 10 minutos.")
+
+            except Exception as e:
+                self.logger.exception(f"Erro fatal no ciclo #{cycle_count}")
+
+            self.logger.info("✅ Ciclo finalizado. Dormindo...")
+            # Mantém 10 minutos (600s) pois o cache de produtos levou 5 min
+            # Se diminuir muito, vai encavalar.
             self._stop_event.wait(600)
 
     def process_sales_orders(self, force: bool = False):
@@ -1211,6 +1228,11 @@ class Orchestrator:
         """
         Calcula uso de componentes com breakdown diário.
         """
+        
+        # CORREÇÃO: Não tenta calcular se não estiver logado
+        if not self.auth.is_authenticated():
+            return {"components": [], "daily_breakdown": []}
+
         now = datetime.now()
         params = {
             'dataEmissaoInicial': (now - timedelta(days=days)).strftime('%Y-%m-%d'),
