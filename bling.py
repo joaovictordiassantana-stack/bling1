@@ -728,126 +728,137 @@ class AuthManager:
 
 @dataclass
 class SalesManager:
-    """Gerencia e calcula os KPIs de vendas."""
-    
     config: Config
     logger: logging.Logger
-    orchestrator: Any = field(default=None) # Referência ao Orchestrator
+    orchestrator: Any = field(default=None)
     
     # Contadores
     daily_count: int = 0
     weekly_count: int = 0
     historic_count: int = 0
     
-    # Data da última atualização dos dados
-    last_recalculated: datetime = field(default_factory=datetime.now)
+    # Dados para o Gráfico (Cache)
+    history_data: Dict[str, Any] = field(default_factory=dict)
     
-    _initial_load_failed: bool = True 
+    last_recalculated: datetime = field(default_factory=datetime.now)
+    lock: Lock = field(default_factory=Lock)
+    recalculation_lock: Lock = field(default_factory=Lock)
+    _recalculation_running: bool = False
 
     def __post_init__(self):
-        # Carrega o estado persistido na inicialização
-        self.lock = Lock()
-        self.recalculation_lock = Lock()
-        self._recalculation_running = False  # Flag de estado para controle de concorrência
         self._load_stats()
 
     def _load_stats(self):
-        """Carrega as estatísticas persistidas do disco."""
         with self.lock:
             data = load_stats_safe(self.config.SALES_STATS_FILE)
             if data:
                 self.daily_count = data.get('daily', 0)
                 self.weekly_count = data.get('weekly', 0)
                 self.historic_count = data.get('historic', 0)
-                self.last_recalculated = data.get('last_recalculated', datetime.now())
-                self.logger.info("Estatísticas de KPIs carregadas do disco.")
-            else:
-                self.logger.warning("Nenhuma estatística de KPI encontrada no disco.")
+                self.history_data = data.get('history_data', {}) # Carrega dados do gráfico
+                
+                last_recalc = data.get('last_recalculated')
+                if isinstance(last_recalc, str):
+                    try:
+                        self.last_recalculated = datetime.fromisoformat(last_recalc)
+                    except:
+                        self.last_recalculated = datetime.now()
+                else:
+                    self.last_recalculated = datetime.now()
 
     def get_stats(self) -> Dict[str, Any]:
-        """Retorna os KPIs atuais."""
         with self.lock:
             return {
                 "daily": self.daily_count,
                 "weekly": self.weekly_count,
                 "historic": self.historic_count,
-                # Retorna o timestamp de quando o worker processou por último
-                "last_update": self.last_recalculated.isoformat() 
+                "last_update": self.last_recalculated.isoformat()
             }
 
-    def _get_state_for_save(self) -> Dict[str, Any]:
-        """Retorna o estado atual para persistência."""
-        return {
-            "daily": self.daily_count,
-            "weekly": self.weekly_count,
-            "historic": self.historic_count,
-            "last_recalculated": self.last_recalculated
-        }
-
-    
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
-        """Calcula KPIs: QUANTIDADE DE PRODUTOS vendidos em 24h, 7 dias e 30 dias."""
-        now = datetime.now()
-        last_24h = now - timedelta(hours=24)
-        last_7d = now - timedelta(days=7)
-        last_30d = now - timedelta(days=30)
+        """
+        Calcula KPIs baseado na QUANTIDADE DE ITENS vendidos.
+        Gera também os dados para o gráfico de histórico.
+        """
+        today = datetime.now().date()
+        date_7d_ago = today - timedelta(days=7)
+        date_30d_ago = today - timedelta(days=30)
         
-        daily = 0
-        weekly = 0
-        historic = 0
+        daily_sum = 0
+        weekly_sum = 0
+        historic_sum = 0
         
+        # Dicionário para o gráfico: { '2023-10-01': 15, ... }
+        daily_breakdown = defaultdict(int)
+
         for order in orders:
-            if not isinstance(order, dict):
-                continue
-            
-            # Extrai data
-            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
-            hora_emissao = safe_get(safe_get(order, 'data', {}), 'horaEmissao')
-            
-            if not data_emissao_str:
-                continue
+            # Pega a data do pedido (YYYY-MM-DD)
+            data_str = safe_get(order.get('data', {}), 'dataEmissao')
+            if not data_str: continue
             
             try:
-                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
+                # Converte apenas para DATA (sem hora), para evitar janelas móveis confusas
+                order_date = datetime.strptime(data_str, '%Y-%m-%d').date()
+            except: continue
+
+            # Conta total de itens neste pedido
+            total_items = 0
+            for item in order.get('itens', []):
+                total_items += int(float(item.get('quantidade', 0)))
+
+            # 1. Popula dados do gráfico (Agrupa por dia)
+            if order_date >= date_30d_ago:
+                daily_breakdown[data_str] += total_items
+
+            # 2. Calcula KPIs
+            # Diário: Apenas hoje (00:00 até agora)
+            if order_date == today:
+                daily_sum += total_items
+            
+            # Semanal: Últimos 7 dias (incluindo hoje)
+            if order_date >= date_7d_ago:
+                weekly_sum += total_items
                 
-                # Adiciona hora se disponível
-                if hora_emissao:
-                    try:
-                        parts = hora_emissao.split(':')
-                        if len(parts) == 3:
-                            h, m, s = map(int, parts)
-                            order_date = order_date.replace(hour=h, minute=m, second=s)
-                    except:
-                        pass
-            except Exception as e:
-                self.logger.warning(f"Data inválida '{data_emissao_str}': {e}")
-                continue
-            
-            # CONTA PRODUTOS
-            itens = safe_get(order, 'itens', [])
-            total_items = sum(safe_get(item, 'quantidade', 0) for item in safe_iter(itens))
-            
-            # Acumula por período (NÃO sobreposto)
-            if order_date >= last_24h:
-                daily += total_items
-            
-            if order_date >= last_7d:
-                weekly += total_items
-            
-            if order_date >= last_30d:
-                historic += total_items
+            # Histórico: Últimos 30 dias (incluindo hoje)
+            if order_date >= date_30d_ago:
+                historic_sum += total_items
+
+        # Prepara dados formatados para o Chart.js
+        chart_labels = []
+        chart_data = []
         
-        # Salva
+        # Preenche os últimos 30 dias (mesmo os dias zerados)
+        for i in range(30):
+            d = today - timedelta(days=29-i)
+            d_str = d.strftime('%Y-%m-%d')
+            chart_labels.append(d.strftime('%d/%m'))
+            chart_data.append(daily_breakdown.get(d_str, 0))
+
+        # Salva tudo protegido por Lock
         with self.lock:
-            self.daily_count = daily
-            self.weekly_count = weekly
-            self.historic_count = historic
-            self.last_recalculated = now
+            self.daily_count = daily_sum
+            self.weekly_count = weekly_sum
+            self.historic_count = historic_sum
             
-            save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+            # Salva estrutura pronta para o gráfico
+            self.history_data = {
+                "labels": chart_labels,
+                "data": chart_data,
+                "avg": round(historic_sum / 30, 1) if historic_sum > 0 else 0
+            }
             
-            if self.orchestrator:
-                self.orchestrator.broadcast_kpi_update(sales_stats=self._get_state_for_save())
+            self.last_recalculated = datetime.now()
+            
+            # Persiste no disco
+            save_stats({
+                "daily": self.daily_count,
+                "weekly": self.weekly_count,
+                "historic": self.historic_count,
+                "history_data": self.history_data,
+                "last_recalculated": self.last_recalculated.isoformat()
+            }, self.config.SALES_STATS_FILE)
+
+        self.logger.info(f"KPIs recalculados: Hoje={daily_sum}, 7D={weekly_sum}, 30D={historic_sum}")
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -1078,150 +1089,70 @@ class Orchestrator:
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
-        
         if not self.auth.is_authenticated():
-            self.logger.error("⛔ Worker abortado: token inexistente ou falha na renovação.")
             return
             
         self.logger.info("Iniciando busca e cache de produtos e kits...")
-        
         all_products = []
         all_kits = []
         page = 1
         
-        # ✅ ADICIONE: Limite absoluto de páginas
-        MAX_TOTAL_PAGES = 50  # Não processa mais que 50 páginas (5000 itens)
-        
-        MAX_PAGES_PER_BATCH = self.config.MAX_PAGES_PER_BATCH
-        batch_count = 0
-        
         while True:
-            params = {
-                'pagina': page,
-                'tipo': 'P,K'
-            }
-            
-            # ✅ TRATAMENTO 429: Captura e aborta o loop
+            # Busca produtos (Tipo P e K)
             try:
-                response = self.api.get('produtos', params=params)
-            except requests.exceptions.HTTPError as e:
-                if e.response and e.response.status_code == 429:
-                    self.logger.warning("🛑 Rate limit (429) detectado. Abortando busca de produtos.")
-                    break
-                raise
-            
-            if response is None:
-                self.logger.error("Falha ao buscar produtos na API. Tentando usar cache anterior.")
+                response = self.api.get('produtos', params={'pagina': page, 'tipo': 'P,K', 'limite': 100})
+            except Exception as e:
+                self.logger.error(f"Erro ao buscar produtos: {e}")
                 break
-
+            
             data = safe_get(response, 'data', [])
+            if not data: break
             
-            if not data or len(data) == 0:
-                self.logger.info(f"Página {page} vazia. Fim da paginação.")
-                break
-            
-            # ✅ CORREÇÃO: Estrutura real da API Bling
             for item in data:
-                if not isinstance(item, dict):
-                    continue
-                
-                # ✅ Acesso direto aos campos
-                tipo = item.get('tipo')
-                sku = item.get('codigo')
-                nome = item.get('nome')
-                
-                # Valida campos obrigatórios
-                if not sku or not tipo:
-                    continue
-                
-                # ✅ Normaliza o item
+                # --- CORREÇÃO DE IMAGEM AQUI ---
+                # Tenta pegar da lista 'imagens' (padrão v3) ou 'imagem' (legado)
+                img_url = ''
+                imagens = item.get('imagens', [])
+                if imagens and isinstance(imagens, list) and len(imagens) > 0:
+                    img_url = safe_get(imagens[0], 'link', '')
+                elif item.get('imagem'):
+                    img_url = item.get('imagem')
+                # -------------------------------
+
                 produto_normalizado = {
-                    'sku': sku,
-                    'codigo': sku,
-                    'nome': item.get('descricao') or nome, # ✅ CORREÇÃO: Usa 'descricao' se existir, senão 'nome'
-                    'tipo': "COMPOSTO" if tipo == 'K' else "SIMPLES", # ✅ PADRONIZAÇÃO: Usa string literal COMPOSTO/SIMPLES
                     'id': item.get('id'),
-                    'preco': item.get('preco', 0),
-                    'precoCusto': item.get('precoCusto', 0),
-                    'estoque': item.get('estoque', {}),
+                    'sku': item.get('codigo'),
+                    'nome': item.get('nome') or item.get('descricao'),
+                    'tipo': "COMPOSTO" if item.get('tipo') == 'K' else "SIMPLES",
                     'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
-                    'situacao': item.get('situacao'),
-                    'formato': item.get('formato'),
-                    'descricaoCurta': item.get('descricaoCurta', ''),
-                    # ✅ NORMALIZAÇÃO DE IMAGEM: O HTML espera 'imagem' com a URL
-                    'imagem': safe_get(item.get('imagem'), 'link', ''), # ✅ NORMALIZAÇÃO: Garante a URL da imagem
-                    'componentes': [] # ✅ PADRONIZAÇÃO: Produto simples começa com lista vazia
+                    'imagem': img_url, # Usa a URL corrigida
+                    'componentes': []
                 }
                 
-                if tipo == 'P':
-                    all_products.append(produto_normalizado)
-                elif tipo == 'K':
-                    # ✅ PADRONIZAÇÃO: Kits já tem 'componentes': [] do produto_normalizado, será sobrescrito abaixo.
-                    # ✅ PADRONIZAÇÃO: Kits já tem 'componentes': [] do produto_normalizado, será sobrescrito abaixo.
-                    # Processa componentes
-                    componentes_raw = item.get('componentes', [])
-                    componentes_processados = []
-                    
-                    for comp in safe_iter(componentes_raw):
-                        comp_produto = safe_get(comp, 'produto', {})
-                        componentes_processados.append({
-                            "nome": safe_get(comp_produto, 'nome'), # ✅ CORREÇÃO: Usa 'nome' do componente
-                            "sku": safe_get(comp_produto, 'codigo'),
-                            "quantidade": safe_get(comp, 'quantidade', 1) # ✅ CORREÇÃO: Quantidade padrão 1
+                # Se for Kit, processa componentes
+                if item.get('tipo') == 'K':
+                    comps = []
+                    for c in item.get('componentes', []):
+                        comps.append({
+                            'sku': safe_get(c.get('produto', {}), 'codigo'),
+                            'quantidade': c.get('quantidade', 1)
                         })
-                    
-                    produto_normalizado['componentes'] = componentes_processados
+                    produto_normalizado['componentes'] = comps
                     all_kits.append(produto_normalizado)
+                else:
+                    all_products.append(produto_normalizado)
 
-            self.logger.info(f"Página {page} processada. Produtos: {len(all_products)}, Kits: {len(all_kits)} | Taxa: {len(data)} itens/página")
-            
-            if len(data) < 100:
-                self.logger.info(f"Última página detectada ({len(data)} itens).")
-                break
-            
+            if len(data) < 100: break
             page += 1
+            time.sleep(0.5) # Evita rate limit
+
+        # Salva no cache
+        with self._cache_lock:
+            self._products_cache = {p['sku']: p for p in all_products}
+            self._kits_cache = {k['sku']: k for k in all_kits}
+            save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
+            self.logger.info(f"Cache atualizado: {len(all_products)} produtos, {len(all_kits)} kits.")
             
-            # ✅ ADICIONE: Proteção contra loops infinitos
-            if page > MAX_TOTAL_PAGES:
-                self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
-                break
-            
-            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
-            time.sleep(1.2)
-            
-            batch_count += 1
-            if batch_count >= MAX_PAGES_PER_BATCH:
-                self.logger.info(f"⏸️ Pausa de {self.config.DELAY_BETWEEN_BATCHES}s após {MAX_PAGES_PER_BATCH} páginas (rate limit)")
-                time.sleep(self.config.DELAY_BETWEEN_BATCHES)
-                batch_count = 0
-                
-        # ✅ PROTEÇÃO: Só atualiza cache se houver mudanças significativas
-        if len(all_products) > 0 or len(all_kits) > 0:
-            with self._cache_lock:
-                old_count = len(self._products_cache) + len(self._kits_cache)
-                new_count = len(all_products) + len(all_kits)
-                
-                # Se diferença for < 5%, pula atualização (evita sobrescrever cache bom)
-                if old_count > 0 and abs(new_count - old_count) / old_count < 0.05:
-                    self.logger.info(f"⭐️ Cache estável ({old_count} → {new_count}). Pulando atualização.")
-                    return
-                
-                self.logger.info(f"Busca de produtos finalizada. Total: {new_count} ({old_count} anterior)")
-                
-                # ✅ LOG DE VALIDAÇÃO (Passo 5 - Parte 1)
-                all_normalized = all_products + all_kits
-                self.logger.info(
-                    f"📦 Cache produtos | total={len(all_normalized)} | "
-                    f"compostos={sum(1 for p in all_normalized if p.get('componentes') and len(p['componentes']) > 0)}"
-                )
-                
-                self._products_cache = {p['sku']: p for p in all_products}
-                self._kits_cache = {k['sku']: k for k in all_kits}
-                save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
-        else:
-            self.logger.warning("⚠️ Nenhum produto/kit retornado. Mantendo cache anterior.")
-            
-        # Notifica o frontend
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
@@ -1563,90 +1494,45 @@ class WebServer:
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
-            """Retorna o histórico REAL de pedidos dos últimos 30 dias."""
+            """Retorna o histórico de vendas já processado pelo Worker."""
+            # Pega os dados direto da memória do SalesManager
+            history = self.orchestrator.sales.history_data
             
-            now = datetime.now()
-            params = {
-                'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
-                'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-            }
+            if not history:
+                return jsonify({
+                    "labels": [],
+                    "daily": [],
+                    "moving_avg": [],
+                    "growth": 0,
+                    "avg_daily": 0
+                })
+
+            # Calcula dados derivados (Média Móvel e Crescimento) aqui ou no frontend
+            # Para simplificar, retornamos o que já temos
             
-            # Busca todos os pedidos (reutiliza lógica do worker)
-            all_orders = []
-            page = 1
-            while True:
-                params['pagina'] = page
-                
-                # ✅ TRATAMENTO 429: Captura e aborta o loop
-                try:
-                    response = self.orchestrator.api.get('pedidos/vendas', params=params)
-                except requests.exceptions.HTTPError as e:
-                    if e.response and e.response.status_code == 429:
-                        self.orchestrator.logger.warning("🛑 Rate limit (429) detectado. Abortando histórico de vendas.")
-                        break
-                    raise
-                
-                if response is None:
-                    break
-                data = safe_get(response, 'data', [])
-                if not data or len(data) == 0:
-                    break
-                all_orders.extend(data)
-                if len(data) < 100:
-                    break
-                page += 1
-                
-                # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
-                time.sleep(1.2)
+            data_values = history.get('data', [])
             
-            # Agrupa pedidos por dia
-            daily_counts = defaultdict(int)
-            for order in all_orders:
-                data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
-                if not data_emissao_str:
-                    continue
-                try:
-                    order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-                    day_key = order_date.strftime('%Y-%m-%d')
-                    
-                    # CONTA QUANTIDADE DE ITENS, NÃO PEDIDOS
-                    itens = safe_get(order, 'itens', [])
-                    for item in safe_iter(itens):
-                        quantidade = safe_get(item, 'quantidade', 0)
-                        daily_counts[day_key] += quantidade
-                except:
-                    continue
-            
-            # Gera labels e valores para os últimos 30 dias
-            labels = []
-            daily = []
-            for i in range(30):
-                date = now - timedelta(days=29-i)
-                day_key = date.strftime('%Y-%m-%d')
-                labels.append(date.strftime('%d/%m'))
-                daily.append(daily_counts.get(day_key, 0))
-            
-            # Calcula média móvel (7 dias)
+            # Cálculo de média móvel simples (7 dias)
             moving_avg = []
-            for i in range(len(daily)):
-                if i < 6:
-                    moving_avg.append(None)
-                else:
-                    avg = sum(daily[i-6:i+1]) / 7
-                    moving_avg.append(round(avg, 1))
-            
-            # Crescimento semanal
-            last_week_sum = sum(daily[-7:])
-            prev_week_sum = sum(daily[-14:-7])
-            growth = ((last_week_sum - prev_week_sum) / prev_week_sum * 100) if prev_week_sum > 0 else 0
-            avg_daily = sum(daily) / len(daily)
-            
+            for i in range(len(data_values)):
+                start = max(0, i-6)
+                subset = data_values[start:i+1]
+                avg = sum(subset) / len(subset) if subset else 0
+                moving_avg.append(round(avg, 1))
+
+            # Cálculo de crescimento (Últimos 7 vs 7 anteriores)
+            last_7 = sum(data_values[-7:])
+            prev_7 = sum(data_values[-14:-7])
+            growth = 0
+            if prev_7 > 0:
+                growth = ((last_7 - prev_7) / prev_7) * 100
+
             return jsonify({
-                "labels": labels,
-                "daily": daily,
+                "labels": history.get('labels', []),
+                "daily": data_values,
                 "moving_avg": moving_avg,
                 "growth": round(growth, 1),
-                "avg_daily": round(avg_daily, 1)
+                "avg_daily": history.get('avg', 0)
             })
 
 
