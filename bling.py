@@ -772,7 +772,19 @@ class SalesManager:
                 "daily": self.daily_count,
                 "weekly": self.weekly_count,
                 "historic": self.historic_count,
+                "history_data": self.history_data,
                 "last_update": self.last_recalculated.isoformat()
+            }
+
+    def _get_state_for_save(self) -> Dict[str, Any]:
+        """Retorna o estado atual para persistência ou transmissão."""
+        with self.lock:
+            return {
+                "daily": self.daily_count,
+                "weekly": self.weekly_count,
+                "historic": self.historic_count,
+                "history_data": self.history_data,
+                "last_recalculated": self.last_recalculated.isoformat()
             }
 
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
