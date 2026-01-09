@@ -1574,8 +1574,7 @@ class WebServer:
             executor.submit(self.orchestrator.process_sales_orders)
             executor.shutdown(wait=False)
             
-            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 200
-        @self.app.route('/api/products/search')
+            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 2        @self.app.route('/api/products/search')
         @token_required
         def api_products_search(token):
             """Busca produtos e kits no cache pelo SKU ou nome."""
@@ -1585,30 +1584,30 @@ class WebServer:
                 
             results = []
             
-            # Busca em produtos simples
-            # ✅ CORREÇÃO CRÍTICA (Passo 3): Usa o cache completo e padronizado
+            # Usa o cache completo carregado pelo Orchestrator
             all_products = self.orchestrator.get_all_products() + self.orchestrator.get_all_kits()
             
             for p in all_products:
-                name = safe_get(p, 'nome', '').lower()
-                sku = safe_get(p, 'sku', '').lower()
+                # Proteção contra valores Nones
+                name = str(safe_get(p, 'nome', '')).lower()
+                sku = str(safe_get(p, 'sku', '')).lower()
                 
                 if query in name or query in sku:
-                    # ✅ Usa o modelo padronizado do cache
                     results.append({
                         "id": p.get("id"),
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
                         "tipo": p.get("tipo"),
-                        "imagem": p.get("imagem"), # Já normalizado
-                        "componentes": p.get("componentes", []) # Já padronizado
+                        "estoque": p.get("estoqueAtual", 0), # Adicionado estoque
+                        "descricaoCurta": p.get("nome"),     # Fallback para descrição
+                        # CORREÇÃO CRÍTICA: Mudado de 'imagem' para 'imagemURL' para bater com o JS
+                        "imagemURL": p.get("imagem"), 
+                        "componentes": p.get("componentes", []),
+                        "usado_em": [] # Placeholder para lógica futura
                     })
 
-            self.logger.info(
-                f"🔍 Busca | resultados={len(results)} | com_componentes="
-                f"{sum(1 for r in results if r.get('componentes') and len(r['componentes']) > 0)}"
-            )
-            return jsonify(results[:10]) # Limita a 10 resultados
+            self.logger.info(f"🔍 Busca '{query}' | resultados={len(results)}")
+            return jsonify(results[:15]) # Retorna até 15 resultados
 
         @self.app.route('/api/kits')
         @token_required
