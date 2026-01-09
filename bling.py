@@ -509,6 +509,12 @@ class BlingAPIClient:
             self.session = requests.Session()
             return None
             
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                # Silencioso para 404, deixa o chamador decidir
+                raise e
+            self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
+            return None
         except Exception as e:
             self.logger.error(f"Erro genérico em {endpoint}: {str(e)}")
             return None
