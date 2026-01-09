@@ -880,8 +880,13 @@ class Orchestrator:
             data = safe_get(resp, 'data', [])
             if data and isinstance(data, list) and data[0].get('link'):
                 return data[0].get('link')
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                self.logger.debug(f"Produto {product_id} sem imagem cadastrada no Bling.")
+            else:
+                self.logger.error(f"Erro ao buscar imagem do produto {product_id}: {e}")
         except Exception as e:
-            self.logger.debug(f"Falha ao buscar imagem do produto {product_id}: {e}")
+            self.logger.error(f"Erro inesperado ao buscar imagem do produto {product_id}: {e}")
         return "/static/no-image.png"
 
     def _load_cache(self):
