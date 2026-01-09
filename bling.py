@@ -788,89 +788,52 @@ class SalesManager:
             }
 
     def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
-        """
-        Calcula KPIs baseado na QUANTIDADE DE ITENS vendidos.
-        Gera também os dados para o gráfico de histórico.
-        """
         today = datetime.now().date()
-        date_7d_ago = today - timedelta(days=7)
         date_30d_ago = today - timedelta(days=30)
-        
-        daily_sum = 0
-        weekly_sum = 0
-        historic_sum = 0
-        
-        # Dicionário para o gráfico: { '2023-10-01': 15, ... }
         daily_breakdown = defaultdict(int)
+        
+        d_sum, w_sum, h_sum = 0, 0, 0
 
         for order in orders:
-            # Pega a data do pedido (YYYY-MM-DD)
-            data_str = safe_get(order.get('data', {}), 'dataEmissao')
-            if not data_str: continue
+            # Tenta pegar a data de emissão de 3 formas diferentes (API v3 compatibilidade)
+            raw_date = order.get('data') or order.get('dataEmissao')
+            if isinstance(raw_date, dict): raw_date = raw_date.get('dataEmissao')
+            
+            if not raw_date: continue
             
             try:
-                # Converte apenas para DATA (sem hora), para evitar janelas móveis confusas
-                order_date = datetime.strptime(data_str, '%Y-%m-%d').date()
+                # Converte a data (formato YYYY-MM-DD)
+                order_date = datetime.strptime(str(raw_date)[:10], '%Y-%m-%d').date()
+                dt_str = order_date.strftime('%Y-%m-%d')
             except: continue
 
-            # Conta total de itens neste pedido
-            total_items = 0
+            # Soma quantidades
+            qtde_pedido = 0
             for item in order.get('itens', []):
-                total_items += int(float(item.get('quantidade', 0)))
+                qtde_pedido += int(float(item.get('quantidade', 1)))
 
-            # 1. Popula dados do gráfico (Agrupa por dia)
             if order_date >= date_30d_ago:
-                daily_breakdown[data_str] += total_items
+                daily_breakdown[dt_str] += qtde_pedido
+                h_sum += qtde_pedido
+                if order_date >= (today - timedelta(days=7)): w_sum += qtde_pedido
+                if order_date == today: d_sum += qtde_pedido
 
-            # 2. Calcula KPIs
-            # Diário: Apenas hoje (00:00 até agora)
-            if order_date == today:
-                daily_sum += total_items
-            
-            # Semanal: Últimos 7 dias (incluindo hoje)
-            if order_date >= date_7d_ago:
-                weekly_sum += total_items
-                
-            # Histórico: Últimos 30 dias (incluindo hoje)
-            if order_date >= date_30d_ago:
-                historic_sum += total_items
-
-        # Prepara dados formatados para o Chart.js
-        chart_labels = []
-        chart_data = []
-        
-        # Preenche os últimos 30 dias (mesmo os dias zerados)
+        # Gera Labels e Dados para o Chart.js aparecer
+        labels, values = [], []
         for i in range(30):
             d = today - timedelta(days=29-i)
             d_str = d.strftime('%Y-%m-%d')
-            chart_labels.append(d.strftime('%d/%m'))
-            chart_data.append(daily_breakdown.get(d_str, 0))
+            labels.append(d.strftime('%d/%m'))
+            values.append(daily_breakdown.get(d_str, 0))
 
-        # Salva tudo protegido por Lock
         with self.lock:
-            self.daily_count = daily_sum
-            self.weekly_count = weekly_sum
-            self.historic_count = historic_sum
-            
-            # Salva estrutura pronta para o gráfico
-            self.history_data = {
-                "labels": chart_labels,
-                "data": chart_data,
-                "avg": round(historic_sum / 30, 1) if historic_sum > 0 else 0
-            }
-            
+            self.daily_count = d_sum
+            self.weekly_count = w_sum
+            self.historic_count = h_sum
+            self.history_data = {"labels": labels, "data": values, "avg": round(h_sum/30, 1)}
             self.last_recalculated = datetime.now()
-            
-            # Persiste no disco
-            save_stats({
-                "daily": self.daily_count,
-                "weekly": self.weekly_count,
-                "historic": self.historic_count,
-                "history_data": self.history_data,
-                "last_recalculated": self.last_recalculated.isoformat()
-            }, self.config.SALES_STATS_FILE)
-
-        self.logger.info(f"KPIs recalculados: Hoje={daily_sum}, 7D={weekly_sum}, 30D={historic_sum}")
+        
+        save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -1121,23 +1084,19 @@ class Orchestrator:
             if not data: break
             
             for item in data:
-                # --- CORREÇÃO DE IMAGEM AQUI ---
-                # Tenta pegar da lista 'imagens' (padrão v3) ou 'imagem' (legado)
-                img_url = ''
+                # Lógica para extrair a URL da imagem corretamente
+                img_url = ""
                 imagens = item.get('imagens', [])
                 if imagens and isinstance(imagens, list) and len(imagens) > 0:
-                    img_url = safe_get(imagens[0], 'link', '')
-                elif item.get('imagem'):
-                    img_url = item.get('imagem')
-                # -------------------------------
-
+                    img_url = imagens[0].get('link', '') # Pega o link da primeira imagem
+                
                 produto_normalizado = {
                     'id': item.get('id'),
                     'sku': item.get('codigo'),
-                    'nome': item.get('nome') or item.get('descricao'),
+                    'nome': item.get('nome'),
                     'tipo': "COMPOSTO" if item.get('tipo') == 'K' else "SIMPLES",
                     'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
-                    'imagem': img_url, # Usa a URL corrigida
+                    'imagem': img_url, # Guarda a URL limpa aqui
                     'componentes': []
                 }
                 
@@ -1494,14 +1453,12 @@ class WebServer:
                 "is_running": self.orchestrator.is_running()
             })
 
+        # Rota de Vendas (KPIs de cima)
         @self.app.route('/api/sales/stats')
         @token_required
         def api_sales_stats(token):
-            """Retorna os contadores Diário, Semanal e Histórico."""
+            # Garante que os números de cima venham do SalesManager
             stats = self.orchestrator.sales.get_stats()
-            
-            
-            
             return jsonify(stats)
         
         @self.app.route("/api/metrics")
@@ -1574,40 +1531,25 @@ class WebServer:
             executor.submit(self.orchestrator.process_sales_orders)
             executor.shutdown(wait=False)
             
-            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 2        @self.app.route('/api/products/search')
+            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 2        # Rota de Busca com correção de 404 e Imagem
+        @self.app.route('/api/products/search')
+        @self.app.route('/products/search') # Aceita as duas chamadas
         @token_required
         def api_products_search(token):
-            """Busca produtos e kits no cache pelo SKU ou nome."""
             query = request.args.get('q', '').lower()
-            if not query:
-                return jsonify([])
-                
             results = []
+            all_items = self.orchestrator.get_all_products() + self.orchestrator.get_all_kits()
             
-            # Usa o cache completo carregado pelo Orchestrator
-            all_products = self.orchestrator.get_all_products() + self.orchestrator.get_all_kits()
-            
-            for p in all_products:
-                # Proteção contra valores Nones
-                name = str(safe_get(p, 'nome', '')).lower()
-                sku = str(safe_get(p, 'sku', '')).lower()
-                
-                if query in name or query in sku:
+            for p in all_items:
+                if query in str(p.get('nome','')).lower() or query in str(p.get('sku','')).lower():
                     results.append({
                         "id": p.get("id"),
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
-                        "tipo": p.get("tipo"),
-                        "estoque": p.get("estoqueAtual", 0), # Adicionado estoque
-                        "descricaoCurta": p.get("nome"),     # Fallback para descrição
-                        # CORREÇÃO CRÍTICA: Mudado de 'imagem' para 'imagemURL' para bater com o JS
-                        "imagemURL": p.get("imagem"), 
-                        "componentes": p.get("componentes", []),
-                        "usado_em": [] # Placeholder para lógica futura
+                        "estoque": p.get("estoqueAtual", 0),
+                        "imagemURL": p.get("imagem") # O SITE PRECISA QUE SEJA 'imagemURL'
                     })
-
-            self.logger.info(f"🔍 Busca '{query}' | resultados={len(results)}")
-            return jsonify(results[:15]) # Retorna até 15 resultados
+            return jsonify(results[:20])
 
         @self.app.route('/api/kits')
         @token_required
@@ -1685,6 +1627,10 @@ class WebServer:
             
             with WebServer.webhook_lock:
                 try:
+                    # Validação de payload vazio
+                    if not request.data:
+                        return jsonify({"error": "Payload vazio"}), 400
+
                     # 1. Valida assinatura
                     signature = request.headers.get('X-Bling-Signature')
                     if not signature:
@@ -1709,10 +1655,20 @@ class WebServer:
                     # 3. Força recálculo de KPIs para pedidos
                     if tipo == 'pedidoVenda' and evento in ['criado', 'alterado', 'faturado']:
                         self.logger.info("🔄 Webhook acionou recálculo de KPIs")
-                        # ✅ CORREÇÃO CRÍTICA: Força o recálculo de forma síncrona para garantir a persistência imediata
-                        self.orchestrator.process_sales_orders(force=True)
-                        self.orchestrator.sales.save_stats() # ✅ Persiste imediatamente para o Power BI
-                        # NOTA: A chamada anterior `executor.submit(self.orchestrator.process_sales_orders)` foi removida.
+                        
+                        # Extrai os dados do pedido do webhook (se disponíveis)
+                        pedidos_novos = []
+                        if 'retorno' in data and 'pedidos' in data['retorno']:
+                            pedidos_novos = data['retorno']['pedidos']
+                        
+                        # Recalcula a partir dos pedidos novos ou força atualização geral
+                        if pedidos_novos:
+                            self.orchestrator.sales.recalculate_from_orders(pedidos_novos)
+                        else:
+                            self.orchestrator.process_sales_orders(force=True)
+                        
+                        # ESSA LINHA É A CHAVE: Avisa o Dashboard via WebSocket para atualizar a tela sozinho
+                        self.orchestrator.broadcast_kpi_update(cache_updated=False)
                         
                     return jsonify({"status": "ok", "message": f"Webhook {tipo}.{evento} processado"}), 200
 
