@@ -865,8 +865,24 @@ class Orchestrator:
         self.logger.debug("Orchestrator inicializado com cache de componentes vazio")
         
         # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
-        self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
-        self.process_products_cache()
+        if self.auth.is_authenticated():
+            self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
+            self.process_products_cache()
+        else:
+            self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
+
+    def fetch_product_image(self, product_id: Optional[str]) -> str:
+        """Busca imagens do produto via endpoint /produtos/{id}/imagens; retorna fallback se não achar."""
+        if not product_id:
+            return "/static/no-image.png"
+        try:
+            resp = self.api.get(f'produtos/{product_id}/imagens')
+            data = safe_get(resp, 'data', [])
+            if data and isinstance(data, list) and data[0].get('link'):
+                return data[0].get('link')
+        except Exception as e:
+            self.logger.debug(f"Falha ao buscar imagem do produto {product_id}: {e}")
+        return "/static/no-image.png"
 
     def _load_cache(self):
         """Carrega o cache de produtos/kits do disco."""
@@ -1052,15 +1068,26 @@ class Orchestrator:
                 if page > MAX_TOTAL_PAGES:
                     self.logger.warning(f"⚠️ Limite de {MAX_TOTAL_PAGES} páginas atingido. Parando busca.")
                     break
-                
-                # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
+                            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
                 time.sleep(1.2)
-        
+
+            # --- depois do loop de paginação terminou ---
+            if all_orders:
+                # Recalcula KPIs a partir dos pedidos coletados
+                try:
+                    self.logger.info(f"Recálculo: processando {len(all_orders)} pedidos coletados para KPIs.")
+                    self.sales.recalculate_from_orders(all_orders)
+                    # Transmite atualização para frontend via WebSocket
+                    self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
+                    self.logger.info("✅ KPIs recalculados com sucesso após coleta de pedidos.")
+                except Exception as e:
+                    self.logger.exception(f"Erro ao recalcular KPIs a partir dos pedidos: {e}")
+
         except Exception as e:
-            self.logger.exception("Erro ao processar pedidos de venda.")
+            self.logger.exception(f"Erro ao processar pedidos de venda: {e}")
         finally:
-            with self.sales.recalculation_lock:
-                self.sales._recalculation_running = False
+            self.logger.info(f"Processamento de pedidos finalizado. Total coletado: {len(all_orders)}")
+            self.sales._recalculation_running = False
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos e kits."""
@@ -1089,6 +1116,10 @@ class Orchestrator:
                 imagens = item.get('imagens', [])
                 if imagens and isinstance(imagens, list) and len(imagens) > 0:
                     img_url = imagens[0].get('link', '') # Pega o link da primeira imagem
+
+                # Se não encontrou via 'imagens' do item, busca pelo endpoint dedicado
+                if not img_url:
+                    img_url = self.fetch_product_image(item.get('id'))
                 
                 produto_normalizado = {
                     'id': item.get('id'),
@@ -1124,6 +1155,7 @@ class Orchestrator:
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
             self.logger.info(f"Cache atualizado: {len(all_products)} produtos, {len(all_kits)} kits.")
             
+        self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
@@ -1560,7 +1592,19 @@ class WebServer:
             
             self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
             
-            return jsonify(kits + products)
+            def normalize_for_api(item):
+                return {
+                    "id": item.get("id"),
+                    "nome": item.get("nome"),
+                    "sku": item.get("sku"),
+                    "estoque": item.get("estoqueAtual", 0),
+                    "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
+                    "tipo": item.get("tipo"),
+                    "componentes": item.get("componentes", [])
+                }
+
+            all_list = [normalize_for_api(p) for p in kits + products]
+            return jsonify(all_list)
 
 
         @self.app.route('/_health')
