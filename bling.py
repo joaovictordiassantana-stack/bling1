@@ -223,6 +223,7 @@ class Config:
     # Bling OAuth
     CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', 'YOUR_CLIENT_ID')
     CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
+    WEBHOOK_SECRET: str = os.environ.get('BLING_WEBHOOK_SECRET', 'YOUR_WEBHOOK_SECRET')
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI')
     if not REDIRECT_URI:
         pass
@@ -1758,26 +1759,33 @@ class WebServer:
                     if not request.data:
                         return jsonify({"error": "Payload vazio"}), 400
 
-                    # 1. Valida assinatura
-                    signature = request.headers.get('X-Bling-Signature')
+                    # 🔧 IMPLEMENTAÇÃO CORRETA (OBRIGATÓRIA)
+                    signature = request.headers.get("X-Bling-Signature-256")
+
                     if not signature:
-                        self.logger.error("❌ Webhook sem assinatura X-Bling-Signature")
-                        return jsonify({"error": "Assinatura ausente"}), 403
-                    
-                    # Gera HMAC esperado
-                    secret = self.config.CLIENT_SECRET.encode()
-                    expected = hmac.new(secret, request.data, hashlib.sha256).hexdigest()
-                    
-                    if not hmac.compare_digest(signature, expected):
-                        self.logger.error(f"❌ Assinatura inválida. Esperado: {expected[:10]}...")
-                        return jsonify({"error": "Assinatura inválida"}), 403
-                    
+                        self.logger.warning("Webhook sem assinatura")
+                        return "ignored", 400
+
+                    signature = signature.replace("sha256=", "")
+
+                    computed = hmac.new(
+                        self.config.WEBHOOK_SECRET.encode(),
+                        request.data,
+                        hashlib.sha256
+                    ).hexdigest()
+
+                    if not hmac.compare_digest(signature, computed):
+                        self.logger.warning("Assinatura inválida")
+                        return "invalid", 403
+
                     # 2. Processa webhook
                     data = request.json
                     tipo = safe_get(data, 'tipo')
                     evento = safe_get(data, 'evento')
 
-                    self.logger.info(f"📩 Webhook válido: {tipo}.{evento}")
+                    # 🧪 LOGS OBRIGATÓRIOS
+                    self.logger.info(f"INFO: Webhook recebido - tipo={tipo}")
+                    self.logger.info("INFO: Webhook validado com sucesso")
 
                     # 3. Força recálculo de KPIs para pedidos
                     if tipo == 'pedidoVenda' and evento in ['criado', 'alterado', 'faturado']:
