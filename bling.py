@@ -156,7 +156,7 @@ def setup_logging():
     # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
     
-    logger.setLevel(logging.INFO) 
+    logger.setLevel(logging.DEBUG)  # DEBUG temporário para investigação
     # ✅ Suprime logs repetitivos
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('flask_sock').setLevel(logging.WARNING)
@@ -344,10 +344,11 @@ def save_products_cache(cache_file, products, kits):
     Salva cache de produtos e kits no disco.
     """
     total_produtos = len(products or []) + len(kits or [])
+    logger.debug(f"save_products_cache chamado. products={len(products or [])} kits={len(kits or [])} total={total_produtos}")
     
     # ✅ 3. Nunca salvar cache se produtos == 0
     if total_produtos == 0:
-        logger.warning("⛔ Cache vazio ignorado. Não salvando no disco.")
+        logger.warning("⛔ Cache vazio ignorado. Não salvando no disco. Isto indica que a API não retornou produtos ou que o parsing falhou.")
         return
         
     try:
@@ -358,6 +359,9 @@ def save_products_cache(cache_file, products, kits):
         }
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+        
+        skus = [p.get('sku') for p in (products or [])[:5]] + [k.get('sku') for k in (kits or [])[:5]]
+        logger.info(f"Cache salvo com sample skus: {skus}")
         logger.info(f"Cache de produtos e kits salvo com sucesso. Total: {total_produtos}")
     except Exception as e:
         logger.exception("Erro ao salvar cache de produtos.")
@@ -469,6 +473,9 @@ class BlingAPIClient:
         kwargs.setdefault('headers', {})
         kwargs['headers']['Authorization'] = f'Bearer {token}'
         
+        # --- DEBUG: log de entrada da requisição ---
+        self.logger.debug(f"API REQ -> {method} {url} params={kwargs.get('params')} json_keys={list(kwargs.get('json', {}).keys()) if kwargs.get('json') else None}")
+
         # Rate Limiter
         self.rate_limiter.wait()
         
@@ -478,8 +485,22 @@ class BlingAPIClient:
             response = self.session.request(method, url, timeout=45, **kwargs)
             latency = time.time() - start_time
             
+            # DEBUG: log de status e tamanho do body
+            text_len = len(response.text) if response.text else 0
+            self.logger.debug(f"API RESP <- {method} {url} status={response.status_code} text_len={text_len}")
+
             self.metrics.record_request(response.status_code, latency)
             
+            # tenta parse do JSON e logar keys top-level (para entender formato)
+            try:
+                resp_json = response.json()
+                if isinstance(resp_json, dict):
+                    self.logger.debug(f"API JSON KEYS: {list(resp_json.keys())}")
+                else:
+                    self.logger.debug(f"API JSON TYPE: {type(resp_json)}")
+            except Exception as e:
+                self.logger.debug(f"API JSON parse failed: {e}")
+
             # Tratamento de Token Expirado (401)
             if response.status_code == 401:
                 self.logger.warning(f"Token 401 em {endpoint}. Tentando refresh...")
@@ -1118,8 +1139,52 @@ class Orchestrator:
                 self.logger.error(f"Erro ao buscar produtos: {e}")
                 break
             
-            data = safe_get(response, 'data', [])
-            if not data: break
+            # --- Normalização robusta do payload de produtos ---
+            data = []
+            if response is None:
+                self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
+            else:
+                # tenta várias chaves possíveis (compatibilidade com diferentes respostas)
+                if isinstance(response, dict):
+                    # forma preferida
+                    if 'data' in response and isinstance(response['data'], list):
+                        data = response['data']
+                    # estrutura antiga/alternativa: retorno -> produtos
+                    elif 'retorno' in response and isinstance(response['retorno'], dict):
+                        # possível path: retorno -> produtos or retorno -> produtos -> produto
+                        # Coloca debug para ver as chaves internas
+                        self.logger.debug(f"Página {page}: 'retorno' keys: {list(response['retorno'].keys())}")
+                        # se retorno contiver 'produtos', tenta usar
+                        if 'produtos' in response['retorno']:
+                            maybe = response['retorno']['produtos']
+                            # alguns endpoints retornam {'produtos': {'produto': [ ... ]}}
+                            if isinstance(maybe, dict) and 'produto' in maybe:
+                                data = maybe['produto']
+                            elif isinstance(maybe, list):
+                                data = maybe
+                        else:
+                            # fallback direto: se houver 'produtos' no top-level
+                            if 'produtos' in response and isinstance(response['produtos'], list):
+                                data = response['produtos']
+                            # último fallback: verifica 'produtos' dentro de qualquer valor dict->list
+                            else:
+                                # DEBUG geral: log keys para inspeção manual
+                                self.logger.debug(f"Página {page}: keys top-level: {list(response.keys())}")
+                else:
+                    self.logger.debug(f"Página {page}: response tipo inesperado: {type(response)}")
+
+            # agora data é lista ou vazia
+            if not data:
+                self.logger.info(f"Página {page}: nenhum produto encontrado (data vazio). Keys ou estrutura foram logadas para investigação.")
+                break
+
+            # log de inspeção de conteúdo
+            sample_count = min(3, len(data))
+            try:
+                sample_keys = [list(item.keys()) for item in data[:sample_count]]
+            except Exception:
+                sample_keys = []
+            self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
             
             for item in data:
                 # Lógica simplificada e robusta para extrair a URL da imagem
@@ -1143,6 +1208,12 @@ class Orchestrator:
                     'componentes': item.get('componentes', [])
                 }
                 
+                # após criar produto_normalizado
+                if produto_normalizado.get('sku'):
+                    if len(all_products) + len(all_kits) < 10:
+                        # loga detalhes das primeiras 10 entradas
+                        self.logger.debug(f"Produto coletado (página {page}): sku={produto_normalizado['sku']} nome={produto_normalizado['nome'][:60]} img_len={len(produto_normalizado.get('imagem',''))}")
+
                 # Armazena tudo sem filtros
                 if item.get('tipo') == 'K':
                     all_kits.append(produto_normalizado)
@@ -1153,6 +1224,7 @@ class Orchestrator:
             page += 1
             time.sleep(0.5) # Evita rate limit
 
+        self.logger.info(f"process_products_cache final: total_products={len(all_products)} total_kits={len(all_kits)} (antes de salvar).")
         # Salva no cache
         with self._cache_lock:
             self._products_cache = {p['sku']: p for p in all_products if p.get('sku')}
@@ -1589,9 +1661,25 @@ class WebServer:
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
                         "estoque": p.get("estoqueAtual", 0),
-                        "imagemURL": p.get("imagem") # O SITE PRECISA QUE SEJA 'imagemURL'
+                        "estoqueAtual": p.get("estoqueAtual", 0),
+                        "imagemURL": p.get("imagem"),
+                        "imagem": p.get("imagem")
                     })
             return jsonify(results[:20])
+
+        @self.app.route('/api/debug/cache')
+        @token_required
+        def api_debug_cache(token):
+            c = self.orchestrator
+            with c._cache_lock:
+                sample_products = list(c._products_cache.values())[:5]
+                sample_kits = list(c._kits_cache.values())[:5]
+                return jsonify({
+                    "products_count": len(c._products_cache),
+                    "kits_count": len(c._kits_cache),
+                    "sample_products": sample_products,
+                    "sample_kits": sample_kits
+                })
 
         @self.app.route('/api/kits')
         @token_required
@@ -1603,13 +1691,21 @@ class WebServer:
             self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
             
             def normalize_for_api(item):
+                estoque_val = item.get("estoqueAtual", item.get("estoque", 0))
+                tipo = item.get("tipo", "P")
+                # Mapeia tipo textual para K/P (compatibilidade)
+                if tipo in ["COMPOSTO", "K"]: tipo_out = "K"
+                else: tipo_out = "P"
+
                 return {
                     "id": item.get("id"),
                     "nome": item.get("nome"),
                     "sku": item.get("sku"),
-                    "estoque": item.get("estoqueAtual", 0),
+                    "estoque": estoque_val,
+                    "estoqueAtual": estoque_val,
                     "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "tipo": item.get("tipo"),
+                    "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
+                    "tipo": tipo_out,
                     "componentes": item.get("componentes", [])
                 }
 
