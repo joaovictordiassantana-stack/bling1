@@ -898,32 +898,14 @@ class Orchestrator:
         else:
             self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
 
-    def fetch_product_image(self, product_id: Optional[str]) -> str:
-        """Busca imagens do produto via endpoint /produtos/{id}/imagens; retorna fallback se não achar."""
-        if not product_id:
-            return "/static/no-image.png"
-        try:
-            resp = self.api.get(f'produtos/{product_id}/imagens')
-            data = safe_get(resp, 'data', [])
-            if data and isinstance(data, list) and data[0].get('link'):
-                return data[0].get('link')
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                self.logger.debug(f"Produto {product_id} sem imagem cadastrada no Bling.")
-            else:
-                self.logger.error(f"Erro ao buscar imagem do produto {product_id}: {e}")
-        except Exception as e:
-            self.logger.error(f"Erro inesperado ao buscar imagem do produto {product_id}: {e}")
-        return "/static/no-image.png"
-
     def _load_cache(self):
         """Carrega o cache de produtos/kits do disco."""
         data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
         if data:
             with self._cache_lock:
-                self._products_cache = {p['sku']: p for p in safe_iter(data.get('products'))}
-                self._kits_cache = {k['sku']: k for k in safe_iter(data.get('kits'))}
-            self.logger.info(f"Cache carregado: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
+                self._products_cache = {p['id']: p for p in safe_iter(data.get('products'))}
+                self._kits_cache = {k['id']: k for k in safe_iter(data.get('kits'))}
+                self.logger.info(f"Cache carregado: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
         else:
             self.logger.warning("Nenhuma cache de produtos/kits encontrado no disco.")
 
@@ -1186,36 +1168,24 @@ class Orchestrator:
                 sample_keys = []
             self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
             
-            for item in data:
-                # Lógica simplificada e robusta para extrair a URL da imagem
-                img_url = item.get('imagemURL') or ""
-                if not img_url:
-                    imagens = item.get('imagens', [])
-                    if imagens and isinstance(imagens, list) and len(imagens) > 0:
-                        img_url = imagens[0].get('link', '')
+            for p in data:
+                # 🔧 4️⃣ FILTRO PERMITIDO (ÚNICO ACEITÁVEL)
+                if not p.get("id") or not p.get("nome"):
+                    continue
 
-                # Se ainda não tem imagem, tenta o fallback silencioso
-                if not img_url:
-                    img_url = self.fetch_product_image(item.get('id'))
-                
+                # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
                 produto_normalizado = {
-                    'id': item.get('id'),
-                    'sku': item.get('codigo'),
-                    'nome': item.get('nome'),
-                    'tipo': "K" if item.get('tipo') == 'K' else "P",
-                    'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
-                    'imagem': img_url or "/static/no-image.png",
-                    'componentes': item.get('componentes', [])
+                    "id": p["id"],
+                    "nome": p["nome"],
+                    "sku": p.get("codigo") or str(p["id"]),
+                    "estoqueAtual": p.get("estoque", 0),
+                    "imagem": p.get("imagemURL"),  # pode ser None
+                    "tipo": "K" if p.get("tipo") == "K" else "P",
+                    "componentes": []
                 }
                 
-                # após criar produto_normalizado
-                if produto_normalizado.get('sku'):
-                    if len(all_products) + len(all_kits) < 10:
-                        # loga detalhes das primeiras 10 entradas
-                        self.logger.debug(f"Produto coletado (página {page}): sku={produto_normalizado['sku']} nome={produto_normalizado['nome'][:60]} img_len={len(produto_normalizado.get('imagem',''))}")
-
                 # Armazena tudo sem filtros
-                if item.get('tipo') == 'K':
+                if p.get('tipo') == 'K':
                     all_kits.append(produto_normalizado)
                 else:
                     all_products.append(produto_normalizado)
@@ -1224,13 +1194,20 @@ class Orchestrator:
             page += 1
             time.sleep(0.5) # Evita rate limit
 
-        self.logger.info(f"process_products_cache final: total_products={len(all_products)} total_kits={len(all_kits)} (antes de salvar).")
-        # Salva no cache
+        # 🔧 5️⃣ SALVAMENTO DO CACHE (CRÍTICO)
+        self.logger.info(
+            f"FINAL CACHE → produtos={len(all_products)} kits={len(all_kits)}"
+        )
+
         with self._cache_lock:
-            self._products_cache = {p['sku']: p for p in all_products if p.get('sku')}
-            self._kits_cache = {k['sku']: k for k in all_kits if k.get('sku')}
+            self._products_cache = {p["id"]: p for p in all_products}
+            self._kits_cache = {k["id"]: k for k in all_kits}
+            
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
-            self.logger.info(f"TOTAL PRODUTOS EM CACHE: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
+            
+            self.logger.info(
+                f"CACHE SALVO → products={len(self._products_cache)} kits={len(self._kits_cache)}"
+            )
             
         self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
         self.broadcast_kpi_update(cache_updated=True)
