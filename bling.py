@@ -1327,21 +1327,26 @@ class Orchestrator:
             "auth_url": self.auth.get_authorization_url() # Envia a URL de auth para o frontend
         }
         
-        # 2. Adiciona KPIs se fornecidos
-        if sales_stats:
-            # Converte a data de volta para ISO string para o WS (se já não for string)
-            stats_data = sales_stats.copy()
-            last_recalc = stats_data.get('last_recalculated')
-            
-            if isinstance(last_recalc, datetime):
-                stats_data['last_update'] = last_recalc.isoformat()
-            else:
-                stats_data['last_update'] = str(last_recalc)
+        # 2. Adiciona KPIs se fornecidos (com proteção contra tipos inválidos)
+        if sales_stats and isinstance(sales_stats, dict):
+            try:
+                # Converte a data de volta para ISO string para o WS (se já não for string)
+                stats_data = sales_stats.copy()
+                last_recalc = stats_data.get('last_recalculated')
                 
-            if 'last_recalculated' in stats_data:
-                stats_data.pop('last_recalculated')
-                
-            payload["sales_stats"] = stats_data
+                if isinstance(last_recalc, datetime):
+                    stats_data['last_update'] = last_recalc.isoformat()
+                else:
+                    stats_data['last_update'] = str(last_recalc)
+                    
+                if 'last_recalculated' in stats_data:
+                    stats_data.pop('last_recalculated')
+                    
+                payload["sales_stats"] = stats_data
+            except Exception as e:
+                self.logger.error(f"Erro ao processar sales_stats para broadcast: {e}")
+        elif sales_stats:
+            self.logger.warning(f"sales_stats recebido em formato inválido ({type(sales_stats)}). Ignorando no broadcast.")
             
         # 3. Adiciona o uso de componentes se fornecido
         if component_usage:
