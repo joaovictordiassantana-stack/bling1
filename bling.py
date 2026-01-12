@@ -827,6 +827,7 @@ class SalesManager:
 
     def recalculate_from_orders(self, orders_list):
         """Recalcula métricas baseado na lista crua de pedidos (V2 ou V3)."""
+        self.logger.debug(f"DEBUG: Iniciando recálculo com {len(orders_list)} pedidos recebidos.")
         temp_total = 0.0
         temp_count = 0
         temp_history = {}
@@ -835,8 +836,9 @@ class SalesManager:
         # Datas para filtro
         now = datetime.now()
         thirty_days_ago = now.date() - timedelta(days=30)
+        self.logger.debug(f"DEBUG: Filtro de data: a partir de {thirty_days_ago}")
 
-        for o in orders_list:
+        for idx, o in enumerate(orders_list):
             try:
                 # 1. Tenta extrair a DATA de várias formas possíveis (V2 e V3)
                 date_str = o.get('data') or o.get('dataEmissao') or o.get('dataSaida')
@@ -846,6 +848,7 @@ class SalesManager:
                     date_str = o['data'].get('data')
 
                 if not date_str:
+                    self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) ignorado: sem data encontrada. Chaves: {list(o.keys())}")
                     continue # Sem data, impossível plotar
 
                 # Converte para objeto Date
@@ -857,10 +860,12 @@ class SalesManager:
                         # Tenta formato DD/MM/YYYY (Padrão V2/Legado)
                         order_date = datetime.strptime(str(date_str).split(' ')[0], "%d/%m/%Y").date()
                     except ValueError:
+                        self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) ignorado: formato de data inválido '{date_str}'")
                         continue # Data inválida
 
                 # Filtra apenas os últimos 30 dias para o gráfico
                 if order_date < thirty_days_ago:
+                    # self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) ignorado: data {order_date} fora do range.")
                     continue
 
                 # 2. Tenta extrair o VALOR (totalvenda ou total)
@@ -868,6 +873,7 @@ class SalesManager:
                 try:
                     val = float(val_str)
                 except:
+                    self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) erro ao converter valor '{val_str}'")
                     val = 0.0
 
                 # Acumula dados
@@ -880,7 +886,7 @@ class SalesManager:
                 temp_history[key] = temp_history.get(key, 0.0) + val
 
             except Exception as e:
-                # Log silencioso para não poluir, apenas pula o pedido problemático
+                self.logger.error(f"DEBUG: Erro inesperado no pedido #{idx}: {e}")
                 continue
 
         # Atualiza estado protegido
@@ -892,8 +898,8 @@ class SalesManager:
             self.orders_cache = valid_orders # Salva a lista limpa
             self.last_updated = datetime.now()
 
-        # LOG IMPORTANTE PARA VOCÊ VERIFICAR
-        print(f"✅ RECALCULO CONCLUÍDO: {temp_count} pedidos válidos nos últimos 30 dias. Total: R$ {temp_total:.2f}")
+        self.logger.info(f"✅ RECALCULO CONCLUÍDO: {temp_count} pedidos válidos nos últimos 30 dias. Total: R$ {temp_total:.2f}")
+        self.logger.debug(f"DEBUG: Histórico gerado para o gráfico: {temp_history}")
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -1047,10 +1053,12 @@ class Orchestrator:
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
+        self.logger.debug(f"DEBUG: process_sales_orders chamado (force={force})")
         
         # Evita recálculos encavalados
         with self.sales.recalculation_lock:
             if self.sales._recalculation_running and not force:
+                self.logger.debug("DEBUG: Recálculo já em execução, ignorando.")
                 return
             self.sales._recalculation_running = True
             
@@ -1073,12 +1081,15 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
+                self.logger.debug(f"DEBUG: Buscando página {page} de pedidos...")
                 try:
                     response = self.api.get('pedidos/vendas', params=params)
-                except Exception:
+                except Exception as e:
+                    self.logger.error(f"DEBUG: Erro na API ao buscar pedidos: {e}")
                     break # Se der erro na API, para o loop mas processa o que já pegou
                 
                 if response is None:
+                    self.logger.debug(f"DEBUG: Resposta da API nula na página {page}")
                     break
     
                 # --- CORREÇÃO DE LEITURA (PARSING) ---
@@ -1097,6 +1108,8 @@ class Orchestrator:
                     # Se o Bling retornar a lista direta
                     data = response
                 # -------------------------------------
+                
+                self.logger.debug(f"DEBUG: Página {page} retornou {len(data) if data else 0} pedidos.")
                 
                 if not data:
                     break
@@ -1123,6 +1136,7 @@ class Orchestrator:
                     if o.get('id') and o.get('data'):
                         valid_orders.append(o)
 
+                self.logger.debug(f"DEBUG: {len(valid_orders)} pedidos válidos após normalização inicial.")
                 self.sales.recalculate_from_orders(valid_orders)
                 
                 # Manda atualização pro Front (Gráfico)
@@ -1795,14 +1809,19 @@ class WebServer:
             """Recebe webhooks do Bling - Correção para V3."""
             with WebServer.webhook_lock:
                 try:
+                    # Log de entrada bruta para diagnóstico
+                    self.logger.debug(f"DEBUG: Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
+                    self.logger.debug(f"DEBUG: Headers do Webhook: {dict(request.headers)}")
+
                     # 1. Validação de Assinatura (Mantenha se configurado no Render)
                     signature = request.headers.get("X-Bling-Signature-256")
                     if self.config.WEBHOOK_SECRET and not signature:
-                        # Se tem segredo configurado mas não veio assinatura, rejeita
-                        return jsonify({"status": "forbidden"}), 403
+                        self.logger.warning("DEBUG: Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
+                        return jsonify({"status": "forbidden", "reason": "missing signature"}), 403
 
                     data = request.json
                     if not data:
+                        self.logger.debug("DEBUG: Webhook ignorado: JSON vazio ou inválido.")
                         return jsonify({"status": "ignored"}), 200
 
                     self.logger.info(f"⚡ Webhook recebido: {str(data)[:200]}")
@@ -1812,18 +1831,22 @@ class WebServer:
 
                     # Caso 1: Webhook V3 Padrão (vem "id", "situacao", "tipo" na raiz)
                     if 'situacao' in data and 'id' in data:
+                        self.logger.debug(f"DEBUG: Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
                         should_update = True
                     
                     # Caso 2: Tipo explícito
                     elif data.get('tipo') == 'pedidoVenda':
+                        self.logger.debug("DEBUG: Webhook tipo pedidoVenda detectado.")
                         should_update = True
 
                     # Caso 3: Formato antigo (V2)
                     elif 'retorno' in data and 'pedidos' in data['retorno']:
+                        self.logger.debug("DEBUG: Webhook V2 detectado.")
                         should_update = True
                     
                     # Caso 4: Callbacks de teste
                     elif data.get('test') == True:
+                        self.logger.debug("DEBUG: Webhook de teste recebido.")
                         return jsonify({"status": "ok", "message": "Test received"}), 200
 
                     if should_update:
