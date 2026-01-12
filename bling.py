@@ -1122,13 +1122,14 @@ class Orchestrator:
             if not data: break
             
             for item in data:
-                # Lógica para extrair a URL da imagem corretamente
-                img_url = ""
-                imagens = item.get('imagens', [])
-                if imagens and isinstance(imagens, list) and len(imagens) > 0:
-                    img_url = imagens[0].get('link', '') # Pega o link da primeira imagem
+                # Lógica simplificada e robusta para extrair a URL da imagem
+                img_url = item.get('imagemURL') or ""
+                if not img_url:
+                    imagens = item.get('imagens', [])
+                    if imagens and isinstance(imagens, list) and len(imagens) > 0:
+                        img_url = imagens[0].get('link', '')
 
-                # Se não encontrou via 'imagens' do item, busca pelo endpoint dedicado
+                # Se ainda não tem imagem, tenta o fallback silencioso
                 if not img_url:
                     img_url = self.fetch_product_image(item.get('id'))
                 
@@ -1136,21 +1137,14 @@ class Orchestrator:
                     'id': item.get('id'),
                     'sku': item.get('codigo'),
                     'nome': item.get('nome'),
-                    'tipo': "COMPOSTO" if item.get('tipo') == 'K' else "SIMPLES",
+                    'tipo': "K" if item.get('tipo') == 'K' else "P",
                     'estoqueAtual': safe_get(item.get('estoque', {}), 'saldoVirtualTotal', 0),
-                    'imagem': img_url, # Guarda a URL limpa aqui
-                    'componentes': []
+                    'imagem': img_url or "/static/no-image.png",
+                    'componentes': item.get('componentes', [])
                 }
                 
-                # Se for Kit, processa componentes
+                # Armazena tudo sem filtros
                 if item.get('tipo') == 'K':
-                    comps = []
-                    for c in item.get('componentes', []):
-                        comps.append({
-                            'sku': safe_get(c.get('produto', {}), 'codigo'),
-                            'quantidade': c.get('quantidade', 1)
-                        })
-                    produto_normalizado['componentes'] = comps
                     all_kits.append(produto_normalizado)
                 else:
                     all_products.append(produto_normalizado)
@@ -1161,10 +1155,10 @@ class Orchestrator:
 
         # Salva no cache
         with self._cache_lock:
-            self._products_cache = {p['sku']: p for p in all_products}
-            self._kits_cache = {k['sku']: k for k in all_kits}
+            self._products_cache = {p['sku']: p for p in all_products if p.get('sku')}
+            self._kits_cache = {k['sku']: k for k in all_kits if k.get('sku')}
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
-            self.logger.info(f"Cache atualizado: {len(all_products)} produtos, {len(all_kits)} kits.")
+            self.logger.info(f"TOTAL PRODUTOS EM CACHE: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
             
         self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
         self.broadcast_kpi_update(cache_updated=True)
