@@ -768,6 +768,12 @@ class SalesManager:
     # Dados para o Gráfico (Cache)
     history_data: Dict[str, Any] = field(default_factory=dict)
     
+    # Cache de Pedidos
+    _orders_cache: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    
+    # Histórico de Vendas Estruturado
+    _sales_history: List[Dict[str, Any]] = field(default_factory=list)
+    
     last_recalculated: datetime = field(default_factory=datetime.now)
     lock: Lock = field(default_factory=Lock)
     recalculation_lock: Lock = field(default_factory=Lock)
@@ -784,6 +790,8 @@ class SalesManager:
                 self.weekly_count = data.get('weekly', 0)
                 self.historic_count = data.get('historic', 0)
                 self.history_data = data.get('history_data', {}) # Carrega dados do gráfico
+                self._orders_cache = data.get('orders_cache', {}) # Carrega cache de pedidos
+                self._sales_history = data.get('sales_history', []) # Carrega histórico de vendas
                 
                 last_recalc = data.get('last_recalculated')
                 if isinstance(last_recalc, str):
@@ -812,6 +820,8 @@ class SalesManager:
                 "weekly": self.weekly_count,
                 "historic": self.historic_count,
                 "history_data": self.history_data,
+                "orders_cache": self._orders_cache,
+                "sales_history": self._sales_history,
                 "last_recalculated": self.last_recalculated.isoformat()
             }
 
@@ -822,7 +832,26 @@ class SalesManager:
         
         d_sum, w_sum, h_sum = 0, 0, 0
 
+        new_orders_cache = {}
         for order in orders:
+            # --- ATUALIZAÇÃO DO CACHE DE PEDIDOS ---
+            itens = order.get("itens", [])
+            new_orders_cache[order["id"]] = {
+                "id": order["id"],
+                "data": order.get("data"),
+                "total": order.get("total"),
+                "situacao": order.get("situacao"),
+                "itens": [
+                    {
+                        "produto_id": i.get("produto", {}).get("id") if isinstance(i.get("produto"), dict) else None,
+                        "nome": i.get("descricao"),
+                        "quantidade": i.get("quantidade"),
+                        "valor": i.get("valor")
+                    }
+                    for i in itens
+                ]
+            }
+
             # Tenta pegar a data de emissão de 3 formas diferentes (API v3 compatibilidade)
             raw_date = order.get('data') or order.get('dataEmissao')
             if isinstance(raw_date, dict): raw_date = raw_date.get('dataEmissao')
@@ -854,13 +883,29 @@ class SalesManager:
             labels.append(d.strftime('%d/%m'))
             values.append(daily_breakdown.get(d_str, 0))
 
+        # --- GERAÇÃO DO HISTÓRICO DE VENDAS (DASHBOARD) ---
+        sales_by_day = defaultdict(float)
+        for order in new_orders_cache.values():
+            if order.get("data"):
+                day = str(order["data"])[:10]
+                sales_by_day[day] += float(order.get("total", 0))
+
+        new_sales_history = sorted(
+            [{"date": d, "total": v} for d, v in sales_by_day.items()],
+            key=lambda x: x["date"]
+        )
+
         with self.lock:
             self.daily_count = d_sum
             self.weekly_count = w_sum
             self.historic_count = h_sum
             self.history_data = {"labels": labels, "data": values, "avg": round(h_sum/30, 1)}
+            self._orders_cache = new_orders_cache
+            self._sales_history = new_sales_history
             self.last_recalculated = datetime.now()
         
+        self.logger.info(f"Orders cache salvo → total={len(new_orders_cache)}")
+        self.logger.info(f"Histórico de vendas gerado → dias={len(new_sales_history)}")
         save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
 
 # ============================================================================ 
@@ -1454,6 +1499,16 @@ class WebServer:
             auth_url = self.orchestrator.auth.create_auth_flow(state)
             
             return redirect(auth_url)
+
+        # Novo Endpoint: Listagem de Pedidos em Cache
+        @self.app.route("/api/orders")
+        def list_orders():
+            return jsonify(list(self.orchestrator.sales._orders_cache.values()))
+
+        # Novo Endpoint: Histórico de Vendas para Dashboard
+        @self.app.route("/api/sales/history")
+        def sales_history():
+            return jsonify(self.orchestrator.sales._sales_history)
 
         # Rota de Callback OAuth
         @self.app.route('/callback')
