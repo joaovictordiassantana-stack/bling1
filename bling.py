@@ -825,88 +825,75 @@ class SalesManager:
                 "last_recalculated": self.last_recalculated.isoformat()
             }
 
-    def recalculate_from_orders(self, orders: List[Dict[str, Any]]):
-        today = datetime.now().date()
-        date_30d_ago = today - timedelta(days=30)
-        daily_breakdown = defaultdict(int)
-        
-        d_sum, w_sum, h_sum = 0, 0, 0
+    def recalculate_from_orders(self, orders_list):
+        """Recalcula métricas baseado na lista crua de pedidos (V2 ou V3)."""
+        temp_total = 0.0
+        temp_count = 0
+        temp_history = {}
+        valid_orders = []
 
-        new_orders_cache = {}
-        for order in orders:
-            # --- ATUALIZAÇÃO DO CACHE DE PEDIDOS ---
-            itens = order.get("itens", [])
-            new_orders_cache[order["id"]] = {
-                "id": order["id"],
-                "data": order.get("data"),
-                "total": order.get("total"),
-                "situacao": order.get("situacao"),
-                "itens": [
-                    {
-                        "produto_id": i.get("produto", {}).get("id") if isinstance(i.get("produto"), dict) else None,
-                        "nome": i.get("descricao"),
-                        "quantidade": i.get("quantidade"),
-                        "valor": i.get("valor")
-                    }
-                    for i in itens
-                ]
-            }
+        # Datas para filtro
+        now = datetime.now()
+        thirty_days_ago = now.date() - timedelta(days=30)
 
-            # Tenta pegar a data de emissão de 3 formas diferentes (API v3 compatibilidade)
-            raw_date = order.get('data') or order.get('dataEmissao')
-            if isinstance(raw_date, dict): raw_date = raw_date.get('dataEmissao')
-            
-            if not raw_date: continue
-            
+        for o in orders_list:
             try:
-                # Converte a data (formato YYYY-MM-DD)
-                order_date = datetime.strptime(str(raw_date)[:10], '%Y-%m-%d').date()
-                dt_str = order_date.strftime('%Y-%m-%d')
-            except: continue
+                # 1. Tenta extrair a DATA de várias formas possíveis (V2 e V3)
+                date_str = o.get('data') or o.get('dataEmissao') or o.get('dataSaida')
+                
+                # Se for um objeto aninhado (alguns endpoints V3)
+                if not date_str and isinstance(o.get('data'), dict):
+                    date_str = o['data'].get('data')
 
-            # Soma quantidades
-            qtde_pedido = 0
-            for item in order.get('itens', []):
-                qtde_pedido += int(float(item.get('quantidade', 1)))
+                if not date_str:
+                    continue # Sem data, impossível plotar
 
-            if order_date >= date_30d_ago:
-                daily_breakdown[dt_str] += qtde_pedido
-                h_sum += qtde_pedido
-                if order_date >= (today - timedelta(days=7)): w_sum += qtde_pedido
-                if order_date == today: d_sum += qtde_pedido
+                # Converte para objeto Date
+                try:
+                    # Tenta formato YYYY-MM-DD (Padrão V3)
+                    order_date = datetime.strptime(str(date_str).split(' ')[0], "%Y-%m-%d").date()
+                except ValueError:
+                    try:
+                        # Tenta formato DD/MM/YYYY (Padrão V2/Legado)
+                        order_date = datetime.strptime(str(date_str).split(' ')[0], "%d/%m/%Y").date()
+                    except ValueError:
+                        continue # Data inválida
 
-        # Gera Labels e Dados para o Chart.js aparecer
-        labels, values = [], []
-        for i in range(30):
-            d = today - timedelta(days=29-i)
-            d_str = d.strftime('%Y-%m-%d')
-            labels.append(d.strftime('%d/%m'))
-            values.append(daily_breakdown.get(d_str, 0))
+                # Filtra apenas os últimos 30 dias para o gráfico
+                if order_date < thirty_days_ago:
+                    continue
 
-        # --- GERAÇÃO DO HISTÓRICO DE VENDAS (DASHBOARD) ---
-        sales_by_day = defaultdict(float)
-        for order in new_orders_cache.values():
-            if order.get("data"):
-                day = str(order["data"])[:10]
-                sales_by_day[day] += float(order.get("total", 0))
+                # 2. Tenta extrair o VALOR (totalvenda ou total)
+                val_str = o.get('total') or o.get('totalvenda') or 0
+                try:
+                    val = float(val_str)
+                except:
+                    val = 0.0
 
-        new_sales_history = sorted(
-            [{"date": d, "total": v} for d, v in sales_by_day.items()],
-            key=lambda x: x["date"]
-        )
+                # Acumula dados
+                temp_total += val
+                temp_count += 1
+                valid_orders.append(o)
 
-        with self.lock:
-            self.daily_count = d_sum
-            self.weekly_count = w_sum
-            self.historic_count = h_sum
-            self.history_data = {"labels": labels, "data": values, "avg": round(h_sum/30, 1)}
-            self._orders_cache = new_orders_cache
-            self._sales_history = new_sales_history
-            self.last_recalculated = datetime.now()
-        
-        self.logger.info(f"Orders cache salvo → total={len(new_orders_cache)}")
-        self.logger.info(f"Histórico de vendas gerado → dias={len(new_sales_history)}")
-        save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+                # Monta histórico para o gráfico (Dia/Mês)
+                key = order_date.strftime("%d/%m")
+                temp_history[key] = temp_history.get(key, 0.0) + val
+
+            except Exception as e:
+                # Log silencioso para não poluir, apenas pula o pedido problemático
+                continue
+
+        # Atualiza estado protegido
+        with self.recalculation_lock:
+            self.total_sales = temp_total
+            self.orders_count = temp_count
+            self.average_ticket = (temp_total / temp_count) if temp_count > 0 else 0.0
+            self.sales_history = temp_history
+            self.orders_cache = valid_orders # Salva a lista limpa
+            self.last_updated = datetime.now()
+
+        # LOG IMPORTANTE PARA VOCÊ VERIFICAR
+        print(f"✅ RECALCULO CONCLUÍDO: {temp_count} pedidos válidos nos últimos 30 dias. Total: R$ {temp_total:.2f}")
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -1805,56 +1792,56 @@ class WebServer:
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
-            """Recebe webhooks do Bling (V2 e V3)."""
+            """Recebe webhooks do Bling - Correção para V3."""
             with WebServer.webhook_lock:
                 try:
-                    # Validação de Assinatura (Essencial no Render se configurado)
+                    # 1. Validação de Assinatura (Mantenha se configurado no Render)
                     signature = request.headers.get("X-Bling-Signature-256")
-                    # Se você não configurou o segredo no Render, comente o bloco abaixo
-                    if self.config.WEBHOOK_SECRET and signature:
-                         # ... lógica de validação HMAC ...
-                         pass 
+                    if self.config.WEBHOOK_SECRET and not signature:
+                        # Se tem segredo configurado mas não veio assinatura, rejeita
+                        return jsonify({"status": "forbidden"}), 403
 
                     data = request.json
                     if not data:
                         return jsonify({"status": "ignored"}), 200
 
-                    self.logger.info(f"Webhook recebido no Render: {str(data)[:100]}...")
+                    self.logger.info(f"⚡ Webhook recebido: {str(data)[:200]}")
 
-                    # --- LÓGICA CORRIGIDA ---
-                    # O Bling V3 manda 'id' e 'situacao' na raiz, ou 'data'
-                    # Se tiver qualquer cheiro de pedido, mandamos atualizar.
-                    
-                    tipo = data.get('tipo', '')
-                    
-                    # Gatilhos para atualização
+                    # 2. DETECÇÃO ROBUSTA DE EVENTO (V2 e V3)
                     should_update = False
+
+                    # Caso 1: Webhook V3 Padrão (vem "id", "situacao", "tipo" na raiz)
+                    if 'situacao' in data and 'id' in data:
+                        should_update = True
                     
-                    # 1. É explicitamente um pedido de venda?
-                    if tipo == 'pedidoVenda':
+                    # Caso 2: Tipo explícito
+                    elif data.get('tipo') == 'pedidoVenda':
                         should_update = True
-                    # 2. Tem formato de alteração de situação? (V3)
-                    elif 'id' in data and 'situacao' in data:
-                        should_update = True
-                    # 3. É um array de pedidos? (V2/Legado)
+
+                    # Caso 3: Formato antigo (V2)
                     elif 'retorno' in data and 'pedidos' in data['retorno']:
                         should_update = True
+                    
+                    # Caso 4: Callbacks de teste
+                    elif data.get('test') == True:
+                        return jsonify({"status": "ok", "message": "Test received"}), 200
 
                     if should_update:
-                        self.logger.info("🔄 Alteração de pedido detectada. Atualizando Dashboard...")
+                        self.logger.info("🔔 Alteração de pedido detectada via Webhook. Iniciando atualização...")
                         
-                        # Roda em background para liberar o webhook rápido (evita timeout do Bling)
+                        # Dispara atualização em background
                         executor = ThreadPoolExecutor(max_workers=1)
-                        # Força busca na API (mais seguro que confiar no payload do webhook)
+                        # Força 'force=True' para ignorar o lock de tempo e atualizar na hora
                         executor.submit(self.orchestrator.process_sales_orders, force=True)
                         executor.shutdown(wait=False)
                         
-                        return jsonify({"status": "ok", "message": "Updating"}), 200
+                        return jsonify({"status": "ok", "message": "Update triggered"}), 200
 
+                    self.logger.info("Webhook ignorado (formato desconhecido ou não é pedido)")
                     return jsonify({"status": "ignored"}), 200
 
                 except Exception as e:
-                    self.logger.error(f"Erro no webhook: {e}")
+                    self.logger.error(f"Erro processando webhook: {e}")
                     return jsonify({"error": "Internal Error"}), 500
 
     def _setup_websockets(self):
