@@ -592,6 +592,18 @@ class AuthManager:
             self.logger.exception("Erro ao carregar state OAuth.")
             return None
 
+    def _validate_oauth_state(self, state: str) -> bool:
+        """Valida o state recebido no callback contra o salvo no arquivo."""
+        saved_state = self._load_oauth_state()
+        if not saved_state or not state:
+            return False
+        
+        is_valid = (saved_state == state)
+        if is_valid:
+            self._clean_oauth_state() # Limpa após uso único
+            
+        return is_valid
+
     def _clean_oauth_state(self):
         """Limpa o state do OAuth do arquivo."""
         if self.OAUTH_STATE_FILE.exists():
