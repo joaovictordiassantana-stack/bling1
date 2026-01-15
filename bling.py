@@ -1580,7 +1580,34 @@ class WebServer:
             executor.submit(self.orchestrator.process_sales_orders)
             executor.shutdown(wait=False)
             
-            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 2        # Rota de Busca com correção de 404 e Imagem
+            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
+
+        # Rota de Callback OAuth (Recebe o code do Bling)
+        @self.app.route('/callback')
+        def callback():
+            code = request.args.get('code')
+            state = request.args.get('state')
+            
+            if not code:
+                return "Erro: Código de autorização não recebido.", 400
+                
+            # Validação do State (CSRF)
+            if not self.orchestrator.auth._validate_oauth_state(state):
+                return "Erro: State inválido ou expirado.", 403
+            
+            # Troca o código pelo token
+            success = self.orchestrator.auth.exchange_code_for_token(code)
+            
+            if success:
+                # Inicia o worker após autenticação bem-sucedida
+                if not self.orchestrator.is_running():
+                    self.orchestrator.start_worker()
+                    start_cleanup_timer()
+                return redirect('/')
+            else:
+                return "Erro ao trocar código pelo token.", 500
+
+        # Rota de Busca com correção de 404 e Imagem
         @self.app.route('/api/products/search')
         @self.app.route('/products/search') # Aceita as duas chamadas
         @token_required
