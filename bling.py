@@ -819,8 +819,6 @@ class SalesManager:
                     self.last_recalculated = last_recalc
                 else:
                     self.last_recalculated = datetime.now()
-                else:
-                    self.last_recalculated = datetime.now()
 
     def get_stats(self) -> Dict[str, Any]:
         with self.lock:
