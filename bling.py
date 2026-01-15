@@ -248,6 +248,9 @@ class Config:
     
     # Arquivos
     TOKENS_FILE: Path = Path('tokens.json')
+    
+    # Token Inicial (para implantação)
+    INITIAL_REFRESH_TOKEN: Optional[str] = os.environ.get('BLING_REFRESH_TOKEN')
 
     SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
     PRODUCTS_CACHE_FILE: Path = Path('products_cache.json') # Persistência de Produtos e Kits
@@ -622,8 +625,15 @@ class AuthManager:
         self._expires_at = self._tokens.get('expires_at', 0)
         self._initial_load_failed = True
         
+        # Se não houver refresh token no arquivo, mas houver na variável de ambiente, usa o da env
+        if not self._refresh_token and self.config.INITIAL_REFRESH_TOKEN:
+            self.logger.info("Utilizando BLING_REFRESH_TOKEN da variável de ambiente.")
+            self._refresh_token = self.config.INITIAL_REFRESH_TOKEN
+            # Salva imediatamente para persistir no arquivo
+            self._save_tokens()
+        
         if not self._access_token and not self._refresh_token:
-            self.logger.warning("⚠️ Nenhum token encontrado no arquivo. Necessário realizar autenticação OAuth.")
+            self.logger.warning("⚠️ Nenhum token encontrado no arquivo ou ambiente. Necessário realizar autenticação OAuth.")
         elif not self._access_token and self._refresh_token:
             self.logger.info("Refresh Token encontrado. Tentativa de renovação será feita na primeira requisição.") 
         
