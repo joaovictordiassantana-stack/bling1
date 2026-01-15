@@ -1519,7 +1519,7 @@ class WebServer:
             return redirect(auth_url)
 
         # Novo Endpoint: Listagem de Pedidos em Cache
-                @self.app.route('/api/webhook', methods=['POST'])
+        @self.app.route('/api/webhook', methods=['POST'])
         def api_webhook():
             signature = request.headers.get('X-Bling-Signature')
             payload = request.data
