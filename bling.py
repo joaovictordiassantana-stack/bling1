@@ -561,14 +561,13 @@ class BlingAPIClient:
 # ============================================================================
 
     def register_webhook(self, event: str, url: str):
-        """Registra um webhook na API do Bling."""
-        payload = {"evento": event, "url": url}
-        try:
-            self.logger.info(f"Registrando webhook para {event} em {url}")
-            return self.post('webhooks', data=payload)
-        except Exception as e:
-            self.logger.error(f"Erro ao registrar webhook: {e}")
-            return None
+        """
+        Nota: Na API v3 do Bling, o registro de webhooks deve ser feito manualmente 
+        no painel do desenvolvedor (Cadastro de Aplicativos > Webhooks).
+        Esta função foi mantida para compatibilidade, mas agora apenas loga a instrução.
+        """
+        self.logger.info(f"📢 Lembrete: Configure o webhook para '{event}' manualmente no painel do Bling apontando para: {url}")
+        return {"status": "manual_config_required"}
 
 class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
@@ -932,7 +931,7 @@ class SalesManager:
             self.last_recalculated = now
             self._orders_cache = {o.get('id'): o for o in all_orders[-100:]}
             
-        self.save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+        save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
         self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
 # ============================================================================ 
@@ -1019,10 +1018,9 @@ class Orchestrator:
             # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
             # O worker principal ainda inicia, mas ele se protege com a verificação de token.
             
-                        # Registro de Webhook
-            webhook_url = self.config.REDIRECT_URI.replace('/callback', '/api/webhook')
-            if 'localhost' not in webhook_url and '127.0.0.1' not in webhook_url:
-                self.api.register_webhook(event='pedido', url=webhook_url)
+                        # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
+            # A chamada para self.api.register_webhook foi removida daqui, pois a função agora apenas loga a instrução.
+            # O registro deve ser feito manualmente no painel do Bling.
             
             self._worker_thread = Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
