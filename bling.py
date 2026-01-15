@@ -29,7 +29,7 @@ import hmac
 import hashlib
 
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread, Event
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Callable
@@ -557,6 +557,16 @@ class BlingAPIClient:
 # 5. AUTH MANAGER
 # ============================================================================
 
+    def register_webhook(self, event: str, url: str):
+        """Registra um webhook na API do Bling."""
+        payload = {"evento": event, "url": url}
+        try:
+            self.logger.info(f"Registrando webhook para {event} em {url}")
+            return self.post('webhooks', data=payload)
+        except Exception as e:
+            self.logger.error(f"Erro ao registrar webhook: {e}")
+            return None
+
 class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
     
@@ -763,6 +773,7 @@ class SalesManager:
     # Contadores
     daily_count: int = 0
     weekly_count: int = 0
+    monthly_count: int = 0
     historic_count: int = 0
     
     # Dados para o Gráfico (Cache)
@@ -773,6 +784,9 @@ class SalesManager:
     
     # Histórico de Vendas Estruturado
     _sales_history: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Novo: Histórico para Gráfico
+    stats_history: Dict[str, Any] = field(default_factory=lambda: {'dates': [], 'daily_counts': [], 'moving_avg': [], 'growth': 0})
     
     last_recalculated: datetime = field(default_factory=datetime.now)
     lock: Lock = field(default_factory=Lock)
@@ -788,10 +802,12 @@ class SalesManager:
             if data:
                 self.daily_count = data.get('daily', 0)
                 self.weekly_count = data.get('weekly', 0)
+                self.monthly_count = data.get('monthly', 0)
                 self.historic_count = data.get('historic', 0)
-                self.history_data = data.get('history_data', {}) # Carrega dados do gráfico
-                self._orders_cache = data.get('orders_cache', {}) # Carrega cache de pedidos
-                self._sales_history = data.get('sales_history', []) # Carrega histórico de vendas
+                self.history_data = data.get('history_data', {})
+                self.stats_history = data.get('stats_history', {'dates': [], 'daily_counts': [], 'moving_avg': [], 'growth': 0})
+                self._orders_cache = data.get('orders_cache', {})
+                self._sales_history = data.get('sales_history', [])
                 
                 last_recalc = data.get('last_recalculated')
                 if isinstance(last_recalc, str):
@@ -799,6 +815,10 @@ class SalesManager:
                         self.last_recalculated = datetime.fromisoformat(last_recalc)
                     except:
                         self.last_recalculated = datetime.now()
+                elif isinstance(last_recalc, datetime):
+                    self.last_recalculated = last_recalc
+                else:
+                    self.last_recalculated = datetime.now()
                 else:
                     self.last_recalculated = datetime.now()
 
@@ -807,99 +827,93 @@ class SalesManager:
             return {
                 "daily": self.daily_count,
                 "weekly": self.weekly_count,
+                "monthly": self.monthly_count,
                 "historic": self.historic_count,
                 "history_data": self.history_data,
+                "stats_history": self.stats_history,
                 "last_update": self.last_recalculated.isoformat()
             }
 
     def _get_state_for_save(self) -> Dict[str, Any]:
-        """Retorna o estado atual para persistência ou transmissão."""
         with self.lock:
             return {
                 "daily": self.daily_count,
                 "weekly": self.weekly_count,
+                "monthly": self.monthly_count,
                 "historic": self.historic_count,
                 "history_data": self.history_data,
+                "stats_history": self.stats_history,
                 "orders_cache": self._orders_cache,
                 "sales_history": self._sales_history,
                 "last_recalculated": self.last_recalculated.isoformat()
             }
 
-    def recalculate_from_orders(self, orders_list):
-        """Recalcula métricas baseado na lista crua de pedidos (V2 ou V3)."""
-        self.logger.debug(f"DEBUG: Iniciando recálculo com {len(orders_list)} pedidos recebidos.")
-        temp_total = 0.0
-        temp_count = 0
-        temp_history = {}
-        valid_orders = []
+    def recalculate_from_orders(self, all_orders):
+        """Recalcula métricas e histórico baseado na lista de pedidos."""
+        from collections import defaultdict
+        self.logger.info(f"Recalculando estatísticas com {len(all_orders)} pedidos.")
+        
+        tz_br = timezone(timedelta(hours=-3))
+        now = datetime.now(tz_br)
+        
+        daily_start = now - timedelta(hours=24)
+        weekly_start = now - timedelta(days=7)
+        monthly_start = now - timedelta(days=30)
+        history_start = now - timedelta(days=90)
 
-        # Datas para filtro
-        now = datetime.now()
-        thirty_days_ago = now.date() - timedelta(days=30)
-        self.logger.debug(f"DEBUG: Filtro de data: a partir de {thirty_days_ago}")
+        daily_orders = []
+        weekly_orders = []
+        monthly_orders = []
+        daily_counts = defaultdict(int)
 
-        for idx, o in enumerate(orders_list):
+        for o in all_orders:
             try:
-                # 1. Tenta extrair a DATA de várias formas possíveis (V2 e V3)
-                date_str = o.get('data') or o.get('dataEmissao') or o.get('dataSaida')
-                
-                # Se for um objeto aninhado (alguns endpoints V3)
-                if not date_str and isinstance(o.get('data'), dict):
-                    date_str = o['data'].get('data')
-
-                if not date_str:
-                    self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) ignorado: sem data encontrada. Chaves: {list(o.keys())}")
-                    continue # Sem data, impossível plotar
-
-                # Converte para objeto Date
+                date_str = o.get('data') or o.get('dataEmissao')
+                if not date_str: continue
                 try:
-                    # Tenta formato YYYY-MM-DD (Padrão V3)
-                    order_date = datetime.strptime(str(date_str).split(' ')[0], "%Y-%m-%d").date()
-                except ValueError:
-                    try:
-                        # Tenta formato DD/MM/YYYY (Padrão V2/Legado)
-                        order_date = datetime.strptime(str(date_str).split(' ')[0], "%d/%m/%Y").date()
-                    except ValueError:
-                        self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) ignorado: formato de data inválido '{date_str}'")
-                        continue # Data inválida
-
-                # Filtra apenas os últimos 30 dias para o gráfico
-                if order_date < thirty_days_ago:
-                    # self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) ignorado: data {order_date} fora do range.")
-                    continue
-
-                # 2. Tenta extrair o VALOR (totalvenda ou total)
-                val_str = o.get('total') or o.get('totalvenda') or 0
-                try:
-                    val = float(val_str)
+                    dt = datetime.fromisoformat(date_str.replace(' ', 'T'))
                 except:
-                    self.logger.debug(f"DEBUG: Pedido #{idx} (ID: {o.get('id')}) erro ao converter valor '{val_str}'")
-                    val = 0.0
-
-                # Acumula dados
-                temp_total += val
-                temp_count += 1
-                valid_orders.append(o)
-
-                # Monta histórico para o gráfico (Dia/Mês)
-                key = order_date.strftime("%d/%m")
-                temp_history[key] = temp_history.get(key, 0.0) + val
-
-            except Exception as e:
-                self.logger.error(f"DEBUG: Erro inesperado no pedido #{idx}: {e}")
+                    try:
+                        dt = datetime.strptime(date_str.split(' ')[0], "%Y-%m-%d")
+                    except:
+                        continue
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=tz_br)
+                if dt >= daily_start: daily_orders.append(o)
+                if dt >= weekly_start: weekly_orders.append(o)
+                if dt >= monthly_start: monthly_orders.append(o)
+                if dt >= history_start:
+                    daily_counts[dt.date()] += 1
+            except:
                 continue
 
-        # Atualiza estado protegido
-        with self.recalculation_lock:
-            self.total_sales = temp_total
-            self.orders_count = temp_count
-            self.average_ticket = (temp_total / temp_count) if temp_count > 0 else 0.0
-            self.sales_history = temp_history
-            self.orders_cache = valid_orders # Salva a lista limpa
-            self.last_updated = datetime.now()
+        dates = [(history_start + timedelta(days=i)).date() for i in range(91)]
+        counts = [daily_counts.get(d, 0) for d in dates]
+        moving_avg = []
+        for i in range(len(counts)):
+            subset = counts[max(0, i-6):i+1]
+            moving_avg.append(sum(subset) / len(subset) if subset else 0)
+        last_week = sum(counts[-7:])
+        prev_week = sum(counts[-14:-7])
+        growth = ((last_week - prev_week) / prev_week * 100) if prev_week else 0
 
-        self.logger.info(f"✅ RECALCULO CONCLUÍDO: {temp_count} pedidos válidos nos últimos 30 dias. Total: R$ {temp_total:.2f}")
-        self.logger.debug(f"DEBUG: Histórico gerado para o gráfico: {temp_history}")
+        with self.lock:
+            self.daily_count = len(daily_orders)
+            self.weekly_count = len(weekly_orders)
+            self.monthly_count = len(monthly_orders)
+            self.historic_count = len(all_orders)
+            self.stats_history = {
+                'dates': [d.isoformat() for d in dates],
+                'daily': counts,
+                'moving_avg': moving_avg,
+                'growth': round(growth, 1),
+                'avg_daily': round(sum(counts[-30:]) / 30, 1) if len(counts) >= 30 else 0
+            }
+            self.last_recalculated = now
+            self._orders_cache = {o.get('id'): o for o in all_orders[-100:]}
+            
+        self.save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+        self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -984,6 +998,11 @@ class Orchestrator:
             
             # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
             # O worker principal ainda inicia, mas ele se protege com a verificação de token.
+            
+                        # Registro de Webhook
+            webhook_url = self.config.REDIRECT_URI.replace('/callback', '/api/webhook')
+            if 'localhost' not in webhook_url and '127.0.0.1' not in webhook_url:
+                self.api.register_webhook(event='pedido', url=webhook_url)
             
             self._worker_thread = Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
@@ -1072,7 +1091,8 @@ class Orchestrator:
             
             # Parâmetros compatíveis
             params = {
-                'dataEmissaoInicial': (now - timedelta(days=30)).strftime('%Y-%m-%d'),
+                'dataEmissaoInicial': (now - timedelta(days=90)).strftime('%Y-%m-%d'),
+                'situacao': 'F',
                 'limite': 100 
             }
             
@@ -1501,162 +1521,46 @@ class WebServer:
             return redirect(auth_url)
 
         # Novo Endpoint: Listagem de Pedidos em Cache
+                @self.app.route('/api/webhook', methods=['POST'])
+        def api_webhook():
+            signature = request.headers.get('X-Bling-Signature')
+            payload = request.data
+            if self.config.WEBHOOK_SECRET != 'YOUR_WEBHOOK_SECRET' and signature:
+                expected = hmac.new(self.config.WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(signature, expected):
+                    return 'Invalid signature', 403
+            try:
+                data = json.loads(payload)
+                event = data.get('evento')
+                if event in ['pedidoCriado', 'pedidoAlterado', 'pedido']:
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    executor.submit(self.orchestrator.process_sales_orders, force=True)
+                    executor.shutdown(wait=False)
+                return 'OK', 200
+            except Exception as e:
+                return 'Error', 500
+
         @self.app.route("/api/orders")
         def list_orders():
             return jsonify(list(self.orchestrator.sales._orders_cache.values()))
 
         # Novo Endpoint: Histórico de Vendas para Dashboard
         @self.app.route("/api/sales/history")
-        def sales_history():
-            return jsonify(self.orchestrator.sales._sales_history)
-
-        # Rota de Callback OAuth
-        @self.app.route('/callback')
-        def callback():
-            from flask import redirect
-            
-            code = request.args.get("code")
-            received_state = request.args.get("state")
-            
-            # 1. VALIDAÇÃO DO STATE (CSRF)
-            saved_state = self.orchestrator.auth._load_oauth_state()
-            
-            if not saved_state or saved_state != received_state:
-                self.logger.error(
-                    f"❌ State inválido detectado! CSRF potencial. "
-                    f"Saved: {saved_state}, Received: {received_state}"
-                )
-                # Limpa o state em caso de falha (boa prática)
-                self.orchestrator.auth._clean_oauth_state()
-                return redirect("/?error=csrf")
-            
-            if self.orchestrator.auth.is_authenticated():
-                self.logger.info("Callback ignorado: Usuário já autenticado.")
-                return redirect('/')
-            
-            if not code:
-                self.logger.error("Callback sem code.")
-                return redirect('/') 
-            
-            # ✅ ADICIONE logging detalhado:
-            self.logger.info(f"Callback recebido - Code: {code[:10]}...")
-            
-            # NOTA: O uso de 'with' padrão bloquearia. A lógica abaixo garante a não-concorrência 
-            # e a saída imediata, se o lock já estiver sendo usado.
-            if not token_exchange_lock.acquire(blocking=False):
-                self.logger.warning("Concorrência detectada no callback. Redirecionando.")
-                return redirect('/')
-                
-            try:
-                with WebServer.code_lock:
-                    if code in WebServer.used_codes:
-                        return redirect('/')
-                    WebServer.used_codes.add(code)
-                
-                self.logger.info(f"Processando callback code...")
-                # O state não é mais passado para exchange_code_for_token, pois já foi validado
-                success = self.orchestrator.auth.exchange_code_for_token(code)
-                
-                if not success:
-                    self.logger.error("Falha na troca de token (erro de API). Redirecionando.")
-                    # Limpa o state em caso de falha (boa prática)
-                    self.orchestrator.auth._clean_oauth_state()
-                    return redirect('/')
-                
-                # 2. LIMPEZA DO STATE APÓS SUCESSO
-                self.orchestrator.auth._clean_oauth_state()
-                
-                # Após a autenticação, envia um full_update para o frontend
-                if success:
-                    # ✅ 2. Após /callback, FORÇAR reload do cache e KPIs
-                    self.logger.info("✅ Autenticação bem-sucedida. Forçando carga inicial de dados (KPIs e Cache).")
-
-                    # Executa o recálculo e o cache em threads separadas para não bloquear o callback
-                    executor = ThreadPoolExecutor(max_workers=2)
-                    executor.submit(self.orchestrator.process_sales_orders)
-                    executor.submit(self.orchestrator.process_products_cache)
-                    executor.shutdown(wait=False)
-
-                    # O broadcast será feito no final de process_products_cache
-                    
-                    # CORREÇÃO PROBLEMA 1: Iniciar worker após autenticação
-                    if not self.orchestrator.is_running():
-                        self.orchestrator.start_worker()
-                        start_cleanup_timer()
-                        self.logger.info("✅ Worker iniciado após autenticação bem-sucedida.")
-                
-                return redirect('/')
-            except Exception as e:
-                self.logger.exception("Erro crítico no callback.")
-                return redirect('/')
-            finally:
-                token_exchange_lock.release()
-
-        @self.app.route('/api/status')
-        def api_status():
-            return jsonify({
-                "authenticated": self.orchestrator.auth.is_authenticated(),
-                "auth_url": self.orchestrator.auth.get_authorization_url(),
-                "is_running": self.orchestrator.is_running()
-            })
-
-        # Rota de Vendas (KPIs de cima)
-        @self.app.route('/api/sales/stats')
-        @token_required
-        def api_sales_stats(token):
-            # Garante que os números de cima venham do SalesManager
-            stats = self.orchestrator.sales.get_stats()
-            return jsonify(stats)
-        
-        @self.app.route("/api/metrics")
-        @token_required
-        def api_metrics(token):
-            """Retorna métricas de observabilidade da API."""
-            metrics = self.orchestrator.api.metrics.get_metrics()
-            return jsonify(metrics)
-
-        @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
-            """Retorna o histórico de vendas já processado pelo Worker."""
-            # Pega os dados direto da memória do SalesManager
-            history = self.orchestrator.sales.history_data
-            
-            if not history:
-                return jsonify({
-                    "labels": [],
-                    "daily": [],
-                    "moving_avg": [],
-                    "growth": 0,
-                    "avg_daily": 0
-                })
-
-            # Calcula dados derivados (Média Móvel e Crescimento) aqui ou no frontend
-            # Para simplificar, retornamos o que já temos
-            
-            data_values = history.get('data', [])
-            
-            # Cálculo de média móvel simples (7 dias)
-            moving_avg = []
-            for i in range(len(data_values)):
-                start = max(0, i-6)
-                subset = data_values[start:i+1]
-                avg = sum(subset) / len(subset) if subset else 0
-                moving_avg.append(round(avg, 1))
-
-            # Cálculo de crescimento (Últimos 7 vs 7 anteriores)
-            last_7 = sum(data_values[-7:])
-            prev_7 = sum(data_values[-14:-7])
-            growth = 0
-            if prev_7 > 0:
-                growth = ((last_7 - prev_7) / prev_7) * 100
-
+            stats = self.orchestrator.sales.stats_history
+            if not stats or not stats.get('dates'):
+                if not self.orchestrator.sales.daily_count:
+                     executor = ThreadPoolExecutor(max_workers=1)
+                     executor.submit(self.orchestrator.process_sales_orders)
+                     executor.shutdown(wait=False)
+                return jsonify({"labels": [], "daily": [], "moving_avg": [], "growth": 0, "avg_daily": 0})
             return jsonify({
-                "labels": history.get('labels', []),
-                "daily": data_values,
-                "moving_avg": moving_avg,
-                "growth": round(growth, 1),
-                "avg_daily": history.get('avg', 0)
+                "labels": stats.get('dates', []),
+                "daily": stats.get('daily', []),
+                "moving_avg": stats.get('moving_avg', []),
+                "growth": stats.get('growth', 0),
+                "avg_daily": stats.get('avg_daily', 0)
             })
 
 
