@@ -1176,7 +1176,7 @@ class Orchestrator:
                 if not data:
                     break
                 
-all_orders.extend(data)
+                all_orders.extend(data)
                 
                 # Se vier menos que 100, é a última página
                 if len(data) < 100:
