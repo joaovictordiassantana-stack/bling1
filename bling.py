@@ -879,8 +879,6 @@ class SalesManager:
         hoje = now.date()
         inicio_semana = hoje - timedelta(days=hoje.weekday()) # Segunda-feira atual
         inicio_mes = hoje.replace(day=1) # Dia 1 do mês atual
-        # Gráfico dinâmico: do dia 1º até hoje
-        history_start_date = inicio_mes
         
         daily_orders = []
         weekly_orders = []
@@ -918,14 +916,16 @@ class SalesManager:
                 if dt_pedido >= inicio_mes:
                     monthly_orders.append(o)
                 
-                # Histórico para o gráfico (últimos 90 dias)
-                if dt_pedido >= history_start_date:
+                # Histórico para o gráfico (Apenas do dia 1º até hoje)
+                if dt_pedido >= inicio_mes:
                     daily_counts[dt_pedido] += 1
             except:
                 continue
 
         # Calcula quantos dias passaram desde o dia 1º deste mês
         days_diff = (hoje - inicio_mes).days
+        
+        # Cria o gráfico apenas do dia 1º até hoje (dinâmico)
         dates = [(inicio_mes + timedelta(days=i)) for i in range(days_diff + 1)]
         counts = [daily_counts.get(d, 0) for d in dates]
         moving_avg = []
@@ -1129,13 +1129,13 @@ class Orchestrator:
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
                 return
                 
-            self.logger.info("Iniciando busca de pedidos (Mês Vigente)...")
+            self.logger.info("Iniciando busca de pedidos (A partir de 01/01/2026)...")
             now = datetime.now()
             # Força o início EXATO no dia 1º do mês atual (Ex: 01/01/2026)
             start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             
             # Parâmetros compatíveis
-            # Busca Mês Vigente (Desde o dia 1º)
+            # Busca Janela Móvel (Últimos 30 dias)
             params = {
                 'dataEmissaoInicial': start_date.strftime('%Y-%m-%d'),
                 'dataEmissaoFinal': now.strftime('%Y-%m-%d %H:%M:%S'),
