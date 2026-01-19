@@ -1130,9 +1130,10 @@ class Orchestrator:
             now = datetime.now()
             
             # Parâmetros compatíveis
-            # Busca desde o início do ano para garantir histórico completo
+            # Busca desde o início do mês atual (Reset Mensal)
             params = {
-                'dataEmissaoInicial': datetime(now.year, 1, 1).strftime('%Y-%m-%d'),
+                'dataEmissaoInicial': datetime(now.year, now.month, 1).strftime('%Y-%m-%d'),
+                'dataEmissaoFinal': now.strftime('%Y-%m-%d %H:%M:%S'),
                 'situacao': 'F', # Faturado. Mude para None ou remova se quiser todos os status.
                 'limite': 100 
             }
@@ -1175,7 +1176,7 @@ class Orchestrator:
                 if not data:
                     break
                 
-                all_orders.extend(data)
+all_orders.extend(data)
                 
                 # Se vier menos que 100, é a última página
                 if len(data) < 100:
@@ -1198,7 +1199,11 @@ class Orchestrator:
                         valid_orders.append(o)
 
                 self.logger.debug(f"DEBUG: {len(valid_orders)} pedidos válidos após normalização inicial.")
-                self.sales.recalculate_from_orders(valid_orders)
+                # 1. Substitui o histórico de vendas pelo resultado da busca (Reset Mensal)
+                self.sales._sales_history = valid_orders
+                
+                # 2. Recalcula as estatísticas
+                self.sales.recalculate_from_orders(self.sales._sales_history)
                 
                 # Manda atualização pro Front (Gráfico)
                 self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
