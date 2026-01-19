@@ -240,7 +240,7 @@ class Config:
     
     # Rate Limiting (Configurável) - ✅ OTIMIZADO PARA EVITAR 429
     MAX_PAGES_PER_BATCH: int = 2  # ✅ Reduz de 3 para 2 (mais conservador)
-    DELAY_BETWEEN_PAGES: float = 4.0  # ✅ Aumenta de 2.5s para 4s
+    DELAY_BETWEEN_PAGES: float = 5.0  # ✅ Aumenta para 5s para maior segurança
     DELAY_BETWEEN_BATCHES: float = 15.0  # ✅ Aumenta de 8s para 15s (pausa longa)
     
     # Automação
@@ -875,15 +875,19 @@ class SalesManager:
         tz_br = timezone(timedelta(hours=-3))
         now = datetime.now(tz_br)
         
-        daily_start = now - timedelta(hours=24)
-        weekly_start = now - timedelta(days=7)
-        monthly_start = now - timedelta(days=30)
-        history_start = now - timedelta(days=90)
-
+        # --- NOVAS REFERÊNCIAS DE CALENDÁRIO ---
+        hoje = now.date()
+        inicio_semana = hoje - timedelta(days=hoje.weekday()) # Segunda-feira atual
+        inicio_mes = hoje.replace(day=1) # Dia 1 do mês atual
+        history_start_date = hoje - timedelta(days=90)
+        
         daily_orders = []
         weekly_orders = []
         monthly_orders = []
         daily_counts = defaultdict(int)
+        
+        # Dicionário para guardar a contagem de cada mês (1 a 12)
+        monthly_report = defaultdict(int)
 
         for o in all_orders:
             try:
@@ -898,15 +902,28 @@ class SalesManager:
                         continue
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=tz_br)
-                if dt >= daily_start: daily_orders.append(o)
-                if dt >= weekly_start: weekly_orders.append(o)
-                if dt >= monthly_start: monthly_orders.append(o)
-                if dt >= history_start:
-                    daily_counts[dt.date()] += 1
+                
+                dt_pedido = dt.date()
+                
+                # Se o pedido for deste ano, soma no mês correspondente
+                if dt.year == now.year:
+                    monthly_report[dt.month] += 1
+                
+                # Lógica de contagem por calendário
+                if dt_pedido == hoje:
+                    daily_orders.append(o)
+                if dt_pedido >= inicio_semana:
+                    weekly_orders.append(o)
+                if dt_pedido >= inicio_mes:
+                    monthly_orders.append(o)
+                
+                # Histórico para o gráfico (últimos 90 dias)
+                if dt_pedido >= history_start_date:
+                    daily_counts[dt_pedido] += 1
             except:
                 continue
 
-        dates = [(history_start + timedelta(days=i)).date() for i in range(91)]
+        dates = [(history_start_date + timedelta(days=i)) for i in range(91)]
         counts = [daily_counts.get(d, 0) for d in dates]
         moving_avg = []
         for i in range(len(counts)):
@@ -919,8 +936,13 @@ class SalesManager:
         with self.lock:
             self.daily_count = len(daily_orders)
             self.weekly_count = len(weekly_orders)
+            # Atualiza o contador do mês ATUAL para manter o KPI do topo do dashboard
             self.monthly_count = len(monthly_orders)
             self.historic_count = len(all_orders)
+            
+            # Salva o relatório completo de todos os meses em history_data
+            self.history_data['yearly_monthly_report'] = dict(monthly_report)
+            
             self.stats_history = {
                 'dates': [d.isoformat() for d in dates],
                 'daily': counts,
@@ -1104,13 +1126,14 @@ class Orchestrator:
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
                 return
                 
-            self.logger.info("Iniciando busca de pedidos (Últimos 30 dias)...")
+            self.logger.info("Iniciando busca de pedidos (Desde o início do ano)...")
             now = datetime.now()
             
             # Parâmetros compatíveis
+            # Busca desde o início do ano para garantir histórico completo
             params = {
-                'dataEmissaoInicial': (now - timedelta(days=90)).strftime('%Y-%m-%d'),
-                'situacao': 'F',
+                'dataEmissaoInicial': datetime(now.year, 1, 1).strftime('%Y-%m-%d'),
+                'situacao': 'F', # Faturado. Mude para None ou remova se quiser todos os status.
                 'limite': 100 
             }
             
