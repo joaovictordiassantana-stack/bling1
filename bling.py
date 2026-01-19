@@ -1126,13 +1126,14 @@ class Orchestrator:
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
                 return
                 
-            self.logger.info("Iniciando busca de pedidos (Desde o início do ano)...")
+            self.logger.info("Iniciando busca de pedidos (Últimos 30 dias)...")
             now = datetime.now()
+            start_date = now - timedelta(days=30)
             
             # Parâmetros compatíveis
-            # Busca desde o início do mês atual (Reset Mensal)
+            # Busca Janela Móvel (Últimos 30 dias)
             params = {
-                'dataEmissaoInicial': datetime(now.year, now.month, 1).strftime('%Y-%m-%d'),
+                'dataEmissaoInicial': start_date.strftime('%Y-%m-%d'),
                 'dataEmissaoFinal': now.strftime('%Y-%m-%d %H:%M:%S'),
                 'situacao': 'F', # Faturado. Mude para None ou remova se quiser todos os status.
                 'limite': 100 
