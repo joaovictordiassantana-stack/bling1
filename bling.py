@@ -878,6 +878,8 @@ class SalesManager:
         # --- NOVAS REFERÊNCIAS DE CALENDÁRIO ---
         hoje = now.date()
         inicio_semana = hoje - timedelta(days=hoje.weekday()) # Segunda-feira atual
+        
+        # CORREÇÃO: Força o início para o dia 1 do mês atual
         inicio_mes = hoje.replace(day=1) # Dia 1 do mês atual
         
         daily_orders = []
@@ -2563,9 +2565,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="col-md-4 mb-4">
                 <div class="card p-4 kpi-card kpi-historic text-center">
-                    <h5>Pedidos Históricos</h5>
+                    <h5>Pedidos Mensais</h5>
                     <h3 id="kpi-historic" style="color: var(--success);">0</h3>
-                    <small class="text-muted">Últimos 30 dias</small>
+                    <small class="text-muted">Este Mês</small>
                 </div>
             </div>
         </div>
@@ -2831,7 +2833,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             kpiDaily.textContent = dSalesStats.daily;
             kpiWeekly.textContent = dSalesStats.weekly;
-            kpiHistoric.textContent = dSalesStats.historic;
+            kpiHistoric.textContent = dSalesStats.monthly;
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
             // Animação de atualização
