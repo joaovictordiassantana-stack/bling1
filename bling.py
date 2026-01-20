@@ -706,31 +706,42 @@ class AuthManager:
         )
 
     def refresh_token(self) -> bool:
-        """Renova o token de acesso usando o refresh token."""
+        """Renova o token de acesso usando o refresh token com proteção contra Race Condition."""
         if not self._refresh_token:
             if not self._initial_load_failed:
                 self.logger.warning("Não há refresh token disponível para renovação.")
             self._initial_load_failed = False
             return False
             
-        self.logger.info("Tentando renovar o token de acesso...")
+        self.logger.info("Verificando necessidade de renovação do token...")
         
-        # O uso de 'with' garante que o lock será liberado, mesmo em caso de exceção.
+        # O uso de 'with' garante que o lock será liberado
         with token_exchange_lock:
-            # Re-verifica se o token não foi renovado por outra thread enquanto esperava o lock
-            if self._access_token and self._expires_at > time.time() + 60:
-                self.logger.info("Token já renovado por outra thread.")
+            # 1. VERIFICAÇÃO CRÍTICA: Recarrega do disco antes de tentar renovar
+            # Isso impede que um processo tente renovar um token que outro processo já renovou
+            disk_data = self._load_tokens()
+            disk_access = disk_data.get('access_token')
+            disk_expires = disk_data.get('expires_at', 0)
+            
+            # Se o arquivo já tem um token válido (renovado por outro worker/thread), usa ele!
+            if disk_access and disk_expires > time.time() + 60:
+                self.logger.info("Token já foi renovado por outro processo. Carregando do disco.")
+                self._access_token = disk_access
+                self._refresh_token = disk_data.get('refresh_token')
+                self._expires_at = disk_expires
                 return True
-                
+
+            # 2. Se realmente estiver expirado no disco, faz a requisição ao Bling
+            self.logger.info("Iniciando requisição de renovação ao Bling...")
             success = self._perform_token_request(
                 grant_type='refresh_token',
                 refresh_token=self._refresh_token
             )
             
             if success:
-                self.logger.info("Token renovado com sucesso.")
+                self.logger.info("Token renovado com sucesso via API.")
             else:
-                self.logger.error("Falha na renovação do token.")
+                self.logger.error("Falha na renovação do token. Necessário reautenticar.")
                 
             return success
 
