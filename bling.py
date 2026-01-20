@@ -970,7 +970,7 @@ class SalesManager:
                 'daily': counts,
                 'moving_avg': moving_avg,
                 'growth': round(growth, 1),
-                'avg_daily': round(sum(counts[-30:]) / 30, 1) if len(counts) >= 30 else 0
+                'avg_daily': round(sum(counts[-30:]) / 30, 1) if len(counts) >= 30 else round(sum(counts)/len(counts), 1) if counts else 0
             }
             self.last_recalculated = now
             self._orders_cache = {o.get('id'): o for o in all_orders[-100:]}
@@ -2569,21 +2569,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             <div class="col-md-4 mb-4">
                 <div class="card p-4 kpi-card kpi-daily text-center">
                     <h5>Pedidos Diários</h5>
-                    <h3 id="kpi-daily" class="text-primary">0</h3>
+                    <h3 id="kpi-daily" class="text-primary">0 Pedidos</h3>
                     <small class="text-muted">Últimas 24h</small>
                 </div>
             </div>
             <div class="col-md-4 mb-4">
                 <div class="card p-4 kpi-card kpi-weekly text-center">
                     <h5>Pedidos Semanais</h5>
-                    <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
+                    <h3 id="kpi-weekly" style="color: var(--warning);">0 Pedidos</h3>
                     <small class="text-muted">Últimos 7 dias</small>
                 </div>
             </div>
             <div class="col-md-4 mb-4">
                 <div class="card p-4 kpi-card kpi-historic text-center">
                     <h5>Pedidos Mensais</h5>
-                    <h3 id="kpi-historic" style="color: var(--success);">0</h3>
+                    <h3 id="kpi-historic" style="color: var(--success);">0 Pedidos</h3>
                     <small class="text-muted">Este Mês</small>
                 </div>
             </div>
@@ -2848,9 +2848,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const kpiWeekly = document.getElementById('kpi-weekly');
             const kpiHistoric = document.getElementById('kpi-historic');
 
-            kpiDaily.textContent = dSalesStats.daily;
-            kpiWeekly.textContent = dSalesStats.weekly;
-            kpiHistoric.textContent = dSalesStats.monthly;
+            kpiDaily.textContent = dSalesStats.daily + " Pedidos";
+            kpiWeekly.textContent = dSalesStats.weekly + " Pedidos";
+            kpiHistoric.textContent = dSalesStats.monthly + " Pedidos";
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
             // Animação de atualização
@@ -3173,7 +3173,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             }
                         },
                         scales: {
-                            y: { beginAtZero: true }
+                            y: { 
+                                beginAtZero: true,
+                                ticks: {
+                                    stepSize: 1,
+                                    callback: function(value) {
+                                        return value + " ped.";
+                                    }
+                                }
+                            }
                         }
                     }
                 });
