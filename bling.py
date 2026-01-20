@@ -602,7 +602,9 @@ class AuthManager:
         
         is_valid = (saved_state == state)
         if is_valid:
-            self._clean_oauth_state() # Limpa após uso único
+            # ✅ MELHORIA: Não limpamos imediatamente para permitir retentativas rápidas (F5)
+            # O state será limpo naturalmente na próxima geração de URL de auth
+            self.logger.info(f"State OAuth validado com sucesso: {state}")
             
         return is_valid
 
@@ -741,12 +743,16 @@ class AuthManager:
             if success:
                 self.logger.info("Token renovado com sucesso via API.")
             else:
-                self.logger.error("Falha na renovação do token. Necessário reautenticar.")
+                self.logger.error(f"Falha na renovação do token. Refresh Token atual: {self._refresh_token[:10]}... Necessário reautenticar.")
+                # ✅ LOG CRÍTICO: Se falhar, vamos registrar o estado do arquivo para depuração
+                disk_data = self._load_tokens()
+                self.logger.debug(f"Estado do tokens.json no momento da falha: {list(disk_data.keys())}")
                 
             return success
 
     def _perform_token_request(self, grant_type: str, **kwargs) -> bool:
         """Executa a requisição de troca/renovação de token."""
+        self.logger.debug(f"Iniciando requisição de token: grant_type={grant_type}")
         
         auth_header = base64.b64encode(
             f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}".encode()
@@ -3260,6 +3266,10 @@ def create_app() -> Flask:
     
     # 3. Inicializa o Flask
     flask_app = Flask(__name__)
+    
+    # ✅ REGRA DE OURO: Define uma SECRET_KEY estável para persistência de sessão
+    # Isso evita que o Flask invalide cookies a cada reinício do servidor.
+    flask_app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'sw-moveis-mdf-secure-key-2025')
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
     WebServer(config, orchestrator, flask_app) 
