@@ -24,7 +24,7 @@ import logging
 import logging.handlers
 import base64
 import secrets
-
+import shutil
 import hmac
 import hashlib
 
@@ -238,10 +238,10 @@ class Config:
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
-    # Rate Limiting (Configurável) - ✅ OTIMIZADO PARA EVITAR 429
-    MAX_PAGES_PER_BATCH: int = 2  # ✅ Reduz de 3 para 2 (mais conservador)
-    DELAY_BETWEEN_PAGES: float = 5.0  # ✅ Aumenta para 5s para maior segurança
-    DELAY_BETWEEN_BATCHES: float = 15.0  # ✅ Aumenta de 8s para 15s (pausa longa)
+    # Rate Limiting (Configurável) - OTIMIZADO
+    MAX_PAGES_PER_BATCH: int = 5  # Pode aumentar um pouco se quiser
+    DELAY_BETWEEN_PAGES: float = 0.8  # Reduzido de 5.0 para 0.8 (mais rápido)
+    DELAY_BETWEEN_BATCHES: float = 5.0  # Reduzido de 15.0 para 5.0
     
     # Automação
     
@@ -258,6 +258,19 @@ class Config:
 # ============================================================================ 
 # 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
 # ============================================================================
+
+def atomic_write_json(data: dict, path: Path):
+    """Escreve em um arquivo temporário e renomeia (Atômico/Seguro)."""
+    temp_path = path.with_suffix('.tmp')
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        # Move o temporário para o original (operação atômica no OS)
+        shutil.move(str(temp_path), str(path))
+    except Exception as e:
+        logger.exception(f"Erro ao salvar arquivo {path} de forma atômica.")
+        if temp_path.exists():
+            os.remove(temp_path)
 
 def load_tokens_safe(path: Path | str = "tokens.json"):
     if isinstance(path, str): path = Path(path)
@@ -278,12 +291,8 @@ def load_tokens_safe(path: Path | str = "tokens.json"):
 
 def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
     if isinstance(path, str): path = Path(path)
-    try:
-        with open(path, "w", encoding="utf-8") as file:
-            json.dump(data, file, indent=4, ensure_ascii=False)
-        logger.info("Tokens salvos com sucesso.")
-    except Exception as e:
-        logger.exception("Erro ao salvar tokens.")
+    atomic_write_json(data, path) # Usa a nova função segura
+    logger.info("Tokens salvos com sucesso (Atômico).")
 
 def load_stats_safe(path: Path):
     """Carrega as estatísticas de vendas de forma segura."""
@@ -302,17 +311,12 @@ def load_stats_safe(path: Path):
 
 def save_stats(data: Dict[str, Any], path: Path):
     """Salva as estatísticas de vendas, convertendo datetime para string ISO."""
-    try:
-        # Cria uma cópia para evitar modificar o objeto original antes do dump
-        data_to_save = data.copy()
-        if 'last_recalculated' in data_to_save and isinstance(data_to_save['last_recalculated'], datetime):
-            data_to_save['last_recalculated'] = data_to_save['last_recalculated'].isoformat()
+    data_to_save = data.copy()
+    if 'last_recalculated' in data_to_save and isinstance(data_to_save['last_recalculated'], datetime):
+        data_to_save['last_recalculated'] = data_to_save['last_recalculated'].isoformat()
 
-        with open(path, "w", encoding="utf-8") as file:
-            json.dump(data_to_save, file, indent=4, ensure_ascii=False)
-        logger.info("Estatísticas de KPIs salvas com sucesso.")
-    except Exception as e:
-        logger.exception("Erro ao salvar estatísticas de KPIs.")
+    atomic_write_json(data_to_save, path) # Usa a nova função segura
+    logger.info("Estatísticas de KPIs salvas com sucesso (Atômico).")
 
 def safe_dict(data):
     """
@@ -361,12 +365,11 @@ def save_products_cache(cache_file, products, kits):
             "products": products or [],
             "kits": kits or []
         }
-        with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
+        atomic_write_json(payload, cache_file) # Usa a nova função segura
         
         skus = [p.get('sku') for p in (products or [])[:5]] + [k.get('sku') for k in (kits or [])[:5]]
         logger.info(f"Cache salvo com sample skus: {skus}")
-        logger.info(f"Cache de produtos e kits salvo com sucesso. Total: {total_produtos}")
+        logger.info(f"Cache de produtos e kits salvo com sucesso (Atômico). Total: {total_produtos}")
     except Exception as e:
         logger.exception("Erro ao salvar cache de produtos.")
 
@@ -619,6 +622,12 @@ class AuthManager:
     
     def __init__(self, config: Config):
         self.config = config
+        
+        # --- ADICIONE ESTA VERIFICAÇÃO ---
+        if not self.config.REDIRECT_URI:
+            raise ValueError("CRÍTICO: BLING_REDIRECT_URI não configurada nas variáveis de ambiente!")
+        # ---------------------------------
+
         self.logger = logging.getLogger('bling_automacao')
         self._tokens = self._load_tokens()
         self._access_token = self._tokens.get('access_token')
@@ -744,6 +753,10 @@ class AuthManager:
                 self.logger.info("Token renovado com sucesso via API.")
             else:
                 self.logger.error(f"Falha na renovação do token. Refresh Token atual: {self._refresh_token[:10]}... Necessário reautenticar.")
+                # Se falhar totalmente, avise o front via WS se possível
+                # (Isso exige passar o orchestrator para o AuthManager ou usar callbacks, 
+                # mas como simplificação, apenas certifique-se que o 'is_authenticated' retorne False)
+                
                 # ✅ LOG CRÍTICO: Se falhar, vamos registrar o estado do arquivo para depuração
                 disk_data = self._load_tokens()
                 self.logger.debug(f"Estado do tokens.json no momento da falha: {list(disk_data.keys())}")
@@ -892,19 +905,20 @@ class SalesManager:
         tz_br = timezone(timedelta(hours=-3))
         now = datetime.now(tz_br)
         
-        # --- NOVAS REFERÊNCIAS DE CALENDÁRIO ---
+        # Mantém KPIs de calendário (Hoje, Semana Atual, Mês Atual)
         hoje = now.date()
-        inicio_semana = hoje - timedelta(days=hoje.weekday()) # Segunda-feira atual
+        inicio_semana = hoje - timedelta(days=hoje.weekday())
+        inicio_mes = hoje.replace(day=1)
         
-        # CORREÇÃO: Força o início para o dia 1 do mês atual
-        inicio_mes = hoje.replace(day=1) # Dia 1 do mês atual
+        # --- MUDANÇA AQUI: Janela móvel de 30 dias para o Gráfico ---
+        inicio_grafico = hoje - timedelta(days=29) # Últimos 30 dias
         
         daily_orders = []
         weekly_orders = []
         monthly_orders = []
-        daily_counts = defaultdict(int)
         
-        # Dicionário para guardar a contagem de cada mês (1 a 12)
+        # Dicionário para gráfico (agora usa janela móvel)
+        daily_counts_chart = defaultdict(int) 
         monthly_report = defaultdict(int)
 
         for o in all_orders:
@@ -923,30 +937,23 @@ class SalesManager:
                 
                 dt_pedido = dt.date()
                 
-                # Se o pedido for deste ano, soma no mês correspondente
                 if dt.year == now.year:
                     monthly_report[dt.month] += 1
                 
-                # Lógica de contagem por calendário
-                if dt_pedido == hoje:
-                    daily_orders.append(o)
-                if dt_pedido >= inicio_semana:
-                    weekly_orders.append(o)
-                if dt_pedido >= inicio_mes:
-                    monthly_orders.append(o)
+                # KPIs Estáticos
+                if dt_pedido == hoje: daily_orders.append(o)
+                if dt_pedido >= inicio_semana: weekly_orders.append(o)
+                if dt_pedido >= inicio_mes: monthly_orders.append(o)
                 
-                # Histórico para o gráfico (Apenas do dia 1º até hoje)
-                if dt_pedido >= inicio_mes:
-                    daily_counts[dt_pedido] += 1
+                # Dados para o Gráfico (Últimos 30 dias)
+                if dt_pedido >= inicio_grafico:
+                    daily_counts_chart[dt_pedido] += 1
             except:
                 continue
 
-        # Calcula quantos dias passaram desde o dia 1º deste mês
-        days_diff = (hoje - inicio_mes).days
-        
-        # Cria o gráfico apenas do dia 1º até hoje (dinâmico)
-        dates = [(inicio_mes + timedelta(days=i)) for i in range(days_diff + 1)]
-        counts = [daily_counts.get(d, 0) for d in dates]
+        # Gera eixo X do gráfico (30 dias corridos)
+        dates = [(inicio_grafico + timedelta(days=i)) for i in range(30)]
+        counts = [daily_counts_chart.get(d, 0) for d in dates]
         moving_avg = []
         for i in range(len(counts)):
             subset = counts[max(0, i-6):i+1]
@@ -1215,11 +1222,16 @@ class Orchestrator:
                 # Filtra pedidos válidos (tem que ter ID e Data)
                 valid_orders = []
                 for o in all_orders:
-                    # Normaliza data V3 vs V2
-                    if not o.get('data') and o.get('dataEmissao'):
-                        o['data'] = o['dataEmissao']
+                    # --- MELHORIA DE NORMALIZAÇÃO ---
+                    # Garante que temos uma data válida, verificando vários campos
+                    data_pedido = o.get('data') or o.get('dataEmissao') or o.get('dataSaida')
                     
-                    if o.get('id') and o.get('data'):
+                    if not data_pedido:
+                        continue # Pula pedido sem data
+                        
+                    o['data'] = data_pedido # Padroniza para 'data'
+                    
+                    if o.get('id'):
                         valid_orders.append(o)
 
                 self.logger.debug(f"DEBUG: {len(valid_orders)} pedidos válidos após normalização inicial.")
@@ -1490,7 +1502,7 @@ class Orchestrator:
             "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
         }
 
-    def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None):
+    def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
         """
         Envia uma atualização completa de status via WebSocket para todos os clientes.
         Inclui status de autenticação, KPIs e, se solicitado, uso de componentes.
@@ -1500,7 +1512,8 @@ class Orchestrator:
         # 1. Monta o payload base
         payload = {
             "type": "full_update",
-            "authenticated": self.auth.is_authenticated(),
+            "authenticated": self.auth.is_authenticated() and not auth_error,
+            "auth_error": auth_error,
             "is_running": self.is_running(),
             "cache_updated": cache_updated,
             "auth_url": self.auth.get_authorization_url() # Envia a URL de auth para o frontend
