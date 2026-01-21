@@ -1115,7 +1115,8 @@ class Orchestrator:
 
             try:
                 # Ciclo de Produtos (Cache Pesado)
-                if cycle_count % 3 == 0:
+                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
+                if cycle_count == 1 or cycle_count % 3 == 0:
                     self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
                     self.process_products_cache()
                 
@@ -1264,51 +1265,56 @@ class Orchestrator:
         while True:
             # Busca produtos (Tipo P e K)
             try:
-                response = self.api.get('produtos', params={'pagina': page, 'tipo': 'P,K', 'limite': 100})
+                self.logger.info(f"Fazendo requisição para 'produtos' página {page}...")
+                # Na API v3 o endpoint correto é 'produtos' mas os parâmetros podem variar.
+                # Vamos tentar sem o filtro de tipo primeiro se falhar, ou garantir que o endpoint está correto.
+                response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
+                if response:
+                    self.logger.info(f"Resposta recebida da API. Chaves: {list(response.keys()) if isinstance(response, dict) else 'Não é dict'}")
+                else:
+                    self.logger.warning(f"Resposta da API é None para página {page}")
             except Exception as e:
                 self.logger.error(f"Erro ao buscar produtos: {e}")
                 break
             
-            # --- Normalização robusta do payload de produtos ---
+            # --- Normalização robusta do payload de produtos (API v3) ---
             data = []
             if response is None:
                 self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
             else:
-                # tenta várias chaves possíveis (compatibilidade com diferentes respostas)
+                # Na API v3, o padrão é {'data': [...]}
                 if isinstance(response, dict):
-                    # forma preferida
                     if 'data' in response and isinstance(response['data'], list):
                         data = response['data']
-                    # estrutura antiga/alternativa: retorno -> produtos
+                    # Fallback para API v2 (retorno -> produtos)
                     elif 'retorno' in response and isinstance(response['retorno'], dict):
-                        # possível path: retorno -> produtos or retorno -> produtos -> produto
-                        # Coloca debug para ver as chaves internas
-                        self.logger.debug(f"Página {page}: 'retorno' keys: {list(response['retorno'].keys())}")
-                        # se retorno contiver 'produtos', tenta usar
-                        if 'produtos' in response['retorno']:
-                            maybe = response['retorno']['produtos']
-                            # alguns endpoints retornam {'produtos': {'produto': [ ... ]}}
-                            if isinstance(maybe, dict) and 'produto' in maybe:
-                                data = maybe['produto']
-                            elif isinstance(maybe, list):
-                                data = maybe
-                        else:
-                            # fallback direto: se houver 'produtos' no top-level
-                            if 'produtos' in response and isinstance(response['produtos'], list):
-                                data = response['produtos']
-                            # último fallback: verifica 'produtos' dentro de qualquer valor dict->list
-                            else:
-                                # DEBUG geral: log keys para inspeção manual
-                                self.logger.debug(f"Página {page}: keys top-level: {list(response.keys())}")
-                else:
-                    self.logger.debug(f"Página {page}: response tipo inesperado: {type(response)}")
+                        retorno = response['retorno']
+                        if 'produtos' in retorno:
+                            p_data = retorno['produtos']
+                            if isinstance(p_data, list):
+                                data = p_data
+                            elif isinstance(p_data, dict) and 'produto' in p_data:
+                                data = p_data['produto'] if isinstance(p_data['produto'], list) else [p_data['produto']]
+                    # Fallback direto se 'produtos' estiver no topo
+                    elif 'produtos' in response:
+                        if isinstance(response['produtos'], list):
+                            data = response['produtos']
+                        elif isinstance(response['produtos'], dict) and 'produto' in response['produtos']:
+                            data = response['produtos']['produto'] if isinstance(response['produtos']['produto'], list) else [response['produtos']['produto']]
+
+            # Se não encontrou dados, tenta uma busca exaustiva por listas no dicionário (último recurso)
+            if not data and isinstance(response, dict):
+                for key, value in response.items():
+                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                        self.logger.info(f"Página {page}: Encontrada lista de dicionários na chave '{key}'. Tentando usar como dados.")
+                        data = value
+                        break
 
             # agora data é lista ou vazia
             if not data:
                 self.logger.info(f"Página {page}: nenhum produto encontrado (data vazio).")
-                # Se for a primeira página e não vier nada, pode ser um erro de permissão ou estrutura
                 if page == 1:
-                    self.logger.error(f"CRÍTICO: Nenhum dado retornado na primeira página. Resposta completa: {response}")
+                    self.logger.error(f"CRÍTICO: Nenhum dado retornado na primeira página. Estrutura da resposta: {list(response.keys()) if isinstance(response, dict) else type(response)}")
                 break
 
             # log de inspeção de conteúdo
@@ -1325,12 +1331,15 @@ class Orchestrator:
                     continue
 
                 # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
+                # Na API v3, o SKU costuma vir no campo 'codigo'
+                sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
+                
                 produto_normalizado = {
                     "id": p["id"],
                     "nome": p["nome"],
-                    "sku": p.get("codigo") or str(p["id"]),
+                    "sku": sku_val,
                     "estoqueAtual": p.get("estoque", 0),
-                    "imagem": p.get("imagemURL"),  # pode ser None
+                    "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
                     "tipo": "K" if p.get("tipo") == "K" else "P",
                     "componentes": []
                 }
@@ -1798,9 +1807,7 @@ class WebServer:
             self.orchestrator._cache_lock.release() # Libera imediatamente (apenas para testar)
 
             # Executa o recarregamento em uma thread separada para não bloquear a requisição HTTP
-            executor = ThreadPoolExecutor(max_workers=1)
-            executor.submit(self.orchestrator.process_products_cache)
-            executor.shutdown(wait=False)
+            Thread(target=self.orchestrator.process_products_cache, daemon=True).start()
             
             return jsonify({"message": "Recarregamento do cache de produtos/kits iniciado em segundo plano."}), 202
 
