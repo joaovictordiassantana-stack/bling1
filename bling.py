@@ -1017,7 +1017,8 @@ class Orchestrator:
         # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
         if self.auth.is_authenticated():
             self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
-            self.process_products_cache()
+            # Inicia o carregamento em uma thread separada para não bloquear o startup
+            Thread(target=self.process_products_cache, daemon=True).start()
         else:
             self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
 
@@ -1274,32 +1275,27 @@ class Orchestrator:
             if response is None:
                 self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
             else:
-                # tenta várias chaves possíveis (compatibilidade com diferentes respostas)
+                # Tenta várias chaves possíveis para interpretar diferentes formatos de resposta da API do Bling
                 if isinstance(response, dict):
-                    # forma preferida
                     if 'data' in response and isinstance(response['data'], list):
                         data = response['data']
-                    # estrutura antiga/alternativa: retorno -> produtos
                     elif 'retorno' in response and isinstance(response['retorno'], dict):
-                        # possível path: retorno -> produtos or retorno -> produtos -> produto
-                        # Coloca debug para ver as chaves internas
-                        self.logger.debug(f"Página {page}: 'retorno' keys: {list(response['retorno'].keys())}")
-                        # se retorno contiver 'produtos', tenta usar
-                        if 'produtos' in response['retorno']:
-                            maybe = response['retorno']['produtos']
-                            # alguns endpoints retornam {'produtos': {'produto': [ ... ]}}
-                            if isinstance(maybe, dict) and 'produto' in maybe:
-                                data = maybe['produto']
-                            elif isinstance(maybe, list):
+                        retorno = response['retorno']
+                        if 'produtos' in retorno:
+                            maybe = retorno['produtos']
+                            if isinstance(maybe, list):
                                 data = maybe
-                        else:
-                            # fallback direto: se houver 'produtos' no top-level
-                            if 'produtos' in response and isinstance(response['produtos'], list):
-                                data = response['produtos']
-                            # último fallback: verifica 'produtos' dentro de qualquer valor dict->list
-                            else:
-                                # DEBUG geral: log keys para inspeção manual
-                                self.logger.debug(f"Página {page}: keys top-level: {list(response.keys())}")
+                            elif isinstance(maybe, dict) and 'produto' in maybe:
+                                data = maybe['produto'] if isinstance(maybe['produto'], list) else [maybe['produto']]
+                    elif 'produtos' in response:
+                        data = response['produtos'] if isinstance(response['produtos'], list) else [response['produtos']]
+                    
+                    # Fallback: se data ainda estiver vazio, procura por qualquer lista dentro do dicionário
+                    if not data:
+                        for key, value in response.items():
+                            if isinstance(value, list):
+                                data = value
+                                break
                 else:
                     self.logger.debug(f"Página {page}: response tipo inesperado: {type(response)}")
 
@@ -1365,8 +1361,14 @@ class Orchestrator:
         Calcula uso de componentes com breakdown diário.
         """
         
-        # CORREÇÃO: Não tenta calcular se não estiver logado
+        # CORREÇÃO: Não tenta calcular se não estiver logado ou se o token não estiver disponível
         if not self.auth.is_authenticated():
+            self.logger.debug("Cálculo de componentes ignorado: não autenticado.")
+            return {"components": [], "daily_breakdown": []}
+
+        token = self.auth.get_access_token()
+        if not token:
+            self.logger.warning("Token indisponível para calcular uso de componentes.")
             return {"components": [], "daily_breakdown": []}
 
         now = datetime.now()
@@ -1699,19 +1701,26 @@ class WebServer:
         def api_products_search(token):
             query = request.args.get('q', '').lower()
             results = []
+            
+            # Combina produtos e kits do cache
             all_items = self.orchestrator.get_all_products() + self.orchestrator.get_all_kits()
             
             for p in all_items:
-                if query in str(p.get('nome','')).lower() or query in str(p.get('sku','')).lower():
+                nome = str(p.get('nome', '')).lower()
+                sku = str(p.get('sku', '')).lower()
+                
+                # Busca insensível a maiúsculas/minúsculas no nome e sku
+                if query in nome or query in sku:
                     results.append({
                         "id": p.get("id"),
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
-                        "estoque": p.get("estoqueAtual", 0),
                         "estoqueAtual": p.get("estoqueAtual", 0),
-                        "imagemURL": p.get("imagem"),
-                        "imagem": p.get("imagem")
+                        "imagemURL": p.get("imagem") or "/static/no-image.png",
+                        "tipo": p.get("tipo", "P")
                     })
+            
+            # Retorna os primeiros 20 resultados padronizados
             return jsonify(results[:20])
 
         @self.app.route('/api/debug/cache')
@@ -1848,13 +1857,13 @@ class WebServer:
                         self.logger.debug(f"DEBUG: Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
                         should_update = True
                     
-                    # Caso 2: Tipo explícito
-                    elif data.get('tipo') == 'pedidoVenda':
-                        self.logger.debug("DEBUG: Webhook tipo pedidoVenda detectado.")
+                    # Caso 2: Tipo explícito (V3 ou customizado)
+                    elif data.get('tipo') in ['pedidoVenda', 'vendas', 'venda']:
+                        self.logger.debug(f"DEBUG: Webhook tipo {data.get('tipo')} detectado.")
                         should_update = True
 
                     # Caso 3: Formato antigo (V2)
-                    elif 'retorno' in data and 'pedidos' in data['retorno']:
+                    elif 'retorno' in data and ('pedidos' in data['retorno'] or 'vendas' in data['retorno']):
                         self.logger.debug("DEBUG: Webhook V2 detectado.")
                         should_update = True
                     
