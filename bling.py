@@ -1027,7 +1027,7 @@ class Orchestrator:
             products = {}
             page = 1
             while True:
-                res = self.api.get("produtos", params={"pagina": page, "limite": 100, "tipo": "P"})
+                res = self.api.get("produtos", params={"pagina": page, "limite": 100, "tipo": "P", "criterio": 5})
                 if not res or "data" not in res or not res["data"]:
                     break
                 for p in res["data"]:
@@ -1040,7 +1040,7 @@ class Orchestrator:
             kits = {}
             page = 1
             while True:
-                res = self.api.get("produtos", params={"pagina": page, "limite": 100, "tipo": "K"})
+                res = self.api.get("produtos", params={"pagina": page, "limite": 100, "tipo": "K", "criterio": 5})
                 if not res or "data" not in res or not res["data"]:
                     break
                 for k in res["data"]:
@@ -1403,8 +1403,12 @@ class WebServer:
                         "sku": p.get("sku"),
                         "estoque": p.get("estoqueAtual", 0),
                         "estoqueAtual": p.get("estoqueAtual", 0),
-                        "imagemURL": p.get("imagem") or "/static/no-image.png",
-                        "imagem": p.get("imagem") or "/static/no-image.png",
+                        "imagemURL": (p.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
+                                      p.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
+                                      p.get("imagem") or "/static/no-image.png"),
+                        "imagem": (p.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
+                                   p.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
+                                   p.get("imagem") or "/static/no-image.png"),
                         "tipo": "Kit" if p.get("tipo") == "K" else "Produto",
                         "componentes": p.get("componentes", [])
                     })
@@ -1448,8 +1452,12 @@ class WebServer:
                     "sku": item.get("sku"),
                     "estoque": estoque_val,
                     "estoqueAtual": estoque_val,
-                    "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
+                    "imagemURL": (item.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
+                                  item.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
+                                  item.get("imagem") or "/static/no-image.png"),
+                    "imagem": (item.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
+                               item.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
+                               item.get("imagem") or "/static/no-image.png"),
                     "tipo": tipo_out,
                     "componentes": item.get("componentes", [])
                 }
