@@ -929,6 +929,9 @@ class Orchestrator:
         self._running = False
         self._worker_thread = None
         self._cache_lock = Lock()
+        self._products_cache = {}
+        self._kits_cache = {}
+        self._cache_loaded = False
         
         # ✅ ADICIONE ESTAS LINHAS:
         self._component_usage_cache = None  # Inicializa o cache de componentes
@@ -988,6 +991,10 @@ class Orchestrator:
                 # Ciclo de Vendas (KPIs)
                 self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
                 self.process_sales_orders()
+                
+                # Ciclo de Produtos (Cache)
+                if cycle_count == 1 or cycle_count % 6 == 0: # A cada 1h (6 ciclos de 10min)
+                    self.process_products_cache()
 
             except Exception as e:
                 self.logger.exception(f"Erro fatal no ciclo #{cycle_count}")
@@ -996,6 +1003,61 @@ class Orchestrator:
             # Mantém 10 minutos (600s) pois o cache de produtos levou 5 min
             # Se diminuir muito, vai encavalar.
             self._stop_event.wait(600)
+
+    def get_all_products(self) -> List[Dict[str, Any]]:
+        with self._cache_lock:
+            return list(self._products_cache.values())
+
+    def get_all_kits(self) -> List[Dict[str, Any]]:
+        with self._cache_lock:
+            return list(self._kits_cache.values())
+
+    def is_cache_loaded(self) -> bool:
+        return self._cache_loaded
+
+    def process_products_cache(self):
+        """Busca produtos e kits da API e atualiza o cache local."""
+        self.logger.info("Iniciando atualização do cache de produtos/kits...")
+        try:
+            if not self.auth.is_authenticated():
+                self.logger.warning("Token expirado, aguardando renovação para cache.")
+                return
+
+            # Busca Produtos
+            products = {}
+            page = 1
+            while True:
+                res = self.api.get("produtos", params={"pagina": page, "limite": 100, "tipo": "P"})
+                if not res or "data" not in res or not res["data"]:
+                    break
+                for p in res["data"]:
+                    products[p["id"]] = p
+                if len(res["data"]) < 100: break
+                page += 1
+                time.sleep(0.2)
+
+            # Busca Kits
+            kits = {}
+            page = 1
+            while True:
+                res = self.api.get("produtos", params={"pagina": page, "limite": 100, "tipo": "K"})
+                if not res or "data" not in res or not res["data"]:
+                    break
+                for k in res["data"]:
+                    kits[k["id"]] = k
+                if len(res["data"]) < 100: break
+                page += 1
+                time.sleep(0.2)
+
+            with self._cache_lock:
+                self._products_cache = products
+                self._kits_cache = kits
+                self._cache_loaded = True
+
+            self.logger.info(f"Cache atualizado: {len(products)} produtos e {len(kits)} kits.")
+            self.broadcast_kpi_update(cache_updated=True)
+        except Exception as e:
+            self.logger.exception(f"Erro ao processar cache: {e}")
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
