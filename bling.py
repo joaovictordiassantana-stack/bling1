@@ -366,6 +366,7 @@ class BlingAPIClient:
         self.logger.info(f"📢 Lembrete: Configure o webhook para '{event}' manualmente no painel do Bling apontando para: {url}")
         return {"status": "manual_config_required"}
 
+class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
     
     OAUTH_STATE_FILE: Path = Path('oauth_state.json')
