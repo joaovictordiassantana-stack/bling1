@@ -49,47 +49,6 @@ try:
 except ImportError:
     class ConnectionClosed(Exception): pass
 
-# ============================================================================
-# CONSTANTES DE NEGÓCIO
-# ============================================================================
-
-# Lista padrão de componentes para itens identificados como "Cadeira"
-CADEIRA_STANDARD_COMPONENTS = [
-    {"sku": "COMP-50X52X17", "nome": "COMPENSADO 50X52X17", "quantidade": 1},
-    {"sku": "SARR-52",       "nome": "SARRAFO 52",           "quantidade": 3},
-    {"sku": "SARR-46",       "nome": "SARRAFO 46",           "quantidade": 1},
-    {"sku": "SARR-14",       "nome": "SARRAFO 14",           "quantidade": 2},
-    {"sku": "MDF-15-52X35",  "nome": "MDF 15MM 52X35",       "quantidade": 2},
-    {"sku": "MDF-6-52X35",   "nome": "MDF 6MM 52X35",        "quantidade": 2},
-    {"sku": "SARR-33",       "nome": "SARRAFO 33",           "quantidade": 2},
-    {"sku": "SARR-10",       "nome": "SARRAFO 10",           "quantidade": 2},
-    {"sku": "MDF-15-GEN",    "nome": "MDF 15MM",             "quantidade": 1},
-    {"sku": "TECIDO-3M",     "nome": "TECIDO 3 METROS",      "quantidade": 1},
-    {"sku": "ESP-ACOPL",     "nome": "ESPUMA ACOPLAGEM 0.5M","quantidade": 0.5},
-    {"sku": "ESP-ASSENTO",   "nome": "ESPUMA ASSENTO",       "quantidade": 1},
-    {"sku": "ESP-ENCOSTO",   "nome": "ESPUMA ENCOSTO",       "quantidade": 1},
-    {"sku": "ESP-CABECOTE",  "nome": "ESPUMA CABEÇOTE",      "quantidade": 1},
-    {"sku": "ESP-ASS-52",    "nome": "ESPUMA ASSENTO 52X7,5X1", "quantidade": 1},
-    {"sku": "ESP-ASS-54",    "nome": "ESPUMA ASSENTO 54X14X1",  "quantidade": 1},
-    {"sku": "ESP-BRA-52",    "nome": "ESPUMA BRAÇO 52X21X1",    "quantidade": 1},
-    {"sku": "ESP-BRA-52-35", "nome": "ESPUMA BRAÇO 52X35X1",    "quantidade": 1},
-    {"sku": "ESP-BRA-35",    "nome": "ESPUMA BRAÇO 35X9,5X1",   "quantidade": 4},
-    {"sku": "ESP-BRA-54",    "nome": "ESPUMA BRAÇO 54X9,5X2",   "quantidade": 2},
-    {"sku": "LINHA",         "nome": "LINHA",        "quantidade": 1},
-    {"sku": "COLA",          "nome": "COLA",         "quantidade": 1},
-    {"sku": "LAM-CROM",      "nome": "LAMINA CROMADA",    "quantidade": 1},
-    {"sku": "LAM-CAB",       "nome": "LAMINA DE CABEÇOTE","quantidade": 1},
-    {"sku": "PAR-14-1",      "nome": "PARAFUSO 1/4 X 1",      "quantidade": 15},
-    {"sku": "PAR-14-214",    "nome": "PARAFUSO 1/4 X 2.1/4",  "quantidade": 8},
-    {"sku": "PAR-5X25",      "nome": "PARAFUSO 5X25",         "quantidade": 6},
-    {"sku": "PORCA-14",      "nome": "PORCA GARRA 1/4",       "quantidade": 20},
-    {"sku": "GRAMPO-80",     "nome": "GRAMPO 80/10", "quantidade": 1},
-    {"sku": "GRAMPO-14",     "nome": "GRAMPO 14/40", "quantidade": 1},
-    {"sku": "SERV-COST",     "nome": "COSTUREIRA",   "quantidade": 1},
-    {"sku": "EMBALAGEM",     "nome": "EMBALAGEM",    "quantidade": 1},
-    {"sku": "BASE",          "nome": "BASE",         "quantidade": 1},
-]
-
 # ============================================================================ 
 # 0. RATE LIMITER GLOBAL (NÍVEL PRODUÇÃO)
 # ============================================================================
@@ -1367,13 +1326,15 @@ class Orchestrator:
             self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
             
             for p in data:
+                # 🔧 4️⃣ FILTRO PERMITIDO (ÚNICO ACEITÁVEL)
                 if not p.get("id") or not p.get("nome"):
                     continue
 
+                # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
+                # Na API v3, o SKU costuma vir no campo 'codigo'
                 sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
-                nome_produto = p.get("nome", "").upper()
                 
-                # Normalização inicial
+                # ✅ ALTERAÇÃO AQUI: Capturamos o 'formato' para filtrar depois
                 produto_normalizado = {
                     "id": p["id"],
                     "nome": p["nome"],
@@ -1381,35 +1342,12 @@ class Orchestrator:
                     "estoqueAtual": p.get("estoque", 0),
                     "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
                     "tipo": "K" if p.get("tipo") == "K" else "P",
-                    "componentes": p.get("componentes", []) # Mantém componentes originais se houver
+                    "formato": p.get("formato", "S"),  # Captura S=Simples, V=Variação, E=Estrutura
+                    "componentes": []
                 }
-
-                # --- LÓGICA DA CADEIRA (INJEÇÃO DE COMPONENTES) ---
-                # Se for identificado como cadeira, forçamos o tipo para "K" (Kit)
-                # e injetamos a lista padrão, a menos que já tenha componentes próprios.
-                if "CADEIRA" in nome_produto:
-                    # Força ser tratado como Kit para cálculos
-                    produto_normalizado["tipo"] = "K" 
-                    
-                    # Se não vier componentes do Bling, usa a lista padrão
-                    if not produto_normalizado["componentes"]:
-                        # Formata para a estrutura que o Orchestrator espera (produto dentro de produto)
-                        lista_formatada = []
-                        for componente in CADEIRA_STANDARD_COMPONENTS:
-                            lista_formatada.append({
-                                "produto": {
-                                    "codigo": componente["sku"],
-                                    "nome": componente["nome"]
-                                },
-                                "quantidade": componente["quantidade"]
-                            })
-                        produto_normalizado["componentes"] = lista_formatada
-                        self.logger.info(f"🪑 Cadeira detectada e componentes injetados: {nome_produto}")
-                # --------------------------------------------------
                 
-                # Armazena tudo (agora as cadeiras entrarão na lista de all_kits também se desejar, 
-                # ou apenas manteremos a consistência do tipo)
-                if produto_normalizado["tipo"] == 'K':
+                # Armazena tudo sem filtros
+                if p.get('tipo') == 'K':
                     all_kits.append(produto_normalizado)
                 else:
                     all_products.append(produto_normalizado)
@@ -1513,10 +1451,8 @@ class Orchestrator:
                 if produto and safe_get(produto, 'tipo') == 'K':
                     componentes = safe_get(produto, 'componentes', [])
                     for comp in safe_iter(componentes):
-                        # Altere para algo mais seguro, pois nossos SKUs injetados são fictícios:
-                        comp_data = safe_get(comp, 'produto', {})
-                        comp_sku = comp_data.get('codigo') or comp_data.get('nome') # Fallback para o nome se não tiver SKU
-                        comp_nome = comp_data.get('nome')
+                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
+                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
                         comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
                         
                         if not comp_sku:
@@ -1784,6 +1720,11 @@ class WebServer:
             self.logger.info(f"🔍 Busca iniciada: '{query}' em {len(all_items)} itens.")
             
             for p in all_items:
+                # ✅ ALTERAÇÃO: Pula o item se for uma Variação (V)
+                # Exibe apenas Simples (S) ou Estrutura/Pai (E)
+                if p.get("formato") == "V":
+                    continue
+
                 nome = str(p.get('nome', '')).lower()
                 sku = str(p.get('sku', '')).lower()
                 
@@ -1843,10 +1784,16 @@ class WebServer:
                     "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "tipo": tipo_out,
+                    "formato": item.get("formato", "S"), # Garante que o formato passe
                     "componentes": item.get("componentes", [])
                 }
 
-            all_list = [normalize_for_api(p) for p in kits + products]
+            # ✅ ALTERAÇÃO: Filtra variações ('V') usando list comprehension
+            all_list = [
+                normalize_for_api(p) 
+                for p in kits + products 
+                if p.get("formato") != "V"
+            ]
             return jsonify(all_list)
 
 
@@ -3184,14 +3131,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         : '<span class="text-muted">-</span>';
 
                     let comps = '';
-                    let isSystemChair = k.nome && k.nome.toUpperCase().includes('CADEIRA');
-                    
                     if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
-                        let header = `<b>KIT (${k.componentes.length} itens):</b>`;
-                        if (isSystemChair) {
-                            header = `<span class="badge bg-warning text-dark">🪑 Cadeira Montada via Sistema</span><br>` + header;
-                        }
-                        comps = header + '<br>' + k.componentes
+                        comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
                             .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                             .join('<br>');
                     } else if (k.tipo === 'P') {
