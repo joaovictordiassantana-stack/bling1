@@ -1031,6 +1031,11 @@ class Orchestrator:
                 if not res or "data" not in res or not res["data"]:
                     break
                 for p in res["data"]:
+                    # Extração de imagem da API v3
+                    img = None
+                    if "midia" in p and p["midia"].get("imagens", {}).get("externas"):
+                        img = p["midia"]["imagens"]["externas"][0].get("link")
+                    p["imagem"] = img
                     products[p["id"]] = p
                 if len(res["data"]) < 100: break
                 page += 1
@@ -1044,6 +1049,11 @@ class Orchestrator:
                 if not res or "data" not in res or not res["data"]:
                     break
                 for k in res["data"]:
+                    # Extração de imagem da API v3
+                    img = None
+                    if "midia" in k and k["midia"].get("imagens", {}).get("externas"):
+                        img = k["midia"]["imagens"]["externas"][0].get("link")
+                    k["imagem"] = img
                     kits[k["id"]] = k
                 if len(res["data"]) < 100: break
                 page += 1
@@ -1397,14 +1407,19 @@ class WebServer:
                 
                 # Se a query estiver vazia, retorna os primeiros 20 itens
                 if not query or (query in nome or query in sku):
+                    # Normalização da imagem para o frontend
+                    img_url = p.get("imagem") or p.get("imagemURL")
+                    if not img_url and "midia" in p and p["midia"].get("imagens", {}).get("externas"):
+                        img_url = p["midia"]["imagens"]["externas"][0].get("link")
+                    
                     results.append({
                         "id": p.get("id"),
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
                         "estoque": p.get("estoqueAtual", 0),
                         "estoqueAtual": p.get("estoqueAtual", 0),
-                        "imagemURL": p.get("imagem") or "/static/no-image.png",
-                        "imagem": p.get("imagem") or "/static/no-image.png",
+                        "imagemURL": img_url or "/static/no-image.png",
+                        "imagem": img_url or "/static/no-image.png",
                         "tipo": "Kit" if p.get("tipo") == "K" else "Produto",
                         "componentes": p.get("componentes", [])
                     })
@@ -1438,9 +1453,12 @@ class WebServer:
             def normalize_for_api(item):
                 estoque_val = item.get("estoqueAtual", item.get("estoque", 0))
                 tipo = item.get("tipo", "P")
-                # Mapeia tipo textual para K/P (compatibilidade)
                 if tipo in ["COMPOSTO", "K"]: tipo_out = "K"
                 else: tipo_out = "P"
+                
+                img_url = item.get("imagem") or item.get("imagemURL")
+                if not img_url and "midia" in item and item["midia"].get("imagens", {}).get("externas"):
+                    img_url = item["midia"]["imagens"]["externas"][0].get("link")
 
                 return {
                     "id": item.get("id"),
@@ -1448,8 +1466,8 @@ class WebServer:
                     "sku": item.get("sku"),
                     "estoque": estoque_val,
                     "estoqueAtual": estoque_val,
-                    "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
+                    "imagemURL": img_url or "/static/no-image.png",
+                    "imagem": img_url or "/static/no-image.png",
                     "tipo": tipo_out,
                     "componentes": item.get("componentes", [])
                 }
