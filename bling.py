@@ -1245,11 +1245,7 @@ class WebServer:
                 return 'Error', 500
 
         
-        @self.app.route("/api/components/usage")
-        @token_required
-        def api_component_usage(token):
-            usage = self.orchestrator.sales.calculate_component_usage()
-            return jsonify(usage)
+
 
         @self.app.route("/api/orders")
         def list_orders():
