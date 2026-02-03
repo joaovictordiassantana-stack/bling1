@@ -253,7 +253,6 @@ class Config:
     INITIAL_REFRESH_TOKEN: Optional[str] = os.environ.get('BLING_REFRESH_TOKEN')
 
     SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
-    PRODUCTS_CACHE_FILE: Path = Path('products_cache.json') # Persistência de Produtos e Kits
 
 # ============================================================================ 
 # 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
@@ -319,9 +318,6 @@ def save_stats(data: Dict[str, Any], path: Path):
     logger.info("Estatísticas de KPIs salvas com sucesso (Atômico).")
 
 def safe_dict(data):
-    """
-    Garante que o objeto é um dict, tentando carregar de string JSON se necessário.
-    """
     if isinstance(data, dict):
         return data
     if isinstance(data, str):
@@ -331,248 +327,45 @@ def safe_dict(data):
             return {}
     return {}
 
-def load_products_cache(cache_file):
-    """
-    Carrega cache de produtos e kits do disco.
-    Retorna dict vazio se não existir ou falhar.
-    """
-    if not cache_file or not os.path.exists(cache_file):
-        return {}
-
-    try:
-        with open(cache_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.warning(f"[WARN] Falha ao carregar cache do disco: {e}")
-        return {}
-
-
-def save_products_cache(cache_file, products, kits):
-    """
-    Salva cache de produtos e kits no disco.
-    """
-    total_produtos = len(products or []) + len(kits or [])
-    logger.debug(f"save_products_cache chamado. products={len(products or [])} kits={len(kits or [])} total={total_produtos}")
-    
-    # ✅ 3. Nunca salvar cache se produtos == 0
-    if total_produtos == 0:
-        logger.warning("⛔ Cache vazio ignorado. Não salvando no disco. Isto indica que a API não retornou produtos ou que o parsing falhou.")
-        return
-        
-    try:
-        payload = {
-            "updated_at": datetime.now().isoformat(),
-            "products": products or [],
-            "kits": kits or []
-        }
-        atomic_write_json(payload, cache_file) # Usa a nova função segura
-        
-        skus = [p.get('sku') for p in (products or [])[:5]] + [k.get('sku') for k in (kits or [])[:5]]
-        logger.info(f"Cache salvo com sample skus: {skus}")
-        logger.info(f"Cache de produtos e kits salvo com sucesso (Atômico). Total: {total_produtos}")
-    except Exception as e:
-        logger.exception("Erro ao salvar cache de produtos.")
-
-def safe_iter(data):
-    """Garante que o dado é iterável (lista ou tupla), senão retorna lista vazia."""
-    if isinstance(data, (list, tuple)):
-        return data
-    return []
-
-def safe_get(data, key, default=None):
-    """Acesso seguro a chaves de dicionário."""
-    if isinstance(data, dict):
-        return data.get(key, default)
-    return default
-
-def token_required(f):
-    """Decorator para verificar se o token está ativo antes de acessar a rota."""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        from flask import current_app, jsonify
-        
-        # Acessa o orchestrator anexado ao objeto Flask
-        auth_manager = current_app.orchestrator.auth
-        
-        if not auth_manager.is_authenticated():
-            return jsonify({"error": "Não autenticado ou token expirado"}), 401
-        
-        token = auth_manager.get_access_token()
-        if not token:
-            return jsonify({"error": "Token de acesso não encontrado"}), 401
-            
-        return f(*args, token=token, **kwargs)
-    return decorated
-# ============================================================================
-
-class MetricsManager:
-    """Gerencia métricas básicas de observabilidade."""
-    def __init__(self):
-        self.requests_total = 0
-        self.status_codes = defaultdict(int)
-        self.latency_sum = 0.0
-        self.latency_count = 0
-        self.lock = Lock()
-
-    def record_request(self, status_code: int, latency: float):
-        with self.lock:
-            self.requests_total += 1
-            self.status_codes[status_code] += 1
-            self.latency_sum += latency
-            self.latency_count += 1
-
-    def get_metrics(self) -> Dict[str, Any]:
-        with self.lock:
-            avg_latency = self.latency_sum / self.latency_count if self.latency_count > 0 else 0.0
-            return {
-                "requests_total": self.requests_total,
-                "status_codes": dict(self.status_codes),
-                "avg_latency_ms": round(avg_latency * 1000, 2),
-                "errors_401": self.status_codes[401],
-                "errors_429": self.status_codes[429],
-            }
-
 class BlingAPIClient:
-    """
-    Cliente HTTP blindado contra quedas de conexão (Errno 104) e Timeouts.
-    """
-    
-    def __init__(self, config: Config, auth_manager):
+    """Cliente para a API v3 do Bling."""
+    def __init__(self, config: Config, auth_manager: "AuthManager"):
         self.config = config
         self.auth = auth_manager
-        self.logger = logging.getLogger('bling_automacao')
-        self.metrics = MetricsManager()
-        self.rate_limiter = RateLimiter(min_interval=0.4)
-        
-        # Configuração de Sessão com Retry Automático
+        self.logger = logging.getLogger("bling_automacao")
         self.session = requests.Session()
-        
-        # Estratégia de Retry: Tenta 3 vezes em caso de falha de conexão, reset ou 50x
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,  # Espera 1s, 2s, 4s
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST", "PUT", "DELETE"],
-            raise_on_status=False
-        )
-        
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        adapter = HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504]))
         self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
 
-        self.session.headers.update({
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            'User-Agent': 'SWMoveis/4.6 (Integracao Bling)'  # Boa prática
-        })
-        
     def _request(self, method: str, endpoint: str, **kwargs) -> Optional[Dict[str, Any]]:
-        url = f"{self.config.BLING_API_URL}/{endpoint}"
         token = self.auth.get_access_token()
-        
         if not token:
-            # Silencia erro se for apenas check de startup
-            if endpoint != 'pedidos/vendas':
-                self.logger.warning(f"Token ausente para {endpoint}.")
             return None
-            
-        # Garante header de auth atualizado
-        kwargs.setdefault('headers', {})
-        kwargs['headers']['Authorization'] = f'Bearer {token}'
-        
-        # --- DEBUG: log de entrada da requisição ---
-        self.logger.debug(f"API REQ -> {method} {url} params={kwargs.get('params')} json_keys={list(kwargs.get('json', {}).keys()) if kwargs.get('json') else None}")
 
-        # Rate Limiter
-        self.rate_limiter.wait()
-        
+        headers = {"Authorization": f"Bearer {token}"}
+        url = f"{self.config.BLING_API_URL}/{endpoint}"
+
         try:
-            start_time = time.time()
-            # Timeout aumentado para evitar quedas em queries lentas do Bling
-            response = self.session.request(method, url, timeout=45, **kwargs)
-            latency = time.time() - start_time
-            
-            # DEBUG: log de status e tamanho do body
-            text_len = len(response.text) if response.text else 0
-            self.logger.debug(f"API RESP <- {method} {url} status={response.status_code} text_len={text_len}")
-
-            self.metrics.record_request(response.status_code, latency)
-            
-            # tenta parse do JSON e logar keys top-level (para entender formato)
-            try:
-                resp_json = response.json()
-                if isinstance(resp_json, dict):
-                    self.logger.debug(f"API JSON KEYS: {list(resp_json.keys())}")
-                else:
-                    self.logger.debug(f"API JSON TYPE: {type(resp_json)}")
-            except Exception as e:
-                self.logger.debug(f"API JSON parse failed: {e}")
-
-            # Tratamento de Token Expirado (401)
-            if response.status_code == 401:
-                self.logger.warning(f"Token 401 em {endpoint}. Tentando refresh...")
-                if self.auth.refresh_token():
-                    new_token = self.auth.get_access_token()
-                    kwargs['headers']['Authorization'] = f'Bearer {new_token}'
-                    # Tenta novamente (apenas 1 vez para evitar loop infinito)
-                    response = self.session.request(method, url, timeout=45, **kwargs)
-                else:
-                    return None
-
+            response = self.session.request(method, url, headers=headers, timeout=self.config.REQUEST_TIMEOUT, **kwargs)
             if response.status_code == 429:
                 self.logger.warning(f"Rate limit (429) em {endpoint}.")
-                raise requests.exceptions.HTTPError(response=response)
-
+                return None
             response.raise_for_status()
-            
-            try:
-                return response.json()
-            except json.JSONDecodeError:
-                return {}
-
-        except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
-            self.logger.error(f"Erro de Conexão (Reset/Queda) em {endpoint}: {str(e)}")
-            # Força recriação da sessão no próximo uso se a conexão estiver corrompida
-            self.session.close()
-            self.session = requests.Session()
-            return None
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                # Silencioso para 404, deixa o chamador decidir
-                raise e
-            self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
-            return None
+            return response.json()
         except Exception as e:
-            self.logger.error(f"Erro genérico em {endpoint}: {str(e)}")
+            self.logger.error(f"Erro na requisição {method} {endpoint}: {e}")
             return None
 
     def get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        return self._request('GET', endpoint, params=params)
+        return self._request("GET", endpoint, params=params)
 
     def post(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        return self._request('POST', endpoint, json=data)
-
-    def put(self, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        return self._request('PUT', endpoint, json=data)
-
-    def delete(self, endpoint: str) -> Optional[Dict[str, Any]]:
-        return self._request('DELETE', endpoint)
-
-# ============================================================================ 
-# 5. AUTH MANAGER
-# ============================================================================
+        return self._request("POST", endpoint, json=data)
 
     def register_webhook(self, event: str, url: str):
-        """
-        Nota: Na API v3 do Bling, o registro de webhooks deve ser feito manualmente 
-        no painel do desenvolvedor (Cadastro de Aplicativos > Webhooks).
-        Esta função foi mantida para compatibilidade, mas agora apenas loga a instrução.
-        """
         self.logger.info(f"📢 Lembrete: Configure o webhook para '{event}' manualmente no painel do Bling apontando para: {url}")
         return {"status": "manual_config_required"}
 
-class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
     
     OAUTH_STATE_FILE: Path = Path('oauth_state.json')
@@ -1005,56 +798,11 @@ class Orchestrator:
         self.sales.orchestrator = self
         self._running = False
         self._worker_thread = None
-        self._products_cache = {}
-        self._kits_cache = {}
-        self._load_cache()
         self._cache_lock = Lock()
         
         # ✅ ADICIONE ESTAS LINHAS:
         self._component_usage_cache = None  # Inicializa o cache de componentes
         self.logger.debug("Orchestrator inicializado com cache de componentes vazio")
-        
-        # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
-        if self.auth.is_authenticated():
-            self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
-            self.process_products_cache()
-        else:
-            self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
-
-    def _load_cache(self):
-        """Carrega o cache de produtos/kits do disco."""
-        data = load_products_cache(self.config.PRODUCTS_CACHE_FILE)
-        if data:
-            with self._cache_lock:
-                self._products_cache = {p['id']: p for p in safe_iter(data.get('products'))}
-                self._kits_cache = {k['id']: k for k in safe_iter(data.get('kits'))}
-                self.logger.info(f"Cache carregado: {len(self._products_cache)} produtos, {len(self._kits_cache)} kits.")
-        else:
-            self.logger.warning("Nenhuma cache de produtos/kits encontrado no disco.")
-
-    def get_all_products(self) -> List[Dict[str, Any]]:
-        """Retorna todos os produtos simples em cache."""
-        with self._cache_lock:
-            return list(self._products_cache.values())
-
-    def get_all_kits(self) -> List[Dict[str, Any]]:
-        """Retorna todos os kits em cache."""
-        with self._cache_lock:
-            return list(self._kits_cache.values())
-
-    def is_cache_loaded(self) -> bool:
-        """Verifica se o cache de produtos/kits foi carregado (não está vazio)."""
-        with self._cache_lock:
-            return len(self._products_cache) > 0 or len(self._kits_cache) > 0
-
-    def get_product_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
-        """Busca um produto ou kit pelo SKU no cache."""
-        with self._cache_lock:
-            if sku in self._products_cache:
-                return self._products_cache[sku]
-            if sku in self._kits_cache:
-                return self._kits_cache[sku]
-            return None
 
     def start_worker(self):
         """Inicia o worker de fundo para atualização de dados."""
@@ -1063,8 +811,8 @@ class Orchestrator:
             self._stop_event = Event() # Evento para sinalizar parada
             
             # ✅ ADICIONE: Verifica se é a primeira execução
-            products_empty = len(self._products_cache) == 0
-            kits_empty = len(self._kits_cache) == 0
+            
+            
             
             # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
             # O worker principal ainda inicia, mas ele se protege com a verificação de token.
@@ -1092,14 +840,6 @@ class Orchestrator:
         """Verifica se o worker está ativo."""
         return self._running
 
-    def _initial_load(self):
-        """Carrega cache de produtos na primeira execução."""
-        try:
-            self.logger.info("⏳ Carregando cache inicial de produtos/kits...")
-            self.process_products_cache()
-            self.logger.info("✅ Cache inicial carregado com sucesso!")
-        except Exception as e:
-            self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
         cycle_count = 0
@@ -1114,23 +854,10 @@ class Orchestrator:
                 continue
 
             try:
-                # Ciclo de Produtos (Cache Pesado)
-                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
-                if cycle_count == 1 or cycle_count % 3 == 0:
-                    self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
-                    self.process_products_cache()
                 
                 # Ciclo de Vendas (KPIs)
                 self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
                 self.process_sales_orders()
-                
-                # Ciclo de Componentes
-                if cycle_count % 4 == 0:
-                    self.logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
-                    usage = self.calculate_component_usage()
-                    if usage.get('components'):
-                        self._component_usage_cache = usage
-                        self.broadcast_kpi_update(component_usage=usage)
 
             except Exception as e:
                 self.logger.exception(f"Erro fatal no ciclo #{cycle_count}")
@@ -1252,267 +979,6 @@ class Orchestrator:
         finally:
             self.sales._recalculation_running = False
 
-    def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos e kits."""
-        if not self.auth.is_authenticated():
-            return
-            
-        self.logger.info("Iniciando busca e cache de produtos e kits...")
-        all_products = []
-        all_kits = []
-        page = 1
-        
-        while True:
-            # Busca produtos (Tipo P e K)
-            try:
-                self.logger.info(f"Fazendo requisição para 'produtos' página {page}...")
-                # Na API v3 o endpoint correto é 'produtos' mas os parâmetros podem variar.
-                # Vamos tentar sem o filtro de tipo primeiro se falhar, ou garantir que o endpoint está correto.
-                response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
-                if response:
-                    self.logger.info(f"Resposta recebida da API. Chaves: {list(response.keys()) if isinstance(response, dict) else 'Não é dict'}")
-                else:
-                    self.logger.warning(f"Resposta da API é None para página {page}")
-            except Exception as e:
-                self.logger.error(f"Erro ao buscar produtos: {e}")
-                break
-            
-            # --- Normalização robusta do payload de produtos (API v3) ---
-            data = []
-            if response is None:
-                self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
-            else:
-                # Na API v3, o padrão é {'data': [...]}
-                if isinstance(response, dict):
-                    if 'data' in response and isinstance(response['data'], list):
-                        data = response['data']
-                    # Fallback para API v2 (retorno -> produtos)
-                    elif 'retorno' in response and isinstance(response['retorno'], dict):
-                        retorno = response['retorno']
-                        if 'produtos' in retorno:
-                            p_data = retorno['produtos']
-                            if isinstance(p_data, list):
-                                data = p_data
-                            elif isinstance(p_data, dict) and 'produto' in p_data:
-                                data = p_data['produto'] if isinstance(p_data['produto'], list) else [p_data['produto']]
-                    # Fallback direto se 'produtos' estiver no topo
-                    elif 'produtos' in response:
-                        if isinstance(response['produtos'], list):
-                            data = response['produtos']
-                        elif isinstance(response['produtos'], dict) and 'produto' in response['produtos']:
-                            data = response['produtos']['produto'] if isinstance(response['produtos']['produto'], list) else [response['produtos']['produto']]
-
-            # Se não encontrou dados, tenta uma busca exaustiva por listas no dicionário (último recurso)
-            if not data and isinstance(response, dict):
-                for key, value in response.items():
-                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
-                        self.logger.info(f"Página {page}: Encontrada lista de dicionários na chave '{key}'. Tentando usar como dados.")
-                        data = value
-                        break
-
-            # agora data é lista ou vazia
-            if not data:
-                self.logger.info(f"Página {page}: nenhum produto encontrado (data vazio).")
-                if page == 1:
-                    self.logger.error(f"CRÍTICO: Nenhum dado retornado na primeira página. Estrutura da resposta: {list(response.keys()) if isinstance(response, dict) else type(response)}")
-                break
-
-            # log de inspeção de conteúdo
-            sample_count = min(3, len(data))
-            try:
-                sample_keys = [list(item.keys()) for item in data[:sample_count]]
-            except Exception:
-                sample_keys = []
-            self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
-            
-            for p in data:
-                # 🔧 4️⃣ FILTRO PERMITIDO (ÚNICO ACEITÁVEL)
-                if not p.get("id") or not p.get("nome"):
-                    continue
-
-                # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
-                # Na API v3, o SKU costuma vir no campo 'codigo'
-                sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
-                
-                produto_normalizado = {
-                    "id": p["id"],
-                    "nome": p["nome"],
-                    "sku": sku_val,
-                    "estoqueAtual": p.get("estoque", 0),
-                    "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
-                    "tipo": "K" if p.get("tipo") == "K" else "P",
-                    "componentes": []
-                }
-                
-                # Armazena tudo sem filtros
-                if p.get('tipo') == 'K':
-                    all_kits.append(produto_normalizado)
-                else:
-                    all_products.append(produto_normalizado)
-
-            if len(data) < 100: break
-            page += 1
-            time.sleep(0.5) # Evita rate limit
-
-        # 🔧 5️⃣ SALVAMENTO DO CACHE (CRÍTICO)
-        self.logger.info(
-            f"FINAL CACHE → produtos={len(all_products)} kits={len(all_kits)}"
-        )
-
-        with self._cache_lock:
-            self._products_cache = {p["id"]: p for p in all_products}
-            self._kits_cache = {k["id"]: k for k in all_kits}
-            
-            save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
-            
-            self.logger.info(
-                f"CACHE SALVO → products={len(self._products_cache)} kits={len(self._kits_cache)}"
-            )
-            
-        self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
-        self.broadcast_kpi_update(cache_updated=True)
-
-    def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
-        """
-        Calcula uso de componentes com breakdown diário.
-        """
-        
-        # CORREÇÃO: Não tenta calcular se não estiver logado
-        if not self.auth.is_authenticated():
-            return {"components": [], "daily_breakdown": []}
-
-        now = datetime.now()
-        params = {
-            'dataEmissaoInicial': (now - timedelta(days=days)).strftime('%Y-%m-%d'),
-            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-        }
-        
-        token = self.auth.get_access_token()
-        if not token:
-            self.logger.warning("Token indisponível para calcular uso de componentes.")
-            return {"components": [], "daily_breakdown": []}
-            
-        all_orders = []
-        page = 1
-        while True:
-            params['pagina'] = page
-            
-            # ✅ TRATAMENTO 429: Captura e aborta o loop
-            try:
-                response = self.api.get('pedidos/vendas', params=params)
-            except requests.exceptions.HTTPError as e:
-                if e.response and e.response.status_code == 429:
-                    self.logger.warning("🛑 Rate limit (429) detectado. Abortando cálculo de componentes.")
-                    break
-                raise
-            
-            if response is None:
-                break
-            data = safe_get(response, 'data', [])
-            if not data or len(data) == 0:
-                break
-            all_orders.extend(data)
-            if len(data) < 100:
-                break
-            page += 1
-            
-            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
-            time.sleep(1.2)
-            
-        # Rastreamento por dia E total
-        component_usage = {}  # Total do período
-        daily_usage = defaultdict(lambda: defaultdict(int))  # Por dia
-        
-        for order in all_orders:
-            # Extrai data
-            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
-            if not data_emissao_str:
-                continue
-            
-            try:
-                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-                day_key = order_date.strftime('%Y-%m-%d')
-            except:
-                continue
-            
-            itens = safe_get(order, 'itens', [])
-            for item in safe_iter(itens):
-                produto_sku = safe_get(item, 'codigo')
-                quantidade_vendida = safe_get(item, 'quantidade', 0)
-                
-                if not produto_sku or quantidade_vendida == 0:
-                    continue
-                
-                produto = self.get_product_by_sku(produto_sku)
-                
-                # Se é KIT, processa componentes
-                if produto and safe_get(produto, 'tipo') == 'K':
-                    componentes = safe_get(produto, 'componentes', [])
-                    for comp in safe_iter(componentes):
-                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
-                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
-                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
-                        
-                        if not comp_sku:
-                            continue
-                        
-                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
-                        
-                        # Atualiza total
-                        if comp_sku not in component_usage:
-                            component_usage[comp_sku] = {
-                                "sku": comp_sku,
-                                "nome": comp_nome,
-                                "quantidade": 0,
-                                "produtos": set()
-                            }
-                        component_usage[comp_sku]["quantidade"] += qtd_consumida
-                        component_usage[comp_sku]["produtos"].add(produto_sku)
-                        
-                        # Atualiza diário
-                        daily_usage[day_key][comp_sku] += qtd_consumida
-                
-                # Se é PRODUTO SIMPLES, conta também
-                else:
-                    if produto_sku not in component_usage:
-                        component_usage[produto_sku] = {
-                            "sku": produto_sku,
-                            "nome": safe_get(produto, 'nome', 'Produto'),
-                            "quantidade": 0,
-                            "produtos": set()
-                        }
-                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
-                    component_usage[produto_sku]["produtos"].add(produto_sku)
-                    
-                    daily_usage[day_key][produto_sku] += quantidade_vendida
-        
-        # Formata resultado
-        result = []
-        for sku, usage in component_usage.items():
-            result.append({
-                "sku": usage["sku"],
-                "nome": usage["nome"],
-                "quantidade": usage["quantidade"],
-                "produtos": sorted(list(usage["produtos"]))
-            })
-        
-        result.sort(key=lambda x: x['quantidade'], reverse=True)
-        
-        # Formata consumo diário
-        daily_breakdown = []
-        for day in sorted(daily_usage.keys(), reverse=True):
-            daily_breakdown.append({
-                "data": day,
-                "componentes": [
-                    {"sku": sku, "quantidade": qtd}
-                    for sku, qtd in daily_usage[day].items()
-                ]
-            })
-        
-        return {
-            "components": result,
-            "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
-        }
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
         """
