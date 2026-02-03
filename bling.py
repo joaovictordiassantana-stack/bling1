@@ -1334,7 +1334,6 @@ class Orchestrator:
                 # Na API v3, o SKU costuma vir no campo 'codigo'
                 sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
                 
-                # ✅ ALTERAÇÃO AQUI: Capturamos o 'formato' para filtrar depois
                 produto_normalizado = {
                     "id": p["id"],
                     "nome": p["nome"],
@@ -1342,7 +1341,6 @@ class Orchestrator:
                     "estoqueAtual": p.get("estoque", 0),
                     "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
                     "tipo": "K" if p.get("tipo") == "K" else "P",
-                    "formato": p.get("formato", "S"),  # Captura S=Simples, V=Variação, E=Estrutura
                     "componentes": []
                 }
                 
@@ -1720,11 +1718,6 @@ class WebServer:
             self.logger.info(f"🔍 Busca iniciada: '{query}' em {len(all_items)} itens.")
             
             for p in all_items:
-                # ✅ ALTERAÇÃO: Pula o item se for uma Variação (V)
-                # Exibe apenas Simples (S) ou Estrutura/Pai (E)
-                if p.get("formato") == "V":
-                    continue
-
                 nome = str(p.get('nome', '')).lower()
                 sku = str(p.get('sku', '')).lower()
                 
@@ -1784,16 +1777,10 @@ class WebServer:
                     "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "tipo": tipo_out,
-                    "formato": item.get("formato", "S"), # Garante que o formato passe
                     "componentes": item.get("componentes", [])
                 }
 
-            # ✅ ALTERAÇÃO: Filtra variações ('V') usando list comprehension
-            all_list = [
-                normalize_for_api(p) 
-                for p in kits + products 
-                if p.get("formato") != "V"
-            ]
+            all_list = [normalize_for_api(p) for p in kits + products]
             return jsonify(all_list)
 
 
