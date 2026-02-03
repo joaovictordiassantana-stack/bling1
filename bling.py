@@ -1036,7 +1036,19 @@ class Orchestrator:
 
 # ============================================================================ 
 # 8. WEB SERVER (FLASK)
-# ============================================================================
+# ============================================================================ 
+
+def token_required(f):
+    """Decorador para proteger rotas que exigem autenticação."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import current_app
+        auth_manager = current_app.orchestrator.auth
+        token = auth_manager.get_access_token()
+        if not token:
+            return jsonify({"error": "Unauthorized", "message": "Token inválido ou expirado. Por favor, faça login."}), 401
+        return f(token, *args, **kwargs)
+    return decorated
 
 class WebServer:
     """Configura e executa o servidor Flask com rotas e WebSockets."""
