@@ -73,6 +73,46 @@ class RateLimiter:
                 time.sleep(self.min_interval - elapsed)
             self.last_call = time.time()
 
+
+# ============================================================================ 
+# 1.1 COMPOSIÇÃO OFICIAL DA CADEIRA (BOM)
+# ============================================================================
+CHAIR_COMPONENTS = [
+    {"nome": "COMPENSADO 50X52X17", "quantidade": 1, "unidade": "UN"},
+    {"nome": "SARRAFO 52", "quantidade": 3, "unidade": "UN"},
+    {"nome": "SARRAFO 46", "quantidade": 1, "unidade": "UN"},
+    {"nome": "SARRAFO 14", "quantidade": 2, "unidade": "UN"},
+    {"nome": "SARRAFO 33", "quantidade": 2, "unidade": "UN"},
+    {"nome": "SARRAFO 10", "quantidade": 2, "unidade": "UN"},
+    {"nome": "MDF 15MM 52X35", "quantidade": 2, "unidade": "UN"},
+    {"nome": "MDF 6MM 52X35", "quantidade": 2, "unidade": "UN"},
+    {"nome": "MDF 15MM", "quantidade": 1, "unidade": "UN"},
+    {"nome": "TECIDO", "quantidade": 3, "unidade": "M"},
+    {"nome": "ESPUMA ACOPLAGEM", "quantidade": 0.5, "unidade": "M"},
+    {"nome": "ESPUMA ASSENTO", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA ENCOSTO", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA CABEÇOTE", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA ASSENTO 52X7,5X1", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA ASSENTO 54X14X1", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA BRAÇO 52X21X1", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA BRAÇO 52X35X1", "quantidade": 1, "unidade": "UN"},
+    {"nome": "ESPUMA BRAÇO 35X9,5X1", "quantidade": 4, "unidade": "UN"},
+    {"nome": "ESPUMA BRAÇO 54X9,5X2", "quantidade": 2, "unidade": "UN"},
+    {"nome": "LINHA", "quantidade": 1, "unidade": "UN"},
+    {"nome": "COLA", "quantidade": 1, "unidade": "UN"},
+    {"nome": "LAMINA CROMADA", "quantidade": 1, "unidade": "UN"},
+    {"nome": "LAMINA DE CABEÇOTE", "quantidade": 1, "unidade": "UN"},
+    {"nome": "PARAFUSO 1/4 X 1", "quantidade": 15, "unidade": "UN"},
+    {"nome": "PARAFUSO 1/4 X 2.1/4", "quantidade": 8, "unidade": "UN"},
+    {"nome": "PARAFUSO 5X25", "quantidade": 6, "unidade": "UN"},
+    {"nome": "PORCA GARRA 1/4", "quantidade": 20, "unidade": "UN"},
+    {"nome": "GRAMPO 80/10", "quantidade": 1, "unidade": "UN"},
+    {"nome": "GRAMPO 14/40", "quantidade": 1, "unidade": "UN"},
+    {"nome": "COSTUREIRA", "quantidade": 1, "unidade": "SERVIÇO"},
+    {"nome": "EMBALAGEM", "quantidade": 1, "unidade": "UN"},
+    {"nome": "BASE", "quantidade": 1, "unidade": "UN"}
+]
+
 # ============================================================================ 
 # 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
 # ============================================================================
@@ -641,6 +681,95 @@ class SalesManager:
     def __post_init__(self):
         self._load_stats()
 
+
+    def calculate_component_usage(self) -> Dict[str, Any]:
+        """Calcula o consumo de componentes baseado nos pedidos dos últimos 30 dias."""
+        self.logger.info("Calculando consumo de componentes dos últimos 30 dias...")
+        
+        now = datetime.now()
+        inicio_30d = (now - timedelta(days=30)).date()
+        
+        # Consolidado total
+        components_total = defaultdict(lambda: {"quantidade": 0, "unidade": "UN", "produtos": set()})
+        
+        # Breakdown diário (últimos 7 dias para o front)
+        daily_breakdown = defaultdict(lambda: defaultdict(lambda: {"quantidade": 0, "produtos": set()}))
+        
+        with self.lock:
+            orders = self._sales_history
+            
+            for order in orders:
+                try:
+                    # Parse data do pedido
+                    date_str = order.get('data') or order.get('dataEmissao')
+                    if not date_str: continue
+                    dt = datetime.fromisoformat(date_str.replace(' ', 'T')).date()
+                    
+                    if dt < inicio_30d: continue
+                    
+                    # Processa itens do pedido
+                    # Nota: O Bling API v3 pode retornar itens dentro do pedido ou exigir busca separada.
+                    # Se os itens não estiverem no cache, o cálculo será parcial.
+                    items = order.get('itens', [])
+                    
+                    for item in items:
+                        nome_produto = (item.get('descricao') or item.get('nome') or "").lower()
+                        quantidade_vendida = float(item.get('quantidade', 0))
+                        
+                        # REGRA: Contém "cadeira"?
+                        if "cadeira" in nome_produto:
+                            # Aplica a composição oficial
+                            for comp in CHAIR_COMPONENTS:
+                                nome_comp = comp["nome"]
+                                qtd_comp = comp["quantidade"]
+                                unidade = comp["unidade"]
+                                
+                                total_consumo = qtd_comp * quantidade_vendida
+                                
+                                # Atualiza consolidado
+                                components_total[nome_comp]["quantidade"] += total_consumo
+                                components_total[nome_comp]["unidade"] = unidade
+                                components_total[nome_comp]["produtos"].add(item.get('descricao') or "Cadeira")
+                                
+                                # Atualiza breakdown diário (se for nos últimos 7 dias)
+                                if dt >= (now - timedelta(days=7)).date():
+                                    day_key = dt.isoformat()
+                                    daily_breakdown[day_key][nome_comp]["quantidade"] += total_consumo
+                                    daily_breakdown[day_key][nome_comp]["produtos"].add(item.get('descricao') or "Cadeira")
+                except Exception as e:
+                    self.logger.error(f"Erro ao processar pedido para consumo: {e}")
+                    continue
+
+        # Formata para o retorno esperado pelo front
+        formatted_components = []
+        for nome, data in components_total.items():
+            formatted_components.append({
+                "nome": nome,
+                "quantidade": round(data["quantidade"], 2),
+                "unidade": data["unidade"],
+                "produtos": list(data["produtos"])
+            })
+            
+        formatted_daily = []
+        for day in sorted(daily_breakdown.keys(), reverse=True):
+            day_comps = []
+            for nome, data in daily_breakdown[day].items():
+                day_comps.append({
+                    "sku": nome, # Usando nome como SKU para simplificar conforme instrução
+                    "quantidade": round(data["quantidade"], 2),
+                    "produtos": list(data["produtos"])
+                })
+            formatted_daily.append({
+                "data": day,
+                "componentes": day_comps
+            })
+
+        return {
+            "periodo": "últimos 30 dias",
+            "components": sorted(formatted_components, key=lambda x: x['quantidade'], reverse=True),
+            "daily_breakdown": formatted_daily
+        }
+
     def _load_stats(self):
         with self.lock:
             data = load_stats_safe(self.config.SALES_STATS_FILE)
@@ -971,7 +1100,8 @@ class Orchestrator:
                 self.sales.recalculate_from_orders(self.sales._sales_history)
                 
                 # Manda atualização pro Front (Gráfico)
-                self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
+                usage = self.sales.calculate_component_usage()
+                self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False, component_usage=usage)
             else:
                 self.logger.warning("Nenhum pedido encontrado na busca.")
 
@@ -1113,6 +1243,13 @@ class WebServer:
                 return 'OK', 200
             except Exception as e:
                 return 'Error', 500
+
+        
+        @self.app.route("/api/components/usage")
+        @token_required
+        def api_component_usage(token):
+            usage = self.orchestrator.sales.calculate_component_usage()
+            return jsonify(usage)
 
         @self.app.route("/api/orders")
         def list_orders():
