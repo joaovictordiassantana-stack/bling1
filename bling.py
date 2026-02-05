@@ -1028,11 +1028,13 @@ class Orchestrator:
             page = 1
             while True:
                 # Filtro por loja Swmoveisv2 (ID: 803393)
-                params = {"pagina": page, "limite": 100, "tipo": "P", "criterio": 5, "idLoja": 803393}
+                params = {"pagina": page, "limite": 100, "tipo": "P", "idLoja": 803393}
                 res = self.api.get("produtos", params=params)
                 if not res or "data" not in res or not res["data"]:
                     break
                 for p in res["data"]:
+                    # Normalização da imagem para o frontend
+                    p['imagem_exibicao'] = p.get('imagem', {}).get('url') or "/static/img/placeholder.png"
                     products[p["id"]] = p
                 if len(res["data"]) < 100: break
                 page += 1
@@ -1043,11 +1045,13 @@ class Orchestrator:
             page = 1
             while True:
                 # Filtro por loja Swmoveisv2 (ID: 803393)
-                params = {"pagina": page, "limite": 100, "tipo": "K", "criterio": 5, "idLoja": 803393}
+                params = {"pagina": page, "limite": 100, "tipo": "K", "idLoja": 803393}
                 res = self.api.get("produtos", params=params)
                 if not res or "data" not in res or not res["data"]:
                     break
                 for k in res["data"]:
+                    # Normalização da imagem para o frontend
+                    k['imagem_exibicao'] = k.get('imagem', {}).get('url') or "/static/img/placeholder.png"
                     kits[k["id"]] = k
                 if len(res["data"]) < 100: break
                 page += 1
@@ -1421,16 +1425,8 @@ class WebServer:
                         "sku": p.get("sku"),
                         "estoque": p.get("estoqueAtual", 0),
                         "estoqueAtual": p.get("estoqueAtual", 0),
-                        "imagemURL": (p.get("imagem", {}).get("url") or 
-                                      p.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
-                                      p.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
-                                      p.get("imagem") if isinstance(p.get("imagem"), str) else None or 
-                                      "/static/no-image.png"),
-                        "imagem": (p.get("imagem", {}).get("url") or 
-                                   p.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
-                                   p.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
-                                   p.get("imagem") if isinstance(p.get("imagem"), str) else None or 
-                                   "/static/no-image.png"),
+                        "imagemURL": p.get("imagem_exibicao") or "/static/img/placeholder.png",
+                        "imagem": p.get("imagem_exibicao") or "/static/img/placeholder.png",
                         "tipo": "Kit" if p.get("tipo") == "K" else "Produto",
                         "componentes": p.get("componentes", [])
                     })
@@ -1474,16 +1470,8 @@ class WebServer:
                     "sku": item.get("sku"),
                     "estoque": estoque_val,
                     "estoqueAtual": estoque_val,
-                    "imagemURL": (item.get("imagem", {}).get("url") or 
-                                  item.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
-                                  item.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
-                                  item.get("imagem") if isinstance(item.get("imagem"), str) else None or 
-                                  "/static/no-image.png"),
-                    "imagem": (item.get("imagem", {}).get("url") or 
-                               item.get("midia", {}).get("imagens", {}).get("externas", [{}])[0].get("link") or 
-                               item.get("midia", {}).get("imagens", {}).get("internas", [{}])[0].get("link") or 
-                               item.get("imagem") if isinstance(item.get("imagem"), str) else None or 
-                               "/static/no-image.png"),
+                    "imagemURL": item.get("imagem_exibicao") or "/static/img/placeholder.png",
+                    "imagem": item.get("imagem_exibicao") or "/static/img/placeholder.png",
                     "tipo": tipo_out,
                     "componentes": item.get("componentes", [])
                 }
