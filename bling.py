@@ -1368,16 +1368,21 @@ class Orchestrator:
                     continue
 
                 # --- ORDEM DE SERVIÇO 01: FILTRAGEM SOBERANA ---
-                # 1. Filtragem por ID da Loja (Tray: 803393)
+                # 1. Filtragem por ID da Loja (Tray: 803393 ou API: 205929726)
                 loja_id = p.get("lojaId")
-                if not loja_id:
-                    # Tenta buscar em listas de lojas vinculadas se disponível
-                    lojas_vinculadas = p.get("lojasVinculadas", [])
-                    if isinstance(lojas_vinculadas, list):
-                        loja_id = next((l.get("lojaId") for l in lojas_vinculadas if str(l.get("lojaId")) == "803393"), None)
+                lojas_vinculadas = p.get("lojasVinculadas", [])
                 
-                if str(loja_id) != "803393":
-                    print(f"[DEBUG] Produto {p.get('nome')} ignorado: Loja incorreta")
+                is_correct_store = False
+                if str(loja_id) in ["803393", "205929726"]:
+                    is_correct_store = True
+                elif isinstance(lojas_vinculadas, list):
+                    for l in lojas_vinculadas:
+                        if str(l.get("lojaId")) in ["803393", "205929726"]:
+                            is_correct_store = True
+                            break
+                
+                if not is_correct_store:
+                    print(f"[DEBUG] Produto {p.get('nome')} ignorado: Loja incorreta (ID: {loja_id})")
                     continue
 
                 # 2. Exibição Apenas do Produto Pai
@@ -1502,6 +1507,7 @@ class Orchestrator:
                 
                 # --- ORDEM DE SERVIÇO 03: LÓGICA DE ASSOCIAÇÃO ---
                 # Verifica se o nome do produto contém "Cadeira" (case-insensitive)
+                # Isso garante que variantes como "Cadeira Azul" ou "Cadeira MDF" sejam contabilizadas
                 if "cadeira" in produto_nome.lower():
                     print(f"[DEBUG] Calculando insumos para {quantidade_vendida} unidades de {produto_nome}")
                     
@@ -1522,6 +1528,9 @@ class Orchestrator:
                         
                         # Atualiza diário
                         daily_usage[day_key][comp_nome] += qtd_consumida
+                else:
+                    # Log para produtos ignorados no cálculo de componentes
+                    print(f"[DEBUG] Produto {produto_nome} ignorado no cálculo de componentes (não contém 'cadeira')")
         
         # Formata resultado
         result = []
@@ -3064,58 +3073,65 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                     const isCadeira = (p.nome || '').toLowerCase().includes('cadeira');
                     const receitaHtml = isCadeira ? `
-                        <div class="mt-3 p-3 bg-white border rounded shadow-sm">
-                            <h6 class="fw-bold mb-2">📋 Receita de Produção</h6>
-                            <table class="table table-sm table-borderless mb-0">
-                                <thead class="border-bottom">
-                                    <tr><th>Componente</th><th class="text-end">Qtd</th></tr>
-                                </thead>
-                                <tbody>
-                                    ${Object.entries(RECEITA_CADEIRA).map(([name, qty]) => `
-                                        <tr><td>${name}</td><td class="text-end fw-bold">${qty}x</td></tr>
-                                    `).join('')}
-                                </tbody>
-                            </table>
+                        <div class="mt-3 p-3 bg-white border rounded shadow-sm" style="border-left: 4px solid var(--accent) !important;">
+                            <h6 class="fw-bold mb-3 text-primary d-flex align-items-center">
+                                <span class="me-2">📋</span> Receita de Produção (Cadeira)
+                            </h6>
+                            <div class="table-responsive">
+                                <table class="table table-sm table-hover mb-0">
+                                    <thead class="table-light">
+                                        <tr>
+                                            <th style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Insumo / Componente</th>
+                                            <th class="text-end" style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Qtd</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        ${Object.entries(RECEITA_CADEIRA).map(([name, qty]) => `
+                                            <tr>
+                                                <td style="font-size: 0.85rem;">${name}</td>
+                                                <td class="text-end fw-bold text-accent" style="font-size: 0.85rem;">${qty}x</td>
+                                            </tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
                     ` : '';
 
                     html += `
-                        <div class="list-group-item list-group-item-action" style="cursor:pointer" onclick="this.querySelector('.expansion-area').classList.toggle('d-none')">
-                            <div class="d-flex">
-                                ${imgHtml}
+                        <div class="list-group-item list-group-item-action border-start-0 border-end-0 py-3" style="cursor:pointer" onclick="const exp = this.querySelector('.expansion-area'); exp.classList.toggle('d-none'); this.classList.toggle('bg-light')">
+                            <div class="d-flex align-items-start">
+                                <div class="me-3">
+                                    ${imgHtml}
+                                </div>
 
                                 <div class="flex-grow-1">
-                                    <div class="d-flex w-100 justify-content-between">
-                                        <h5 class="mb-1 text-primary fw-bold">${p.nome || p.produto || 'Sem nome'}</h5>
-                                        <small class="text-muted">${p.sku || 'N/D'}</small>
+                                    <div class="d-flex w-100 justify-content-between align-items-center mb-1">
+                                        <h6 class="mb-0 text-primary fw-bold" style="font-size: 1.1rem;">${p.nome || p.produto || 'Sem nome'}</h6>
+                                        <span class="badge bg-light text-muted border">${p.sku || 'N/D'}</span>
                                     </div>
 
-                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
+                                    <div class="d-flex align-items-center gap-2 mb-2">
+                                        <span class="badge ${p.tipo === 'Kit' ? 'bg-info' : 'bg-secondary'} bg-opacity-10 text-${p.tipo === 'Kit' ? 'info' : 'secondary'} border-0" style="font-size: 0.7rem; font-weight: 600; text-transform: uppercase;">
+                                            ${p.tipo}
+                                        </span>
+                                        <small class="text-muted" style="font-size: 0.8rem;">Clique para ver componentes</small>
+                                    </div>
 
-                                    <small class="text-muted d-block">
-                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
-                                    </small>
-
-                                    <div class="expansion-area d-none mt-2">
+                                    <div class="expansion-area d-none animate-fade-in">
                                         ${receitaHtml}
                                         
                                         ${p.componentes && p.componentes.length > 0 ? `
-                                            <div class="componentes mt-2 p-2 bg-light rounded">
-                                                <small class="fw-bold">Componentes (API):</small>
-                                                <ul class="mb-0">
+                                            <div class="mt-3 p-3 bg-light rounded border">
+                                                <h6 class="fw-bold mb-2" style="font-size: 0.85rem;">📦 Estrutura do Kit (Bling)</h6>
+                                                <ul class="list-unstyled mb-0" style="font-size: 0.85rem;">
                                                     ${p.componentes.map(c =>
-                                                        `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
+                                                        `<li class="d-flex justify-content-between border-bottom py-1">
+                                                            <span>${c.nome || 'Sem nome'}</span>
+                                                            <span class="fw-bold">${c.quantidade}x</span>
+                                                        </li>`
                                                     ).join("")}
                                                 </ul>
-                                            </div>
-                                        ` : ""}
-
-                                        ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
-                                            <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
-                                                <b>📦 Este componente é usado em:</b><br>
-                                                ${p.usado_em.map(u =>
-                                                    `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
-                                                ).join("<br>")}
                                             </div>
                                         ` : ""}
                                     </div>
