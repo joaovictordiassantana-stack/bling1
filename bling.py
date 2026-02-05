@@ -1374,6 +1374,12 @@ class WebServer:
                 if not self.orchestrator.is_running():
                     self.orchestrator.start_worker()
                     start_cleanup_timer()
+                
+                # ✅ Força a carga inicial do cache de produtos imediatamente após o login
+                executor = ThreadPoolExecutor(max_workers=1)
+                executor.submit(self.orchestrator.process_products_cache)
+                executor.shutdown(wait=False)
+                
                 return redirect('/')
             else:
                 return "Erro ao trocar código pelo token.", 500
@@ -1388,6 +1394,13 @@ class WebServer:
             
             # Pega todos os itens (produtos e kits)
             all_items = self.orchestrator.get_all_products() + self.orchestrator.get_all_kits()
+            
+            # ✅ Se o cache estiver vazio, tenta carregar em segundo plano para a próxima busca
+            if not all_items:
+                self.logger.warning("⚠️ Cache vazio durante a busca. Iniciando carga em segundo plano.")
+                executor = ThreadPoolExecutor(max_workers=1)
+                executor.submit(self.orchestrator.process_products_cache)
+                executor.shutdown(wait=False)
             
             self.logger.info(f"🔍 Busca iniciada: '{query}' em {len(all_items)} itens.")
             
