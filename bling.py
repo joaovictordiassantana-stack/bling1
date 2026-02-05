@@ -185,6 +185,7 @@ def setup_logging():
     return logger, error_logger
 
 logger, error_logger = setup_logging()
+print("[DEBUG] Módulo de Estoque desativado com sucesso.")
 
 # ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
 def cleanup_kpi_callbacks():
@@ -216,6 +217,42 @@ def start_cleanup_timer():
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
 # ============================================================================
+
+RECEITA_CADEIRA = {
+    "COMPENSADO 50X52X17": 1,
+    "SARRAFO 52": 3,
+    "SARRAFO 46": 1,
+    "SARRAFO 14": 2,
+    "MDF 15MM 52X35": 2,
+    "MDF 6MM 52X35": 2,
+    "SARRAFO 33": 2,
+    "SARRAFO 10": 2,
+    "MDF 15MM": 1,
+    "TECIDO (Metros)": 3,
+    "ESPUMA ACOPLAGEM (Metros)": 0.5,
+    "ESPUMA ASSENTO": 1, # Unidade não especificada, assumindo 1 kit ou peça
+    "ESPUMA ENCOSTO": 1,
+    "ESPUMA CABEÇOTE": 1,
+    "ESPUMA ASSENTO 52X7.5X1": 1,
+    "ESPUMA ASSENTO 54X14X1": 1,
+    "ESPUMA BRAÇO 52X21X1": 1,
+    "ESPUMA BRAÇO 52X35X1": 1,
+    "ESPUMA BRAÇO 35X9.5X1": 4,
+    "ESPUMA BRAÇO 54X9.5X2": 2,
+    "LINHA": 1, # Definir unidade média
+    "COLA": 1,  # Definir unidade média
+    "LAMINA CROMADA": 1,
+    "LAMINA DE CABEÇOTE": 1,
+    "PARAFUSO 1/4 X 1": 15,
+    "PARAFUSO 1/4 X 2.1/4": 8,
+    "PARAFUSO 5X25": 6,
+    "PORCA GARRA 1/4": 20,
+    "GRAMPO 80/10": 1, # Unidade de medida? (ex: 0.1 caixa)
+    "GRAMPO 14/40": 1,
+    "COSTUREIRA": 1, # Mão de obra unitária
+    "EMBALAGEM": 1,
+    "BASE": 1
+}
 
 class Config:
     """Configurações globais da aplicação."""
@@ -1330,6 +1367,26 @@ class Orchestrator:
                 if not p.get("id") or not p.get("nome"):
                     continue
 
+                # --- ORDEM DE SERVIÇO 01: FILTRAGEM SOBERANA ---
+                # 1. Filtragem por ID da Loja (Tray: 803393)
+                loja_id = p.get("lojaId")
+                if not loja_id:
+                    # Tenta buscar em listas de lojas vinculadas se disponível
+                    lojas_vinculadas = p.get("lojasVinculadas", [])
+                    if isinstance(lojas_vinculadas, list):
+                        loja_id = next((l.get("lojaId") for l in lojas_vinculadas if str(l.get("lojaId")) == "803393"), None)
+                
+                if str(loja_id) != "803393":
+                    print(f"[DEBUG] Produto {p.get('nome')} ignorado: Loja incorreta")
+                    continue
+
+                # 2. Exibição Apenas do Produto Pai
+                # Se o campo codigoPai existir e não for vazio, é uma variante e deve ser ocultada da visualização
+                codigo_pai = p.get("codigoPai")
+                if codigo_pai and str(codigo_pai).strip():
+                    # Ignora variantes para o cache de visualização
+                    continue
+
                 # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
                 # Na API v3, o SKU costuma vir no campo 'codigo'
                 sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
@@ -1374,7 +1431,7 @@ class Orchestrator:
 
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
         """
-        Calcula uso de componentes com breakdown diário.
+        Calcula uso de componentes baseado na RECEITA_CADEIRA e histórico de vendas local.
         """
         
         # CORREÇÃO: Não tenta calcular se não estiver logado
@@ -1437,58 +1494,38 @@ class Orchestrator:
             
             itens = safe_get(order, 'itens', [])
             for item in safe_iter(itens):
-                produto_sku = safe_get(item, 'codigo')
+                produto_nome = safe_get(item, 'descricao', '')
                 quantidade_vendida = safe_get(item, 'quantidade', 0)
                 
-                if not produto_sku or quantidade_vendida == 0:
+                if not produto_nome or quantidade_vendida == 0:
                     continue
                 
-                produto = self.get_product_by_sku(produto_sku)
-                
-                # Se é KIT, processa componentes
-                if produto and safe_get(produto, 'tipo') == 'K':
-                    componentes = safe_get(produto, 'componentes', [])
-                    for comp in safe_iter(componentes):
-                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
-                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
-                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
-                        
-                        if not comp_sku:
-                            continue
-                        
-                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
+                # --- ORDEM DE SERVIÇO 03: LÓGICA DE ASSOCIAÇÃO ---
+                # Verifica se o nome do produto contém "Cadeira" (case-insensitive)
+                if "cadeira" in produto_nome.lower():
+                    print(f"[DEBUG] Calculando insumos para {quantidade_vendida} unidades de {produto_nome}")
+                    
+                    # Multiplica a quantidade vendida por cada item da RECEITA_CADEIRA
+                    for comp_nome, qtd_unitaria in RECEITA_CADEIRA.items():
+                        qtd_consumida = quantidade_vendida * qtd_unitaria
                         
                         # Atualiza total
-                        if comp_sku not in component_usage:
-                            component_usage[comp_sku] = {
-                                "sku": comp_sku,
+                        if comp_nome not in component_usage:
+                            component_usage[comp_nome] = {
+                                "sku": "INSUMO",
                                 "nome": comp_nome,
                                 "quantidade": 0,
                                 "produtos": set()
                             }
-                        component_usage[comp_sku]["quantidade"] += qtd_consumida
-                        component_usage[comp_sku]["produtos"].add(produto_sku)
+                        component_usage[comp_nome]["quantidade"] += qtd_consumida
+                        component_usage[comp_nome]["produtos"].add(produto_nome)
                         
                         # Atualiza diário
-                        daily_usage[day_key][comp_sku] += qtd_consumida
-                
-                # Se é PRODUTO SIMPLES, conta também
-                else:
-                    if produto_sku not in component_usage:
-                        component_usage[produto_sku] = {
-                            "sku": produto_sku,
-                            "nome": safe_get(produto, 'nome', 'Produto'),
-                            "quantidade": 0,
-                            "produtos": set()
-                        }
-                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
-                    component_usage[produto_sku]["produtos"].add(produto_sku)
-                    
-                    daily_usage[day_key][produto_sku] += quantidade_vendida
+                        daily_usage[day_key][comp_nome] += qtd_consumida
         
         # Formata resultado
         result = []
-        for sku, usage in component_usage.items():
+        for nome, usage in component_usage.items():
             result.append({
                 "sku": usage["sku"],
                 "nome": usage["nome"],
@@ -2917,7 +2954,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
 
             html += '</tbody></table></div>';
-            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
+            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Parafusos e insumos necessários para repor o estoque dos últimos 30 dias: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
 
             if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
                 html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
@@ -3025,43 +3062,63 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
                         : '<span class="text-muted">-</span>';
 
+                    const isCadeira = (p.nome || '').toLowerCase().includes('cadeira');
+                    const receitaHtml = isCadeira ? `
+                        <div class="mt-3 p-3 bg-white border rounded shadow-sm">
+                            <h6 class="fw-bold mb-2">📋 Receita de Produção</h6>
+                            <table class="table table-sm table-borderless mb-0">
+                                <thead class="border-bottom">
+                                    <tr><th>Componente</th><th class="text-end">Qtd</th></tr>
+                                </thead>
+                                <tbody>
+                                    ${Object.entries(RECEITA_CADEIRA).map(([name, qty]) => `
+                                        <tr><td>${name}</td><td class="text-end fw-bold">${qty}x</td></tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    ` : '';
+
                     html += `
-                        <div class="list-group-item">
+                        <div class="list-group-item list-group-item-action" style="cursor:pointer" onclick="this.querySelector('.expansion-area').classList.toggle('d-none')">
                             <div class="d-flex">
                                 ${imgHtml}
 
                                 <div class="flex-grow-1">
                                     <div class="d-flex w-100 justify-content-between">
-                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                        <small>${p.sku || 'N/D'}</small>
+                                        <h5 class="mb-1 text-primary fw-bold">${p.nome || p.produto || 'Sem nome'}</h5>
+                                        <small class="text-muted">${p.sku || 'N/D'}</small>
                                     </div>
 
                                     <p class="mb-1">${p.descricaoCurta || ''}</p>
 
                                     <small class="text-muted d-block">
-                                        <b>Estoque:</b> ${p.estoque}
                                         <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
                                     </small>
 
-                                    ${p.componentes && p.componentes.length > 0 ? `
-                                        <div class="componentes mt-2 p-2 bg-light rounded">
-                                            <small>Componentes:</small>
-                                            <ul>
-                                                ${p.componentes.map(c =>
-                                                    `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
-                                                ).join("")}
-                                            </ul>
-                                        </div>
-                                    ` : ""}
+                                    <div class="expansion-area d-none mt-2">
+                                        ${receitaHtml}
+                                        
+                                        ${p.componentes && p.componentes.length > 0 ? `
+                                            <div class="componentes mt-2 p-2 bg-light rounded">
+                                                <small class="fw-bold">Componentes (API):</small>
+                                                <ul class="mb-0">
+                                                    ${p.componentes.map(c =>
+                                                        `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
+                                                    ).join("")}
+                                                </ul>
+                                            </div>
+                                        ` : ""}
 
-                                    ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
-                                        <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
-                                            <b>📦 Este componente é usado em:</b><br>
-                                            ${p.usado_em.map(u =>
-                                                `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
-                                            ).join("<br>")}
-                                        </div>
-                                    ` : ""}
+                                        ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
+                                            <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
+                                                <b>📦 Este componente é usado em:</b><br>
+                                                ${p.usado_em.map(u =>
+                                                    `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
+                                                ).join("<br>")}
+                                            </div>
+                                        ` : ""}
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -3074,6 +3131,43 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch(e) {
                 div.innerHTML = `<div class="alert alert-danger">Erro: ${e.message}</div>`;
             }
+        };
+
+        /* ✅ DESIGN: Receita Hardcoded para Front-end */
+        const RECEITA_CADEIRA = {
+            "COMPENSADO 50X52X17": 1,
+            "SARRAFO 52": 3,
+            "SARRAFO 46": 1,
+            "SARRAFO 14": 2,
+            "MDF 15MM 52X35": 2,
+            "MDF 6MM 52X35": 2,
+            "SARRAFO 33": 2,
+            "SARRAFO 10": 2,
+            "MDF 15MM": 1,
+            "TECIDO (Metros)": 3,
+            "ESPUMA ACOPLAGEM (Metros)": 0.5,
+            "ESPUMA ASSENTO": 1,
+            "ESPUMA ENCOSTO": 1,
+            "ESPUMA CABEÇOTE": 1,
+            "ESPUMA ASSENTO 52X7.5X1": 1,
+            "ESPUMA ASSENTO 54X14X1": 1,
+            "ESPUMA BRAÇO 52X21X1": 1,
+            "ESPUMA BRAÇO 52X35X1": 1,
+            "ESPUMA BRAÇO 35X9.5X1": 4,
+            "ESPUMA BRAÇO 54X9.5X2": 2,
+            "LINHA": 1,
+            "COLA": 1,
+            "LAMINA CROMADA": 1,
+            "LAMINA DE CABEÇOTE": 1,
+            "PARAFUSO 1/4 X 1": 15,
+            "PARAFUSO 1/4 X 2.1/4": 8,
+            "PARAFUSO 5X25": 6,
+            "PORCA GARRA 1/4": 20,
+            "GRAMPO 80/10": 1,
+            "GRAMPO 14/40": 1,
+            "COSTUREIRA": 1,
+            "EMBALAGEM": 1,
+            "BASE": 1
         };
 
         /* ✅ DESIGN: Carregar Kits */
@@ -3112,31 +3206,48 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <tbody>
                 `;
 
-                data.forEach(k => {
-                    const imgHtml = k.imagemURL
-                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
-                        : '<span class="text-muted">-</span>';
+                    data.forEach(k => {
+                        const imgHtml = k.imagemURL
+                            ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
+                            : '<span class="text-muted">-</span>';
 
-                    let comps = '';
-                    if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
-                        comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
-                            .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
-                            .join('<br>');
-                    } else if (k.tipo === 'P') {
-                        comps = `<span class="badge bg-info">Produto Simples</span><br><small>Estoque: ${k.estoqueAtual || 0}</small>`;
-                    } else {
-                        comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
-                    }
+                        const isCadeira = (k.nome || '').toLowerCase().includes('cadeira');
+                        const receitaHtml = isCadeira ? `
+                            <div class="mt-2 p-2 bg-white border rounded shadow-sm expansion-area d-none">
+                                <h6 class="fw-bold mb-1" style="font-size:0.85rem">📋 Receita de Produção</h6>
+                                <table class="table table-sm table-borderless mb-0" style="font-size:0.75rem">
+                                    <tbody>
+                                        ${Object.entries(RECEITA_CADEIRA).map(([name, qty]) => `
+                                            <tr><td class="py-0">${name}</td><td class="text-end fw-bold py-0">${qty}x</td></tr>
+                                        `).join('')}
+                                    </tbody>
+                                </table>
+                            </div>
+                        ` : '';
 
-                    html += `
-                        <tr>
-                            <td style="width:60px">${imgHtml}</td>
-                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-                            <td>${k.nome || 'N/D'}</td>
-                            <td>${comps}</td>
-                        </tr>
-                    `;
-                });
+                        let comps = '';
+                        if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
+                            comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
+                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                                .join('<br>');
+                        } else if (k.tipo === 'P') {
+                            comps = `<span class="badge bg-info">Produto Simples</span>`;
+                        } else {
+                            comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
+                        }
+
+                        html += `
+                            <tr style="cursor:pointer" onclick="const exp = this.querySelector('.expansion-area'); if(exp) exp.classList.toggle('d-none')">
+                                <td style="width:60px">${imgHtml}</td>
+                                <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                                <td>
+                                    <div class="fw-bold text-primary">${k.nome || 'N/D'}</div>
+                                    ${receitaHtml}
+                                </td>
+                                <td>${comps}</td>
+                            </tr>
+                        `;
+                    });
 
                 html += '</tbody></table></div>';
                 div.innerHTML = html;
