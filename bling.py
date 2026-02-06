@@ -368,6 +368,25 @@ def safe_dict(data):
             return {}
     return {}
 
+COMPONENTS_FILE = Path('components_registry.json')
+
+def load_components_registry():
+    if not COMPONENTS_FILE.exists():
+        return {}
+    try:
+        with open(COMPONENTS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.exception("Erro lendo components_registry.json")
+        return {}
+
+def save_components_registry(reg):
+    try:
+        atomic_write_json(reg, COMPONENTS_FILE)
+        logger.info(f"Components registry salvo ({len(reg)} entradas).")
+    except Exception:
+        logger.exception("Erro salvando components_registry.json")
+
 def load_products_cache(cache_file):
     """
     Carrega cache de produtos e kits do disco.
@@ -1044,6 +1063,7 @@ class Orchestrator:
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
+        self._components_registry = load_components_registry()
         self._load_cache()
         self._cache_lock = Lock()
         
@@ -1396,15 +1416,38 @@ class Orchestrator:
                 # Na API v3, o SKU costuma vir no campo 'codigo'
                 sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
                 
+                # Preservação de imagem e debug
+                imagem = p.get("imagemURL") or p.get("imagem") or (p.get("imagem", {}) or {}).get("link")
+                if not imagem:
+                    self.logger.debug(f"Produto sem imagem: id={p.get('id')} nome={p.get('nome')}")
+                
                 produto_normalizado = {
                     "id": p["id"],
                     "nome": p["nome"],
                     "sku": sku_val,
-                    "estoqueAtual": p.get("estoque", 0),
-                    "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
+                    "imagem": imagem or "/static/no-image.png",
                     "tipo": "K" if p.get("tipo") == "K" else "P",
                     "componentes": []
                 }
+
+                # Anexar componentes do registro interno
+                attached_components = []
+                sku_key = str(sku_val)
+                if sku_key in self._components_registry:
+                    attached_components = self._components_registry[sku_key].get('componentes', [])
+                else:
+                    # procura matches por nome
+                    for k, v in self._components_registry.items():
+                        if isinstance(v, dict) and v.get('match_name_contains'):
+                            if v['match_name_contains'].lower() in produto_normalizado['nome'].lower():
+                                attached_components = v.get('componentes', [])
+                                break
+                
+                # fallback: se for 'cadeira' e não tem registro, deixa receita hardcoded (RECEITA_CADEIRA)
+                if not attached_components and 'cadeira' in produto_normalizado['nome'].lower():
+                    attached_components = [{"nome": k, "quantidade": v} for k,v in RECEITA_CADEIRA.items()]
+                
+                produto_normalizado['componentes'] = attached_components
                 
                 # Armazena tudo sem filtros
                 if p.get('tipo') == 'K':
@@ -1506,13 +1549,29 @@ class Orchestrator:
                     continue
                 
                 # --- ORDEM DE SERVIÇO 03: LÓGICA DE ASSOCIAÇÃO ---
-                # Verifica se o nome do produto contém "Cadeira" (case-insensitive)
-                # Isso garante que variantes como "Cadeira Azul" ou "Cadeira MDF" sejam contabilizadas
-                if "cadeira" in produto_nome.lower():
-                    print(f"[DEBUG] Calculando insumos para {quantidade_vendida} unidades de {produto_nome}")
-                    
-                    # Multiplica a quantidade vendida por cada item da RECEITA_CADEIRA
-                    for comp_nome, qtd_unitaria in RECEITA_CADEIRA.items():
+                # Busca componentes no registry por SKU ou match_name_contains
+                sku_val = safe_get(item, 'codigo', '')
+                componentes = []
+                
+                sku_key = str(sku_val)
+                if sku_key in self._components_registry:
+                    componentes = self._components_registry[sku_key].get('componentes', [])
+                else:
+                    for k, v in self._components_registry.items():
+                        if isinstance(v, dict) and v.get('match_name_contains'):
+                            if v['match_name_contains'].lower() in produto_nome.lower():
+                                componentes = v.get('componentes', [])
+                                break
+                
+                # Fallback: se for 'cadeira' e não tem registro, usa RECEITA_CADEIRA
+                if not componentes and "cadeira" in produto_nome.lower():
+                    componentes = [{"nome": k, "quantidade": v} for k, v in RECEITA_CADEIRA.items()]
+
+                if componentes:
+                    self.logger.debug(f"Calculando insumos para {quantidade_vendida} unidades de {produto_nome}")
+                    for comp in componentes:
+                        comp_nome = comp["nome"]
+                        qtd_unitaria = comp["quantidade"]
                         qtd_consumida = quantidade_vendida * qtd_unitaria
                         
                         # Atualiza total
@@ -1681,9 +1740,50 @@ class WebServer:
             except Exception as e:
                 return 'Error', 500
 
-        @self.app.route("/api/orders")
+        @self.app.route('/api/orders')
         def list_orders():
             return jsonify(list(self.orchestrator.sales._orders_cache.values()))
+
+        @self.app.route('/api/product/<product_id>/components')
+        @token_required
+        def api_product_components(token, product_id):
+            # Tenta produto no cache
+            c = self.orchestrator
+            with c._cache_lock:
+                p = c._products_cache.get(int(product_id)) or c._kits_cache.get(int(product_id))
+            if not p:
+                return jsonify({"error": "Produto não encontrado"}), 404
+            # já terá 'componentes' anexado no cache
+            comps = p.get('componentes', [])
+            return jsonify({"id": p.get('id'), "nome": p.get('nome'), "componentes": comps})
+
+        @self.app.route('/api/components', methods=['GET'])
+        @token_required
+        def api_components_list(token):
+            reg = load_components_registry()
+            return jsonify(reg)
+
+        @self.app.route('/api/components', methods=['POST'])
+        @token_required
+        def api_components_create(token):
+            payload = request.json or {}
+            reg = load_components_registry()
+            key = payload.get('key')  # sku ou identificador
+            if not key:
+                return jsonify({"error":"key required"}), 400
+            reg[key] = payload.get('value', {})
+            save_components_registry(reg)
+            # atualiza cache em Orchestrator
+            self.orchestrator._components_registry = reg
+            return jsonify({"status":"ok"})
+
+        @self.app.route('/api/debug/components')
+        @token_required
+        def api_debug_components(token):
+            return jsonify({
+                "registry_size": len(self.orchestrator._components_registry),
+                "registry_keys": list(self.orchestrator._components_registry.keys())
+            })
 
         # Novo Endpoint: Histórico de Vendas para Dashboard
         @self.app.route("/api/sales/history")
@@ -1773,8 +1873,6 @@ class WebServer:
                         "id": p.get("id"),
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
-                        "estoque": p.get("estoqueAtual", 0),
-                        "estoqueAtual": p.get("estoqueAtual", 0),
                         "imagemURL": p.get("imagem") or "/static/no-image.png",
                         "imagem": p.get("imagem") or "/static/no-image.png",
                         "tipo": "Kit" if p.get("tipo") == "K" else "Produto",
@@ -1808,7 +1906,6 @@ class WebServer:
             self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
             
             def normalize_for_api(item):
-                estoque_val = item.get("estoqueAtual", item.get("estoque", 0))
                 tipo = item.get("tipo", "P")
                 # Mapeia tipo textual para K/P (compatibilidade)
                 if tipo in ["COMPOSTO", "K"]: tipo_out = "K"
@@ -1818,8 +1915,6 @@ class WebServer:
                     "id": item.get("id"),
                     "nome": item.get("nome"),
                     "sku": item.get("sku"),
-                    "estoque": estoque_val,
-                    "estoqueAtual": estoque_val,
                     "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "tipo": tipo_out,
@@ -2540,10 +2635,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             letter-spacing: 0.05em;
         }
 
-        .badge.bg-success {
-            background: linear-gradient(135deg, var(--success) 0%, #059669 100%) !important;
-        }
-
         .badge.bg-info {
             background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%) !important;
         }
@@ -3066,80 +3157,39 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                 let html = '<div class="list-group">';
 
-                data.forEach(p => {
-                    const imgHtml = p.imagemURL
-                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
-                        : '<span class="text-muted">-</span>';
+                    data.forEach(p => {
+                        const imgHtml = p.imagemURL
+                            ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
+                            : '<span class="text-muted">-</span>';
 
-                    const isCadeira = (p.nome || '').toLowerCase().includes('cadeira');
-                    const receitaHtml = isCadeira ? `
-                        <div class="mt-3 p-3 bg-white border rounded shadow-sm" style="border-left: 4px solid var(--accent) !important;">
-                            <h6 class="fw-bold mb-3 text-primary d-flex align-items-center">
-                                <span class="me-2">📋</span> Receita de Produção (Cadeira)
-                            </h6>
-                            <div class="table-responsive">
-                                <table class="table table-sm table-hover mb-0">
-                                    <thead class="table-light">
-                                        <tr>
-                                            <th style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Insumo / Componente</th>
-                                            <th class="text-end" style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Qtd</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        ${Object.entries(RECEITA_CADEIRA).map(([name, qty]) => `
-                                            <tr>
-                                                <td style="font-size: 0.85rem;">${name}</td>
-                                                <td class="text-end fw-bold text-accent" style="font-size: 0.85rem;">${qty}x</td>
-                                            </tr>
-                                        `).join('')}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    ` : '';
-
-                    html += `
-                        <div class="list-group-item list-group-item-action border-start-0 border-end-0 py-3" style="cursor:pointer" onclick="const exp = this.querySelector('.expansion-area'); exp.classList.toggle('d-none'); this.classList.toggle('bg-light')">
-                            <div class="d-flex align-items-start">
-                                <div class="me-3">
-                                    ${imgHtml}
-                                </div>
-
-                                <div class="flex-grow-1">
-                                    <div class="d-flex w-100 justify-content-between align-items-center mb-1">
-                                        <h6 class="mb-0 text-primary fw-bold" style="font-size: 1.1rem;">${p.nome || p.produto || 'Sem nome'}</h6>
-                                        <span class="badge bg-light text-muted border">${p.sku || 'N/D'}</span>
+                        html += `
+                            <div class="list-group-item list-group-item-action border-start-0 border-end-0 py-3" style="cursor:pointer" onclick="toggleComponents(this, ${p.id})">
+                                <div class="d-flex align-items-start">
+                                    <div class="me-3">
+                                        ${imgHtml}
                                     </div>
 
-                                    <div class="d-flex align-items-center gap-2 mb-2">
-                                        <span class="badge ${p.tipo === 'Kit' ? 'bg-info' : 'bg-secondary'} bg-opacity-10 text-${p.tipo === 'Kit' ? 'info' : 'secondary'} border-0" style="font-size: 0.7rem; font-weight: 600; text-transform: uppercase;">
-                                            ${p.tipo}
-                                        </span>
-                                        <small class="text-muted" style="font-size: 0.8rem;">Clique para ver componentes</small>
-                                    </div>
+                                    <div class="flex-grow-1">
+                                        <div class="d-flex w-100 justify-content-between align-items-center mb-1">
+                                            <h6 class="mb-0 text-primary fw-bold" style="font-size: 1.1rem;">${p.nome || p.produto || 'Sem nome'}</h6>
+                                            <span class="badge bg-light text-muted border">${p.sku || 'N/D'}</span>
+                                        </div>
 
-                                    <div class="expansion-area d-none animate-fade-in">
-                                        ${receitaHtml}
-                                        
-                                        ${p.componentes && p.componentes.length > 0 ? `
-                                            <div class="mt-3 p-3 bg-light rounded border">
-                                                <h6 class="fw-bold mb-2" style="font-size: 0.85rem;">📦 Estrutura do Kit (Bling)</h6>
-                                                <ul class="list-unstyled mb-0" style="font-size: 0.85rem;">
-                                                    ${p.componentes.map(c =>
-                                                        `<li class="d-flex justify-content-between border-bottom py-1">
-                                                            <span>${c.nome || 'Sem nome'}</span>
-                                                            <span class="fw-bold">${c.quantidade}x</span>
-                                                        </li>`
-                                                    ).join("")}
-                                                </ul>
-                                            </div>
-                                        ` : ""}
+                                        <div class="d-flex align-items-center gap-2 mb-2">
+                                            <span class="badge ${p.tipo === 'Kit' ? 'bg-info' : 'bg-secondary'} bg-opacity-10 text-${p.tipo === 'Kit' ? 'info' : 'secondary'} border-0" style="font-size: 0.7rem; font-weight: 600; text-transform: uppercase;">
+                                                ${p.tipo}
+                                            </span>
+                                            <small class="text-muted" style="font-size: 0.8rem;">Clique para ver componentes</small>
+                                        </div>
+
+                                        <div class="expansion-area d-none animate-fade-in" id="comp-area-${p.id}">
+                                            <div class="text-center py-2"><div class="spinner-border spinner-border-sm text-primary"></div></div>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
-                        </div>
-                    `;
-                });
+                        `;
+                    });
 
                 html += '</div>';
                 div.innerHTML = html;
@@ -3227,40 +3277,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
                             : '<span class="text-muted">-</span>';
 
-                        const isCadeira = (k.nome || '').toLowerCase().includes('cadeira');
-                        const receitaHtml = isCadeira ? `
-                            <div class="mt-2 p-2 bg-white border rounded shadow-sm expansion-area d-none">
-                                <h6 class="fw-bold mb-1" style="font-size:0.85rem">📋 Receita de Produção</h6>
-                                <table class="table table-sm table-borderless mb-0" style="font-size:0.75rem">
-                                    <tbody>
-                                        ${Object.entries(RECEITA_CADEIRA).map(([name, qty]) => `
-                                            <tr><td class="py-0">${name}</td><td class="text-end fw-bold py-0">${qty}x</td></tr>
-                                        `).join('')}
-                                    </tbody>
-                                </table>
-                            </div>
-                        ` : '';
-
-                        let comps = '';
-                        if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
-                            comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
-                                .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
-                                .join('<br>');
-                        } else if (k.tipo === 'P') {
-                            comps = `<span class="badge bg-info">Produto Simples</span>`;
-                        } else {
-                            comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
-                        }
-
                         html += `
-                            <tr style="cursor:pointer" onclick="const exp = this.querySelector('.expansion-area'); if(exp) exp.classList.toggle('d-none')">
+                            <tr style="cursor:pointer" onclick="toggleComponents(this, ${k.id})">
                                 <td style="width:60px">${imgHtml}</td>
                                 <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
                                 <td>
                                     <div class="fw-bold text-primary">${k.nome || 'N/D'}</div>
-                                    ${receitaHtml}
+                                    <div class="expansion-area d-none animate-fade-in" id="comp-area-${k.id}">
+                                        <div class="text-center py-2"><div class="spinner-border spinner-border-sm text-primary"></div></div>
+                                    </div>
                                 </td>
-                                <td>${comps}</td>
+                                <td><span class="badge ${k.tipo === 'K' ? 'bg-info' : 'bg-secondary'}">${k.tipo === 'K' ? 'Kit' : 'Produto'}</span></td>
                             </tr>
                         `;
                     });
@@ -3270,6 +3297,57 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             } catch(e) {
                 div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+            }
+        }
+
+        /* ✅ DESIGN: Toggle Components */
+        async function toggleComponents(row, productId) {
+            const area = document.getElementById(`comp-area-${productId}`);
+            if (!area) return;
+            
+            area.classList.toggle('d-none');
+            if (row.classList.contains('bg-light')) {
+                row.classList.remove('bg-light');
+            } else {
+                row.classList.add('bg-light');
+            }
+
+            if (!area.classList.contains('d-none') && area.innerHTML.includes('spinner-border')) {
+                try {
+                    const data = await fetchAPI(`${API}/product/${productId}/components`);
+                    if (data.componentes && data.componentes.length > 0) {
+                        let compHtml = `
+                            <div class="mt-3 p-3 bg-white border rounded shadow-sm" style="border-left: 4px solid var(--accent) !important;">
+                                <h6 class="fw-bold mb-3 text-primary d-flex align-items-center">
+                                    <span class="me-2">📋</span> Componentes e Insumos
+                                </h6>
+                                <div class="table-responsive">
+                                    <table class="table table-sm table-hover mb-0">
+                                        <thead class="table-light">
+                                            <tr>
+                                                <th style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Insumo / Componente</th>
+                                                <th class="text-end" style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Qtd</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            ${data.componentes.map(c => `
+                                                <tr>
+                                                    <td style="font-size: 0.85rem;">${c.nome}</td>
+                                                    <td class="text-end fw-bold text-accent" style="font-size: 0.85rem;">${c.quantidade}x</td>
+                                                </tr>
+                                            `).join('')}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        `;
+                        area.innerHTML = compHtml;
+                    } else {
+                        area.innerHTML = '<div class="alert alert-light border mt-2 mb-0" style="font-size:0.85rem">Nenhum componente registrado para este produto.</div>';
+                    }
+                } catch (e) {
+                    area.innerHTML = `<div class="alert alert-danger mt-2 mb-0" style="font-size:0.85rem">Erro ao carregar componentes: ${e.message}</div>`;
+                }
             }
         }
 
