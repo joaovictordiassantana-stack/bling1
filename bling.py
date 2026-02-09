@@ -1114,6 +1114,28 @@ class Orchestrator:
             else:
                 self.logger.info("Worker de fundo parado com sucesso.")
 
+    def wake_worker(self):
+        """
+        Acorda o worker imediatamente se estiver dormindo.
+        
+        Útil após OAuth para forçar início imediato do processamento
+        sem esperar os 60 segundos de sleep.
+        """
+        logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
+        
+        if self._running and self._stop_event:
+            logger.info("⏰ Acordando worker (interrompendo sleep)...")
+            self._stop_event.set()  # Interrompe o sleep
+            
+            # Recria o evento para o próximo ciclo
+            import time
+            time.sleep(0.1)  # Pequena pausa para garantir que o worker processou
+            self._stop_event.clear()
+            
+            logger.info("✅ Worker acordado com sucesso!")
+        else:
+            logger.debug("⚠️ Worker não está rodando ou evento não existe")
+
     def is_running(self) -> bool:
         """Verifica se o worker está ativo."""
         return self._running
@@ -1191,8 +1213,15 @@ class Orchestrator:
             logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
             logger.debug(f"")
             
-            # Mantém 10 minutos (600s)
-            self._stop_event.wait(600)
+            # Mantém 10 minutos (600s), mas pode ser interrompido por wake_worker()
+            logger.debug("💤 [DEBUG-WORKER] Entrando em sleep de 600s (ou até ser acordado)...")
+            interrupted = self._stop_event.wait(600)
+            
+            if interrupted:
+                logger.info("⏰ [DEBUG-WORKER] Sleep interrompido! Iniciando próximo ciclo imediatamente...")
+                self._stop_event.clear()  # Limpa o evento para não interromper próximos ciclos
+            else:
+                logger.debug("⏰ [DEBUG-WORKER] Sleep de 600s completado naturalmente")
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
@@ -1778,6 +1807,9 @@ class WebServer:
                     logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
                 else:
                     logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
+                    # 🔧 NOVO: Acorda o worker imediatamente
+                    logger.debug("⏰ [DEBUG-CALLBACK] Acordando worker para processar imediatamente...")
+                    self.orchestrator.wake_worker()
                 
                 logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
                 return redirect('/')
