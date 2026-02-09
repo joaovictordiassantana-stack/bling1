@@ -1310,26 +1310,32 @@ class Orchestrator:
             self.sales._recalculation_running = False
 
     def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos e kits."""
+        """Busca e armazena em cache todos os produtos e kits (Filtrado por Loja)."""
         if not self.auth.is_authenticated():
             return
             
-        self.logger.info("Iniciando busca e cache de produtos e kits...")
+        self.logger.info("Iniciando busca e cache de produtos e kits (Filtro Loja: 803393 / 205929726)...")
         all_products = []
         all_kits = []
         page = 1
+        
+        # IDs permitidos (Tray e API Code)
+        ALLOWED_STORE_IDS = ["803393", "205929726"]
         
         while True:
             # Busca produtos (Tipo P e K)
             try:
                 self.logger.info(f"Fazendo requisição para 'produtos' página {page}...")
-                # Na API v3 o endpoint correto é 'produtos' mas os parâmetros podem variar.
-                # Vamos tentar sem o filtro de tipo primeiro se falhar, ou garantir que o endpoint está correto.
-                response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
-                if response:
-                    self.logger.info(f"Resposta recebida da API. Chaves: {list(response.keys()) if isinstance(response, dict) else 'Não é dict'}")
-                else:
-                    self.logger.warning(f"Resposta da API é None para página {page}")
+                
+                # ✅ MUDANÇA 1: Adicionado filtro 'idLoja' na requisição para filtrar na fonte
+                params = {
+                    'pagina': page, 
+                    'limite': 100,
+                    'idLoja': '205929726' # Tenta filtrar direto pela API Code
+                }
+                
+                response = self.api.get('produtos', params=params)
+                
             except Exception as e:
                 self.logger.error(f"Erro ao buscar produtos: {e}")
                 break
@@ -1339,11 +1345,9 @@ class Orchestrator:
             if response is None:
                 self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
             else:
-                # Na API v3, o padrão é {'data': [...]}
                 if isinstance(response, dict):
                     if 'data' in response and isinstance(response['data'], list):
                         data = response['data']
-                    # Fallback para API v2 (retorno -> produtos)
                     elif 'retorno' in response and isinstance(response['retorno'], dict):
                         retorno = response['retorno']
                         if 'produtos' in retorno:
@@ -1352,80 +1356,89 @@ class Orchestrator:
                                 data = p_data
                             elif isinstance(p_data, dict) and 'produto' in p_data:
                                 data = p_data['produto'] if isinstance(p_data['produto'], list) else [p_data['produto']]
-                    # Fallback direto se 'produtos' estiver no topo
                     elif 'produtos' in response:
                         if isinstance(response['produtos'], list):
                             data = response['produtos']
                         elif isinstance(response['produtos'], dict) and 'produto' in response['produtos']:
                             data = response['produtos']['produto'] if isinstance(response['produtos']['produto'], list) else [response['produtos']['produto']]
 
-            # Se não encontrou dados, tenta uma busca exaustiva por listas no dicionário (último recurso)
-            if not data and isinstance(response, dict):
-                for key, value in response.items():
-                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
-                        self.logger.info(f"Página {page}: Encontrada lista de dicionários na chave '{key}'. Tentando usar como dados.")
-                        data = value
-                        break
-
-            # agora data é lista ou vazia
             if not data:
-                self.logger.info(f"Página {page}: nenhum produto encontrado (data vazio).")
-                if page == 1:
-                    self.logger.error(f"CRÍTICO: Nenhum dado retornado na primeira página. Estrutura da resposta: {list(response.keys()) if isinstance(response, dict) else type(response)}")
+                self.logger.info(f"Página {page}: nenhum produto encontrado ou fim da lista.")
                 break
-
-            # log de inspeção de conteúdo
-            sample_count = min(3, len(data))
-            try:
-                sample_keys = [list(item.keys()) for item in data[:sample_count]]
-            except Exception:
-                sample_keys = []
-            self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
             
             for p in data:
-                # 🔧 4️⃣ FILTRO PERMITIDO (ÚNICO ACEITÁVEL)
                 if not p.get("id") or not p.get("nome"):
                     continue
 
-                # --- ORDEM DE SERVIÇO 01: FILTRAGEM SOBERANA ---
-                # 1. Filtragem por ID da Loja (Tray: 803393 ou API: 205929726)
-                loja_id = p.get("lojaId")
-                lojas_vinculadas = p.get("lojasVinculadas", [])
+                # --- ✅ MUDANÇA 2: FILTRAGEM RIGOROSA DE LOJA ---
+                # Verifica ID da loja no produto ou nas lojas vinculadas
+                p_loja_id = str(p.get("lojaId", ""))
                 
+                # Verifica array de lojas vinculadas (comum na V3)
+                p_lojas_vinculadas = p.get("lojasVinculadas", [])
+                ids_vinculados = []
+                
+                if isinstance(p_lojas_vinculadas, list):
+                    for l in p_lojas_vinculadas:
+                        # Tenta pegar 'id' ou 'idLoja' ou 'lojaId' dentro do objeto vinculado
+                        lid = str(l.get("idLoja") or l.get("lojaId") or l.get("id") or "")
+                        if lid: ids_vinculados.append(lid)
+
+                # Lógica de Aprovação
                 is_correct_store = False
-                if str(loja_id) in ["803393", "205929726"]:
+                
+                # 1. Verifica ID direto
+                if p_loja_id in ALLOWED_STORE_IDS:
                     is_correct_store = True
-                elif isinstance(lojas_vinculadas, list):
-                    for l in lojas_vinculadas:
-                        if str(l.get("lojaId")) in ["803393", "205929726"]:
-                            is_correct_store = True
-                            break
+                # 2. Verifica Vínculos
+                elif any(lid in ALLOWED_STORE_IDS for lid in ids_vinculados):
+                    is_correct_store = True
                 
                 if not is_correct_store:
-                    print(f"[DEBUG] Produto {p.get('nome')} ignorado: Loja incorreta (ID: {loja_id})")
+                    # ✅ DEBUG: Mostra o motivo da rejeição
+                    self.logger.debug(f"⛔ Produto IGNORADO: '{p.get('nome')}' | Loja encontrada: {p_loja_id} | Vínculos: {ids_vinculados}")
                     continue
+                else:
+                    self.logger.debug(f"✅ Produto ACEITO: '{p.get('nome')}'")
 
-                # 2. Exibição Apenas do Produto Pai
-                # Se o campo codigoPai existir e não for vazio, é uma variante e deve ser ocultada da visualização
+                # 3. Exibição Apenas do Produto Pai (Ignora Variantes)
                 codigo_pai = p.get("codigoPai")
                 if codigo_pai and str(codigo_pai).strip():
-                    # Ignora variantes para o cache de visualização
                     continue
 
-                # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
-                # Na API v3, o SKU costuma vir no campo 'codigo'
                 sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
                 
-                # Preservação de imagem e debug
-                imagem = p.get("imagemURL") or p.get("imagem") or (p.get("imagem", {}) or {}).get("link")
+                # --- ✅ MUDANÇA 3: BLINDAGEM DE IMAGEM ---
+                # Tenta todas as formas possíveis que o Bling envia imagem
+                imagem = None
+                
+                # 1. Tenta URL direta (V2/V3 simples)
+                imagem = p.get("imagemURL") or p.get("imagem")
+                
+                # 2. Se for objeto (V2 antigo)
+                if isinstance(imagem, dict):
+                    imagem = imagem.get("link")
+                
+                # 3. Tenta campo 'midia' (V3 Padrão para imagens múltiplas)
                 if not imagem:
-                    self.logger.debug(f"Produto sem imagem: id={p.get('id')} nome={p.get('nome')}")
+                    midias = p.get("midia", [])
+                    if isinstance(midias, list) and len(midias) > 0:
+                        # Pega a primeira imagem válida da lista de mídias
+                        for m in midias:
+                            if m.get("tipo") == "F" or m.get("url"): # F = Foto
+                                imagem = m.get("url") or m.get("urlMiniatura")
+                                if imagem: break
+                
+                # Fallback final
+                if not imagem:
+                    self.logger.debug(f"⚠️ Imagem não detectada para: {p.get('nome')}")
+                    imagem = "/static/no-image.png"
                 
                 produto_normalizado = {
                     "id": p["id"],
                     "nome": p["nome"],
                     "sku": sku_val,
-                    "imagem": imagem or "/static/no-image.png",
+                    "imagem": imagem,
                     "tipo": "K" if p.get("tipo") == "K" else "P",
                     "componentes": []
                 }
@@ -1436,20 +1449,18 @@ class Orchestrator:
                 if sku_key in self._components_registry:
                     attached_components = self._components_registry[sku_key].get('componentes', [])
                 else:
-                    # procura matches por nome
                     for k, v in self._components_registry.items():
                         if isinstance(v, dict) and v.get('match_name_contains'):
                             if v['match_name_contains'].lower() in produto_normalizado['nome'].lower():
                                 attached_components = v.get('componentes', [])
                                 break
                 
-                # fallback: se for 'cadeira' e não tem registro, deixa receita hardcoded (RECEITA_CADEIRA)
+                # fallback: receita cadeira
                 if not attached_components and 'cadeira' in produto_normalizado['nome'].lower():
                     attached_components = [{"nome": k, "quantidade": v} for k,v in RECEITA_CADEIRA.items()]
                 
                 produto_normalizado['componentes'] = attached_components
                 
-                # Armazena tudo sem filtros
                 if p.get('tipo') == 'K':
                     all_kits.append(produto_normalizado)
                 else:
@@ -1457,11 +1468,10 @@ class Orchestrator:
 
             if len(data) < 100: break
             page += 1
-            time.sleep(0.5) # Evita rate limit
+            time.sleep(0.6) # Delay um pouco maior para segurança
 
-        # 🔧 5️⃣ SALVAMENTO DO CACHE (CRÍTICO)
         self.logger.info(
-            f"FINAL CACHE → produtos={len(all_products)} kits={len(all_kits)}"
+            f"FINAL CACHE (FILTRADO) → produtos={len(all_products)} kits={len(all_kits)}"
         )
 
         with self._cache_lock:
@@ -1470,12 +1480,9 @@ class Orchestrator:
             
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
             
-            self.logger.info(
-                f"CACHE SALVO → products={len(self._products_cache)} kits={len(self._kits_cache)}"
-            )
-            
         self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
         self.broadcast_kpi_update(cache_updated=True)
+
 
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
         """
