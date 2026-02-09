@@ -185,7 +185,6 @@ def setup_logging():
     return logger, error_logger
 
 logger, error_logger = setup_logging()
-print("[DEBUG] Módulo de Estoque desativado com sucesso.")
 
 # ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
 def cleanup_kpi_callbacks():
@@ -217,42 +216,6 @@ def start_cleanup_timer():
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
 # ============================================================================
-
-RECEITA_CADEIRA = {
-    "COMPENSADO 50X52X17": 1,
-    "SARRAFO 52": 3,
-    "SARRAFO 46": 1,
-    "SARRAFO 14": 2,
-    "MDF 15MM 52X35": 2,
-    "MDF 6MM 52X35": 2,
-    "SARRAFO 33": 2,
-    "SARRAFO 10": 2,
-    "MDF 15MM": 1,
-    "TECIDO (Metros)": 3,
-    "ESPUMA ACOPLAGEM (Metros)": 0.5,
-    "ESPUMA ASSENTO": 1, # Unidade não especificada, assumindo 1 kit ou peça
-    "ESPUMA ENCOSTO": 1,
-    "ESPUMA CABEÇOTE": 1,
-    "ESPUMA ASSENTO 52X7.5X1": 1,
-    "ESPUMA ASSENTO 54X14X1": 1,
-    "ESPUMA BRAÇO 52X21X1": 1,
-    "ESPUMA BRAÇO 52X35X1": 1,
-    "ESPUMA BRAÇO 35X9.5X1": 4,
-    "ESPUMA BRAÇO 54X9.5X2": 2,
-    "LINHA": 1, # Definir unidade média
-    "COLA": 1,  # Definir unidade média
-    "LAMINA CROMADA": 1,
-    "LAMINA DE CABEÇOTE": 1,
-    "PARAFUSO 1/4 X 1": 15,
-    "PARAFUSO 1/4 X 2.1/4": 8,
-    "PARAFUSO 5X25": 6,
-    "PORCA GARRA 1/4": 20,
-    "GRAMPO 80/10": 1, # Unidade de medida? (ex: 0.1 caixa)
-    "GRAMPO 14/40": 1,
-    "COSTUREIRA": 1, # Mão de obra unitária
-    "EMBALAGEM": 1,
-    "BASE": 1
-}
 
 class Config:
     """Configurações globais da aplicação."""
@@ -367,25 +330,6 @@ def safe_dict(data):
         except:
             return {}
     return {}
-
-COMPONENTS_FILE = Path('components_registry.json')
-
-def load_components_registry():
-    if not COMPONENTS_FILE.exists():
-        return {}
-    try:
-        with open(COMPONENTS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.exception("Erro lendo components_registry.json")
-        return {}
-
-def save_components_registry(reg):
-    try:
-        atomic_write_json(reg, COMPONENTS_FILE)
-        logger.info(f"Components registry salvo ({len(reg)} entradas).")
-    except Exception:
-        logger.exception("Erro salvando components_registry.json")
 
 def load_products_cache(cache_file):
     """
@@ -1063,7 +1007,6 @@ class Orchestrator:
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
-        self._components_registry = load_components_registry()
         self._load_cache()
         self._cache_lock = Lock()
         
@@ -1310,32 +1253,26 @@ class Orchestrator:
             self.sales._recalculation_running = False
 
     def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos e kits (Filtrado por Loja)."""
+        """Busca e armazena em cache todos os produtos e kits."""
         if not self.auth.is_authenticated():
             return
             
-        self.logger.info("Iniciando busca e cache de produtos e kits (Filtro Loja: 803393 / 205929726)...")
+        self.logger.info("Iniciando busca e cache de produtos e kits...")
         all_products = []
         all_kits = []
         page = 1
-        
-        # IDs permitidos (Tray e API Code)
-        ALLOWED_STORE_IDS = ["803393", "205929726"]
         
         while True:
             # Busca produtos (Tipo P e K)
             try:
                 self.logger.info(f"Fazendo requisição para 'produtos' página {page}...")
-                
-                # ✅ MUDANÇA 1: Adicionado filtro 'idLoja' na requisição para filtrar na fonte
-                params = {
-                    'pagina': page, 
-                    'limite': 100,
-                    'idLoja': '205929726' # Tenta filtrar direto pela API Code
-                }
-                
-                response = self.api.get('produtos', params=params)
-                
+                # Na API v3 o endpoint correto é 'produtos' mas os parâmetros podem variar.
+                # Vamos tentar sem o filtro de tipo primeiro se falhar, ou garantir que o endpoint está correto.
+                response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
+                if response:
+                    self.logger.info(f"Resposta recebida da API. Chaves: {list(response.keys()) if isinstance(response, dict) else 'Não é dict'}")
+                else:
+                    self.logger.warning(f"Resposta da API é None para página {page}")
             except Exception as e:
                 self.logger.error(f"Erro ao buscar produtos: {e}")
                 break
@@ -1345,9 +1282,11 @@ class Orchestrator:
             if response is None:
                 self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
             else:
+                # Na API v3, o padrão é {'data': [...]}
                 if isinstance(response, dict):
                     if 'data' in response and isinstance(response['data'], list):
                         data = response['data']
+                    # Fallback para API v2 (retorno -> produtos)
                     elif 'retorno' in response and isinstance(response['retorno'], dict):
                         retorno = response['retorno']
                         if 'produtos' in retorno:
@@ -1356,111 +1295,56 @@ class Orchestrator:
                                 data = p_data
                             elif isinstance(p_data, dict) and 'produto' in p_data:
                                 data = p_data['produto'] if isinstance(p_data['produto'], list) else [p_data['produto']]
+                    # Fallback direto se 'produtos' estiver no topo
                     elif 'produtos' in response:
                         if isinstance(response['produtos'], list):
                             data = response['produtos']
                         elif isinstance(response['produtos'], dict) and 'produto' in response['produtos']:
                             data = response['produtos']['produto'] if isinstance(response['produtos']['produto'], list) else [response['produtos']['produto']]
 
+            # Se não encontrou dados, tenta uma busca exaustiva por listas no dicionário (último recurso)
+            if not data and isinstance(response, dict):
+                for key, value in response.items():
+                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                        self.logger.info(f"Página {page}: Encontrada lista de dicionários na chave '{key}'. Tentando usar como dados.")
+                        data = value
+                        break
+
+            # agora data é lista ou vazia
             if not data:
-                self.logger.info(f"Página {page}: nenhum produto encontrado ou fim da lista.")
+                self.logger.info(f"Página {page}: nenhum produto encontrado (data vazio).")
+                if page == 1:
+                    self.logger.error(f"CRÍTICO: Nenhum dado retornado na primeira página. Estrutura da resposta: {list(response.keys()) if isinstance(response, dict) else type(response)}")
                 break
+
+            # log de inspeção de conteúdo
+            sample_count = min(3, len(data))
+            try:
+                sample_keys = [list(item.keys()) for item in data[:sample_count]]
+            except Exception:
+                sample_keys = []
+            self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
             
             for p in data:
+                # 🔧 4️⃣ FILTRO PERMITIDO (ÚNICO ACEITÁVEL)
                 if not p.get("id") or not p.get("nome"):
                     continue
 
-                # --- ✅ MUDANÇA 2: FILTRAGEM RIGOROSA DE LOJA ---
-                # Verifica ID da loja no produto ou nas lojas vinculadas
-                p_loja_id = str(p.get("lojaId", ""))
-                
-                # Verifica array de lojas vinculadas (comum na V3)
-                p_lojas_vinculadas = p.get("lojasVinculadas", [])
-                ids_vinculados = []
-                
-                if isinstance(p_lojas_vinculadas, list):
-                    for l in p_lojas_vinculadas:
-                        # Tenta pegar 'id' ou 'idLoja' ou 'lojaId' dentro do objeto vinculado
-                        lid = str(l.get("idLoja") or l.get("lojaId") or l.get("id") or "")
-                        if lid: ids_vinculados.append(lid)
-
-                # Lógica de Aprovação
-                is_correct_store = False
-                
-                # 1. Verifica ID direto
-                if p_loja_id in ALLOWED_STORE_IDS:
-                    is_correct_store = True
-                # 2. Verifica Vínculos
-                elif any(lid in ALLOWED_STORE_IDS for lid in ids_vinculados):
-                    is_correct_store = True
-                
-                if not is_correct_store:
-                    # ✅ DEBUG: Mostra o motivo da rejeição
-                    self.logger.debug(f"⛔ Produto IGNORADO: '{p.get('nome')}' | Loja encontrada: {p_loja_id} | Vínculos: {ids_vinculados}")
-                    continue
-                else:
-                    self.logger.debug(f"✅ Produto ACEITO: '{p.get('nome')}'")
-
-                # 3. Exibição Apenas do Produto Pai (Ignora Variantes)
-                codigo_pai = p.get("codigoPai")
-                if codigo_pai and str(codigo_pai).strip():
-                    continue
-
+                # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
+                # Na API v3, o SKU costuma vir no campo 'codigo'
                 sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
-                
-                # --- ✅ MUDANÇA 3: BLINDAGEM DE IMAGEM ---
-                # Tenta todas as formas possíveis que o Bling envia imagem
-                imagem = None
-                
-                # 1. Tenta URL direta (V2/V3 simples)
-                imagem = p.get("imagemURL") or p.get("imagem")
-                
-                # 2. Se for objeto (V2 antigo)
-                if isinstance(imagem, dict):
-                    imagem = imagem.get("link")
-                
-                # 3. Tenta campo 'midia' (V3 Padrão para imagens múltiplas)
-                if not imagem:
-                    midias = p.get("midia", [])
-                    if isinstance(midias, list) and len(midias) > 0:
-                        # Pega a primeira imagem válida da lista de mídias
-                        for m in midias:
-                            if m.get("tipo") == "F" or m.get("url"): # F = Foto
-                                imagem = m.get("url") or m.get("urlMiniatura")
-                                if imagem: break
-                
-                # Fallback final
-                if not imagem:
-                    self.logger.debug(f"⚠️ Imagem não detectada para: {p.get('nome')}")
-                    imagem = "/static/no-image.png"
                 
                 produto_normalizado = {
                     "id": p["id"],
                     "nome": p["nome"],
                     "sku": sku_val,
-                    "imagem": imagem,
+                    "estoqueAtual": p.get("estoque", 0),
+                    "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
                     "tipo": "K" if p.get("tipo") == "K" else "P",
                     "componentes": []
                 }
-
-                # Anexar componentes do registro interno
-                attached_components = []
-                sku_key = str(sku_val)
-                if sku_key in self._components_registry:
-                    attached_components = self._components_registry[sku_key].get('componentes', [])
-                else:
-                    for k, v in self._components_registry.items():
-                        if isinstance(v, dict) and v.get('match_name_contains'):
-                            if v['match_name_contains'].lower() in produto_normalizado['nome'].lower():
-                                attached_components = v.get('componentes', [])
-                                break
                 
-                # fallback: receita cadeira
-                if not attached_components and 'cadeira' in produto_normalizado['nome'].lower():
-                    attached_components = [{"nome": k, "quantidade": v} for k,v in RECEITA_CADEIRA.items()]
-                
-                produto_normalizado['componentes'] = attached_components
-                
+                # Armazena tudo sem filtros
                 if p.get('tipo') == 'K':
                     all_kits.append(produto_normalizado)
                 else:
@@ -1468,10 +1352,11 @@ class Orchestrator:
 
             if len(data) < 100: break
             page += 1
-            time.sleep(0.6) # Delay um pouco maior para segurança
+            time.sleep(0.5) # Evita rate limit
 
+        # 🔧 5️⃣ SALVAMENTO DO CACHE (CRÍTICO)
         self.logger.info(
-            f"FINAL CACHE (FILTRADO) → produtos={len(all_products)} kits={len(all_kits)}"
+            f"FINAL CACHE → produtos={len(all_products)} kits={len(all_kits)}"
         )
 
         with self._cache_lock:
@@ -1480,13 +1365,16 @@ class Orchestrator:
             
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
             
+            self.logger.info(
+                f"CACHE SALVO → products={len(self._products_cache)} kits={len(self._kits_cache)}"
+            )
+            
         self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
         self.broadcast_kpi_update(cache_updated=True)
 
-
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
         """
-        Calcula uso de componentes baseado na RECEITA_CADEIRA e histórico de vendas local.
+        Calcula uso de componentes com breakdown diário.
         """
         
         # CORREÇÃO: Não tenta calcular se não estiver logado
@@ -1549,58 +1437,58 @@ class Orchestrator:
             
             itens = safe_get(order, 'itens', [])
             for item in safe_iter(itens):
-                produto_nome = safe_get(item, 'descricao', '')
+                produto_sku = safe_get(item, 'codigo')
                 quantidade_vendida = safe_get(item, 'quantidade', 0)
                 
-                if not produto_nome or quantidade_vendida == 0:
+                if not produto_sku or quantidade_vendida == 0:
                     continue
                 
-                # --- ORDEM DE SERVIÇO 03: LÓGICA DE ASSOCIAÇÃO ---
-                # Busca componentes no registry por SKU ou match_name_contains
-                sku_val = safe_get(item, 'codigo', '')
-                componentes = []
+                produto = self.get_product_by_sku(produto_sku)
                 
-                sku_key = str(sku_val)
-                if sku_key in self._components_registry:
-                    componentes = self._components_registry[sku_key].get('componentes', [])
-                else:
-                    for k, v in self._components_registry.items():
-                        if isinstance(v, dict) and v.get('match_name_contains'):
-                            if v['match_name_contains'].lower() in produto_nome.lower():
-                                componentes = v.get('componentes', [])
-                                break
-                
-                # Fallback: se for 'cadeira' e não tem registro, usa RECEITA_CADEIRA
-                if not componentes and "cadeira" in produto_nome.lower():
-                    componentes = [{"nome": k, "quantidade": v} for k, v in RECEITA_CADEIRA.items()]
-
-                if componentes:
-                    self.logger.debug(f"Calculando insumos para {quantidade_vendida} unidades de {produto_nome}")
-                    for comp in componentes:
-                        comp_nome = comp["nome"]
-                        qtd_unitaria = comp["quantidade"]
-                        qtd_consumida = quantidade_vendida * qtd_unitaria
+                # Se é KIT, processa componentes
+                if produto and safe_get(produto, 'tipo') == 'K':
+                    componentes = safe_get(produto, 'componentes', [])
+                    for comp in safe_iter(componentes):
+                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
+                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
+                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
+                        
+                        if not comp_sku:
+                            continue
+                        
+                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
                         
                         # Atualiza total
-                        if comp_nome not in component_usage:
-                            component_usage[comp_nome] = {
-                                "sku": "INSUMO",
+                        if comp_sku not in component_usage:
+                            component_usage[comp_sku] = {
+                                "sku": comp_sku,
                                 "nome": comp_nome,
                                 "quantidade": 0,
                                 "produtos": set()
                             }
-                        component_usage[comp_nome]["quantidade"] += qtd_consumida
-                        component_usage[comp_nome]["produtos"].add(produto_nome)
+                        component_usage[comp_sku]["quantidade"] += qtd_consumida
+                        component_usage[comp_sku]["produtos"].add(produto_sku)
                         
                         # Atualiza diário
-                        daily_usage[day_key][comp_nome] += qtd_consumida
+                        daily_usage[day_key][comp_sku] += qtd_consumida
+                
+                # Se é PRODUTO SIMPLES, conta também
                 else:
-                    # Log para produtos ignorados no cálculo de componentes
-                    print(f"[DEBUG] Produto {produto_nome} ignorado no cálculo de componentes (não contém 'cadeira')")
+                    if produto_sku not in component_usage:
+                        component_usage[produto_sku] = {
+                            "sku": produto_sku,
+                            "nome": safe_get(produto, 'nome', 'Produto'),
+                            "quantidade": 0,
+                            "produtos": set()
+                        }
+                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
+                    component_usage[produto_sku]["produtos"].add(produto_sku)
+                    
+                    daily_usage[day_key][produto_sku] += quantidade_vendida
         
         # Formata resultado
         result = []
-        for nome, usage in component_usage.items():
+        for sku, usage in component_usage.items():
             result.append({
                 "sku": usage["sku"],
                 "nome": usage["nome"],
@@ -1747,50 +1635,9 @@ class WebServer:
             except Exception as e:
                 return 'Error', 500
 
-        @self.app.route('/api/orders')
+        @self.app.route("/api/orders")
         def list_orders():
             return jsonify(list(self.orchestrator.sales._orders_cache.values()))
-
-        @self.app.route('/api/product/<product_id>/components')
-        @token_required
-        def api_product_components(token, product_id):
-            # Tenta produto no cache
-            c = self.orchestrator
-            with c._cache_lock:
-                p = c._products_cache.get(int(product_id)) or c._kits_cache.get(int(product_id))
-            if not p:
-                return jsonify({"error": "Produto não encontrado"}), 404
-            # já terá 'componentes' anexado no cache
-            comps = p.get('componentes', [])
-            return jsonify({"id": p.get('id'), "nome": p.get('nome'), "componentes": comps})
-
-        @self.app.route('/api/components', methods=['GET'])
-        @token_required
-        def api_components_list(token):
-            reg = load_components_registry()
-            return jsonify(reg)
-
-        @self.app.route('/api/components', methods=['POST'])
-        @token_required
-        def api_components_create(token):
-            payload = request.json or {}
-            reg = load_components_registry()
-            key = payload.get('key')  # sku ou identificador
-            if not key:
-                return jsonify({"error":"key required"}), 400
-            reg[key] = payload.get('value', {})
-            save_components_registry(reg)
-            # atualiza cache em Orchestrator
-            self.orchestrator._components_registry = reg
-            return jsonify({"status":"ok"})
-
-        @self.app.route('/api/debug/components')
-        @token_required
-        def api_debug_components(token):
-            return jsonify({
-                "registry_size": len(self.orchestrator._components_registry),
-                "registry_keys": list(self.orchestrator._components_registry.keys())
-            })
 
         # Novo Endpoint: Histórico de Vendas para Dashboard
         @self.app.route("/api/sales/history")
@@ -1880,6 +1727,8 @@ class WebServer:
                         "id": p.get("id"),
                         "nome": p.get("nome"),
                         "sku": p.get("sku"),
+                        "estoque": p.get("estoqueAtual", 0),
+                        "estoqueAtual": p.get("estoqueAtual", 0),
                         "imagemURL": p.get("imagem") or "/static/no-image.png",
                         "imagem": p.get("imagem") or "/static/no-image.png",
                         "tipo": "Kit" if p.get("tipo") == "K" else "Produto",
@@ -1913,6 +1762,7 @@ class WebServer:
             self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
             
             def normalize_for_api(item):
+                estoque_val = item.get("estoqueAtual", item.get("estoque", 0))
                 tipo = item.get("tipo", "P")
                 # Mapeia tipo textual para K/P (compatibilidade)
                 if tipo in ["COMPOSTO", "K"]: tipo_out = "K"
@@ -1922,6 +1772,8 @@ class WebServer:
                     "id": item.get("id"),
                     "nome": item.get("nome"),
                     "sku": item.get("sku"),
+                    "estoque": estoque_val,
+                    "estoqueAtual": estoque_val,
                     "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
                     "tipo": tipo_out,
@@ -2642,6 +2494,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             letter-spacing: 0.05em;
         }
 
+        .badge.bg-success {
+            background: linear-gradient(135deg, var(--success) 0%, #059669 100%) !important;
+        }
+
         .badge.bg-info {
             background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%) !important;
         }
@@ -3061,7 +2917,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
 
             html += '</tbody></table></div>';
-            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Parafusos e insumos necessários para repor o estoque dos últimos 30 dias: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
+            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
 
             if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
                 html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
@@ -3164,39 +3020,53 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                 let html = '<div class="list-group">';
 
-                    data.forEach(p => {
-                        const imgHtml = p.imagemURL
-                            ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
-                            : '<span class="text-muted">-</span>';
+                data.forEach(p => {
+                    const imgHtml = p.imagemURL
+                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
+                        : '<span class="text-muted">-</span>';
 
-                        html += `
-                            <div class="list-group-item list-group-item-action border-start-0 border-end-0 py-3" style="cursor:pointer" onclick="toggleComponents(this, ${p.id})">
-                                <div class="d-flex align-items-start">
-                                    <div class="me-3">
-                                        ${imgHtml}
+                    html += `
+                        <div class="list-group-item">
+                            <div class="d-flex">
+                                ${imgHtml}
+
+                                <div class="flex-grow-1">
+                                    <div class="d-flex w-100 justify-content-between">
+                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                        <small>${p.sku || 'N/D'}</small>
                                     </div>
 
-                                    <div class="flex-grow-1">
-                                        <div class="d-flex w-100 justify-content-between align-items-center mb-1">
-                                            <h6 class="mb-0 text-primary fw-bold" style="font-size: 1.1rem;">${p.nome || p.produto || 'Sem nome'}</h6>
-                                            <span class="badge bg-light text-muted border">${p.sku || 'N/D'}</span>
-                                        </div>
+                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
 
-                                        <div class="d-flex align-items-center gap-2 mb-2">
-                                            <span class="badge ${p.tipo === 'Kit' ? 'bg-info' : 'bg-secondary'} bg-opacity-10 text-${p.tipo === 'Kit' ? 'info' : 'secondary'} border-0" style="font-size: 0.7rem; font-weight: 600; text-transform: uppercase;">
-                                                ${p.tipo}
-                                            </span>
-                                            <small class="text-muted" style="font-size: 0.8rem;">Clique para ver componentes</small>
-                                        </div>
+                                    <small class="text-muted d-block">
+                                        <b>Estoque:</b> ${p.estoque}
+                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                    </small>
 
-                                        <div class="expansion-area d-none animate-fade-in" id="comp-area-${p.id}">
-                                            <div class="text-center py-2"><div class="spinner-border spinner-border-sm text-primary"></div></div>
+                                    ${p.componentes && p.componentes.length > 0 ? `
+                                        <div class="componentes mt-2 p-2 bg-light rounded">
+                                            <small>Componentes:</small>
+                                            <ul>
+                                                ${p.componentes.map(c =>
+                                                    `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
+                                                ).join("")}
+                                            </ul>
                                         </div>
-                                    </div>
+                                    ` : ""}
+
+                                    ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
+                                        <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
+                                            <b>📦 Este componente é usado em:</b><br>
+                                            ${p.usado_em.map(u =>
+                                                `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
+                                            ).join("<br>")}
+                                        </div>
+                                    ` : ""}
                                 </div>
                             </div>
-                        `;
-                    });
+                        </div>
+                    `;
+                });
 
                 html += '</div>';
                 div.innerHTML = html;
@@ -3204,43 +3074,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch(e) {
                 div.innerHTML = `<div class="alert alert-danger">Erro: ${e.message}</div>`;
             }
-        };
-
-        /* ✅ DESIGN: Receita Hardcoded para Front-end */
-        const RECEITA_CADEIRA = {
-            "COMPENSADO 50X52X17": 1,
-            "SARRAFO 52": 3,
-            "SARRAFO 46": 1,
-            "SARRAFO 14": 2,
-            "MDF 15MM 52X35": 2,
-            "MDF 6MM 52X35": 2,
-            "SARRAFO 33": 2,
-            "SARRAFO 10": 2,
-            "MDF 15MM": 1,
-            "TECIDO (Metros)": 3,
-            "ESPUMA ACOPLAGEM (Metros)": 0.5,
-            "ESPUMA ASSENTO": 1,
-            "ESPUMA ENCOSTO": 1,
-            "ESPUMA CABEÇOTE": 1,
-            "ESPUMA ASSENTO 52X7.5X1": 1,
-            "ESPUMA ASSENTO 54X14X1": 1,
-            "ESPUMA BRAÇO 52X21X1": 1,
-            "ESPUMA BRAÇO 52X35X1": 1,
-            "ESPUMA BRAÇO 35X9.5X1": 4,
-            "ESPUMA BRAÇO 54X9.5X2": 2,
-            "LINHA": 1,
-            "COLA": 1,
-            "LAMINA CROMADA": 1,
-            "LAMINA DE CABEÇOTE": 1,
-            "PARAFUSO 1/4 X 1": 15,
-            "PARAFUSO 1/4 X 2.1/4": 8,
-            "PARAFUSO 5X25": 6,
-            "PORCA GARRA 1/4": 20,
-            "GRAMPO 80/10": 1,
-            "GRAMPO 14/40": 1,
-            "COSTUREIRA": 1,
-            "EMBALAGEM": 1,
-            "BASE": 1
         };
 
         /* ✅ DESIGN: Carregar Kits */
@@ -3279,82 +3112,37 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <tbody>
                 `;
 
-                    data.forEach(k => {
-                        const imgHtml = k.imagemURL
-                            ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
-                            : '<span class="text-muted">-</span>';
+                data.forEach(k => {
+                    const imgHtml = k.imagemURL
+                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
+                        : '<span class="text-muted">-</span>';
 
-                        html += `
-                            <tr style="cursor:pointer" onclick="toggleComponents(this, ${k.id})">
-                                <td style="width:60px">${imgHtml}</td>
-                                <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-                                <td>
-                                    <div class="fw-bold text-primary">${k.nome || 'N/D'}</div>
-                                    <div class="expansion-area d-none animate-fade-in" id="comp-area-${k.id}">
-                                        <div class="text-center py-2"><div class="spinner-border spinner-border-sm text-primary"></div></div>
-                                    </div>
-                                </td>
-                                <td><span class="badge ${k.tipo === 'K' ? 'bg-info' : 'bg-secondary'}">${k.tipo === 'K' ? 'Kit' : 'Produto'}</span></td>
-                            </tr>
-                        `;
-                    });
+                    let comps = '';
+                    if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
+                        comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
+                            .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                            .join('<br>');
+                    } else if (k.tipo === 'P') {
+                        comps = `<span class="badge bg-info">Produto Simples</span><br><small>Estoque: ${k.estoqueAtual || 0}</small>`;
+                    } else {
+                        comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
+                    }
+
+                    html += `
+                        <tr>
+                            <td style="width:60px">${imgHtml}</td>
+                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                            <td>${k.nome || 'N/D'}</td>
+                            <td>${comps}</td>
+                        </tr>
+                    `;
+                });
 
                 html += '</tbody></table></div>';
                 div.innerHTML = html;
 
             } catch(e) {
                 div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
-            }
-        }
-
-        /* ✅ DESIGN: Toggle Components */
-        async function toggleComponents(row, productId) {
-            const area = document.getElementById(`comp-area-${productId}`);
-            if (!area) return;
-            
-            area.classList.toggle('d-none');
-            if (row.classList.contains('bg-light')) {
-                row.classList.remove('bg-light');
-            } else {
-                row.classList.add('bg-light');
-            }
-
-            if (!area.classList.contains('d-none') && area.innerHTML.includes('spinner-border')) {
-                try {
-                    const data = await fetchAPI(`${API}/product/${productId}/components`);
-                    if (data.componentes && data.componentes.length > 0) {
-                        let compHtml = `
-                            <div class="mt-3 p-3 bg-white border rounded shadow-sm" style="border-left: 4px solid var(--accent) !important;">
-                                <h6 class="fw-bold mb-3 text-primary d-flex align-items-center">
-                                    <span class="me-2">📋</span> Componentes e Insumos
-                                </h6>
-                                <div class="table-responsive">
-                                    <table class="table table-sm table-hover mb-0">
-                                        <thead class="table-light">
-                                            <tr>
-                                                <th style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Insumo / Componente</th>
-                                                <th class="text-end" style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">Qtd</th>
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            ${data.componentes.map(c => `
-                                                <tr>
-                                                    <td style="font-size: 0.85rem;">${c.nome}</td>
-                                                    <td class="text-end fw-bold text-accent" style="font-size: 0.85rem;">${c.quantidade}x</td>
-                                                </tr>
-                                            `).join('')}
-                                        </tbody>
-                                    </table>
-                                </div>
-                            </div>
-                        `;
-                        area.innerHTML = compHtml;
-                    } else {
-                        area.innerHTML = '<div class="alert alert-light border mt-2 mb-0" style="font-size:0.85rem">Nenhum componente registrado para este produto.</div>';
-                    }
-                } catch (e) {
-                    area.innerHTML = `<div class="alert alert-danger mt-2 mb-0" style="font-size:0.85rem">Erro ao carregar componentes: ${e.message}</div>`;
-                }
             }
         }
 
