@@ -660,6 +660,32 @@ class AuthManager:
         }
         save_tokens(data, self.config.TOKENS_FILE)
 
+    def reload_tokens_from_disk(self):
+        """
+        Recarrega os tokens do disco para a memória.
+        Útil após OAuth ou quando outro processo atualizou os tokens.
+        """
+        logger.debug("🔄 [DEBUG-AUTH] Recarregando tokens do disco...")
+        
+        try:
+            disk_tokens = self._load_tokens()
+            
+            self._access_token = disk_tokens.get('access_token')
+            self._refresh_token = disk_tokens.get('refresh_token')
+            self._expires_at = disk_tokens.get('expires_at', 0)
+            
+            logger.debug(f"✅ [DEBUG-AUTH] Tokens recarregados:")
+            logger.debug(f"   • Access Token: {'Presente' if self._access_token else 'Ausente'}")
+            logger.debug(f"   • Refresh Token: {'Presente' if self._refresh_token else 'Ausente'}")
+            logger.debug(f"   • Expira em: {self._expires_at - time.time():.0f}s")
+            
+            logger.info("✅ Tokens recarregados do disco com sucesso!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ [DEBUG-AUTH] Erro ao recarregar tokens: {str(e)}", exc_info=True)
+            return False
+
     def is_authenticated(self) -> bool:
         """Verifica se o token de acesso é válido ou pode ser renovado."""
         if self._access_token and self._expires_at > time.time() + 60: # 60s de buffer
@@ -1104,40 +1130,68 @@ class Orchestrator:
     def _worker_loop(self):
         cycle_count = 0
         
+        logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
+        
         while not self._stop_event.is_set():
             cycle_count += 1
             
+            logger.debug(f"")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
+            
             # Verifica autenticação antes de tudo
-            if not self.auth.is_authenticated():
-                self.logger.info("Aguardando autenticação para iniciar ciclos...")
-                self._stop_event.wait(60)
-                continue
+            logger.debug(f"🔍 [DEBUG-WORKER] Verificando autenticação...")
+            is_auth = self.auth.is_authenticated()
+            logger.debug(f"   • is_authenticated() = {is_auth}")
+            
+            if not is_auth:
+                logger.info(f"⏸️ [DEBUG-WORKER] Ciclo #{cycle_count}: Aguardando autenticação...")
+                logger.debug(f"   • Access Token: {'Presente' if self.auth._access_token else 'Ausente'}")
+                logger.debug(f"   • Refresh Token: {'Presente' if self.auth._refresh_token else 'Ausente'}")
+                
+                # Tenta recarregar tokens do disco antes de esperar
+                logger.debug("🔄 [DEBUG-WORKER] Tentando recarregar tokens do disco...")
+                self.auth.reload_tokens_from_disk()
+                
+                # Verifica novamente
+                is_auth_after_reload = self.auth.is_authenticated()
+                logger.debug(f"   • is_authenticated() após reload = {is_auth_after_reload}")
+                
+                if not is_auth_after_reload:
+                    logger.info("⏳ [DEBUG-WORKER] Aguardando 60s para próxima tentativa...")
+                    self._stop_event.wait(60)
+                    continue
+                else:
+                    logger.info("✅ [DEBUG-WORKER] Autenticação OK após reload! Continuando ciclo...")
 
+            logger.debug(f"✅ [DEBUG-WORKER] Autenticação confirmada! Iniciando processamento...")
+            
             try:
                 # Ciclo de Produtos (Cache Pesado)
                 # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
                 if cycle_count == 1 or cycle_count % 3 == 0:
-                    self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
+                    logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
                     self.process_products_cache()
                 
                 # Ciclo de Vendas (KPIs)
-                self.logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
+                logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
                 self.process_sales_orders()
                 
                 # Ciclo de Componentes
                 if cycle_count % 4 == 0:
-                    self.logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
+                    logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
                     usage = self.calculate_component_usage()
                     if usage.get('components'):
                         self._component_usage_cache = usage
                         self.broadcast_kpi_update(component_usage=usage)
 
             except Exception as e:
-                self.logger.exception(f"Erro fatal no ciclo #{cycle_count}")
+                logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
 
-            self.logger.info("✅ Ciclo finalizado. Dormindo...")
-            # Mantém 10 minutos (600s) pois o cache de produtos levou 5 min
-            # Se diminuir muito, vai encavalar.
+            logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
+            logger.debug(f"")
+            
+            # Mantém 10 minutos (600s)
             self._stop_event.wait(600)
 
     def process_sales_orders(self, force: bool = False):
@@ -1685,23 +1739,50 @@ class WebServer:
             code = request.args.get('code')
             state = request.args.get('state')
             
+            logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
+            logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
+            logger.debug(f"   • State: {state[:20]}..." if state else "   • State: Ausente")
+            
             if not code:
+                logger.error("❌ [DEBUG-CALLBACK] Código de autorização não recebido!")
                 return "Erro: Código de autorização não recebido.", 400
                 
             # Validação do State (CSRF)
+            logger.debug("🔍 [DEBUG-CALLBACK] Validando state OAuth...")
             if not self.orchestrator.auth._validate_oauth_state(state):
+                logger.error("❌ [DEBUG-CALLBACK] State inválido ou expirado!")
                 return "Erro: State inválido ou expirado.", 403
             
+            logger.debug("✅ [DEBUG-CALLBACK] State validado com sucesso")
+            
             # Troca o código pelo token
+            logger.debug("🔄 [DEBUG-CALLBACK] Trocando code por tokens...")
             success = self.orchestrator.auth.exchange_code_for_token(code)
             
             if success:
+                logger.info("✅ [DEBUG-CALLBACK] Tokens obtidos com sucesso!")
+                
+                # 🔧 CORREÇÃO CRÍTICA: Recarrega tokens na memória
+                logger.debug("🔄 [DEBUG-CALLBACK] Recarregando tokens na memória...")
+                self.orchestrator.auth.reload_tokens_from_disk()
+                
+                # Verifica autenticação após reload
+                is_auth = self.orchestrator.auth.is_authenticated()
+                logger.debug(f"🔍 [DEBUG-CALLBACK] is_authenticated() = {is_auth}")
+                
                 # Inicia o worker após autenticação bem-sucedida
                 if not self.orchestrator.is_running():
+                    logger.info("🚀 [DEBUG-CALLBACK] Iniciando worker...")
                     self.orchestrator.start_worker()
                     start_cleanup_timer()
+                    logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
+                else:
+                    logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
+                
+                logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
                 return redirect('/')
             else:
+                logger.error("❌ [DEBUG-CALLBACK] Erro ao trocar código pelo token!")
                 return "Erro ao trocar código pelo token.", 500
 
         # Rota de Busca com correção de 404 e Imagem
