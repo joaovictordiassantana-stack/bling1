@@ -256,101 +256,98 @@ def start_cleanup_timer():
 
 # 2. Gerenciador de Persistência (Timer e Checklist)
 class ProductionManager:
-    DB_FILE = Path("producao_dados.json")
-
     def __init__(self):
-        self.data = self._load_data()
-        self._ensure_safety_pause() # Pausa automática se o server reiniciou
+        self.db_path = Path("production_state.json")
+        self.state = self._load()
+        self._auto_pause_on_restart()
 
-    def _load_data(self):
-        if not self.DB_FILE.exists():
-            return {"timers": {}, "checklists": {}, "month": datetime.now().strftime("%m/%Y")}
-        try:
-            with open(self.DB_FILE, 'r') as f:
-                data = json.load(f)
-                # Verifica se mudou o mês para reiniciar
-                current_month = datetime.now().strftime("%m/%Y")
-                if data.get("month") != current_month:
-                    return {"timers": {}, "checklists": {}, "month": current_month}
-                return data
-        except:
-            return {"timers": {}, "checklists": {}, "month": datetime.now().strftime("%m/%Y")}
+    def _load(self):
+        current_month = datetime.now().strftime("%m/%Y")
+        if self.db_path.exists():
+            try:
+                with open(self.db_path, 'r') as f:
+                    data = json.load(f)
+                    if data.get("mes") == current_month:
+                        return data
+            except Exception:
+                pass
+        return {"mes": current_month, "timers": {}, "checklists": {}, "manual_consumption": {}}
 
-    def _save_data(self):
-        with open(self.DB_FILE, 'w') as f:
-            json.dump(self.data, f)
+    def _save(self):
+        with open(self.db_path, 'w') as f:
+            json.dump(self.state, f)
 
-    def _ensure_safety_pause(self):
-        """Segurança: Se o server reiniciou, pausa tudo que estava rodando."""
+    def _auto_pause_on_restart(self):
+        """Regra: Se o servidor reiniciou, pausa timers ativos para não perder controle"""
         changed = False
-        for pid, timer in self.data.get("timers", {}).items():
-            if timer.get("state") == "running":
-                # Calcula o tempo até o crash/restart e pausa
-                timer["state"] = "paused"
-                timer["last_start"] = 0 
+        for pid in self.state.get("timers", {}):
+            if self.state["timers"][pid].get("state") == "running":
+                self.state["timers"][pid]["state"] = "paused"
+                self.state["timers"][pid]["last_start"] = 0
                 changed = True
         if changed:
-            self._save_data()
+            self._save()
 
     # --- Lógica do Timer ---
     def timer_action(self, product_id, action):
         """Start, Pause, Stop (Reset)"""
-        timer = self.data["timers"].get(product_id, {"accumulated": 0, "state": "stopped", "last_start": 0})
         now = time.time()
-
+        t = self.state["timers"].get(product_id, {"accumulated": 0, "state": "stopped", "last_start": 0})
+        
         if action == "start":
-            if timer["state"] != "running":
-                timer["state"] = "running"
-                timer["last_start"] = now
-        
+            if t["state"] != "running":
+                t["state"], t["last_start"] = "running", now
         elif action == "pause":
-            if timer["state"] == "running":
-                timer["state"] = "paused"
-                timer["accumulated"] += (now - timer["last_start"])
-                timer["last_start"] = 0
-        
-        elif action == "stop": # Reiniciar/Finalizar
-            timer = {"accumulated": 0, "state": "stopped", "last_start": 0}
-
-        # Atualiza apenas para leitura
-        self.data["timers"][product_id] = timer
-        self._save_data()
-        
-        # Retorna estado calculado
-        total_time = timer["accumulated"]
-        if timer["state"] == "running":
-            total_time += (now - timer["last_start"])
-        
-        return {"state": timer["state"], "elapsed": total_time}
-
-    # --- Lógica do Checklist ---
-    def toggle_item(self, product_id, item_name, is_checked):
-        if product_id not in self.data["checklists"]:
-            self.data["checklists"][product_id] = []
-        
-        current_list = self.data["checklists"][product_id]
-        if is_checked and item_name not in current_list:
-            current_list.append(item_name)
-        elif not is_checked and item_name in current_list:
-            current_list.remove(item_name)
+            if t["state"] == "running":
+                t["state"] = "paused"
+                t["accumulated"] += (now - t["last_start"])
+                t["last_start"] = 0
+        elif action == "stop":
+            t = {"accumulated": 0, "state": "stopped", "last_start": 0}
             
-        self._save_data()
-        return current_list
+        self.state["timers"][product_id] = t
+        self._save()
+        
+        # Retorna estado calculado para o front
+        total_time = t["accumulated"]
+        if t["state"] == "running":
+            total_time += (now - t["last_start"])
+        return {"state": t["state"], "elapsed": total_time}
 
-    # --- Lógica de Consumo (Vendas + Checklist) ---
+    # --- Lógica do Checklist e Consumo Manual ---
+    def toggle_item(self, product_id, item_name, is_checked):
+        if product_id not in self.state["checklists"]:
+            self.state["checklists"][product_id] = []
+        
+        check_list = self.state["checklists"][product_id]
+        if is_checked:
+            if item_name not in check_list:
+                check_list.append(item_name)
+                # Incrementa consumo manual
+                self.state["manual_consumption"][item_name] = self.state["manual_consumption"].get(item_name, 0) + 1
+        else:
+            if item_name in check_list:
+                check_list.remove(item_name)
+                # Decrementa consumo manual (mínimo 0)
+                self.state["manual_consumption"][item_name] = max(0, self.state["manual_consumption"].get(item_name, 0) - 1)
+            
+        self._save()
+        return check_list
+
+    # --- Lógica de Relatório (Vendas + Manual) ---
     def get_monthly_report(self, sales_history):
         """
-        Cruza as vendas do Bling (Code Pedidos) com a Receita.
+        Cruza as vendas do Bling com a Receita + Consumo Manual do Checklist.
         """
-        report = defaultdict(lambda: {"qtd_teorica": 0, "qtd_real_checklist": 0, "un": ""})
+        # Relatório consolidado
+        report = defaultdict(lambda: {"qtd_vendas": 0, "qtd_manual": 0, "total": 0, "un": ""})
         products_sold = defaultdict(int)
         
-        # 1. Cálculo Baseado em Vendas (Teórico)
-        current_month = datetime.now().strftime("%Y-%m")
+        # 1. Cálculo Baseado em Vendas (Mês Atual)
+        current_month_iso = datetime.now().strftime("%Y-%m")
         
         for order in sales_history:
-            # Filtro de Data (Mês Atual)
-            if not order.get('data', '').startswith(current_month):
+            if not order.get('data', '').startswith(current_month_iso):
                 continue
                 
             for item in order.get('itens', []):
@@ -359,19 +356,30 @@ class ProductionManager:
                 
                 if "CADEIRA" in name:
                     products_sold[name] += int(qtd)
-                    # Explosão de materiais
                     for ing in RECIPE_CADEIRA:
                         key = ing['nome']
-                        report[key]["qtd_teorica"] += (ing['qtd'] * qtd)
+                        report[key]["qtd_vendas"] += (ing['qtd'] * qtd)
                         report[key]["un"] = ing['un']
 
-        # 2. Cálculo Baseado no Checklist (Opcional - se quiser saber o que já foi marcado na tela)
-        # Se quiser somar o que os operários clicaram:
-        # Percorre self.data["checklists"] e soma as receitas unitárias.
+        # 2. Adiciona Consumo Manual (Checklist)
+        for item_name, qtd_manual in self.state.get("manual_consumption", {}).items():
+            report[item_name]["qtd_manual"] = qtd_manual
+            # Se não tiver unidade definida pelas vendas, tenta pegar da receita
+            if not report[item_name]["un"]:
+                for ing in RECIPE_CADEIRA:
+                    if ing['nome'] == item_name:
+                        report[item_name]["un"] = ing['un']
+                        break
+
+        # 3. Calcula Total
+        for key in report:
+            report[key]["total"] = report[key]["qtd_vendas"] + report[key]["qtd_manual"]
         
         return {
             "insumos": dict(report),
-            "produtos_vendidos": dict(products_sold)
+            "produtos_vendidos": dict(products_sold),
+            "timers": self.state.get("timers", {}),
+            "mes": self.state.get("mes")
         }
 
 prod_manager = ProductionManager()
@@ -2134,9 +2142,23 @@ class WebServer:
                 
                 data = prod_manager.get_monthly_report(history)
                 
-                # Formata para compatibilidade com o frontend antigo se necessário
-                # mas foca na nova lógica de produção
-                return jsonify(data)
+                # Prepara resposta consolidada
+                response = {
+                    "insumos": data["insumos"],
+                    "produtos_vendidos": data["produtos_vendidos"],
+                    "timers": data["timers"],
+                    "mes": data["mes"],
+                    "components": [
+                        {
+                            "nome": k,
+                            "quantidade": v["total"],
+                            "qtd_vendas": v["qtd_vendas"],
+                            "qtd_manual": v["qtd_manual"],
+                            "un": v["un"]
+                        } for k, v in data["insumos"].items()
+                    ]
+                }
+                return jsonify(response)
             except Exception as e:
                 self.logger.exception("Erro ao gerar relatório de produção")
                 return jsonify({"error": str(e)}), 500
@@ -3336,8 +3358,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
 
-            // Carrega o estado atual do timer do servidor
+            // Carrega o estado atual do timer e checklist do servidor
             controlTimer('get', productName);
+            loadChecklistState(productName);
+        }
+
+        async function loadChecklistState(productName) {
+            try {
+                const res = await fetch('/api/production/report');
+                const data = await res.json();
+                const checklist = data.checklists ? data.checklists[productName] : [];
+                if (checklist) {
+                    checklist.forEach(item => {
+                        // Tenta encontrar o checkbox pelo nome do item (usando o atributo customizado se necessário ou iterando)
+                        const checkboxes = document.querySelectorAll('#productionModal .form-check-input');
+                        checkboxes.forEach(cb => {
+                            // Extrai o nome do item do onchange para comparar
+                            if (cb.getAttribute('onchange').includes(`'${item}'`)) {
+                                cb.checked = true;
+                            }
+                        });
+                    });
+                }
+            } catch (e) { console.error("Erro ao carregar checklist:", e); }
         }
 
         /* Lógica do Timer Conectada ao Backend */
@@ -3403,12 +3446,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
+        /* ✅ DESIGN: Atualizar Componentes (Versão Produção Integrada) */
         function updateComponentUsage(usageData) {
             const div = document.getElementById('component-usage-content');
 
             if (!usageData.components || usageData.components.length === 0) {
-                div.innerHTML = '<div class="alert alert-info">Nenhum pedido de Cadeira processado este mês para gerar insumos.</div>';
+                div.innerHTML = '<div class="alert alert-info">Nenhum pedido ou produção registrada para o mês de ' + (usageData.mes || 'N/D') + '.</div>';
                 return;
             }
 
@@ -3417,7 +3460,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <div class="col-md-12">
                         <div class="card bg-dark text-white shadow-sm">
                             <div class="card-body">
-                                <h6 class="card-title text-uppercase small opacity-75">Produtos Vendidos (Mês)</h6>
+                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                    <h6 class="card-title text-uppercase small opacity-75 mb-0">Produtos Vendidos (Mês: ${usageData.mes})</h6>
+                                    <span class="badge bg-warning text-dark">Reinício Mensal Ativo</span>
+                                </div>
                                 <div class="d-flex flex-wrap gap-2">
                                     ${Object.entries(usageData.produtos_vendidos || {}).map(([nome, qtd]) => `
                                         <span class="badge bg-primary p-2">${nome}: ${qtd}x</span>
@@ -3427,13 +3473,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                     </div>
                 </div>
-                <h5>📊 Necessidade Consolidada de Insumos</h5>
+                
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="mb-0">📊 Consumo Consolidado (Vendas + Checklist)</h5>
+                    <small class="text-muted">Os dados são zerados automaticamente todo dia 01.</small>
+                </div>
+
                 <div class="table-responsive">
-                    <table class="table table-hover align-middle">
+                    <table class="table table-hover align-middle border">
                         <thead class="table-light">
                             <tr>
-                                <th>Insumo</th>
-                                <th class="text-center">Quantidade Total</th>
+                                <th>Insumo / Componente</th>
+                                <th class="text-center">Via Vendas</th>
+                                <th class="text-center">Via Checklist</th>
+                                <th class="text-center">Total Geral</th>
                                 <th class="text-center">Unidade</th>
                             </tr>
                         </thead>
@@ -3444,8 +3497,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 html += `
                     <tr>
                         <td><strong>${comp.nome}</strong></td>
+                        <td class="text-center text-muted">${comp.qtd_vendas || 0}</td>
+                        <td class="text-center text-primary">+ ${comp.qtd_manual || 0}</td>
                         <td class="text-center"><span class="badge bg-success fs-6">${comp.quantidade}</span></td>
-                        <td class="text-center text-muted">${comp.un}</td>
+                        <td class="text-center text-muted small">${comp.un}</td>
                     </tr>
                 `;
             });
