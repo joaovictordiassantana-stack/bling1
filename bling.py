@@ -221,7 +221,9 @@ def setup_logging():
         
     return logger, error_logger
 
-logger, error_logger = setup_logging()
+logger = None
+error_logger = None
+memory_handler = None
 
 # ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
 def cleanup_kpi_callbacks():
@@ -2151,7 +2153,16 @@ class WebServer:
             }
             return jsonify(status), 200
 
-        @self.app.route('/api/force-load', methods=['POST'])
+        @self.app.route("/api/status")
+        def api_status():
+            """Retorna status de autenticação e worker para o front-end"""
+            return jsonify({
+                "authenticated": self.orchestrator.auth.is_authenticated(),
+                "worker_running": self.orchestrator.is_running(),
+                "cache_loaded": self.orchestrator.is_cache_loaded()
+            })
+
+        @self.app.route("/api/force-load", methods=["POST"])
         @token_required
         def api_force_load(token):
             """Força o recarregamento do cache de produtos/kits em uma thread separada."""
@@ -2238,6 +2249,15 @@ class WebServer:
         @self.sock.route('/ws/logs')
         def ws_logs(ws):
             self.logger.info("📡 WebSocket logs conectado.")
+            
+            # ✅ ADICIONAR VERIFICAÇÃO:
+            if memory_handler is None:
+                self.logger.error("❌ memory_handler não inicializado!")
+                try:
+                    ws.send(json.dumps({"error": "Logger não inicializado"}))
+                except:
+                    pass
+                return
             
             # ✅ Limite de callbacks para evitar DoS acidental
             if len(memory_handler.ws_callbacks) >= 10:
@@ -3909,7 +3929,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
     
-    setup_logging()  # <-- ADICIONAR AQUI
+    global logger, error_logger, memory_handler
+    
+    if logger is None:
+        logger, error_logger = setup_logging()
     
     # 1. Inicializa as dependências na ordem correta
     config = Config()
@@ -3957,14 +3980,5 @@ app = create_app()
 
 if __name__ == '__main__':
     # Apenas para testes locais
-    
-    # Lógica de worker para ambiente local (apenas 1 processo)
-    # Garante que o worker inicie no ambiente local
-    orchestrator = app.orchestrator # Acessa o orchestrator criado em create_app
-    if not orchestrator.is_running():
-        orchestrator.start_worker()
-        start_cleanup_timer()
-        logger.info("✅ Worker de fundo iniciado em modo local.")
-        
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
