@@ -74,8 +74,45 @@ class RateLimiter:
             self.last_call = time.time()
 
 # ============================================================================ 
-# 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
+# 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK) E ENGENHARIA
 # ============================================================================
+# Mapeamento de Produção - Lista Técnica (Hardcoded)
+RECIPE_CADEIRA = [
+    {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+    {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+    {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+    {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+    {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+    {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+    {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+    {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+    {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+    {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+    {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+    {"nome": "COLA", "qtd": 1, "un": "Unid"},
+    {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+    {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+    {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+    {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+    {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+    {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+    {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+    {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+    {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+    {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+    {"nome": "BASE", "qtd": 1, "un": "Unid"}
+]
+
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
 kpi_update_callbacks: List[Callable] = []
@@ -1448,146 +1485,94 @@ class Orchestrator:
         self.logger.info(f"✅ Cache atualizado: {len(all_products)} produtos/variações, {len(all_kits)} kits.")
         self.broadcast_kpi_update(cache_updated=True)
 
-    def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
+    def calculate_component_usage(self) -> Dict[str, Any]:
         """
-        Calcula uso de componentes com breakdown diário.
+        Calcula a necessidade de insumos baseada nos pedidos REAIS do mês atual.
+        Utiliza a Lista Técnica (BOM) interna para produtos "Cadeira".
         """
-        
-        # CORREÇÃO: Não tenta calcular se não estiver logado
         if not self.auth.is_authenticated():
-            return {"components": [], "daily_breakdown": []}
-
-        now = datetime.now()
-        params = {
-            'dataEmissaoInicial': (now - timedelta(days=days)).strftime('%Y-%m-%d'),
-            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-        }
+            return {"components": [], "daily_breakdown": [], "produtos_vendidos": {}}
+            
+        self.logger.info("Calculando necessidade de insumos (Lista Técnica Interna)...")
         
-        token = self.auth.get_access_token()
-        if not token:
-            self.logger.warning("Token indisponível para calcular uso de componentes.")
-            return {"components": [], "daily_breakdown": []}
+        # 1. Utiliza o cache de pedidos já carregado pelo worker (Mês Atual)
+        with self.sales.lock:
+            all_orders = self.sales._sales_history
             
-        all_orders = []
-        page = 1
-        while True:
-            params['pagina'] = page
+        if not all_orders:
+            self.logger.warning("Nenhum pedido no histórico para calcular insumos.")
+            return {"components": [], "daily_breakdown": [], "produtos_vendidos": {}}
             
-            # ✅ TRATAMENTO 429: Captura e aborta o loop
-            try:
-                response = self.api.get('pedidos/vendas', params=params)
-            except requests.exceptions.HTTPError as e:
-                if e.response and e.response.status_code == 429:
-                    self.logger.warning("🛑 Rate limit (429) detectado. Abortando cálculo de componentes.")
-                    break
-                raise
-            
-            if response is None:
-                break
-            data = safe_get(response, 'data', [])
-            if not data or len(data) == 0:
-                break
-            all_orders.extend(data)
-            if len(data) < 100:
-                break
-            page += 1
-            
-            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
-            time.sleep(1.2)
-            
-        # Rastreamento por dia E total
-        component_usage = {}  # Total do período
-        daily_usage = defaultdict(lambda: defaultdict(int))  # Por dia
+        # Rastreamento
+        insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0, "un": ""})
+        produtos_vendidos = defaultdict(int)
+        daily_usage = defaultdict(lambda: defaultdict(float))
         
         for order in all_orders:
             # Extrai data
-            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
-            if not data_emissao_str:
-                continue
+            data_emissao_str = order.get('data')
+            if not data_emissao_str: continue
             
             try:
-                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-                day_key = order_date.strftime('%Y-%m-%d')
-            except:
-                continue
+                # Normaliza data para YYYY-MM-DD
+                day_key = data_emissao_str.split('T')[0].split(' ')[0]
+            except: continue
             
-            itens = safe_get(order, 'itens', [])
+            itens = order.get('itens', [])
             for item in safe_iter(itens):
-                produto_sku = safe_get(item, 'codigo')
-                quantidade_vendida = safe_get(item, 'quantidade', 0)
+                nome_produto = (item.get('nome') or item.get('descricao') or "").upper()
+                sku_produto = item.get('codigo') or "N/D"
+                qtd_vendida = float(item.get('quantidade', 0))
                 
-                if not produto_sku or quantidade_vendida == 0:
-                    continue
+                if qtd_vendida <= 0: continue
                 
-                produto = self.get_product_by_sku(produto_sku)
+                # Registra venda do produto
+                produtos_vendidos[f"{nome_produto} ({sku_produto})"] += int(qtd_vendida)
                 
-                # Se é KIT, processa componentes
-                if produto and safe_get(produto, 'tipo') == 'K':
-                    componentes = safe_get(produto, 'componentes', [])
-                    for comp in safe_iter(componentes):
-                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
-                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
-                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
+                # REGRA DE GATILHO: Se for CADEIRA, usa RECIPE_CADEIRA
+                if "CADEIRA" in nome_produto:
+                    for insumo in RECIPE_CADEIRA:
+                        nome_insumo = insumo["nome"]
+                        qtd_necessaria = insumo["qtd"] * qtd_vendida
+                        unidade = insumo["un"]
                         
-                        if not comp_sku:
-                            continue
+                        # Acumula no total
+                        insumos_totais[nome_insumo]["nome"] = nome_insumo
+                        insumos_totais[nome_insumo]["quantidade"] += qtd_necessaria
+                        insumos_totais[nome_insumo]["un"] = unidade
                         
-                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
-                        
-                        # Atualiza total
-                        if comp_sku not in component_usage:
-                            component_usage[comp_sku] = {
-                                "sku": comp_sku,
-                                "nome": comp_nome,
-                                "quantidade": 0,
-                                "produtos": set()
-                            }
-                        component_usage[comp_sku]["quantidade"] += qtd_consumida
-                        component_usage[comp_sku]["produtos"].add(produto_sku)
-                        
-                        # Atualiza diário
-                        daily_usage[day_key][comp_sku] += qtd_consumida
-                
-                # Se é PRODUTO SIMPLES, conta também
+                        # Acumula no diário
+                        daily_usage[day_key][nome_insumo] += qtd_necessaria
                 else:
-                    if produto_sku not in component_usage:
-                        component_usage[produto_sku] = {
-                            "sku": produto_sku,
-                            "nome": safe_get(produto, 'nome', 'Produto'),
-                            "quantidade": 0,
-                            "produtos": set()
-                        }
-                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
-                    component_usage[produto_sku]["produtos"].add(produto_sku)
-                    
-                    daily_usage[day_key][produto_sku] += quantidade_vendida
+                    # Se não for cadeira, apenas registra o próprio produto como insumo (venda direta)
+                    insumos_totais[nome_produto]["nome"] = nome_produto
+                    insumos_totais[nome_produto]["quantidade"] += qtd_vendida
+                    insumos_totais[nome_produto]["un"] = "Unid"
+                    daily_usage[day_key][nome_produto] += qtd_vendida
         
-        # Formata resultado
-        result = []
-        for sku, usage in component_usage.items():
-            result.append({
-                "sku": usage["sku"],
-                "nome": usage["nome"],
-                "quantidade": usage["quantidade"],
-                "produtos": sorted(list(usage["produtos"]))
+        # Formata resultado final
+        result_insumos = []
+        for nome, data in insumos_totais.items():
+            result_insumos.append({
+                "nome": nome,
+                "quantidade": round(data["quantidade"], 2),
+                "un": data["un"]
             })
         
-        result.sort(key=lambda x: x['quantidade'], reverse=True)
+        result_insumos.sort(key=lambda x: x['quantidade'], reverse=True)
         
         # Formata consumo diário
         daily_breakdown = []
         for day in sorted(daily_usage.keys(), reverse=True):
-            daily_breakdown.append({
-                "data": day,
-                "componentes": [
-                    {"sku": sku, "quantidade": qtd}
-                    for sku, qtd in daily_usage[day].items()
-                ]
-            })
-        
+            day_items = []
+            for nome, qty in daily_usage[day].items():
+                day_items.append({"nome": nome, "quantidade": round(qty, 2)})
+            daily_breakdown.append({"data": day, "componentes": day_items})
+            
         return {
-            "components": result,
-            "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
+            "components": result_insumos,
+            "daily_breakdown": daily_breakdown[:7],
+            "produtos_vendidos": dict(produtos_vendidos)
         }
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
@@ -3009,48 +2994,163 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        /* ✅ DESIGN: Atualizar Componentes */
+        /* ✅ DESIGN: Lista Técnica Hardcoded (Engenharia) */
+        const RECIPE_CADEIRA = [
+            {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+            {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+            {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+            {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+            {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+            {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+            {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+            {"nome": "COLA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+            {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+            {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+            {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+            {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+            {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+            {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+            {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+            {"nome": "BASE", "qtd": 1, "un": "Unid"}
+        ];
+
+        /* ✅ DESIGN: Abrir Checklist de Produção */
+        function openProductionChecklist(productName) {
+            if (!productName.toUpperCase().includes('CADEIRA')) return;
+
+            const modalHtml = `
+                <div class="modal fade" id="productionModal" tabindex="-1">
+                    <div class="modal-dialog modal-lg">
+                        <div class="modal-content border-0 shadow-lg">
+                            <div class="modal-header bg-dark text-white">
+                                <h5 class="modal-title">🛠️ Ordem de Produção: ${productName}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                            </div>
+                            <div class="modal-body p-4" style="font-family: 'Inter', sans-serif;">
+                                <p class="text-muted mb-4">Lista Técnica (BOM) para montagem de 1 unidade.</p>
+                                <div class="row">
+                                    ${RECIPE_CADEIRA.map((item, i) => `
+                                        <div class="col-md-6 mb-2">
+                                            <div class="form-check p-3 border rounded bg-light d-flex align-items-center">
+                                                <input class="form-check-input ms-0 me-3" type="checkbox" id="check${i}" style="width: 20px; height: 20px;">
+                                                <label class="form-check-label flex-grow-1 fw-500" for="check${i}">
+                                                    ${item.nome} 
+                                                    <span class="badge bg-secondary float-end">${item.qtd} ${item.un}</span>
+                                                </label>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+                            <div class="modal-footer bg-light">
+                                <button type="button" class="btn btn-dark px-4" data-bs-dismiss="modal">Finalizar Separação</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Remove modal anterior se existir
+            const oldModal = document.getElementById('productionModal');
+            if (oldModal) oldModal.remove();
+
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
+            modal.show();
+        }
+
+        /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
         function updateComponentUsage(usageData) {
             const div = document.getElementById('component-usage-content');
 
             if (!usageData.components || usageData.components.length === 0) {
-                div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
+                div.innerHTML = '<div class="alert alert-info">Nenhum pedido de Cadeira processado este mês para gerar insumos.</div>';
                 return;
             }
 
-            let html = '<h5>📊 Consumo Total (30 dias)</h5>';
-            html += '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Total</th><th>Produtos</th></tr></thead><tbody>';
+            let html = `
+                <div class="row mb-4">
+                    <div class="col-md-12">
+                        <div class="card bg-dark text-white shadow-sm">
+                            <div class="card-body">
+                                <h6 class="card-title text-uppercase small opacity-75">Produtos Vendidos (Mês)</h6>
+                                <div class="d-flex flex-wrap gap-2">
+                                    ${Object.entries(usageData.produtos_vendidos || {}).map(([nome, qtd]) => `
+                                        <span class="badge bg-primary p-2">${nome}: ${qtd}x</span>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <h5>📊 Necessidade Consolidada de Insumos</h5>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Insumo</th>
+                                <th class="text-center">Quantidade Total</th>
+                                <th class="text-center">Unidade</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
 
-            let total = 0;
             usageData.components.forEach(comp => {
-                total += comp.quantidade;
-                html += `<tr><td><strong>${comp.nome}</strong></td><td><code>${comp.sku}</code></td><td><span class="badge bg-success">${comp.quantidade}x</span></td><td><small>${comp.produtos.join(', ')}</small></td></tr>`;
+                html += `
+                    <tr>
+                        <td><strong>${comp.nome}</strong></td>
+                        <td class="text-center"><span class="badge bg-success fs-6">${comp.quantidade}</span></td>
+                        <td class="text-center text-muted">${comp.un}</td>
+                    </tr>
+                `;
             });
 
             html += '</tbody></table></div>';
-            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
 
             if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
-                html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
-                html += '<div class="accordion" id="dailyAccordion">';
+                html += '<hr><h5 class="mt-4">📅 Necessidade Diária (Últimos 7 dias)</h5>';
+                html += '<div class="accordion shadow-sm" id="dailyAccordion">';
 
                 usageData.daily_breakdown.forEach((day, idx) => {
-                    const date = new Date(day.data);
-                    const dateStr = date.toLocaleDateString('pt-BR');
-                    const totalDay = day.componentes.reduce((sum, c) => sum + c.quantidade, 0);
+                    const dateParts = day.data.split('-');
+                    const dateStr = `${dateParts[2]}/${dateParts[1]}/${dateParts[0]}`;
 
                     html += `
-                        <div class="accordion-item">
+                        <div class="accordion-item border-0 mb-2 shadow-sm">
                             <h2 class="accordion-header">
-                                <button class="accordion-button ${idx > 0 ? 'collapsed' : ''}" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
-                                    ${dateStr} - <span class="badge bg-info ms-2">${totalDay} itens</span>
+                                <button class="accordion-button ${idx > 0 ? 'collapsed' : ''} bg-white fw-bold" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
+                                    📅 ${dateStr}
                                 </button>
                             </h2>
                             <div id="day${idx}" class="accordion-collapse collapse ${idx === 0 ? 'show' : ''}" data-bs-parent="#dailyAccordion">
-                                <div class="accordion-body">
-                                    <ul class="list-group">
-                                        ${day.componentes.map(c => `<li class="list-group-item d-flex justify-content-between"><span>${c.sku}</span><span class="badge bg-secondary">${c.quantidade}x</span></li>`).join('')}
-                                    </ul>
+                                <div class="accordion-body bg-light">
+                                    <div class="row">
+                                        ${day.componentes.map(c => `
+                                            <div class="col-md-4 mb-1">
+                                                <small class="d-block p-2 bg-white rounded border">
+                                                    ${c.nome}: <strong>${c.quantidade}</strong>
+                                                </small>
+                                            </div>
+                                        `).join('')}
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -3137,7 +3237,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         : '<span class="text-muted">-</span>';
 
                     html += `
-                        <div class="list-group-item">
+                        <div class="list-group-item list-group-item-action" onclick="openProductionChecklist('${p.nome || p.produto}')" style="cursor: pointer;">
                             <div class="d-flex">
                                 ${imgHtml}
 
@@ -3245,7 +3345,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     }
 
                     html += `
-                        <tr>
+                        <tr onclick="openProductionChecklist('${k.nome}')" style="cursor: pointer;">
                             <td style="width:60px">${imgHtml}</td>
                             <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
                             <td>${k.nome || 'N/D'}</td>
