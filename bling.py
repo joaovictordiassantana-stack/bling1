@@ -250,6 +250,132 @@ def start_cleanup_timer():
     
     Thread(target=cleanup_loop, daemon=True).start()
 
+# ==============================================================================
+# MÓDULO DE ENGENHARIA E PRODUÇÃO (HARDCODED)
+# ==============================================================================
+
+# 2. Gerenciador de Persistência (Timer e Checklist)
+class ProductionManager:
+    DB_FILE = Path("producao_dados.json")
+
+    def __init__(self):
+        self.data = self._load_data()
+        self._ensure_safety_pause() # Pausa automática se o server reiniciou
+
+    def _load_data(self):
+        if not self.DB_FILE.exists():
+            return {"timers": {}, "checklists": {}, "month": datetime.now().strftime("%m/%Y")}
+        try:
+            with open(self.DB_FILE, 'r') as f:
+                data = json.load(f)
+                # Verifica se mudou o mês para reiniciar
+                current_month = datetime.now().strftime("%m/%Y")
+                if data.get("month") != current_month:
+                    return {"timers": {}, "checklists": {}, "month": current_month}
+                return data
+        except:
+            return {"timers": {}, "checklists": {}, "month": datetime.now().strftime("%m/%Y")}
+
+    def _save_data(self):
+        with open(self.DB_FILE, 'w') as f:
+            json.dump(self.data, f)
+
+    def _ensure_safety_pause(self):
+        """Segurança: Se o server reiniciou, pausa tudo que estava rodando."""
+        changed = False
+        for pid, timer in self.data.get("timers", {}).items():
+            if timer.get("state") == "running":
+                # Calcula o tempo até o crash/restart e pausa
+                timer["state"] = "paused"
+                timer["last_start"] = 0 
+                changed = True
+        if changed:
+            self._save_data()
+
+    # --- Lógica do Timer ---
+    def timer_action(self, product_id, action):
+        """Start, Pause, Stop (Reset)"""
+        timer = self.data["timers"].get(product_id, {"accumulated": 0, "state": "stopped", "last_start": 0})
+        now = time.time()
+
+        if action == "start":
+            if timer["state"] != "running":
+                timer["state"] = "running"
+                timer["last_start"] = now
+        
+        elif action == "pause":
+            if timer["state"] == "running":
+                timer["state"] = "paused"
+                timer["accumulated"] += (now - timer["last_start"])
+                timer["last_start"] = 0
+        
+        elif action == "stop": # Reiniciar/Finalizar
+            timer = {"accumulated": 0, "state": "stopped", "last_start": 0}
+
+        # Atualiza apenas para leitura
+        self.data["timers"][product_id] = timer
+        self._save_data()
+        
+        # Retorna estado calculado
+        total_time = timer["accumulated"]
+        if timer["state"] == "running":
+            total_time += (now - timer["last_start"])
+        
+        return {"state": timer["state"], "elapsed": total_time}
+
+    # --- Lógica do Checklist ---
+    def toggle_item(self, product_id, item_name, is_checked):
+        if product_id not in self.data["checklists"]:
+            self.data["checklists"][product_id] = []
+        
+        current_list = self.data["checklists"][product_id]
+        if is_checked and item_name not in current_list:
+            current_list.append(item_name)
+        elif not is_checked and item_name in current_list:
+            current_list.remove(item_name)
+            
+        self._save_data()
+        return current_list
+
+    # --- Lógica de Consumo (Vendas + Checklist) ---
+    def get_monthly_report(self, sales_history):
+        """
+        Cruza as vendas do Bling (Code Pedidos) com a Receita.
+        """
+        report = defaultdict(lambda: {"qtd_teorica": 0, "qtd_real_checklist": 0, "un": ""})
+        products_sold = defaultdict(int)
+        
+        # 1. Cálculo Baseado em Vendas (Teórico)
+        current_month = datetime.now().strftime("%Y-%m")
+        
+        for order in sales_history:
+            # Filtro de Data (Mês Atual)
+            if not order.get('data', '').startswith(current_month):
+                continue
+                
+            for item in order.get('itens', []):
+                name = item.get('descricao', '').upper()
+                qtd = float(item.get('quantidade', 0))
+                
+                if "CADEIRA" in name:
+                    products_sold[name] += int(qtd)
+                    # Explosão de materiais
+                    for ing in RECIPE_CADEIRA:
+                        key = ing['nome']
+                        report[key]["qtd_teorica"] += (ing['qtd'] * qtd)
+                        report[key]["un"] = ing['un']
+
+        # 2. Cálculo Baseado no Checklist (Opcional - se quiser saber o que já foi marcado na tela)
+        # Se quiser somar o que os operários clicaram:
+        # Percorre self.data["checklists"] e soma as receitas unitárias.
+        
+        return {
+            "insumos": dict(report),
+            "produtos_vendidos": dict(products_sold)
+        }
+
+prod_manager = ProductionManager()
+
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
 # ============================================================================
@@ -1803,22 +1929,36 @@ class WebServer:
             
             return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
 
-        @self.app.route('/api/timer/action', methods=['POST'])
-        def api_timer_action():
+        # --- ROTAS DE PRODUÇÃO ---
+        @self.app.route('/api/production/timer', methods=['POST'])
+        def production_timer():
+            """Controla Start/Pause/Stop do Timer"""
             data = request.json
-            action = data.get('action') # start, pause, reset, get
-            produto = data.get('produto')
+            pid = str(data.get('id'))
+            action = data.get('action')
+            res = prod_manager.timer_action(pid, action)
+            return jsonify(res)
+
+        @self.app.route('/api/production/checklist', methods=['POST'])
+        def production_checklist():
+            """Salva o item marcado na checklist"""
+            data = request.json
+            pid = str(data.get('id'))
+            item = data.get('item')
+            checked = data.get('checked')
+            prod_manager.toggle_item(pid, item, checked)
+            # Ao marcar, já contabiliza no consumo geral (implícito no relatório)
+            return jsonify({"status": "ok"})
+
+        @self.app.route('/api/production/report')
+        def production_report():
+            """Retorna dados para a Guia Componentes"""
+            # Pega histórico de vendas seguro
+            with self.orchestrator.sales.lock:
+                history = list(self.orchestrator.sales._sales_history)
             
-            if action == 'start':
-                status = production_timer.start(produto)
-            elif action == 'pause':
-                status = production_timer.pause(produto)
-            elif action == 'reset':
-                status = production_timer.reset(produto)
-            else:
-                status = production_timer.get_status(produto)
-                
-            return jsonify(status)
+            data = prod_manager.get_monthly_report(history)
+            return jsonify(data)
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
@@ -1983,33 +2123,34 @@ class WebServer:
             return jsonify({"message": "Recarregamento do cache de produtos/kits iniciado em segundo plano."}), 202
 
         @self.app.route('/api/components/usage')
+        @self.app.route('/api/production/report')
         @token_required
-        def api_component_usage(token):
-            """Retorna uso de componentes (do cache do worker)."""
+        def api_production_report(token):
+            """Retorna dados de produção e insumos (Guia Componentes)"""
             try:
-                # Retorna cache se disponível E não vazio
-                cache = getattr(self.orchestrator, '_component_usage_cache', None)
+                # Pega histórico de vendas seguro
+                with self.orchestrator.sales.lock:
+                    history = list(self.orchestrator.sales._sales_history)
                 
-                if cache and (cache.get('components') or cache.get('daily_breakdown')):
-                    self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
-                    return jsonify(cache)
+                data = prod_manager.get_monthly_report(history)
                 
-                # Calcula sob demanda
-                self.logger.info("🔄 Cache vazio. Calculando componentes sob demanda...")
-                usage_data = self.orchestrator.calculate_component_usage()
-                
-                # Armazena no cache para reutilizar
-                self.orchestrator._component_usage_cache = usage_data
-                
-                return jsonify(usage_data)
-                
+                # Formata para compatibilidade com o frontend antigo se necessário
+                # mas foca na nova lógica de produção
+                return jsonify(data)
             except Exception as e:
-                self.logger.exception("Erro ao processar /api/components/usage")
-                return jsonify({
-                    "error": str(e),
-                    "components": [],
-                    "daily_breakdown": []
-                }), 500
+                self.logger.exception("Erro ao gerar relatório de produção")
+                return jsonify({"error": str(e)}), 500
+
+        @self.app.route('/api/production/check', methods=['POST'])
+        @token_required
+        def api_production_check(token):
+            """Registra item marcado na checklist (conforme pedido Gemini)"""
+            data = request.json
+            pid = str(data.get('id'))
+            item = data.get('item')
+            checked = data.get('checked')
+            prod_manager.toggle_item(pid, item, checked)
+            return jsonify({"status": "ok"})
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
@@ -3141,7 +3282,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         ${RECIPE_CADEIRA.map((item, i) => `
                             <div class="col-md-6">
                                 <div class="form-check p-2 border rounded bg-white d-flex align-items-center">
-                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}">
+                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}" onchange="toggleChecklist('${productName}', '${item.nome}', this.checked)">
                                     <label class="form-check-label flex-grow-1 small fw-bold" for="check${i}">
                                         ${item.nome} 
                                         <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
@@ -3252,6 +3393,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 badge.textContent = 'Parado';
                 badge.classList.remove('pulse-animation');
             }
+        }
+
+        function toggleChecklist(pid, item, checked) {
+            fetch('/api/production/check', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: pid, item: item, checked: checked})
+            });
         }
 
         /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
@@ -3424,8 +3573,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                         <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
                                         <small>${p.sku || 'N/D'}</small>
                                     </div>
-
-                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
 
                                     <small class="text-muted d-block">
                                         <b>Tipo:</b> ${p.tipo}
