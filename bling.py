@@ -1336,123 +1336,116 @@ class Orchestrator:
             self.sales._recalculation_running = False
 
     def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos e kits."""
+        """Busca e armazena em cache todos os produtos, variações e kits."""
         if not self.auth.is_authenticated():
             return
             
-        self.logger.info("Iniciando busca e cache de produtos e kits...")
+        self.logger.info("Iniciando busca profunda de produtos, variações e kits...")
         all_products = []
         all_kits = []
         page = 1
         
         while True:
-            # Busca produtos (Tipo P e K)
             try:
-                self.logger.info(f"Fazendo requisição para 'produtos' página {page}...")
-                # Na API v3 o endpoint correto é 'produtos' mas os parâmetros podem variar.
-                # Vamos tentar sem o filtro de tipo primeiro se falhar, ou garantir que o endpoint está correto.
+                self.logger.info(f"Buscando produtos página {page}...")
+                # Inclui variações na busca se a API suportar o parâmetro
                 response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
-                if response:
-                    self.logger.info(f"Resposta recebida da API. Chaves: {list(response.keys()) if isinstance(response, dict) else 'Não é dict'}")
-                else:
-                    self.logger.warning(f"Resposta da API é None para página {page}")
+                if not response: break
             except Exception as e:
                 self.logger.error(f"Erro ao buscar produtos: {e}")
                 break
             
-            # --- Normalização robusta do payload de produtos (API v3) ---
-            data = []
-            if response is None:
-                self.logger.warning(f"Página {page}: resposta None da API para 'produtos'.")
-            else:
-                # Na API v3, o padrão é {'data': [...]}
-                if isinstance(response, dict):
-                    if 'data' in response and isinstance(response['data'], list):
-                        data = response['data']
-                    # Fallback para API v2 (retorno -> produtos)
-                    elif 'retorno' in response and isinstance(response['retorno'], dict):
-                        retorno = response['retorno']
-                        if 'produtos' in retorno:
-                            p_data = retorno['produtos']
-                            if isinstance(p_data, list):
-                                data = p_data
-                            elif isinstance(p_data, dict) and 'produto' in p_data:
-                                data = p_data['produto'] if isinstance(p_data['produto'], list) else [p_data['produto']]
-                    # Fallback direto se 'produtos' estiver no topo
-                    elif 'produtos' in response:
-                        if isinstance(response['produtos'], list):
-                            data = response['produtos']
-                        elif isinstance(response['produtos'], dict) and 'produto' in response['produtos']:
-                            data = response['produtos']['produto'] if isinstance(response['produtos']['produto'], list) else [response['produtos']['produto']]
+            data = safe_get(response, 'data', [])
+            if not data: break
 
-            # Se não encontrou dados, tenta uma busca exaustiva por listas no dicionário (último recurso)
-            if not data and isinstance(response, dict):
-                for key, value in response.items():
-                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
-                        self.logger.info(f"Página {page}: Encontrada lista de dicionários na chave '{key}'. Tentando usar como dados.")
-                        data = value
-                        break
-
-            # agora data é lista ou vazia
-            if not data:
-                self.logger.info(f"Página {page}: nenhum produto encontrado (data vazio).")
-                if page == 1:
-                    self.logger.error(f"CRÍTICO: Nenhum dado retornado na primeira página. Estrutura da resposta: {list(response.keys()) if isinstance(response, dict) else type(response)}")
-                break
-
-            # log de inspeção de conteúdo
-            sample_count = min(3, len(data))
-            try:
-                sample_keys = [list(item.keys()) for item in data[:sample_count]]
-            except Exception:
-                sample_keys = []
-            self.logger.info(f"Página {page}: items recebidos = {len(data)}; sample_keys={sample_keys}")
-            
             for p in data:
-                # 🔧 4️⃣ FILTRO PERMITIDO (ÚNICO ACEITÁVEL)
-                if not p.get("id") or not p.get("nome"):
-                    continue
+                p_id = p.get("id")
+                if not p_id: continue
 
-                # 🔧 3️⃣ ESTRUTURA CORRETA DO PRODUTO (OBRIGATÓRIA)
-                # Na API v3, o SKU costuma vir no campo 'codigo'
-                sku_val = p.get("codigo") or p.get("sku") or str(p["id"])
+                # 1. Processa o produto principal
+                sku_val = p.get("codigo") or p.get("sku") or str(p_id)
                 
+                # Busca estoque detalhado se disponível na listagem, senão tenta obter saldo
+                estoque = p.get("estoque", {})
+                saldo = 0
+                if isinstance(estoque, dict):
+                    saldo = estoque.get("saldoVirtual") or estoque.get("saldo") or 0
+                else:
+                    saldo = estoque or 0
+
                 produto_normalizado = {
-                    "id": p["id"],
-                    "nome": p["nome"],
+                    "id": p_id,
+                    "nome": p.get("nome"),
                     "sku": sku_val,
-                    "estoqueAtual": p.get("estoque", 0),
+                    "estoqueAtual": saldo,
                     "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
-                    "tipo": "K" if p.get("tipo") == "K" else "P",
+                    "tipo": p.get("tipo", "P"),
                     "componentes": []
                 }
-                
-                # Armazena tudo sem filtros
-                if p.get('tipo') == 'K':
+
+                # 2. Se for KIT, precisamos dos componentes (exige busca detalhada)
+                if produto_normalizado["tipo"] == "K":
+                    try:
+                        detalhe = self.api.get(f'produtos/{p_id}')
+                        if detalhe and 'data' in detalhe:
+                            comp_data = detalhe['data'].get('estrutura', {}).get('componentes', [])
+                            produto_normalizado["componentes"] = comp_data
+                    except:
+                        pass
                     all_kits.append(produto_normalizado)
                 else:
                     all_products.append(produto_normalizado)
 
+                # 3. PROCESSAMENTO DE VARIAÇÕES (CRÍTICO)
+                # Na API v3, variações podem vir em 'variacoes' dentro do produto pai
+                variacoes = p.get("variacoes", [])
+                if variacoes:
+                    self.logger.debug(f"Processando {len(variacoes)} variações para o produto {sku_val}")
+                    for v in variacoes:
+                        v_id = v.get("id")
+                        v_sku = v.get("codigo") or v.get("sku")
+                        if not v_id or not v_sku: continue
+                        
+                        v_estoque = v.get("estoque", {})
+                        v_saldo = 0
+                        if isinstance(v_estoque, dict):
+                            v_saldo = v_estoque.get("saldoVirtual") or v_estoque.get("saldo") or 0
+                        else:
+                            v_saldo = v_estoque or 0
+
+                        var_normalizada = {
+                            "id": v_id,
+                            "nome": f"{p.get('nome')} - {v.get('nome', '')}".strip(),
+                            "sku": v_sku,
+                            "estoqueAtual": v_saldo,
+                            "imagem": v.get("imagemURL") or produto_normalizado["imagem"],
+                            "tipo": "P",
+                            "pai_id": p_id
+                        }
+                        all_products.append(var_normalizada)
+
             if len(data) < 100: break
             page += 1
-            time.sleep(0.5) # Evita rate limit
-
-        # 🔧 5️⃣ SALVAMENTO DO CACHE (CRÍTICO)
-        self.logger.info(
-            f"FINAL CACHE → produtos={len(all_products)} kits={len(all_kits)}"
-        )
+            time.sleep(0.8)
 
         with self._cache_lock:
-            self._products_cache = {p["id"]: p for p in all_products}
-            self._kits_cache = {k["id"]: k for k in all_kits}
+            # Limpa caches atuais
+            self._products_cache = {}
+            self._kits_cache = {}
+            
+            # Mapeia produtos por SKU e ID
+            for p in all_products:
+                self._products_cache[str(p["sku"])] = p
+                self._products_cache[str(p["id"])] = p
+            
+            # Mapeia kits por SKU e ID
+            for k in all_kits:
+                self._kits_cache[str(k["sku"])] = k
+                self._kits_cache[str(k["id"])] = k
             
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
             
-            self.logger.info(
-                f"CACHE SALVO → products={len(self._products_cache)} kits={len(self._kits_cache)}"
-            )
-            
-        self.logger.info("✅ Cache de produtos e kits processado e salvo com sucesso.")
+        self.logger.info(f"✅ Cache atualizado: {len(all_products)} produtos/variações, {len(all_kits)} kits.")
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
@@ -1639,6 +1632,11 @@ class Orchestrator:
         if component_usage:
             payload["component_usage"] = component_usage
             self.logger.debug("Uso de componentes incluído no broadcast.")
+
+        # 3.1 Adiciona lista de produtos se o cache foi atualizado
+        if cache_updated:
+            payload["products"] = self.get_all_products()
+            payload["kits"] = self.get_all_kits()
                 
         # 4. Envia o broadcast
         with kpi_update_lock:
@@ -3236,7 +3234,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                             .join('<br>');
                     } else if (k.tipo === 'P') {
-                        comps = `<span class="badge bg-info">Produto Simples</span><br><small>Estoque: ${k.estoqueAtual || 0}</small>`;
+                        const estoqueClass = k.estoqueAtual > 0 ? 'bg-success' : 'bg-danger';
+                        comps = `<span class="badge bg-info">Produto Simples</span><br>
+                                 <span class="badge ${estoqueClass}">Estoque: ${k.estoqueAtual || 0}</span>`;
+                        if (k.pai_id) {
+                            comps += `<br><span class="badge bg-secondary">Variação</span>`;
+                        }
                     } else {
                         comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
                     }
