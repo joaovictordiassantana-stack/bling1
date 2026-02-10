@@ -1109,6 +1109,17 @@ class SalesManager:
             }
 
     def _get_state_for_save(self) -> Dict[str, Any]:
+        """Retorna o estado atual das estatísticas de vendas"""
+        
+        # ✅ ADICIONAR AQUI: Verifica se há dados válidos
+        if self.daily_count is None or (isinstance(self.daily_count, dict) and not self.daily_count):
+             return {
+                "daily": 0,
+                "weekly": 0,
+                "monthly": 0,
+                "last_update": datetime.now(timezone.utc).isoformat()
+            }
+
         with self.lock:
             return {
                 "daily": self.daily_count,
@@ -2294,10 +2305,13 @@ class WebServer:
         
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
-            self.logger.info("📡 WebSocket KPI conectado.")
-            
             # ✅ Limite de callbacks para evitar DoS acidental
             global kpi_update_callbacks, kpi_update_lock
+
+            self.logger.info("📡 WebSocket KPI conectado.")
+            self.logger.debug(f"   • Total de callbacks ativos: {len(kpi_update_callbacks)}")
+            self.logger.debug(f"   • Autenticado: {self.orchestrator.auth.is_authenticated()}")
+            self.logger.debug(f"   • Worker rodando: {self.orchestrator.is_running()}")
             if len(kpi_update_callbacks) >= 10:
                 self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
                 return
@@ -2307,16 +2321,27 @@ class WebServer:
                 try:
                     ws.send(json.dumps(payload))
                 except ConnectionClosed:
-                    # ✅ ADICIONE: Sinaliza para remover este callback
                     raise
                 except Exception as e:
                     self.logger.exception("Erro enviando via WS.")
                     raise ConnectionClosed()  # Força desconexão
-                
-            # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
-            # 1. Envia o estado inicial completo
+            
+            # ✅ CORREÇÃO: ADICIONA O CALLBACK **ANTES** DO BROADCAST
+            with kpi_update_lock:
+                kpi_update_callbacks.append(kpi_callback)
+            
+            # Envia o estado inicial completo
             try:
                 sales_stats = self.orchestrator.sales._get_state_for_save()
+                
+                # ✅ CORREÇÃO: Garante que sales_stats nunca seja None
+                if not sales_stats or not isinstance(sales_stats, dict):
+                    sales_stats = {
+                        "daily": 0,
+                        "weekly": 0,
+                        "monthly": 0,
+                        "last_update": datetime.now(timezone.utc).isoformat()
+                    }
                 
                 # Tenta usar cache se disponível
                 component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
@@ -2330,6 +2355,7 @@ class WebServer:
                         self.logger.error(f"Falha ao calcular componentes: {calc_error}")
                         component_usage = {"components": [], "daily_breakdown": []}
                 
+                # ✅ AGORA O CALLBACK JÁ ESTÁ REGISTRADO, ENTÃO O BROADCAST FUNCIONARÁ
                 self.orchestrator.broadcast_kpi_update(
                     sales_stats=sales_stats,
                     component_usage=component_usage
@@ -2339,10 +2365,6 @@ class WebServer:
             except Exception as e:
                 self.logger.exception("Erro ao enviar estado inicial via WS.")
                 
-            # 2. Adiciona o callback à lista global
-            with kpi_update_lock:
-                kpi_update_callbacks.append(kpi_callback)
-                
             try:
                 while True:
                     # Mantém a conexão aberta
@@ -2350,7 +2372,7 @@ class WebServer:
             except ConnectionClosed:
                 pass
             finally:
-                # 3. Remove o callback ao desconectar
+                # Remove o callback ao desconectar
                 with kpi_update_lock:
                     if kpi_callback in kpi_update_callbacks:
                         kpi_update_callbacks.remove(kpi_callback)
@@ -3236,6 +3258,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('auth-link').classList.add('d-none');
                 document.getElementById('content-tabs').classList.remove('hidden');
                 document.getElementById('auth-required-tabs').classList.add('hidden');
+                
+                // ✅ ADICIONAR: Emite evento de confirmação
+                window.dispatchEvent(new Event('auth-confirmed'));
+                
             } else {
                 badge.className = 'badge bg-danger';
                 badge.textContent = '🔴 Offline';
@@ -3637,6 +3663,49 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         setupKpiWebSocket();
+
+        // ✅ ADICIONAR AQUI: Verificação inicial de autenticação
+        async function checkInitialAuth() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                // Pega a URL de autenticação do meta tag ou usa padrão
+                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
+                
+                updateAuthStatus(data.authenticated, authUrl);
+                
+                // Se autenticado, força um reload de dados
+                if (data.authenticated) {
+                    console.log("✅ Autenticado! Carregando dados...");
+                } else {
+                    console.log("❌ Não autenticado. Aguardando login...");
+                }
+            } catch (error) {
+                console.error("Erro ao verificar autenticação inicial:", error);
+                // Em caso de erro, assume não autenticado
+                updateAuthStatus(false, '/auth');
+            }
+        }
+
+        // Executa verificação inicial após 500ms (aguarda WebSocket conectar)
+        setTimeout(checkInitialAuth, 500);
+
+        // ✅ ADICIONAR: Timeout de segurança
+        let authCheckTimeout = setTimeout(() => {
+            const badge = document.getElementById('status-badge');
+            if (!isAuthenticated && badge.textContent === '⏳ CARREGANDO...') {
+                console.warn("⚠️ Timeout de autenticação. Forçando estado não autenticado.");
+                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
+                updateAuthStatus(false, authUrl);
+                showToast('Aviso', 'Não foi possível verificar autenticação. Por favor, faça login.', 'warning');
+            }
+        }, 5000); // 5 segundos
+
+        // Limpa o timeout quando autenticação for confirmada
+        window.addEventListener('auth-confirmed', () => {
+            clearTimeout(authCheckTimeout);
+        });
 
         /* ✅ DESIGN: Busca de Produtos */
         const btnSearch = document.getElementById('btn-search');
