@@ -1048,6 +1048,69 @@ class SalesManager:
         save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
         self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
+class ProductionTimer:
+    """Gerencia cronômetros de produção persistentes."""
+    FILE_PATH = Path('production_timers.json')
+
+    def __init__(self):
+        self.timers = self._load()
+
+    def _load(self):
+        if not self.FILE_PATH.exists():
+            return {}
+        try:
+            with open(self.FILE_PATH, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save(self):
+        with open(self.FILE_PATH, 'w') as f:
+            json.dump(self.timers, f)
+
+    def start(self, produto_nome):
+        now = time.time()
+        if produto_nome not in self.timers:
+            self.timers[produto_nome] = {'start_ts': now, 'accumulated': 0, 'state': 'running'}
+        else:
+            t = self.timers[produto_nome]
+            if t['state'] == 'paused':
+                t['start_ts'] = now
+                t['state'] = 'running'
+        self._save()
+        return self.get_status(produto_nome)
+
+    def pause(self, produto_nome):
+        if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
+            t = self.timers[produto_nome]
+            now = time.time()
+            elapsed = now - t['start_ts']
+            t['accumulated'] += elapsed
+            t['start_ts'] = 0
+            t['state'] = 'paused'
+            self._save()
+        return self.get_status(produto_nome)
+
+    def reset(self, produto_nome):
+        if produto_nome in self.timers:
+            del self.timers[produto_nome]
+            self._save()
+        return {'elapsed': 0, 'state': 'stopped'}
+
+    def get_status(self, produto_nome):
+        if produto_nome not in self.timers:
+            return {'elapsed': 0, 'state': 'stopped'}
+        
+        t = self.timers[produto_nome]
+        total = t['accumulated']
+        if t['state'] == 'running':
+            total += (time.time() - t['start_ts'])
+        
+        return {'elapsed': int(total), 'state': t['state']}
+
+# Instancie globalmente
+production_timer = ProductionTimer()
+
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
 # ============================================================================
@@ -1486,80 +1549,74 @@ class Orchestrator:
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self) -> Dict[str, Any]:
-        """
-        Calcula a necessidade de insumos baseada nos pedidos REAIS do mês atual.
-        Utiliza a Lista Técnica (BOM) interna para produtos "Cadeira".
-        """
-        if not self.auth.is_authenticated():
-            return {"components": [], "daily_breakdown": [], "produtos_vendidos": {}}
-            
-        self.logger.info("Calculando necessidade de insumos (Lista Técnica Interna)...")
+        """Calcula insumos baseado APENAS no código interno e vendas do Mês Atual."""
         
-        # 1. Utiliza o cache de pedidos já carregado pelo worker (Mês Atual)
-        with self.sales.lock:
-            all_orders = self.sales._sales_history
-            
-        if not all_orders:
-            self.logger.warning("Nenhum pedido no histórico para calcular insumos.")
-            return {"components": [], "daily_breakdown": [], "produtos_vendidos": {}}
-            
-        # Rastreamento
+        # Define o intervalo: Primeiro dia do mês atual até agora
+        agora = datetime.now()
+        inicio_mes = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
         insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0, "un": ""})
         produtos_vendidos = defaultdict(int)
         daily_usage = defaultdict(lambda: defaultdict(float))
         
-        for order in all_orders:
-            # Extrai data
-            data_emissao_str = order.get('data')
-            if not data_emissao_str: continue
+        # Pega o histórico de vendas (que já é buscado pelo worker)
+        # Filtra apenas o que foi vendido DEPOIS do dia 1 do mês
+        with self.sales.lock:
+            todos_pedidos = self.sales._sales_history
             
+        for pedido in todos_pedidos:
+            data_str = pedido.get('data')
+            if not data_str: continue
+            
+            # Converte string para datetime para comparar
             try:
-                # Normaliza data para YYYY-MM-DD
-                day_key = data_emissao_str.split('T')[0].split(' ')[0]
+                # Tenta ISO format primeiro, depois fallback
+                dt_pedido = datetime.fromisoformat(data_str.split(' ')[0].replace('T', ' '))
+                day_key = dt_pedido.strftime('%Y-%m-%d')
             except: continue
             
-            itens = order.get('itens', [])
+            # FILTRO CRUCIAL: Apenas mês atual
+            if dt_pedido < inicio_mes:
+                continue
+
+            itens = pedido.get('itens', [])
             for item in safe_iter(itens):
-                nome_produto = (item.get('nome') or item.get('descricao') or "").upper()
-                sku_produto = item.get('codigo') or "N/D"
-                qtd_vendida = float(item.get('quantidade', 0))
+                nome = (item.get('descricao') or item.get('nome') or "").upper()
+                qtd = float(item.get('quantidade', 0))
                 
-                if qtd_vendida <= 0: continue
-                
-                # Registra venda do produto
-                produtos_vendidos[f"{nome_produto} ({sku_produto})"] += int(qtd_vendida)
-                
-                # REGRA DE GATILHO: Se for CADEIRA, usa RECIPE_CADEIRA
-                if "CADEIRA" in nome_produto:
-                    for insumo in RECIPE_CADEIRA:
-                        nome_insumo = insumo["nome"]
-                        qtd_necessaria = insumo["qtd"] * qtd_vendida
-                        unidade = insumo["un"]
+                if qtd <= 0: continue
+
+                # Regra: Se tem "CADEIRA" no nome, explode a lista técnica
+                if "CADEIRA" in nome:
+                    produtos_vendidos[nome] += int(qtd)
+                    
+                    # Usa a lista hardcoded RECIPE_CADEIRA (definida no início do arquivo)
+                    for componente in RECIPE_CADEIRA:
+                        nome_comp = componente['nome']
+                        qtd_comp = componente['qtd'] * qtd
+                        un = componente['un']
                         
-                        # Acumula no total
-                        insumos_totais[nome_insumo]["nome"] = nome_insumo
-                        insumos_totais[nome_insumo]["quantidade"] += qtd_necessaria
-                        insumos_totais[nome_insumo]["un"] = unidade
+                        insumos_totais[nome_comp]["nome"] = nome_comp
+                        insumos_totais[nome_comp]["quantidade"] += qtd_comp
+                        insumos_totais[nome_comp]["un"] = un
                         
-                        # Acumula no diário
-                        daily_usage[day_key][nome_insumo] += qtd_necessaria
+                        daily_usage[day_key][nome_comp] += qtd_comp
                 else:
                     # Se não for cadeira, apenas registra o próprio produto como insumo (venda direta)
-                    insumos_totais[nome_produto]["nome"] = nome_produto
-                    insumos_totais[nome_produto]["quantidade"] += qtd_vendida
-                    insumos_totais[nome_produto]["un"] = "Unid"
-                    daily_usage[day_key][nome_produto] += qtd_vendida
+                    insumos_totais[nome]["nome"] = nome
+                    insumos_totais[nome]["quantidade"] += qtd
+                    insumos_totais[nome]["un"] = "Unid"
+                    daily_usage[day_key][nome] += qtd
         
-        # Formata resultado final
-        result_insumos = []
-        for nome, data in insumos_totais.items():
-            result_insumos.append({
-                "nome": nome,
+        # Formata para lista
+        lista_final = []
+        for data in insumos_totais.values():
+            lista_final.append({
+                "nome": data["nome"],
                 "quantidade": round(data["quantidade"], 2),
                 "un": data["un"]
             })
-        
-        result_insumos.sort(key=lambda x: x['quantidade'], reverse=True)
+        lista_final.sort(key=lambda x: x['quantidade'], reverse=True)
         
         # Formata consumo diário
         daily_breakdown = []
@@ -1568,11 +1625,12 @@ class Orchestrator:
             for nome, qty in daily_usage[day].items():
                 day_items.append({"nome": nome, "quantidade": round(qty, 2)})
             daily_breakdown.append({"data": day, "componentes": day_items})
-            
+        
         return {
-            "components": result_insumos,
+            "components": lista_final,
             "daily_breakdown": daily_breakdown[:7],
-            "produtos_vendidos": dict(produtos_vendidos)
+            "produtos_vendidos": dict(produtos_vendidos),
+            "mes_referencia": agora.strftime("%m/%Y")
         }
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
@@ -1744,6 +1802,23 @@ class WebServer:
             executor.shutdown(wait=False)
             
             return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
+
+        @self.app.route('/api/timer/action', methods=['POST'])
+        def api_timer_action():
+            data = request.json
+            action = data.get('action') # start, pause, reset, get
+            produto = data.get('produto')
+            
+            if action == 'start':
+                status = production_timer.start(produto)
+            elif action == 'pause':
+                status = production_timer.pause(produto)
+            elif action == 'reset':
+                status = production_timer.reset(produto)
+            else:
+                status = production_timer.get_status(produto)
+                
+            return jsonify(status)
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
@@ -2620,6 +2695,26 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             display: none;
         }
 
+        /* Remova ou oculte classes de estoque */
+        .stock-badge, .estoque-info, .stock-info-row {
+            display: none !important;
+        }
+
+        @keyframes pulse-animation {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        .pulse-animation {
+            animation: pulse-animation 2s infinite;
+        }
+        .shadow-2xl {
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        .letter-spacing-2 {
+            letter-spacing: 0.1em;
+        }
+
         /* ✅ DESIGN: Responsivo */
         @media (max-width: 768px) {
             .kpi-card h3 {
@@ -3031,49 +3126,132 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             {"nome": "BASE", "qtd": 1, "un": "Unid"}
         ];
 
-        /* ✅ DESIGN: Abrir Checklist de Produção */
-        function openProductionChecklist(productName) {
-            if (!productName.toUpperCase().includes('CADEIRA')) return;
+        /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
+        let timerInterval = null;
 
-            const modalHtml = `
-                <div class="modal fade" id="productionModal" tabindex="-1">
-                    <div class="modal-dialog modal-lg">
-                        <div class="modal-content border-0 shadow-lg">
-                            <div class="modal-header bg-dark text-white">
-                                <h5 class="modal-title">🛠️ Ordem de Produção: ${productName}</h5>
-                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
-                            </div>
-                            <div class="modal-body p-4" style="font-family: 'Inter', sans-serif;">
-                                <p class="text-muted mb-4">Lista Técnica (BOM) para montagem de 1 unidade.</p>
-                                <div class="row">
-                                    ${RECIPE_CADEIRA.map((item, i) => `
-                                        <div class="col-md-6 mb-2">
-                                            <div class="form-check p-3 border rounded bg-light d-flex align-items-center">
-                                                <input class="form-check-input ms-0 me-3" type="checkbox" id="check${i}" style="width: 20px; height: 20px;">
-                                                <label class="form-check-label flex-grow-1 fw-500" for="check${i}">
-                                                    ${item.nome} 
-                                                    <span class="badge bg-secondary float-end">${item.qtd} ${item.un}</span>
-                                                </label>
-                                            </div>
-                                        </div>
-                                    `).join('')}
+        function openProductionChecklist(productName) {
+            // 1. Verifica se é uma Cadeira para mostrar a lista técnica
+            const isCadeira = productName.toUpperCase().includes('CADEIRA');
+            let checklistHtml = '';
+
+            if (isCadeira) {
+                checklistHtml = `
+                    <h6 class="text-muted mb-3">📋 Lista de Corte & Insumos (1 Unidade)</h6>
+                    <div class="row g-2 mb-4" style="max-height: 300px; overflow-y: auto;">
+                        ${RECIPE_CADEIRA.map((item, i) => `
+                            <div class="col-md-6">
+                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center">
+                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}">
+                                    <label class="form-check-label flex-grow-1 small fw-bold" for="check${i}">
+                                        ${item.nome} 
+                                        <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
+                                    </label>
                                 </div>
                             </div>
-                            <div class="modal-footer bg-light">
-                                <button type="button" class="btn btn-dark px-4" data-bs-dismiss="modal">Finalizar Separação</button>
+                        `).join('')}
+                    </div>
+                `;
+            } else {
+                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática (não é Cadeira).</div>`;
+            }
+
+            const modalHtml = `
+                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
+                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                        <div class="modal-content border-0 shadow-2xl">
+                            <div class="modal-header bg-dark text-white">
+                                <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
+                            </div>
+                            <div class="modal-body bg-light">
+                                <div class="card mb-4 border-0 shadow-sm">
+                                    <div class="card-body text-center">
+                                        <h6 class="text-uppercase text-muted small letter-spacing-2">Tempo de Produção</h6>
+                                        <div id="timer-display" class="display-4 fw-bold my-2 font-monospace">00:00:00</div>
+                                        <div class="btn-group mt-2">
+                                            <button class="btn btn-success px-4" onclick="controlTimer('start', '${productName}')">▶ Iniciar</button>
+                                            <button class="btn btn-warning px-4" onclick="controlTimer('pause', '${productName}')">⏸ Pausar</button>
+                                            <button class="btn btn-danger px-4" onclick="controlTimer('reset', '${productName}')">⏹ Reiniciar/Fim</button>
+                                        </div>
+                                        <div id="timer-status" class="mt-2 badge bg-secondary">Parado</div>
+                                    </div>
+                                </div>
+
+                                ${checklistHtml}
+                            </div>
+                            <div class="modal-footer bg-white">
+                                <button type="button" class="btn btn-outline-dark" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar Janela</button>
                             </div>
                         </div>
                     </div>
                 </div>
             `;
 
-            // Remove modal anterior se existir
+            // Remove anterior e cria novo
             const oldModal = document.getElementById('productionModal');
             if (oldModal) oldModal.remove();
-
             document.body.insertAdjacentHTML('beforeend', modalHtml);
+            
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
+
+            // Carrega o estado atual do timer do servidor
+            controlTimer('get', productName);
+        }
+
+        /* Lógica do Timer Conectada ao Backend */
+        async function controlTimer(action, produto) {
+            try {
+                const res = await fetch('/api/timer/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action: action, produto: produto })
+                });
+                const data = await res.json();
+                
+                updateTimerDisplay(data.elapsed, data.state);
+                
+                // Se estiver rodando, inicia atualização local para feedback visual imediato
+                if (action === 'start' || (action === 'get' && data.state === 'running')) {
+                    startLocalCounter(data.elapsed);
+                } else {
+                    clearInterval(timerInterval);
+                }
+            } catch (e) {
+                console.error("Erro no timer:", e);
+            }
+        }
+
+        function startLocalCounter(startSeconds) {
+            clearInterval(timerInterval);
+            let seconds = startSeconds;
+            const display = document.getElementById('timer-display');
+            
+            timerInterval = setInterval(() => {
+                seconds++;
+                display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            }, 1000);
+        }
+
+        function updateTimerDisplay(seconds, state) {
+            const display = document.getElementById('timer-display');
+            const badge = document.getElementById('timer-status');
+            
+            display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            
+            if(state === 'running') {
+                badge.className = 'mt-2 badge bg-success';
+                badge.textContent = 'Em Produção...';
+                badge.classList.add('pulse-animation');
+            } else if (state === 'paused') {
+                badge.className = 'mt-2 badge bg-warning text-dark';
+                badge.textContent = 'Pausado';
+                badge.classList.remove('pulse-animation');
+            } else {
+                badge.className = 'mt-2 badge bg-secondary';
+                badge.textContent = 'Parado';
+                badge.classList.remove('pulse-animation');
+            }
         }
 
         /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
@@ -3250,8 +3428,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <p class="mb-1">${p.descricaoCurta || ''}</p>
 
                                     <small class="text-muted d-block">
-                                        <b>Estoque:</b> ${p.estoque}
-                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                        <b>Tipo:</b> ${p.tipo}
                                     </small>
 
                                     ${p.componentes && p.componentes.length > 0 ? `
@@ -3334,9 +3511,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                             .join('<br>');
                     } else if (k.tipo === 'P') {
-                        const estoqueClass = k.estoqueAtual > 0 ? 'bg-success' : 'bg-danger';
-                        comps = `<span class="badge bg-info">Produto Simples</span><br>
-                                 <span class="badge ${estoqueClass}">Estoque: ${k.estoqueAtual || 0}</span>`;
+                        comps = `<span class="badge bg-light text-dark border">Produto Cadastrado</span>`;
                         if (k.pai_id) {
                             comps += `<br><span class="badge bg-secondary">Variação</span>`;
                         }
