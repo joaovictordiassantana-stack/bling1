@@ -843,9 +843,18 @@ class AuthManager:
         
         if not self._access_token and not self._refresh_token:
             self.logger.warning("⚠️ Nenhum token encontrado no arquivo ou ambiente. Necessário realizar autenticação OAuth.")
-        elif not self._access_token and self._refresh_token:
+        if not self._access_token and self._refresh_token:
             self.logger.info("Refresh Token encontrado. Tentativa de renovação será feita na primeira requisição.") 
         
+        # ✅ ADICIONAR NO FINAL DO __init__:
+        # Carrega tokens do disco automaticamente no início
+        try:
+            self.reload_tokens_from_disk()
+            if self.is_authenticated():
+                self.logger.info("✅ Tokens carregados automaticamente do disco no início")
+        except Exception as e:
+            self.logger.debug(f"Sem tokens salvos no disco (primeira execução): {e}")
+
     def _load_tokens(self) -> Dict[str, Any]:
         """Carrega tokens do arquivo de forma segura."""
         return load_tokens_safe(self.config.TOKENS_FILE)
@@ -2024,6 +2033,20 @@ class WebServer:
             code = request.args.get('code')
             state = request.args.get('state')
             
+            # ✅ ADICIONAR AQUI: Prevenir duplo processamento
+            with WebServer.code_lock:
+                if code in WebServer.used_codes:
+                    logger.warning(f"⚠️ Code {code[:10]}... já foi processado. Ignorando.")
+                    return redirect('/')
+                
+                WebServer.used_codes.add(code)
+                # Limpa codes antigos (mantém apenas últimos 10)
+                if len(WebServer.used_codes) > 10:
+                    # WebServer.used_codes é um set, pop() remove um elemento arbitrário.
+                    # Para manter os últimos 10, poderíamos usar uma lista ou deque,
+                    # mas como o objetivo é apenas evitar reprocessamento imediato, pop() serve.
+                    WebServer.used_codes.pop()
+            
             logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
             logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
             logger.debug(f"   • State: {state[:20]}..." if state else "   • State: Ausente")
@@ -2305,6 +2328,13 @@ class WebServer:
         
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
+            # ✅ ADICIONAR LOGS DETALHADOS
+            self.logger.info("="*60)
+            self.logger.info("📡 WebSocket KPI TENTANDO CONECTAR...")
+            self.logger.info(f"   • Cliente: {request.remote_addr}")
+            self.logger.info(f"   • Headers: {dict(request.headers)}")
+            self.logger.info("="*60)
+            
             # ✅ Limite de callbacks para evitar DoS acidental
             global kpi_update_callbacks, kpi_update_lock
 
@@ -2319,6 +2349,7 @@ class WebServer:
             # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
+                    self.logger.debug(f"🔔 Enviando payload: {list(payload.keys())}")
                     ws.send(json.dumps(payload))
                 except ConnectionClosed:
                     raise
@@ -2326,16 +2357,19 @@ class WebServer:
                     self.logger.exception("Erro enviando via WS.")
                     raise ConnectionClosed()  # Força desconexão
             
-            # ✅ CORREÇÃO: ADICIONA O CALLBACK **ANTES** DO BROADCAST
+            # ✅ ADICIONAR CALLBACK **ANTES** DO BROADCAST
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
+                self.logger.info(f"✅ Callback adicionado. Total: {len(kpi_update_callbacks)}")
             
             # Envia o estado inicial completo
             try:
+                self.logger.info("🔄 Preparando estado inicial...")
                 sales_stats = self.orchestrator.sales._get_state_for_save()
                 
                 # ✅ CORREÇÃO: Garante que sales_stats nunca seja None
                 if not sales_stats or not isinstance(sales_stats, dict):
+                    self.logger.warning("⚠️ sales_stats vazio. Usando valores padrão.")
                     sales_stats = {
                         "daily": 0,
                         "weekly": 0,
@@ -2356,6 +2390,7 @@ class WebServer:
                         component_usage = {"components": [], "daily_breakdown": []}
                 
                 # ✅ AGORA O CALLBACK JÁ ESTÁ REGISTRADO, ENTÃO O BROADCAST FUNCIONARÁ
+                self.logger.info("📤 Enviando broadcast...")
                 self.orchestrator.broadcast_kpi_update(
                     sales_stats=sales_stats,
                     component_usage=component_usage
@@ -2363,14 +2398,14 @@ class WebServer:
                 self.logger.info("✅ Estado inicial enviado ao WebSocket")
                 
             except Exception as e:
-                self.logger.exception("Erro ao enviar estado inicial via WS.")
+                self.logger.exception("❌ Erro ao enviar estado inicial via WS.")
                 
             try:
                 while True:
                     # Mantém a conexão aberta
                     ws.receive(timeout=60)
             except ConnectionClosed:
-                pass
+                self.logger.info("WebSocket KPI desconectado pelo cliente.")
             finally:
                 # Remove o callback ao desconectar
                 with kpi_update_lock:
