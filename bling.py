@@ -3909,6 +3909,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
     
+    setup_logging()  # <-- ADICIONAR AQUI
+    
     # 1. Inicializa as dependências na ordem correta
     config = Config()
     
@@ -3934,12 +3936,19 @@ def create_app() -> Flask:
     flask_app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'sw-moveis-mdf-secure-key-2025')
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
-    WebServer(config, orchestrator, flask_app) 
+    WebServer(config, orchestrator, flask_app)
     
-    # 5. LÓGICA DE INÍCIO DO WORKER (REMOVIDA DO STARTUP)
-    # O worker não deve iniciar automaticamente no startup.
-    # Ele deve ser iniciado apenas após a autenticação ou sob demanda.
-    # A chamada para orchestrator.start() e start_cleanup_timer() foi removida daqui.
+    # ✅ ADICIONAR: Atribui orchestrator ao app
+    flask_app.orchestrator = orchestrator 
+    
+    # 5. Iniciar worker automaticamente
+    if not orchestrator.is_running():
+        try:
+            orchestrator.start_worker()
+            start_cleanup_timer()
+            logger.info("✅ Worker de fundo iniciado automaticamente no startup.")
+        except Exception as e:
+            logger.error(f"❌ Erro ao iniciar worker: {e}")
     
     return flask_app
 
