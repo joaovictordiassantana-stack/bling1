@@ -3108,9 +3108,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const response = await fetch(url, options);
 
                 if (response.status === 401) {
-                    console.error("Sessão expirada (401). Redirecionando para autenticação.");
-                    window.location.href = document.getElementById('auth-link').href;
-                    throw new Error("Sessão expirada. Redirecionamento em curso.");
+                    console.error("Sessão expirada (401).");
+                    updateAuthStatus(false, document.getElementById('auth-link').href);
+                    throw new Error("Sessão expirada.");
                 }
 
                 if (!response.ok) {
