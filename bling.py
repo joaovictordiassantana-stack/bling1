@@ -1312,6 +1312,7 @@ class Orchestrator:
         # Garante que o SalesManager tenha a referência correta
         self.sales.orchestrator = self
         self._running = False
+        self._is_processing = False # ✅ Flag de controle de processamento
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
@@ -1366,6 +1367,11 @@ class Orchestrator:
 
     def start_worker(self):
         """Inicia o worker de fundo para atualização de dados."""
+        # ✅ SEGURANÇA: Impede múltiplos workers ativos
+        if self._worker_thread and self._worker_thread.is_alive():
+            self.logger.debug("⚠️ Tentativa de iniciar worker ignorada: Worker já está rodando.")
+            return
+
         if not self._running:
             self._running = True
             self._stop_event = Event() # Evento para sinalizar parada
@@ -1377,7 +1383,7 @@ class Orchestrator:
             # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
             # O worker principal ainda inicia, mas ele se protege com a verificação de token.
             
-                        # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
+            # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
             # A chamada para self.api.register_webhook foi removida daqui, pois a função agora apenas loga a instrução.
             # O registro deve ser feito manualmente no painel do Bling.
             
@@ -1402,6 +1408,11 @@ class Orchestrator:
         """
         logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
         
+        # ✅ SEGURANÇA: Não chama wake_worker se já estiver processando
+        if self._is_processing:
+            logger.debug("⚠️ Worker já está processando. Wake ignorado para evitar duplicidade.")
+            return
+
         # 1. Verifica se a thread do worker ainda está viva
         if self._worker_thread is None or not self._worker_thread.is_alive():
             logger.warning("💀 [DEBUG-WORKER] Worker encontrado morto ou não iniciado! Ressuscitando...")
@@ -1443,6 +1454,7 @@ class Orchestrator:
         
         while not self._stop_event.is_set():
             cycle_count += 1
+            self._is_processing = True # ✅ Inicia processamento
             
             logger.debug(f"")
             logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
@@ -1495,6 +1507,8 @@ class Orchestrator:
 
             except Exception as e:
                 logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
+            finally:
+                self._is_processing = False # ✅ Finaliza processamento
 
             logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
             logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
@@ -1914,9 +1928,14 @@ class WebServer:
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
         @self.app.route('/auth')
         def auth():
-            from flask import redirect
+            from flask import redirect, url_for
             import secrets
             
+            # ✅ SEGURANÇA: Bloqueia nova autenticação se já estiver autenticado
+            if self.orchestrator.auth.is_authenticated():
+                self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
+                return redirect(url_for("dashboard"))
+
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
             self.orchestrator.auth._save_oauth_state(state)
