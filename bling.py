@@ -2328,86 +2328,40 @@ class WebServer:
         
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
-            # ✅ ADICIONAR LOGS DETALHADOS
-            self.logger.info("="*60)
-            self.logger.info("📡 WebSocket KPI TENTANDO CONECTAR...")
-            self.logger.info(f"   • Cliente: {request.remote_addr}")
-            self.logger.info(f"   • Headers: {dict(request.headers)}")
-            self.logger.info("="*60)
-            
-            # ✅ Limite de callbacks para evitar DoS acidental
-            global kpi_update_callbacks, kpi_update_lock
-
             self.logger.info("📡 WebSocket KPI conectado.")
-            self.logger.debug(f"   • Total de callbacks ativos: {len(kpi_update_callbacks)}")
-            self.logger.debug(f"   • Autenticado: {self.orchestrator.auth.is_authenticated()}")
-            self.logger.debug(f"   • Worker rodando: {self.orchestrator.is_running()}")
-            if len(kpi_update_callbacks) >= 10:
-                self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
-                return
-
-            # Função de callback para enviar atualizações completas
+            
+            # 1. Definição do Callback
             def kpi_callback(payload):
                 try:
-                    self.logger.debug(f"🔔 Enviando payload: {list(payload.keys())}")
+                    if not ws.connected: raise ConnectionClosed() # Verificação extra
                     ws.send(json.dumps(payload))
-                except ConnectionClosed:
-                    raise
-                except Exception as e:
-                    self.logger.exception("Erro enviando via WS.")
-                    raise ConnectionClosed()  # Força desconexão
-            
-            # ✅ ADICIONAR CALLBACK **ANTES** DO BROADCAST
+                except Exception:
+                    raise ConnectionClosed()
+
+            # 2. Registro e Envio Imediato (CRÍTICO)
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
-                self.logger.info(f"✅ Callback adicionado. Total: {len(kpi_update_callbacks)}")
             
-            # Envia o estado inicial completo
             try:
-                self.logger.info("🔄 Preparando estado inicial...")
-                sales_stats = self.orchestrator.sales._get_state_for_save()
+                # Força o envio do estado ATUAL imediatamente após conectar
+                current_stats = self.orchestrator.sales._get_state_for_save()
                 
-                # ✅ CORREÇÃO: Garante que sales_stats nunca seja None
-                if not sales_stats or not isinstance(sales_stats, dict):
-                    self.logger.warning("⚠️ sales_stats vazio. Usando valores padrão.")
-                    sales_stats = {
-                        "daily": 0,
-                        "weekly": 0,
-                        "monthly": 0,
-                        "last_update": datetime.now(timezone.utc).isoformat()
-                    }
+                # Payload inicial robusto
+                initial_payload = {
+                    "type": "full_update",
+                    "authenticated": self.orchestrator.auth.is_authenticated(), # Verifica autenticação real
+                    "worker_running": self.orchestrator.is_running(),
+                    "sales_stats": current_stats or {},
+                    "auth_url": self.orchestrator.auth.get_authorization_url()
+                }
                 
-                # Tenta usar cache se disponível
-                component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
+                ws.send(json.dumps(initial_payload)) # Envia o "aperto de mão"
                 
-                if not component_usage:
-                    self.logger.info("🔄 Cache de componentes vazio. Calculando...")
-                    try:
-                        component_usage = self.orchestrator.calculate_component_usage()
-                        self.orchestrator._component_usage_cache = component_usage
-                    except Exception as calc_error:
-                        self.logger.error(f"Falha ao calcular componentes: {calc_error}")
-                        component_usage = {"components": [], "daily_breakdown": []}
-                
-                # ✅ AGORA O CALLBACK JÁ ESTÁ REGISTRADO, ENTÃO O BROADCAST FUNCIONARÁ
-                self.logger.info("📤 Enviando broadcast...")
-                self.orchestrator.broadcast_kpi_update(
-                    sales_stats=sales_stats,
-                    component_usage=component_usage
-                )
-                self.logger.info("✅ Estado inicial enviado ao WebSocket")
-                
-            except Exception as e:
-                self.logger.exception("❌ Erro ao enviar estado inicial via WS.")
-                
-            try:
                 while True:
-                    # Mantém a conexão aberta
-                    ws.receive(timeout=60)
-            except ConnectionClosed:
-                self.logger.info("WebSocket KPI desconectado pelo cliente.")
+                    ws.receive(timeout=60) # Mantém vivo
+            except Exception as e:
+                self.logger.debug(f"WebSocket cliente desconectado: {e}")
             finally:
-                # Remove o callback ao desconectar
                 with kpi_update_lock:
                     if kpi_callback in kpi_update_callbacks:
                         kpi_update_callbacks.remove(kpi_callback)
@@ -3697,34 +3651,33 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             };
         }
 
-        setupKpiWebSocket();
-
-        // ✅ ADICIONAR AQUI: Verificação inicial de autenticação
+        /* ✅ DESIGN: Verificação Híbrida (WebSocket + REST) */
         async function checkInitialAuth() {
             try {
+                console.log("🕵️ Verificando status via REST API...");
                 const response = await fetch('/api/status');
-                const data = await response.json();
                 
-                // Pega a URL de autenticação do meta tag ou usa padrão
-                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
-                
-                updateAuthStatus(data.authenticated, authUrl);
-                
-                // Se autenticado, força um reload de dados
-                if (data.authenticated) {
-                    console.log("✅ Autenticado! Carregando dados...");
-                } else {
-                    console.log("❌ Não autenticado. Aguardando login...");
+                if (response.ok) {
+                    const data = await response.json();
+                    console.log("✅ Status REST recebido:", data);
+                    
+                    // Se a API diz que está autenticado, força a atualização da UI
+                    // mesmo que o WebSocket ainda não tenha conectado.
+                    const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
+                    updateAuthStatus(data.authenticated, authUrl);
+                    
+                    if (data.authenticated) {
+                        // Se já estamos autenticados, carregamos os dados iniciais
+                        loadKits();
+                        loadKPIChart();
+                    }
                 }
             } catch (error) {
-                console.error("Erro ao verificar autenticação inicial:", error);
-                // Em caso de erro, assume não autenticado
-                updateAuthStatus(false, '/auth');
+                console.error("❌ Erro ao verificar autenticação inicial via REST:", error);
             }
         }
 
-        // Executa verificação inicial após 500ms (aguarda WebSocket conectar)
-        setTimeout(checkInitialAuth, 500);
+
 
         // ✅ ADICIONAR: Timeout de segurança
         let authCheckTimeout = setTimeout(() => {
@@ -3976,8 +3929,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* ✅ DESIGN: Inicialização */
         document.addEventListener('DOMContentLoaded', () => {
-            loadKits();
+            // 1. Tenta conectar WebSockets
+            setupKpiWebSocket();
+            
+            // 2. Faz uma verificação REST imediata para destravar a UI rapidamente
+            checkInitialAuth();
 
+            // 3. Configura listeners das abas
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
             if (kpiTab) {
                 kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
