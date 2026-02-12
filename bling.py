@@ -74,8 +74,45 @@ class RateLimiter:
             self.last_call = time.time()
 
 # ============================================================================ 
-# 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK)
+# 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK) E ENGENHARIA
 # ============================================================================
+# Mapeamento de Produção - Lista Técnica (Hardcoded)
+RECIPE_CADEIRA = [
+    {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+    {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+    {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+    {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+    {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+    {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+    {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+    {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+    {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+    {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+    {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+    {"nome": "COLA", "qtd": 1, "un": "Unid"},
+    {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+    {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+    {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+    {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+    {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+    {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+    {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+    {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+    {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+    {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+    {"nome": "BASE", "qtd": 1, "un": "Unid"}
+]
+
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
 kpi_update_callbacks: List[Callable] = []
@@ -212,6 +249,140 @@ def start_cleanup_timer():
             cleanup_kpi_callbacks()
     
     Thread(target=cleanup_loop, daemon=True).start()
+
+# ==============================================================================
+# MÓDULO DE ENGENHARIA E PRODUÇÃO (HARDCODED)
+# ==============================================================================
+
+# 2. Gerenciador de Persistência (Timer e Checklist)
+class ProductionManager:
+    def __init__(self):
+        self.db_path = Path("production_state.json")
+        self.state = self._load()
+        self._auto_pause_on_restart()
+
+    def _load(self):
+        current_month = datetime.now().strftime("%m/%Y")
+        if self.db_path.exists():
+            try:
+                with open(self.db_path, 'r') as f:
+                    data = json.load(f)
+                    if data.get("mes") == current_month:
+                        return data
+            except Exception:
+                pass
+        return {"mes": current_month, "timers": {}, "checklists": {}, "manual_consumption": {}}
+
+    def _save(self):
+        with open(self.db_path, 'w') as f:
+            json.dump(self.state, f)
+
+    def _auto_pause_on_restart(self):
+        """Regra: Se o servidor reiniciou, pausa timers ativos para não perder controle"""
+        changed = False
+        for pid in self.state.get("timers", {}):
+            if self.state["timers"][pid].get("state") == "running":
+                self.state["timers"][pid]["state"] = "paused"
+                self.state["timers"][pid]["last_start"] = 0
+                changed = True
+        if changed:
+            self._save()
+
+    # --- Lógica do Timer ---
+    def timer_action(self, product_id, action):
+        """Start, Pause, Stop (Reset)"""
+        now = time.time()
+        t = self.state["timers"].get(product_id, {"accumulated": 0, "state": "stopped", "last_start": 0})
+        
+        if action == "start":
+            if t["state"] != "running":
+                t["state"], t["last_start"] = "running", now
+        elif action == "pause":
+            if t["state"] == "running":
+                t["state"] = "paused"
+                t["accumulated"] += (now - t["last_start"])
+                t["last_start"] = 0
+        elif action == "stop":
+            t = {"accumulated": 0, "state": "stopped", "last_start": 0}
+            
+        self.state["timers"][product_id] = t
+        self._save()
+        
+        # Retorna estado calculado para o front
+        total_time = t["accumulated"]
+        if t["state"] == "running":
+            total_time += (now - t["last_start"])
+        return {"state": t["state"], "elapsed": total_time}
+
+    # --- Lógica do Checklist e Consumo Manual ---
+    def toggle_item(self, product_id, item_name, is_checked):
+        if product_id not in self.state["checklists"]:
+            self.state["checklists"][product_id] = []
+        
+        check_list = self.state["checklists"][product_id]
+        if is_checked:
+            if item_name not in check_list:
+                check_list.append(item_name)
+                # Incrementa consumo manual
+                self.state["manual_consumption"][item_name] = self.state["manual_consumption"].get(item_name, 0) + 1
+        else:
+            if item_name in check_list:
+                check_list.remove(item_name)
+                # Decrementa consumo manual (mínimo 0)
+                self.state["manual_consumption"][item_name] = max(0, self.state["manual_consumption"].get(item_name, 0) - 1)
+            
+        self._save()
+        return check_list
+
+    # --- Lógica de Relatório (Vendas + Manual) ---
+    def get_monthly_report(self, sales_history):
+        """
+        Cruza as vendas do Bling com a Receita + Consumo Manual do Checklist.
+        """
+        # Relatório consolidado
+        report = defaultdict(lambda: {"qtd_vendas": 0, "qtd_manual": 0, "total": 0, "un": ""})
+        products_sold = defaultdict(int)
+        
+        # 1. Cálculo Baseado em Vendas (Mês Atual)
+        current_month_iso = datetime.now().strftime("%Y-%m")
+        
+        for order in sales_history:
+            if not order.get('data', '').startswith(current_month_iso):
+                continue
+                
+            for item in order.get('itens', []):
+                name = item.get('descricao', '').upper()
+                qtd = float(item.get('quantidade', 0))
+                
+                if "CADEIRA" in name:
+                    products_sold[name] += int(qtd)
+                    for ing in RECIPE_CADEIRA:
+                        key = ing['nome']
+                        report[key]["qtd_vendas"] += (ing['qtd'] * qtd)
+                        report[key]["un"] = ing['un']
+
+        # 2. Adiciona Consumo Manual (Checklist)
+        for item_name, qtd_manual in self.state.get("manual_consumption", {}).items():
+            report[item_name]["qtd_manual"] = qtd_manual
+            # Se não tiver unidade definida pelas vendas, tenta pegar da receita
+            if not report[item_name]["un"]:
+                for ing in RECIPE_CADEIRA:
+                    if ing['nome'] == item_name:
+                        report[item_name]["un"] = ing['un']
+                        break
+
+        # 3. Calcula Total
+        for key in report:
+            report[key]["total"] = report[key]["qtd_vendas"] + report[key]["qtd_manual"]
+        
+        return {
+            "insumos": dict(report),
+            "produtos_vendidos": dict(products_sold),
+            "timers": self.state.get("timers", {}),
+            "mes": self.state.get("mes")
+        }
+
+prod_manager = ProductionManager()
 
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
@@ -1011,6 +1182,69 @@ class SalesManager:
         save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
         self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
+class ProductionTimer:
+    """Gerencia cronômetros de produção persistentes."""
+    FILE_PATH = Path('production_timers.json')
+
+    def __init__(self):
+        self.timers = self._load()
+
+    def _load(self):
+        if not self.FILE_PATH.exists():
+            return {}
+        try:
+            with open(self.FILE_PATH, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save(self):
+        with open(self.FILE_PATH, 'w') as f:
+            json.dump(self.timers, f)
+
+    def start(self, produto_nome):
+        now = time.time()
+        if produto_nome not in self.timers:
+            self.timers[produto_nome] = {'start_ts': now, 'accumulated': 0, 'state': 'running'}
+        else:
+            t = self.timers[produto_nome]
+            if t['state'] == 'paused':
+                t['start_ts'] = now
+                t['state'] = 'running'
+        self._save()
+        return self.get_status(produto_nome)
+
+    def pause(self, produto_nome):
+        if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
+            t = self.timers[produto_nome]
+            now = time.time()
+            elapsed = now - t['start_ts']
+            t['accumulated'] += elapsed
+            t['start_ts'] = 0
+            t['state'] = 'paused'
+            self._save()
+        return self.get_status(produto_nome)
+
+    def reset(self, produto_nome):
+        if produto_nome in self.timers:
+            del self.timers[produto_nome]
+            self._save()
+        return {'elapsed': 0, 'state': 'stopped'}
+
+    def get_status(self, produto_nome):
+        if produto_nome not in self.timers:
+            return {'elapsed': 0, 'state': 'stopped'}
+        
+        t = self.timers[produto_nome]
+        total = t['accumulated']
+        if t['state'] == 'running':
+            total += (time.time() - t['start_ts'])
+        
+        return {'elapsed': int(total), 'state': t['state']}
+
+# Instancie globalmente
+production_timer = ProductionTimer()
+
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
 # ============================================================================
@@ -1448,146 +1682,89 @@ class Orchestrator:
         self.logger.info(f"✅ Cache atualizado: {len(all_products)} produtos/variações, {len(all_kits)} kits.")
         self.broadcast_kpi_update(cache_updated=True)
 
-    def calculate_component_usage(self, days: int = 30) -> Dict[str, Any]:
-        """
-        Calcula uso de componentes com breakdown diário.
-        """
+    def calculate_component_usage(self) -> Dict[str, Any]:
+        """Calcula insumos baseado APENAS no código interno e vendas do Mês Atual."""
         
-        # CORREÇÃO: Não tenta calcular se não estiver logado
-        if not self.auth.is_authenticated():
-            return {"components": [], "daily_breakdown": []}
+        # Define o intervalo: Primeiro dia do mês atual até agora
+        agora = datetime.now()
+        inicio_mes = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0, "un": ""})
+        produtos_vendidos = defaultdict(int)
+        daily_usage = defaultdict(lambda: defaultdict(float))
+        
+        # Pega o histórico de vendas (que já é buscado pelo worker)
+        # Filtra apenas o que foi vendido DEPOIS do dia 1 do mês
+        with self.sales.lock:
+            todos_pedidos = self.sales._sales_history
+            
+        for pedido in todos_pedidos:
+            data_str = pedido.get('data')
+            if not data_str: continue
+            
+            # Converte string para datetime para comparar
+            try:
+                # Tenta ISO format primeiro, depois fallback
+                dt_pedido = datetime.fromisoformat(data_str.split(' ')[0].replace('T', ' '))
+                day_key = dt_pedido.strftime('%Y-%m-%d')
+            except: continue
+            
+            # FILTRO CRUCIAL: Apenas mês atual
+            if dt_pedido < inicio_mes:
+                continue
 
-        now = datetime.now()
-        params = {
-            'dataEmissaoInicial': (now - timedelta(days=days)).strftime('%Y-%m-%d'),
-            'situacao': 'atendidos,em_aberto,em_andamento,faturados,em_producao'
-        }
-        
-        token = self.auth.get_access_token()
-        if not token:
-            self.logger.warning("Token indisponível para calcular uso de componentes.")
-            return {"components": [], "daily_breakdown": []}
-            
-        all_orders = []
-        page = 1
-        while True:
-            params['pagina'] = page
-            
-            # ✅ TRATAMENTO 429: Captura e aborta o loop
-            try:
-                response = self.api.get('pedidos/vendas', params=params)
-            except requests.exceptions.HTTPError as e:
-                if e.response and e.response.status_code == 429:
-                    self.logger.warning("🛑 Rate limit (429) detectado. Abortando cálculo de componentes.")
-                    break
-                raise
-            
-            if response is None:
-                break
-            data = safe_get(response, 'data', [])
-            if not data or len(data) == 0:
-                break
-            all_orders.extend(data)
-            if len(data) < 100:
-                break
-            page += 1
-            
-            # ✅ PAUSA FIXA: Aguarda 1.2s entre páginas (obrigatório para evitar burst)
-            time.sleep(1.2)
-            
-        # Rastreamento por dia E total
-        component_usage = {}  # Total do período
-        daily_usage = defaultdict(lambda: defaultdict(int))  # Por dia
-        
-        for order in all_orders:
-            # Extrai data
-            data_emissao_str = safe_get(safe_get(order, 'data', {}), 'dataEmissao')
-            if not data_emissao_str:
-                continue
-            
-            try:
-                order_date = datetime.strptime(data_emissao_str, '%Y-%m-%d')
-                day_key = order_date.strftime('%Y-%m-%d')
-            except:
-                continue
-            
-            itens = safe_get(order, 'itens', [])
+            itens = pedido.get('itens', [])
             for item in safe_iter(itens):
-                produto_sku = safe_get(item, 'codigo')
-                quantidade_vendida = safe_get(item, 'quantidade', 0)
+                nome = (item.get('descricao') or item.get('nome') or "").upper()
+                qtd = float(item.get('quantidade', 0))
                 
-                if not produto_sku or quantidade_vendida == 0:
-                    continue
-                
-                produto = self.get_product_by_sku(produto_sku)
-                
-                # Se é KIT, processa componentes
-                if produto and safe_get(produto, 'tipo') == 'K':
-                    componentes = safe_get(produto, 'componentes', [])
-                    for comp in safe_iter(componentes):
-                        comp_sku = safe_get(safe_get(comp, 'produto', {}), 'codigo')
-                        comp_nome = safe_get(safe_get(comp, 'produto', {}), 'nome')
-                        comp_qtd_por_kit = safe_get(comp, 'quantidade', 0)
-                        
-                        if not comp_sku:
-                            continue
-                        
-                        qtd_consumida = quantidade_vendida * comp_qtd_por_kit
-                        
-                        # Atualiza total
-                        if comp_sku not in component_usage:
-                            component_usage[comp_sku] = {
-                                "sku": comp_sku,
-                                "nome": comp_nome,
-                                "quantidade": 0,
-                                "produtos": set()
-                            }
-                        component_usage[comp_sku]["quantidade"] += qtd_consumida
-                        component_usage[comp_sku]["produtos"].add(produto_sku)
-                        
-                        # Atualiza diário
-                        daily_usage[day_key][comp_sku] += qtd_consumida
-                
-                # Se é PRODUTO SIMPLES, conta também
-                else:
-                    if produto_sku not in component_usage:
-                        component_usage[produto_sku] = {
-                            "sku": produto_sku,
-                            "nome": safe_get(produto, 'nome', 'Produto'),
-                            "quantidade": 0,
-                            "produtos": set()
-                        }
-                    component_usage[produto_sku]["quantidade"] += quantidade_vendida
-                    component_usage[produto_sku]["produtos"].add(produto_sku)
+                if qtd <= 0: continue
+
+                # Regra: Se tem "CADEIRA" no nome, explode a lista técnica
+                if "CADEIRA" in nome:
+                    produtos_vendidos[nome] += int(qtd)
                     
-                    daily_usage[day_key][produto_sku] += quantidade_vendida
+                    # Usa a lista hardcoded RECIPE_CADEIRA (definida no início do arquivo)
+                    for componente in RECIPE_CADEIRA:
+                        nome_comp = componente['nome']
+                        qtd_comp = componente['qtd'] * qtd
+                        un = componente['un']
+                        
+                        insumos_totais[nome_comp]["nome"] = nome_comp
+                        insumos_totais[nome_comp]["quantidade"] += qtd_comp
+                        insumos_totais[nome_comp]["un"] = un
+                        
+                        daily_usage[day_key][nome_comp] += qtd_comp
+                else:
+                    # Se não for cadeira, apenas registra o próprio produto como insumo (venda direta)
+                    insumos_totais[nome]["nome"] = nome
+                    insumos_totais[nome]["quantidade"] += qtd
+                    insumos_totais[nome]["un"] = "Unid"
+                    daily_usage[day_key][nome] += qtd
         
-        # Formata resultado
-        result = []
-        for sku, usage in component_usage.items():
-            result.append({
-                "sku": usage["sku"],
-                "nome": usage["nome"],
-                "quantidade": usage["quantidade"],
-                "produtos": sorted(list(usage["produtos"]))
+        # Formata para lista
+        lista_final = []
+        for data in insumos_totais.values():
+            lista_final.append({
+                "nome": data["nome"],
+                "quantidade": round(data["quantidade"], 2),
+                "un": data["un"]
             })
-        
-        result.sort(key=lambda x: x['quantidade'], reverse=True)
+        lista_final.sort(key=lambda x: x['quantidade'], reverse=True)
         
         # Formata consumo diário
         daily_breakdown = []
         for day in sorted(daily_usage.keys(), reverse=True):
-            daily_breakdown.append({
-                "data": day,
-                "componentes": [
-                    {"sku": sku, "quantidade": qtd}
-                    for sku, qtd in daily_usage[day].items()
-                ]
-            })
+            day_items = []
+            for nome, qty in daily_usage[day].items():
+                day_items.append({"nome": nome, "quantidade": round(qty, 2)})
+            daily_breakdown.append({"data": day, "componentes": day_items})
         
         return {
-            "components": result,
-            "daily_breakdown": daily_breakdown[:7]  # Últimos 7 dias
+            "components": lista_final,
+            "daily_breakdown": daily_breakdown[:7],
+            "produtos_vendidos": dict(produtos_vendidos),
+            "mes_referencia": agora.strftime("%m/%Y")
         }
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
@@ -1760,6 +1937,37 @@ class WebServer:
             
             return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
 
+        # --- ROTAS DE PRODUÇÃO ---
+        @self.app.route('/api/production/timer', methods=['POST'])
+        def production_timer():
+            """Controla Start/Pause/Stop do Timer"""
+            data = request.json
+            pid = str(data.get('id'))
+            action = data.get('action')
+            res = prod_manager.timer_action(pid, action)
+            return jsonify(res)
+
+        @self.app.route('/api/production/checklist', methods=['POST'])
+        def production_checklist():
+            """Salva o item marcado na checklist"""
+            data = request.json
+            pid = str(data.get('id'))
+            item = data.get('item')
+            checked = data.get('checked')
+            prod_manager.toggle_item(pid, item, checked)
+            # Ao marcar, já contabiliza no consumo geral (implícito no relatório)
+            return jsonify({"status": "ok"})
+
+        @self.app.route('/api/production/report')
+        def production_report():
+            """Retorna dados para a Guia Componentes"""
+            # Pega histórico de vendas seguro
+            with self.orchestrator.sales.lock:
+                history = list(self.orchestrator.sales._sales_history)
+            
+            data = prod_manager.get_monthly_report(history)
+            return jsonify(data)
+
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
@@ -1923,33 +2131,48 @@ class WebServer:
             return jsonify({"message": "Recarregamento do cache de produtos/kits iniciado em segundo plano."}), 202
 
         @self.app.route('/api/components/usage')
+        @self.app.route('/api/production/report')
         @token_required
-        def api_component_usage(token):
-            """Retorna uso de componentes (do cache do worker)."""
+        def api_production_report(token):
+            """Retorna dados de produção e insumos (Guia Componentes)"""
             try:
-                # Retorna cache se disponível E não vazio
-                cache = getattr(self.orchestrator, '_component_usage_cache', None)
+                # Pega histórico de vendas seguro
+                with self.orchestrator.sales.lock:
+                    history = list(self.orchestrator.sales._sales_history)
                 
-                if cache and (cache.get('components') or cache.get('daily_breakdown')):
-                    self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
-                    return jsonify(cache)
+                data = prod_manager.get_monthly_report(history)
                 
-                # Calcula sob demanda
-                self.logger.info("🔄 Cache vazio. Calculando componentes sob demanda...")
-                usage_data = self.orchestrator.calculate_component_usage()
-                
-                # Armazena no cache para reutilizar
-                self.orchestrator._component_usage_cache = usage_data
-                
-                return jsonify(usage_data)
-                
+                # Prepara resposta consolidada
+                response = {
+                    "insumos": data["insumos"],
+                    "produtos_vendidos": data["produtos_vendidos"],
+                    "timers": data["timers"],
+                    "mes": data["mes"],
+                    "components": [
+                        {
+                            "nome": k,
+                            "quantidade": v["total"],
+                            "qtd_vendas": v["qtd_vendas"],
+                            "qtd_manual": v["qtd_manual"],
+                            "un": v["un"]
+                        } for k, v in data["insumos"].items()
+                    ]
+                }
+                return jsonify(response)
             except Exception as e:
-                self.logger.exception("Erro ao processar /api/components/usage")
-                return jsonify({
-                    "error": str(e),
-                    "components": [],
-                    "daily_breakdown": []
-                }), 500
+                self.logger.exception("Erro ao gerar relatório de produção")
+                return jsonify({"error": str(e)}), 500
+
+        @self.app.route('/api/production/check', methods=['POST'])
+        @token_required
+        def api_production_check(token):
+            """Registra item marcado na checklist (conforme pedido Gemini)"""
+            data = request.json
+            pid = str(data.get('id'))
+            item = data.get('item')
+            checked = data.get('checked')
+            prod_manager.toggle_item(pid, item, checked)
+            return jsonify({"status": "ok"})
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
@@ -2635,6 +2858,26 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             display: none;
         }
 
+        /* Remova ou oculte classes de estoque */
+        .stock-badge, .estoque-info, .stock-info-row {
+            display: none !important;
+        }
+
+        @keyframes pulse-animation {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        .pulse-animation {
+            animation: pulse-animation 2s infinite;
+        }
+        .shadow-2xl {
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+        .letter-spacing-2 {
+            letter-spacing: 0.1em;
+        }
+
         /* ✅ DESIGN: Responsivo */
         @media (max-width: 768px) {
             .kpi-card h3 {
@@ -3009,48 +3252,287 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        /* ✅ DESIGN: Atualizar Componentes */
+        /* ✅ DESIGN: Lista Técnica Hardcoded (Engenharia) */
+        const RECIPE_CADEIRA = [
+            {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+            {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+            {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+            {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+            {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+            {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+            {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+            {"nome": "COLA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+            {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+            {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+            {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+            {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+            {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+            {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+            {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+            {"nome": "BASE", "qtd": 1, "un": "Unid"}
+        ];
+
+        /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
+        let timerInterval = null;
+
+        function openProductionChecklist(productName) {
+            // 1. Verifica se é uma Cadeira para mostrar a lista técnica
+            const isCadeira = productName.toUpperCase().includes('CADEIRA');
+            let checklistHtml = '';
+
+            if (isCadeira) {
+                checklistHtml = `
+                    <h6 class="text-muted mb-3">📋 Lista de Corte & Insumos (1 Unidade)</h6>
+                    <div class="row g-2 mb-4" style="max-height: 300px; overflow-y: auto;">
+                        ${RECIPE_CADEIRA.map((item, i) => `
+                            <div class="col-md-6">
+                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center">
+                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}" onchange="toggleChecklist('${productName}', '${item.nome}', this.checked)">
+                                    <label class="form-check-label flex-grow-1 small fw-bold" for="check${i}">
+                                        ${item.nome} 
+                                        <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
+                                    </label>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            } else {
+                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática (não é Cadeira).</div>`;
+            }
+
+            const modalHtml = `
+                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
+                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                        <div class="modal-content border-0 shadow-2xl">
+                            <div class="modal-header bg-dark text-white">
+                                <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
+                            </div>
+                            <div class="modal-body bg-light">
+                                <div class="card mb-4 border-0 shadow-sm">
+                                    <div class="card-body text-center">
+                                        <h6 class="text-uppercase text-muted small letter-spacing-2">Tempo de Produção</h6>
+                                        <div id="timer-display" class="display-4 fw-bold my-2 font-monospace">00:00:00</div>
+                                        <div class="btn-group mt-2">
+                                            <button class="btn btn-success px-4" onclick="controlTimer('start', '${productName}')">▶ Iniciar</button>
+                                            <button class="btn btn-warning px-4" onclick="controlTimer('pause', '${productName}')">⏸ Pausar</button>
+                                            <button class="btn btn-danger px-4" onclick="controlTimer('reset', '${productName}')">⏹ Reiniciar/Fim</button>
+                                        </div>
+                                        <div id="timer-status" class="mt-2 badge bg-secondary">Parado</div>
+                                    </div>
+                                </div>
+
+                                ${checklistHtml}
+                            </div>
+                            <div class="modal-footer bg-white">
+                                <button type="button" class="btn btn-outline-dark" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar Janela</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            // Remove anterior e cria novo
+            const oldModal = document.getElementById('productionModal');
+            if (oldModal) oldModal.remove();
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            
+            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
+            modal.show();
+
+            // Carrega o estado atual do timer e checklist do servidor
+            controlTimer('get', productName);
+            loadChecklistState(productName);
+        }
+
+        async function loadChecklistState(productName) {
+            try {
+                const res = await fetch('/api/production/report');
+                const data = await res.json();
+                const checklist = data.checklists ? data.checklists[productName] : [];
+                if (checklist) {
+                    checklist.forEach(item => {
+                        // Tenta encontrar o checkbox pelo nome do item (usando o atributo customizado se necessário ou iterando)
+                        const checkboxes = document.querySelectorAll('#productionModal .form-check-input');
+                        checkboxes.forEach(cb => {
+                            // Extrai o nome do item do onchange para comparar
+                            if (cb.getAttribute('onchange').includes(`'${item}'`)) {
+                                cb.checked = true;
+                            }
+                        });
+                    });
+                }
+            } catch (e) { console.error("Erro ao carregar checklist:", e); }
+        }
+
+        /* Lógica do Timer Conectada ao Backend */
+        async function controlTimer(action, produto) {
+            try {
+                const res = await fetch('/api/timer/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action: action, produto: produto })
+                });
+                const data = await res.json();
+                
+                updateTimerDisplay(data.elapsed, data.state);
+                
+                // Se estiver rodando, inicia atualização local para feedback visual imediato
+                if (action === 'start' || (action === 'get' && data.state === 'running')) {
+                    startLocalCounter(data.elapsed);
+                } else {
+                    clearInterval(timerInterval);
+                }
+            } catch (e) {
+                console.error("Erro no timer:", e);
+            }
+        }
+
+        function startLocalCounter(startSeconds) {
+            clearInterval(timerInterval);
+            let seconds = startSeconds;
+            const display = document.getElementById('timer-display');
+            
+            timerInterval = setInterval(() => {
+                seconds++;
+                display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            }, 1000);
+        }
+
+        function updateTimerDisplay(seconds, state) {
+            const display = document.getElementById('timer-display');
+            const badge = document.getElementById('timer-status');
+            
+            display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            
+            if(state === 'running') {
+                badge.className = 'mt-2 badge bg-success';
+                badge.textContent = 'Em Produção...';
+                badge.classList.add('pulse-animation');
+            } else if (state === 'paused') {
+                badge.className = 'mt-2 badge bg-warning text-dark';
+                badge.textContent = 'Pausado';
+                badge.classList.remove('pulse-animation');
+            } else {
+                badge.className = 'mt-2 badge bg-secondary';
+                badge.textContent = 'Parado';
+                badge.classList.remove('pulse-animation');
+            }
+        }
+
+        function toggleChecklist(pid, item, checked) {
+            fetch('/api/production/check', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({id: pid, item: item, checked: checked})
+            });
+        }
+
+        /* ✅ DESIGN: Atualizar Componentes (Versão Produção Integrada) */
         function updateComponentUsage(usageData) {
             const div = document.getElementById('component-usage-content');
 
             if (!usageData.components || usageData.components.length === 0) {
-                div.innerHTML = '<div class="alert alert-info">Nenhum componente utilizado nos últimos 30 dias.</div>';
+                div.innerHTML = '<div class="alert alert-info">Nenhum pedido ou produção registrada para o mês de ' + (usageData.mes || 'N/D') + '.</div>';
                 return;
             }
 
-            let html = '<h5>📊 Consumo Total (30 dias)</h5>';
-            html += '<div class="table-responsive"><table class="table table-sm"><thead><tr><th>Componente</th><th>SKU</th><th>Qtd. Total</th><th>Produtos</th></tr></thead><tbody>';
+            let html = `
+                <div class="row mb-4">
+                    <div class="col-md-12">
+                        <div class="card bg-dark text-white shadow-sm">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                    <h6 class="card-title text-uppercase small opacity-75 mb-0">Produtos Vendidos (Mês: ${usageData.mes})</h6>
+                                    <span class="badge bg-warning text-dark">Reinício Mensal Ativo</span>
+                                </div>
+                                <div class="d-flex flex-wrap gap-2">
+                                    ${Object.entries(usageData.produtos_vendidos || {}).map(([nome, qtd]) => `
+                                        <span class="badge bg-primary p-2">${nome}: ${qtd}x</span>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="mb-0">📊 Consumo Consolidado (Vendas + Checklist)</h5>
+                    <small class="text-muted">Os dados são zerados automaticamente todo dia 01.</small>
+                </div>
 
-            let total = 0;
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle border">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Insumo / Componente</th>
+                                <th class="text-center">Via Vendas</th>
+                                <th class="text-center">Via Checklist</th>
+                                <th class="text-center">Total Geral</th>
+                                <th class="text-center">Unidade</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+            `;
+
             usageData.components.forEach(comp => {
-                total += comp.quantidade;
-                html += `<tr><td><strong>${comp.nome}</strong></td><td><code>${comp.sku}</code></td><td><span class="badge bg-success">${comp.quantidade}x</span></td><td><small>${comp.produtos.join(', ')}</small></td></tr>`;
+                html += `
+                    <tr>
+                        <td><strong>${comp.nome}</strong></td>
+                        <td class="text-center text-muted">${comp.qtd_vendas || 0}</td>
+                        <td class="text-center text-primary">+ ${comp.qtd_manual || 0}</td>
+                        <td class="text-center"><span class="badge bg-success fs-6">${comp.quantidade}</span></td>
+                        <td class="text-center text-muted small">${comp.un}</td>
+                    </tr>
+                `;
             });
 
             html += '</tbody></table></div>';
-            html += `<div class="mt-3 p-3 bg-light rounded"><h6>Total de Insumos: <span class="badge bg-primary fs-5">${total}</span></h6></div>`;
 
             if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
-                html += '<hr><h5 class="mt-4">📅 Consumo Diário (Últimos 7 dias)</h5>';
-                html += '<div class="accordion" id="dailyAccordion">';
+                html += '<hr><h5 class="mt-4">📅 Necessidade Diária (Últimos 7 dias)</h5>';
+                html += '<div class="accordion shadow-sm" id="dailyAccordion">';
 
                 usageData.daily_breakdown.forEach((day, idx) => {
-                    const date = new Date(day.data);
-                    const dateStr = date.toLocaleDateString('pt-BR');
-                    const totalDay = day.componentes.reduce((sum, c) => sum + c.quantidade, 0);
+                    const dateParts = day.data.split('-');
+                    const dateStr = `${dateParts[2]}/${dateParts[1]}/${dateParts[0]}`;
 
                     html += `
-                        <div class="accordion-item">
+                        <div class="accordion-item border-0 mb-2 shadow-sm">
                             <h2 class="accordion-header">
-                                <button class="accordion-button ${idx > 0 ? 'collapsed' : ''}" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
-                                    ${dateStr} - <span class="badge bg-info ms-2">${totalDay} itens</span>
+                                <button class="accordion-button ${idx > 0 ? 'collapsed' : ''} bg-white fw-bold" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
+                                    📅 ${dateStr}
                                 </button>
                             </h2>
                             <div id="day${idx}" class="accordion-collapse collapse ${idx === 0 ? 'show' : ''}" data-bs-parent="#dailyAccordion">
-                                <div class="accordion-body">
-                                    <ul class="list-group">
-                                        ${day.componentes.map(c => `<li class="list-group-item d-flex justify-content-between"><span>${c.sku}</span><span class="badge bg-secondary">${c.quantidade}x</span></li>`).join('')}
-                                    </ul>
+                                <div class="accordion-body bg-light">
+                                    <div class="row">
+                                        ${day.componentes.map(c => `
+                                            <div class="col-md-4 mb-1">
+                                                <small class="d-block p-2 bg-white rounded border">
+                                                    ${c.nome}: <strong>${c.quantidade}</strong>
+                                                </small>
+                                            </div>
+                                        `).join('')}
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -3137,7 +3619,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         : '<span class="text-muted">-</span>';
 
                     html += `
-                        <div class="list-group-item">
+                        <div class="list-group-item list-group-item-action" onclick="openProductionChecklist('${p.nome || p.produto}')" style="cursor: pointer;">
                             <div class="d-flex">
                                 ${imgHtml}
 
@@ -3147,11 +3629,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                         <small>${p.sku || 'N/D'}</small>
                                     </div>
 
-                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
-
                                     <small class="text-muted d-block">
-                                        <b>Estoque:</b> ${p.estoque}
-                                        <b style="margin-left:10px;">Tipo:</b> ${p.tipo}
+                                        <b>Tipo:</b> ${p.tipo}
                                     </small>
 
                                     ${p.componentes && p.componentes.length > 0 ? `
@@ -3234,9 +3713,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
                             .join('<br>');
                     } else if (k.tipo === 'P') {
-                        const estoqueClass = k.estoqueAtual > 0 ? 'bg-success' : 'bg-danger';
-                        comps = `<span class="badge bg-info">Produto Simples</span><br>
-                                 <span class="badge ${estoqueClass}">Estoque: ${k.estoqueAtual || 0}</span>`;
+                        comps = `<span class="badge bg-light text-dark border">Produto Cadastrado</span>`;
                         if (k.pai_id) {
                             comps += `<br><span class="badge bg-secondary">Variação</span>`;
                         }
@@ -3245,7 +3722,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     }
 
                     html += `
-                        <tr>
+                        <tr onclick="openProductionChecklist('${k.nome}')" style="cursor: pointer;">
                             <td style="width:60px">${imgHtml}</td>
                             <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
                             <td>${k.nome || 'N/D'}</td>
