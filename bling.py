@@ -593,6 +593,9 @@ def token_required(f):
         # Acessa o orchestrator anexado ao objeto Flask
         auth_manager = current_app.orchestrator.auth
         
+        # ✅ Sincroniza tokens com o disco para multi-worker
+        auth_manager.reload_tokens_from_disk()
+        
         if not auth_manager.is_authenticated():
             return jsonify({"error": "Não autenticado ou token expirado"}), 401
         
@@ -1419,27 +1422,38 @@ class Orchestrator:
             self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
+        """Loop principal do worker em thread separada"""
         import time
         import threading
         logger.info(f"🧠 Worker iniciado - ID: {threading.get_ident()}")
         
-        while self._running:
-            try:
-                if not self.auth.is_authenticated():
-                    logger.info("⏸️ Aguardando autenticação...")
-                    time.sleep(10)
-                    continue
+        try:
+            while self._running:
+                try:
+                    # ✅ Sincroniza tokens com o disco para multi-worker
+                    self.auth.reload_tokens_from_disk()
+                    
+                    if not self.auth.is_authenticated():
+                        logger.info("⏸️ Aguardando autenticação...")
+                        time.sleep(10)
+                        continue
 
-                logger.info("🚀 Atualizando produtos...")
-                self.process_products_cache()
+                    logger.info("🚀 Atualizando produtos...")
+                    self.process_products_cache()
 
-                logger.info("🚀 Atualizando pedidos...")
-                self.process_sales_orders()
+                    logger.info("🚀 Atualizando pedidos...")
+                    self.process_sales_orders()
 
-            except Exception as e:
-                logger.exception(f"Erro no worker: {e}")
-
-            time.sleep(60)
+                except Exception as e:
+                    logger.error(f"❌ Erro no worker loop: {e}")
+                    time.sleep(60)
+                
+                time.sleep(60)
+        except KeyboardInterrupt:
+            logger.info("Worker interrompido")
+        finally:
+            # ✅ Remove thread sem tentar acessar _active para evitar KeyError
+            pass
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
@@ -2151,6 +2165,8 @@ class WebServer:
         @self.app.route("/api/status")
         def api_status():
             """Retorna status de autenticação e worker para o front-end"""
+            # ✅ Sincroniza tokens com o disco para multi-worker
+            self.orchestrator.auth.reload_tokens_from_disk()
             return jsonify({
                 "authenticated": self.orchestrator.auth.is_authenticated(),
                 "worker_running": self.orchestrator.is_running(),
