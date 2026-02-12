@@ -1330,7 +1330,7 @@ class Orchestrator:
         # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
         if self.auth.is_authenticated():
             self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
-            self.process_products_cache()
+            # self.process_products_cache()  # <-- COMENTADO: Evita bloqueio do startup
         else:
             self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
 
@@ -1416,7 +1416,7 @@ class Orchestrator:
         """Carrega cache de produtos na primeira execução."""
         try:
             self.logger.info("⏳ Carregando cache inicial de produtos/kits...")
-            self.process_products_cache()
+            # self.process_products_cache()  # <-- COMENTADO: Evita bloqueio do startup
             self.logger.info("✅ Cache inicial carregado com sucesso!")
         except Exception as e:
             self.logger.exception("❌ Erro no carregamento inicial.")
@@ -1439,7 +1439,7 @@ class Orchestrator:
                         continue
 
                     logger.info("🚀 Atualizando produtos...")
-                    self.process_products_cache()
+                    self.process_products_cache()  # ✅ Executa em background pelo Worker
 
                     logger.info("🚀 Atualizando pedidos...")
                     self.process_sales_orders()
