@@ -221,9 +221,7 @@ def setup_logging():
         
     return logger, error_logger
 
-logger = None
-error_logger = None
-memory_handler = None
+logger, error_logger = setup_logging()
 
 # ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
 def cleanup_kpi_callbacks():
@@ -251,166 +249,6 @@ def start_cleanup_timer():
             cleanup_kpi_callbacks()
     
     Thread(target=cleanup_loop, daemon=True).start()
-
-# ==============================================================================
-# MÓDULO DE ENGENHARIA E PRODUÇÃO (HARDCODED)
-# ==============================================================================
-
-# 2. Gerenciador de Persistência (Produção Autônoma)
-class ProductionManager:
-    def __init__(self):
-        self.db_path = Path("production_state.json")
-        self.history_path = Path("production_history.json")
-        self.state = self._load()
-        self._auto_pause_on_restart()
-
-    def _load(self):
-        current_month = datetime.now().strftime("%m-%Y")
-        if self.db_path.exists():
-            try:
-                with open(self.db_path, 'r') as f:
-                    data = json.load(f)
-                    if data.get("mes_ano") == current_month:
-                        return data
-                    else:
-                        # Mês mudou, arquiva e reseta
-                        self._archive_and_reset(data, current_month)
-            except Exception:
-                pass
-        return self._get_empty_state(current_month)
-
-    def _get_empty_state(self, mes_ano):
-        return {
-            "mes_ano": mes_ano,
-            "componentes_consumidos": {}, # {nome: {"total": 0, "marcado": False}}
-            "insumos_consumidos": {},      # {nome: {"total": 0, "marcado": False}}
-            "produtos_vendidos_detalhado": {}, # {nome: qtd}
-            "timers": {}, # {pid: {"accumulated": 0, "state": "stopped", "last_start": 0, "nome": ""}}
-            "checklists": {} # {pid: [itens_marcados]}
-        }
-
-    def _archive_and_reset(self, old_data, new_month):
-        """Arquiva o mês anterior e cria um novo estado."""
-        history = []
-        if self.history_path.exists():
-            try:
-                with open(self.history_path, 'r') as f:
-                    history = json.load(f)
-            except: pass
-        
-        history.append(old_data)
-        with open(self.history_path, 'w') as f:
-            json.dump(history, f)
-        
-        # Mantém timers ativos, mas reseta consumos
-        new_state = self._get_empty_state(new_month)
-        new_state["timers"] = old_data.get("timers", {})
-        self.state = new_state
-        self._save()
-
-    def _save(self):
-        with open(self.db_path, 'w') as f:
-            json.dump(self.state, f)
-
-    def _auto_pause_on_restart(self):
-        """Regra: Se o servidor reiniciou, pausa timers ativos."""
-        changed = False
-        for pid in self.state.get("timers", {}):
-            if self.state["timers"][pid].get("state") == "running":
-                # Calcula tempo até o restart e pausa
-                now = time.time()
-                self.state["timers"][pid]["accumulated"] += (now - self.state["timers"][pid]["last_start"])
-                self.state["timers"][pid]["state"] = "paused"
-                self.state["timers"][pid]["last_start"] = 0
-                changed = True
-        if changed:
-            self._save()
-
-    # --- Lógica do Timer ---
-    def timer_action(self, product_id, action, product_name=""):
-        now = time.time()
-        
-        if action == "pause_all":
-            for pid in self.state["timers"]:
-                if self.state["timers"][pid]["state"] == "running":
-                    self.state["timers"][pid]["accumulated"] += (now - self.state["timers"][pid]["last_start"])
-                    self.state["timers"][pid]["state"] = "paused"
-                    self.state["timers"][pid]["last_start"] = 0
-            self._save()
-            return {"status": "all_paused"}
-
-        t = self.state["timers"].get(product_id, {"accumulated": 0, "state": "stopped", "last_start": 0, "nome": product_name})
-        
-        if action == "start":
-            if t["state"] != "running":
-                t["state"], t["last_start"] = "running", now
-        elif action == "pause":
-            if t["state"] == "running":
-                t["state"] = "paused"
-                t["accumulated"] += (now - t["last_start"])
-                t["last_start"] = 0
-        elif action == "stop":
-            t["state"] = "finished"
-            if t["last_start"] > 0:
-                t["accumulated"] += (now - t["last_start"])
-                t["last_start"] = 0
-            
-        self.state["timers"][product_id] = t
-        self._save()
-        
-        total_time = t["accumulated"]
-        if t["state"] == "running":
-            total_time += (now - t["last_start"])
-        return {"state": t["state"], "elapsed": total_time}
-
-    # --- Lógica de Consumo (Vendas x Receita) ---
-    def calcular_consumo_code(self, sales_history):
-        """Calcula consumo baseado em vendas e receita interna."""
-        current_month_iso = datetime.now().strftime("%Y-%m")
-        
-        # Reset temporário para recalcular
-        new_comp = {}
-        new_ins = {}
-        new_prod = defaultdict(int)
-        
-        for order in sales_history:
-            if not order.get('data', '').startswith(current_month_iso):
-                continue
-                
-            for item in order.get('itens', []):
-                name = item.get('descricao', '').upper()
-                qtd = float(item.get('quantidade', 0))
-                
-                if "CADEIRA" in name:
-                    new_prod[name] += int(qtd)
-                    for ing in RECIPE_CADEIRA:
-                        target = new_comp if "MDF" in ing['nome'] or "SARRAFO" in ing['nome'] or "COMPENSADO" in ing['nome'] else new_ins
-                        
-                        if ing['nome'] not in target:
-                            # Mantém o estado de 'marcado' se já existia
-                            old_marcado = self.state["componentes_consumidos"].get(ing['nome'], {}).get("marcado", False) or \
-                                          self.state["insumos_consumidos"].get(ing['nome'], {}).get("marcado", False)
-                            target[ing['nome']] = {"total": 0, "marcado": old_marcado, "un": ing['un']}
-                        
-                        target[ing['nome']]["total"] += (ing['qtd'] * qtd)
-
-        self.state["componentes_consumidos"] = new_comp
-        self.state["insumos_consumidos"] = new_ins
-        self.state["produtos_vendidos_detalhado"] = dict(new_prod)
-        self._save()
-
-    def toggle_marcado(self, item_name, is_checked):
-        """Marca um componente/insumo como validado fisicamente."""
-        if item_name in self.state["componentes_consumidos"]:
-            self.state["componentes_consumidos"][item_name]["marcado"] = is_checked
-        elif item_name in self.state["insumos_consumidos"]:
-            self.state["insumos_consumidos"][item_name]["marcado"] = is_checked
-        self._save()
-
-    def get_report(self):
-        return self.state
-
-prod_manager = ProductionManager()
 
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
@@ -843,18 +681,9 @@ class AuthManager:
         
         if not self._access_token and not self._refresh_token:
             self.logger.warning("⚠️ Nenhum token encontrado no arquivo ou ambiente. Necessário realizar autenticação OAuth.")
-        if not self._access_token and self._refresh_token:
+        elif not self._access_token and self._refresh_token:
             self.logger.info("Refresh Token encontrado. Tentativa de renovação será feita na primeira requisição.") 
         
-        # ✅ ADICIONAR NO FINAL DO __init__:
-        # Carrega tokens do disco automaticamente no início
-        try:
-            self.reload_tokens_from_disk()
-            if self.is_authenticated():
-                self.logger.info("✅ Tokens carregados automaticamente do disco no início")
-        except Exception as e:
-            self.logger.debug(f"Sem tokens salvos no disco (primeira execução): {e}")
-
     def _load_tokens(self) -> Dict[str, Any]:
         """Carrega tokens do arquivo de forma segura."""
         return load_tokens_safe(self.config.TOKENS_FILE)
@@ -896,7 +725,7 @@ class AuthManager:
 
     def is_authenticated(self) -> bool:
         """Verifica se o token de acesso é válido ou pode ser renovado."""
-        if self._access_token and self._expires_at > time.time() + 300: # 60s de buffer
+        if self._access_token and self._expires_at > time.time() + 60: # 60s de buffer
             return True
         
         if self._refresh_token:
@@ -906,7 +735,7 @@ class AuthManager:
 
     def get_access_token(self) -> Optional[str]:
         """Retorna o token de acesso, renovando se necessário."""
-        if self._access_token and self._expires_at > time.time() + 300:
+        if self._access_token and self._expires_at > time.time() + 60:
             return self._access_token
             
         if self._refresh_token:
@@ -969,7 +798,7 @@ class AuthManager:
             disk_expires = disk_data.get('expires_at', 0)
             
             # Se o arquivo já tem um token válido (renovado por outro worker/thread), usa ele!
-            if disk_access and disk_expires > time.time() + 300:
+            if disk_access and disk_expires > time.time() + 60:
                 self.logger.info("Token já foi renovado por outro processo. Carregando do disco.")
                 self._access_token = disk_access
                 self._refresh_token = disk_data.get('refresh_token')
@@ -1023,9 +852,8 @@ class AuthManager:
                 data=data,
                 timeout=self.config.AUTH_TIMEOUT
             )
-            if not response.ok:
-                self.logger.error(f"❌ Erro na resposta do Bling ({response.status_code}): {response.text}")
             response.raise_for_status()
+            
             token_data = response.json()
             
             self._access_token = token_data.get('access_token')
@@ -1119,17 +947,6 @@ class SalesManager:
             }
 
     def _get_state_for_save(self) -> Dict[str, Any]:
-        """Retorna o estado atual das estatísticas de vendas"""
-        
-        # ✅ ADICIONAR AQUI: Verifica se há dados válidos
-        if self.daily_count is None or (isinstance(self.daily_count, dict) and not self.daily_count):
-             return {
-                "daily": 0,
-                "weekly": 0,
-                "monthly": 0,
-                "last_update": datetime.now(timezone.utc).isoformat()
-            }
-
         with self.lock:
             return {
                 "daily": self.daily_count,
@@ -1313,7 +1130,6 @@ class Orchestrator:
         # Garante que o SalesManager tenha a referência correta
         self.sales.orchestrator = self
         self._running = False
-        # self._is_processing = False # REMOVIDO: Simplificação do worker
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
@@ -1368,11 +1184,6 @@ class Orchestrator:
 
     def start_worker(self):
         """Inicia o worker de fundo para atualização de dados."""
-        # ✅ SEGURANÇA: Impede múltiplos workers ativos
-        if self._worker_thread and self._worker_thread.is_alive():
-            self.logger.debug("⚠️ Tentativa de iniciar worker ignorada: Worker já está rodando.")
-            return
-
         if not self._running:
             self._running = True
             self._stop_event = Event() # Evento para sinalizar parada
@@ -1384,7 +1195,7 @@ class Orchestrator:
             # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
             # O worker principal ainda inicia, mas ele se protege com a verificação de token.
             
-            # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
+                        # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
             # A chamada para self.api.register_webhook foi removida daqui, pois a função agora apenas loga a instrução.
             # O registro deve ser feito manualmente no painel do Bling.
             
@@ -1403,7 +1214,27 @@ class Orchestrator:
             else:
                 self.logger.info("Worker de fundo parado com sucesso.")
 
-    # wake_worker() REMOVIDO para simplificação e estabilidade.
+    def wake_worker(self):
+        """
+        Acorda o worker imediatamente se estiver dormindo.
+        
+        Útil após OAuth para forçar início imediato do processamento
+        sem esperar os 60 segundos de sleep.
+        """
+        logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
+        
+        if self._running and self._stop_event:
+            logger.info("⏰ Acordando worker (interrompendo sleep)...")
+            self._stop_event.set()  # Interrompe o sleep
+            
+            # Recria o evento para o próximo ciclo
+            import time
+            time.sleep(0.1)  # Pequena pausa para garantir que o worker processou
+            self._stop_event.clear()
+            
+            logger.info("✅ Worker acordado com sucesso!")
+        else:
+            logger.debug("⚠️ Worker não está rodando ou evento não existe")
 
     def is_running(self) -> bool:
         """Verifica se o worker está ativo."""
@@ -1419,27 +1250,78 @@ class Orchestrator:
             self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
-        import time
-        import threading
-        logger.info(f"🧠 Worker iniciado - ID: {threading.get_ident()}")
+        cycle_count = 0
         
-        while self._running:
-            try:
-                if not self.auth.is_authenticated():
-                    logger.info("⏸️ Aguardando autenticação...")
-                    time.sleep(10)
+        logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
+        
+        while not self._stop_event.is_set():
+            cycle_count += 1
+            
+            logger.debug(f"")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
+            
+            # Verifica autenticação antes de tudo
+            logger.debug(f"🔍 [DEBUG-WORKER] Verificando autenticação...")
+            is_auth = self.auth.is_authenticated()
+            logger.debug(f"   • is_authenticated() = {is_auth}")
+            
+            if not is_auth:
+                logger.info(f"⏸️ [DEBUG-WORKER] Ciclo #{cycle_count}: Aguardando autenticação...")
+                logger.debug(f"   • Access Token: {'Presente' if self.auth._access_token else 'Ausente'}")
+                logger.debug(f"   • Refresh Token: {'Presente' if self.auth._refresh_token else 'Ausente'}")
+                
+                # Tenta recarregar tokens do disco antes de esperar
+                logger.debug("🔄 [DEBUG-WORKER] Tentando recarregar tokens do disco...")
+                self.auth.reload_tokens_from_disk()
+                
+                # Verifica novamente
+                is_auth_after_reload = self.auth.is_authenticated()
+                logger.debug(f"   • is_authenticated() após reload = {is_auth_after_reload}")
+                
+                if not is_auth_after_reload:
+                    logger.info("⏳ [DEBUG-WORKER] Aguardando 60s para próxima tentativa...")
+                    self._stop_event.wait(60)
                     continue
+                else:
+                    logger.info("✅ [DEBUG-WORKER] Autenticação OK após reload! Continuando ciclo...")
 
-                logger.info("🚀 Atualizando produtos...")
-                self.process_products_cache()
-
-                logger.info("🚀 Atualizando pedidos...")
+            logger.debug(f"✅ [DEBUG-WORKER] Autenticação confirmada! Iniciando processamento...")
+            
+            try:
+                # Ciclo de Produtos (Cache Pesado)
+                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
+                if cycle_count == 1 or cycle_count % 3 == 0:
+                    logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
+                    self.process_products_cache()
+                
+                # Ciclo de Vendas (KPIs)
+                logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
                 self.process_sales_orders()
+                
+                # Ciclo de Componentes
+                if cycle_count % 4 == 0:
+                    logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
+                    usage = self.calculate_component_usage()
+                    if usage.get('components'):
+                        self._component_usage_cache = usage
+                        self.broadcast_kpi_update(component_usage=usage)
 
             except Exception as e:
-                logger.exception(f"Erro no worker: {e}")
+                logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
 
-            time.sleep(60)
+            logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
+            logger.debug(f"")
+            
+            # Mantém 10 minutos (600s), mas pode ser interrompido por wake_worker()
+            logger.debug("💤 [DEBUG-WORKER] Entrando em sleep de 600s (ou até ser acordado)...")
+            interrupted = self._stop_event.wait(600)
+            
+            if interrupted:
+                logger.info("⏰ [DEBUG-WORKER] Sleep interrompido! Iniciando próximo ciclo imediatamente...")
+                self._stop_event.clear()  # Limpa o evento para não interromper próximos ciclos
+            else:
+                logger.debug("⏰ [DEBUG-WORKER] Sleep de 600s completado naturalmente")
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
@@ -1839,43 +1721,15 @@ class WebServer:
         # Rota principal (Dashboard)
         @self.app.route('/')
         def index():
-            self.logger.info("🧠 [DEBUG-DASHBOARD] Entrou na rota /")
-            auth = self.orchestrator.auth
-            
-            # Força recarga do disco para garantir que o worker e a web thread vejam o mesmo token
-            auth.reload_tokens_from_disk()
-            
-            is_auth = auth.is_authenticated()
-            self.logger.info(f"🧠 Token em memória? {auth._access_token is not None}")
-            self.logger.info(f"🧠 is_authenticated()? {is_auth}")
-            
-            try:
-                expires_in = auth._expires_at - time.time()
-                self.logger.info(f"🧠 Expira em: {expires_in:.0f}s")
-            except:
-                self.logger.info("🧠 Expira em: erro")
-            
-            auth_url = auth.get_authorization_url()
+            auth_url = self.orchestrator.auth.get_authorization_url()
             return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
 
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
         @self.app.route('/auth')
         def auth():
-            from flask import redirect, url_for
+            from flask import redirect
             import secrets
             
-            self.logger.info("🔎 [DEBUG-AUTH-ROUTE] Chamou /auth")
-            auth = self.orchestrator.auth
-            auth.reload_tokens_from_disk()
-            
-            is_auth = auth.is_authenticated()
-            self.logger.info(f"🔎 Já autenticado? {is_auth}")
-            
-            # ✅ SEGURANÇA: Bloqueia nova autenticação se já estiver autenticado
-            if is_auth:
-                self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
-                return redirect(url_for("index"))
-
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
             self.orchestrator.auth._save_oauth_state(state)
@@ -1949,67 +1803,28 @@ class WebServer:
             
             return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
 
-        # --- ROTAS DE PRODUÇÃO (AUTÔNOMA) ---
-        @self.app.route('/api/production/timer', methods=['POST'])
         @self.app.route('/api/timer/action', methods=['POST'])
-        @token_required
-        def api_timer_action(token):
-            """Controla o timer de produção com persistência no Code"""
+        def api_timer_action():
             data = request.json
-            pid = str(data.get('id') or data.get('produto'))
-            action = data.get('action')
-            pname = data.get('nome_produto', '')
-            if not action or not pid:
-                return jsonify({"error": "Dados incompletos"}), 400
-            res = prod_manager.timer_action(pid, action, pname)
-            return jsonify(res)
-
-        @self.app.route('/api/production/check', methods=['POST'])
-        @self.app.route('/api/production/checklist', methods=['POST'])
-        @token_required
-        def api_production_check(token):
-            """Registra item marcado na checklist de validação manual"""
-            data = request.json
-            item = data.get('item')
-            checked = data.get('checked', False)
-            if not item:
-                return jsonify({"error": "Dados incompletos"}), 400
-            prod_manager.toggle_marcado(item, checked)
-            return jsonify({"status": "ok"})
-
-        @self.app.route('/api/components/usage')
-        @self.app.route('/api/production/report')
-        @token_required
-        def api_production_report(token):
-            """Retorna dados de produção e insumos (Guia Componentes)"""
-            try:
-                with self.orchestrator.sales.lock:
-                    history = list(self.orchestrator.sales._sales_history)
-                prod_manager.calcular_consumo_code(history)
-                return jsonify(prod_manager.get_report())
-            except Exception as e:
-                self.logger.exception("Erro ao gerar relatório de produção")
-                return jsonify({"error": str(e)}), 500
+            action = data.get('action') # start, pause, reset, get
+            produto = data.get('produto')
+            
+            if action == 'start':
+                status = production_timer.start(produto)
+            elif action == 'pause':
+                status = production_timer.pause(produto)
+            elif action == 'reset':
+                status = production_timer.reset(produto)
+            else:
+                status = production_timer.get_status(produto)
+                
+            return jsonify(status)
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
             code = request.args.get('code')
             state = request.args.get('state')
-            
-            # ✅ ADICIONAR AQUI: Prevenir duplo processamento
-            with WebServer.webhook_lock:
-                if code in WebServer.used_codes:
-                    logger.warning(f"⚠️ Code {code[:10]}... já foi processado. Ignorando.")
-                    return redirect('/')
-                
-                WebServer.used_codes.add(code)
-                # Limpa codes antigos (mantém apenas últimos 10)
-                if len(WebServer.used_codes) > 10:
-                    # WebServer.used_codes é um set, pop() remove um elemento arbitrário.
-                    # Para manter os últimos 10, poderíamos usar uma lista ou deque,
-                    # mas como o objetivo é apenas evitar reprocessamento imediato, pop() serve.
-                    WebServer.used_codes.pop()
             
             logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
             logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
@@ -2050,6 +1865,9 @@ class WebServer:
                     logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
                 else:
                     logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
+                    # 🔧 NOVO: Acorda o worker imediatamente
+                    logger.debug("⏰ [DEBUG-CALLBACK] Acordando worker para processar imediatamente...")
+                    self.orchestrator.wake_worker()
                 
                 logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
                 return redirect('/')
@@ -2148,16 +1966,7 @@ class WebServer:
             }
             return jsonify(status), 200
 
-        @self.app.route("/api/status")
-        def api_status():
-            """Retorna status de autenticação e worker para o front-end"""
-            return jsonify({
-                "authenticated": self.orchestrator.auth.is_authenticated(),
-                "worker_running": self.orchestrator.is_running(),
-                "cache_loaded": self.orchestrator.is_cache_loaded()
-            })
-
-        @self.app.route("/api/force-load", methods=["POST"])
+        @self.app.route('/api/force-load', methods=['POST'])
         @token_required
         def api_force_load(token):
             """Força o recarregamento do cache de produtos/kits em uma thread separada."""
@@ -2173,7 +1982,34 @@ class WebServer:
             
             return jsonify({"message": "Recarregamento do cache de produtos/kits iniciado em segundo plano."}), 202
 
-
+        @self.app.route('/api/components/usage')
+        @token_required
+        def api_component_usage(token):
+            """Retorna uso de componentes (do cache do worker)."""
+            try:
+                # Retorna cache se disponível E não vazio
+                cache = getattr(self.orchestrator, '_component_usage_cache', None)
+                
+                if cache and (cache.get('components') or cache.get('daily_breakdown')):
+                    self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
+                    return jsonify(cache)
+                
+                # Calcula sob demanda
+                self.logger.info("🔄 Cache vazio. Calculando componentes sob demanda...")
+                usage_data = self.orchestrator.calculate_component_usage()
+                
+                # Armazena no cache para reutilizar
+                self.orchestrator._component_usage_cache = usage_data
+                
+                return jsonify(usage_data)
+                
+            except Exception as e:
+                self.logger.exception("Erro ao processar /api/components/usage")
+                return jsonify({
+                    "error": str(e),
+                    "components": [],
+                    "daily_breakdown": []
+                }), 500
 
         @self.app.route('/webhook', methods=['POST'])
         def webhook():
@@ -2245,15 +2081,6 @@ class WebServer:
         def ws_logs(ws):
             self.logger.info("📡 WebSocket logs conectado.")
             
-            # ✅ ADICIONAR VERIFICAÇÃO:
-            if memory_handler is None:
-                self.logger.error("❌ memory_handler não inicializado!")
-                try:
-                    ws.send(json.dumps({"error": "Logger não inicializado"}))
-                except:
-                    pass
-                return
-            
             # ✅ Limite de callbacks para evitar DoS acidental
             if len(memory_handler.ws_callbacks) >= 10:
                 self.logger.warning("Limite de 10 conexões de log WS atingido. Conexão recusada.")
@@ -2291,38 +2118,61 @@ class WebServer:
         def ws_kpi_updates(ws):
             self.logger.info("📡 WebSocket KPI conectado.")
             
-            # 1. Definição do Callback
+            # ✅ Limite de callbacks para evitar DoS acidental
+            global kpi_update_callbacks, kpi_update_lock
+            if len(kpi_update_callbacks) >= 10:
+                self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
+                return
+
+            # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
-                    if not ws.connected: raise ConnectionClosed() # Verificação extra
                     ws.send(json.dumps(payload))
-                except Exception:
-                    raise ConnectionClosed()
-
-            # 2. Registro e Envio Imediato (CRÍTICO)
+                except ConnectionClosed:
+                    # ✅ ADICIONE: Sinaliza para remover este callback
+                    raise
+                except Exception as e:
+                    self.logger.exception("Erro enviando via WS.")
+                    raise ConnectionClosed()  # Força desconexão
+                
+            # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
+            # 1. Envia o estado inicial completo
+            try:
+                sales_stats = self.orchestrator.sales._get_state_for_save()
+                
+                # Tenta usar cache se disponível
+                component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
+                
+                if not component_usage:
+                    self.logger.info("🔄 Cache de componentes vazio. Calculando...")
+                    try:
+                        component_usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = component_usage
+                    except Exception as calc_error:
+                        self.logger.error(f"Falha ao calcular componentes: {calc_error}")
+                        component_usage = {"components": [], "daily_breakdown": []}
+                
+                self.orchestrator.broadcast_kpi_update(
+                    sales_stats=sales_stats,
+                    component_usage=component_usage
+                )
+                self.logger.info("✅ Estado inicial enviado ao WebSocket")
+                
+            except Exception as e:
+                self.logger.exception("Erro ao enviar estado inicial via WS.")
+                
+            # 2. Adiciona o callback à lista global
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
-            
+                
             try:
-                # Força o envio do estado ATUAL imediatamente após conectar
-                current_stats = self.orchestrator.sales._get_state_for_save()
-                
-                # Payload inicial robusto
-                initial_payload = {
-                    "type": "full_update",
-                    "authenticated": self.orchestrator.auth.is_authenticated(), # Verifica autenticação real
-                    "worker_running": self.orchestrator.is_running(),
-                    "sales_stats": current_stats or {},
-                    "auth_url": self.orchestrator.auth.get_authorization_url()
-                }
-                
-                ws.send(json.dumps(initial_payload)) # Envia o "aperto de mão"
-                
                 while True:
-                    ws.receive(timeout=60) # Mantém vivo
-            except Exception as e:
-                self.logger.debug(f"WebSocket cliente desconectado: {e}")
+                    # Mantém a conexão aberta
+                    ws.receive(timeout=60)
+            except ConnectionClosed:
+                pass
             finally:
+                # 3. Remove o callback ao desconectar
                 with kpi_update_lock:
                     if kpi_callback in kpi_update_callbacks:
                         kpi_update_callbacks.remove(kpi_callback)
@@ -3208,10 +3058,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('auth-link').classList.add('d-none');
                 document.getElementById('content-tabs').classList.remove('hidden');
                 document.getElementById('auth-required-tabs').classList.add('hidden');
-                
-                // ✅ ADICIONAR: Emite evento de confirmação
-                window.dispatchEvent(new Event('auth-confirmed'));
-                
             } else {
                 badge.className = 'badge bg-danger';
                 badge.textContent = '🔴 Offline';
@@ -3283,7 +3129,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
         let timerInterval = null;
 
-        function openProductionChecklist(productName, productId) {
+        function openProductionChecklist(productName) {
+            // 1. Verifica se é uma Cadeira para mostrar a lista técnica
             const isCadeira = productName.toUpperCase().includes('CADEIRA');
             let checklistHtml = '';
 
@@ -3294,7 +3141,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         ${RECIPE_CADEIRA.map((item, i) => `
                             <div class="col-md-6">
                                 <div class="form-check p-2 border rounded bg-white d-flex align-items-center">
-                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}" onchange="toggleChecklist('${productName}', '${item.nome}', this.checked)">
+                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}">
                                     <label class="form-check-label flex-grow-1 small fw-bold" for="check${i}">
                                         ${item.nome} 
                                         <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
@@ -3322,13 +3169,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                         <h6 class="text-uppercase text-muted small letter-spacing-2">Tempo de Produção</h6>
                                         <div id="timer-display" class="display-4 fw-bold my-2 font-monospace">00:00:00</div>
                                         <div class="btn-group mt-2">
-                                            <button class="btn btn-success px-4" onclick="controlTimer('start', '${productId}', '${productName}')">▶ Iniciar</button>
-                                            <button class="btn btn-warning px-4" onclick="controlTimer('pause', '${productId}', '${productName}')">⏸ Pausar</button>
-                                            <button class="btn btn-danger px-4" onclick="controlTimer('stop', '${productId}', '${productName}')">⏹ Finalizar</button>
+                                            <button class="btn btn-success px-4" onclick="controlTimer('start', '${productName}')">▶ Iniciar</button>
+                                            <button class="btn btn-warning px-4" onclick="controlTimer('pause', '${productName}')">⏸ Pausar</button>
+                                            <button class="btn btn-danger px-4" onclick="controlTimer('reset', '${productName}')">⏹ Reiniciar/Fim</button>
                                         </div>
                                         <div id="timer-status" class="mt-2 badge bg-secondary">Parado</div>
                                     </div>
                                 </div>
+
                                 ${checklistHtml}
                             </div>
                             <div class="modal-footer bg-white">
@@ -3339,52 +3187,39 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
             `;
 
+            // Remove anterior e cria novo
             const oldModal = document.getElementById('productionModal');
             if (oldModal) oldModal.remove();
             document.body.insertAdjacentHTML('beforeend', modalHtml);
+            
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
 
-            controlTimer('get', productId, productName);
-            loadChecklistState(productName);
+            // Carrega o estado atual do timer do servidor
+            controlTimer('get', productName);
         }
 
-        async function loadChecklistState(productName) {
-            try {
-                const res = await fetch('/api/production/report');
-                const data = await res.json();
-                const checklist = data.checklists ? data.checklists[productName] : [];
-                if (checklist) {
-                    checklist.forEach(item => {
-                        // Tenta encontrar o checkbox pelo nome do item (usando o atributo customizado se necessário ou iterando)
-                        const checkboxes = document.querySelectorAll('#productionModal .form-check-input');
-                        checkboxes.forEach(cb => {
-                            // Extrai o nome do item do onchange para comparar
-                            if (cb.getAttribute('onchange').includes(`'${item}'`)) {
-                                cb.checked = true;
-                            }
-                        });
-                    });
-                }
-            } catch (e) { console.error("Erro ao carregar checklist:", e); }
-        }
-
-        /* Lógica do Timer Conectada ao Backend (Persistência Code) */
-        async function controlTimer(action, productId, productName) {
+        /* Lógica do Timer Conectada ao Backend */
+        async function controlTimer(action, produto) {
             try {
                 const res = await fetch('/api/timer/action', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ action: action, id: productId, nome_produto: productName })
+                    body: JSON.stringify({ action: action, produto: produto })
                 });
                 const data = await res.json();
+                
                 updateTimerDisplay(data.elapsed, data.state);
-                if (data.state === 'running') {
+                
+                // Se estiver rodando, inicia atualização local para feedback visual imediato
+                if (action === 'start' || (action === 'get' && data.state === 'running')) {
                     startLocalCounter(data.elapsed);
                 } else {
                     clearInterval(timerInterval);
                 }
-            } catch (e) { console.error("Erro no timer:", e); }
+            } catch (e) {
+                console.error("Erro no timer:", e);
+            }
         }
 
         function startLocalCounter(startSeconds) {
@@ -3419,116 +3254,54 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        function toggleChecklist(pid, item, checked) {
-            fetch('/api/production/check', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({id: pid, item: item, checked: checked})
-            });
-        }
-
-        /* ✅ DESIGN: Atualizar Componentes (Versão Autônoma) */
-        function updateComponentUsage(data) {
+        /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
+        function updateComponentUsage(usageData) {
             const div = document.getElementById('component-usage-content');
-            const mes = data.mes_ano || 'N/D';
-            
-            const compList = Object.entries(data.componentes_consumidos || {});
-            const insList = Object.entries(data.insumos_consumidos || {});
-            const prodList = Object.entries(data.produtos_vendidos_detalhado || {});
-            const timers = Object.entries(data.timers || {});
+
+            if (!usageData.components || usageData.components.length === 0) {
+                div.innerHTML = '<div class="alert alert-info">Nenhum pedido de Cadeira processado este mês para gerar insumos.</div>';
+                return;
+            }
 
             let html = `
                 <div class="row mb-4">
                     <div class="col-md-12">
                         <div class="card bg-dark text-white shadow-sm">
                             <div class="card-body">
-                                <div class="d-flex justify-content-between align-items-center mb-3">
-                                    <h6 class="card-title text-uppercase small opacity-75 mb-0">📊 RESUMO MENSAL - ${mes}</h6>
-                                    <button class="btn btn-sm btn-outline-light" onclick="loadKPIChart()">🔄 Atualizar</button>
-                                </div>
-                                <div class="row text-center">
-                                    <div class="col-4 border-end">
-                                        <div class="small opacity-75">Componentes</div>
-                                        <div class="h4 mb-0">${compList.length}</div>
-                                    </div>
-                                    <div class="col-4 border-end">
-                                        <div class="small opacity-75">Insumos</div>
-                                        <div class="h4 mb-0">${insList.length}</div>
-                                    </div>
-                                    <div class="col-4">
-                                        <div class="small opacity-75">Fabricados</div>
-                                        <div class="h4 mb-0">${prodList.reduce((a, b) => a + b[1], 0)}</div>
-                                    </div>
+                                <h6 class="card-title text-uppercase small opacity-75">Produtos Vendidos (Mês)</h6>
+                                <div class="d-flex flex-wrap gap-2">
+                                    ${Object.entries(usageData.produtos_vendidos || {}).map(([nome, qtd]) => `
+                                        <span class="badge bg-primary p-2">${nome}: ${qtd}x</span>
+                                    `).join('')}
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
-
-                <div class="row">
-                    <div class="col-md-6">
-                        <h6 class="fw-bold mb-3">📦 LISTA DE COMPONENTES</h6>
-                        <div class="list-group mb-4">
-                            ${compList.map(([nome, info]) => `
-                                <div class="list-group-item d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <input class="form-check-input me-2" type="checkbox" ${info.marcado ? 'checked' : ''} onchange="toggleChecklist('GLOBAL', '${nome}', this.checked)">
-                                        <span class="${info.marcado ? 'text-decoration-line-through text-muted' : ''}">${nome}</span>
-                                    </div>
-                                    <span class="badge bg-light text-dark border">${info.total} ${info.un || ''}</span>
-                                </div>
-                            `).join('') || '<div class="text-muted small">Nenhum componente registrado.</div>'}
-                        </div>
-                    </div>
-                    <div class="col-md-6">
-                        <h6 class="fw-bold mb-3">🧪 LISTA DE INSUMOS</h6>
-                        <div class="list-group mb-4">
-                            ${insList.map(([nome, info]) => `
-                                <div class="list-group-item d-flex justify-content-between align-items-center">
-                                    <div>
-                                        <input class="form-check-input me-2" type="checkbox" ${info.marcado ? 'checked' : ''} onchange="toggleChecklist('GLOBAL', '${nome}', this.checked)">
-                                        <span class="${info.marcado ? 'text-decoration-line-through text-muted' : ''}">${nome}</span>
-                                    </div>
-                                    <span class="badge bg-light text-dark border">${info.total} ${info.un || ''}</span>
-                                </div>
-                            `).join('') || '<div class="text-muted small">Nenhum insumo registrado.</div>'}
-                        </div>
-                    </div>
-                </div>
-
-                <div class="row">
-                    <div class="col-md-6">
-                        <h6 class="fw-bold mb-3">🛒 PRODUTOS VENDIDOS</h6>
-                        <div class="list-group mb-4">
-                            ${prodList.map(([nome, qtd]) => `
-                                <div class="list-group-item d-flex justify-content-between align-items-center">
-                                    <span>${nome}</span>
-                                    <span class="badge bg-primary">${qtd} un</span>
-                                </div>
-                            `).join('') || '<div class="text-muted small">Nenhuma venda registrada.</div>'}
-                        </div>
-                    </div>
-                    <div class="col-md-6">
-                        <h6 class="fw-bold mb-3">🕐 TIMERS DE PRODUÇÃO</h6>
-                        <div class="list-group mb-4">
-                            ${timers.map(([pid, t]) => `
-                                <div class="list-group-item">
-                                    <div class="d-flex justify-content-between align-items-center mb-2">
-                                        <span class="fw-bold">${t.nome || 'Produto '+pid}</span>
-                                        <span class="badge ${t.state === 'running' ? 'bg-success' : t.state === 'paused' ? 'bg-warning text-dark' : 'bg-secondary'}">${t.state}</span>
-                                    </div>
-                                    <div class="d-flex justify-content-between align-items-center">
-                                        <small class="font-monospace">${new Date(t.accumulated * 1000).toISOString().substr(11, 8)}</small>
-                                        <button class="btn btn-sm btn-outline-dark" onclick="openProductionChecklist('${t.nome}', '${pid}')">Abrir</button>
-                                    </div>
-                                </div>
-                            `).join('') || '<div class="text-muted small">Nenhum timer ativo.</div>'}
-                        </div>
-                    </div>
-                </div>
+                <h5>📊 Necessidade Consolidada de Insumos</h5>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Insumo</th>
+                                <th class="text-center">Quantidade Total</th>
+                                <th class="text-center">Unidade</th>
+                            </tr>
+                        </thead>
+                        <tbody>
             `;
-            div.innerHTML = html;
-        }
+
+            usageData.components.forEach(comp => {
+                html += `
+                    <tr>
+                        <td><strong>${comp.nome}</strong></td>
+                        <td class="text-center"><span class="badge bg-success fs-6">${comp.quantidade}</span></td>
+                        <td class="text-center text-muted">${comp.un}</td>
+                    </tr>
+                `;
+            });
+
+            html += '</tbody></table></div>';
 
             if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
                 html += '<hr><h5 class="mt-4">📅 Necessidade Diária (Últimos 7 dias)</h5>';
@@ -3612,49 +3385,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             };
         }
 
-        /* ✅ DESIGN: Verificação Híbrida (WebSocket + REST) */
-        async function checkInitialAuth() {
-            try {
-                console.log("🕵️ Verificando status via REST API...");
-                const response = await fetch('/api/status');
-                
-                if (response.ok) {
-                    const data = await response.json();
-                    console.log("✅ Status REST recebido:", data);
-                    
-                    // Se a API diz que está autenticado, força a atualização da UI
-                    // mesmo que o WebSocket ainda não tenha conectado.
-                    const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
-                    updateAuthStatus(data.authenticated, authUrl);
-                    
-                    if (data.authenticated) {
-                        // Se já estamos autenticados, carregamos os dados iniciais
-                        loadKits();
-                        loadKPIChart();
-                    }
-                }
-            } catch (error) {
-                console.error("❌ Erro ao verificar autenticação inicial via REST:", error);
-            }
-        }
-
-
-
-        // ✅ ADICIONAR: Timeout de segurança
-        let authCheckTimeout = setTimeout(() => {
-            const badge = document.getElementById('status-badge');
-            if (!isAuthenticated && badge.textContent === '⏳ CARREGANDO...') {
-                console.warn("⚠️ Timeout de autenticação. Forçando estado não autenticado.");
-                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
-                updateAuthStatus(false, authUrl);
-                showToast('Aviso', 'Não foi possível verificar autenticação. Por favor, faça login.', 'warning');
-            }
-        }, 5000); // 5 segundos
-
-        // Limpa o timeout quando autenticação for confirmada
-        window.addEventListener('auth-confirmed', () => {
-            clearTimeout(authCheckTimeout);
-        });
+        setupKpiWebSocket();
 
         /* ✅ DESIGN: Busca de Produtos */
         const btnSearch = document.getElementById('btn-search');
@@ -3684,7 +3415,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         : '<span class="text-muted">-</span>';
 
                     html += `
-                        <div class="list-group-item list-group-item-action" onclick="openProductionChecklist('${p.nome || p.produto}', '${p.id}')" style="cursor: pointer;">
+                        <div class="list-group-item list-group-item-action" onclick="openProductionChecklist('${p.nome || p.produto}')" style="cursor: pointer;">
                             <div class="d-flex">
                                 ${imgHtml}
 
@@ -3693,6 +3424,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                         <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
                                         <small>${p.sku || 'N/D'}</small>
                                     </div>
+
+                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
 
                                     <small class="text-muted d-block">
                                         <b>Tipo:</b> ${p.tipo}
@@ -3787,7 +3520,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     }
 
                     html += `
-                        <tr onclick="openProductionChecklist('${k.nome}', '${k.id}')" style="cursor: pointer;">
+                        <tr onclick="openProductionChecklist('${k.nome}')" style="cursor: pointer;">
                             <td style="width:60px">${imgHtml}</td>
                             <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
                             <td>${k.nome || 'N/D'}</td>
@@ -3881,25 +3614,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: Pausa Automática ao Sair */
-        window.addEventListener('beforeunload', () => {
-            // Tenta avisar o servidor para pausar timers ativos (Best effort)
-            // O servidor já tem a lógica de _auto_pause_on_restart para segurança extra
-            navigator.sendBeacon('/api/timer/action', JSON.stringify({ action: 'pause_all' }));
-        });
-
         /* ✅ DESIGN: Inicialização */
         document.addEventListener('DOMContentLoaded', () => {
-            console.log("🚀 Inicializando Dashboard...");
+            loadKits();
 
-            // 1. Tenta conectar WebSockets
-            setupKpiWebSocket();
-            
-            // 2. CRÍTICO: Faz uma verificação REST imediata para destravar a UI
-            // Isto garante que se o WebSocket falhar, o painel abre na mesma.
-            checkInitialAuth();
-
-            // 3. Configura listeners das abas
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
             if (kpiTab) {
                 kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
@@ -3955,11 +3673,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
     
-    global logger, error_logger, memory_handler
-    
-    if logger is None:
-        logger, error_logger = setup_logging()
-    
     # 1. Inicializa as dependências na ordem correta
     config = Config()
     
@@ -3985,19 +3698,12 @@ def create_app() -> Flask:
     flask_app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'sw-moveis-mdf-secure-key-2025')
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
-    WebServer(config, orchestrator, flask_app)
+    WebServer(config, orchestrator, flask_app) 
     
-    # ✅ ADICIONAR: Atribui orchestrator ao app
-    flask_app.orchestrator = orchestrator 
-    
-    # 5. Iniciar worker automaticamente
-    if not orchestrator.is_running():
-        try:
-            orchestrator.start_worker()
-            start_cleanup_timer()
-            logger.info("✅ Worker de fundo iniciado automaticamente no startup.")
-        except Exception as e:
-            logger.error(f"❌ Erro ao iniciar worker: {e}")
+    # 5. LÓGICA DE INÍCIO DO WORKER (REMOVIDA DO STARTUP)
+    # O worker não deve iniciar automaticamente no startup.
+    # Ele deve ser iniciado apenas após a autenticação ou sob demanda.
+    # A chamada para orchestrator.start() e start_cleanup_timer() foi removida daqui.
     
     return flask_app
 
@@ -4006,5 +3712,14 @@ app = create_app()
 
 if __name__ == '__main__':
     # Apenas para testes locais
+    
+    # Lógica de worker para ambiente local (apenas 1 processo)
+    # Garante que o worker inicie no ambiente local
+    orchestrator = app.orchestrator # Acessa o orchestrator criado em create_app
+    if not orchestrator.is_running():
+        orchestrator.start_worker()
+        start_cleanup_timer()
+        logger.info("✅ Worker de fundo iniciado em modo local.")
+        
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
