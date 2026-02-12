@@ -1312,7 +1312,6 @@ class Orchestrator:
         # Garante que o SalesManager tenha a referência correta
         self.sales.orchestrator = self
         self._running = False
-        self._is_processing = False # ✅ Flag de controle de processamento
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
@@ -1367,11 +1366,6 @@ class Orchestrator:
 
     def start_worker(self):
         """Inicia o worker de fundo para atualização de dados."""
-        # ✅ SEGURANÇA: Impede múltiplos workers ativos
-        if self._worker_thread and self._worker_thread.is_alive():
-            self.logger.debug("⚠️ Tentativa de iniciar worker ignorada: Worker já está rodando.")
-            return
-
         if not self._running:
             self._running = True
             self._stop_event = Event() # Evento para sinalizar parada
@@ -1383,7 +1377,7 @@ class Orchestrator:
             # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
             # O worker principal ainda inicia, mas ele se protege com a verificação de token.
             
-            # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
+                        # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
             # A chamada para self.api.register_webhook foi removida daqui, pois a função agora apenas loga a instrução.
             # O registro deve ser feito manualmente no painel do Bling.
             
@@ -1404,30 +1398,20 @@ class Orchestrator:
 
     def wake_worker(self):
         """
-        Acorda o worker ou REINICIA-O se estiver morto.
+        Acorda o worker imediatamente se estiver dormindo.
+        
+        Útil após OAuth para forçar início imediato do processamento
+        sem esperar os 60 segundos de sleep.
         """
         logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
         
-        # ✅ SEGURANÇA: Não chama wake_worker se já estiver processando
-        if self._is_processing:
-            logger.debug("⚠️ Worker já está processando. Wake ignorado para evitar duplicidade.")
-            return
-
-        # 1. Verifica se a thread do worker ainda está viva
-        if self._worker_thread is None or not self._worker_thread.is_alive():
-            logger.warning("💀 [DEBUG-WORKER] Worker encontrado morto ou não iniciado! Ressuscitando...")
-            self._running = False # Reseta flag para permitir restart
-            self.start_worker()
-            return
-
-        # 2. Se estiver vivo, apenas acorda
         if self._running and self._stop_event:
             logger.info("⏰ Acordando worker (interrompendo sleep)...")
             self._stop_event.set()  # Interrompe o sleep
             
             # Recria o evento para o próximo ciclo
             import time
-            time.sleep(0.1)
+            time.sleep(0.1)  # Pequena pausa para garantir que o worker processou
             self._stop_event.clear()
             
             logger.info("✅ Worker acordado com sucesso!")
@@ -1454,7 +1438,6 @@ class Orchestrator:
         
         while not self._stop_event.is_set():
             cycle_count += 1
-            self._is_processing = True # ✅ Inicia processamento
             
             logger.debug(f"")
             logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
@@ -1507,8 +1490,6 @@ class Orchestrator:
 
             except Exception as e:
                 logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
-            finally:
-                self._is_processing = False # ✅ Finaliza processamento
 
             logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
             logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
@@ -1928,14 +1909,9 @@ class WebServer:
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
         @self.app.route('/auth')
         def auth():
-            from flask import redirect, url_for
+            from flask import redirect
             import secrets
             
-            # ✅ SEGURANÇA: Bloqueia nova autenticação se já estiver autenticado
-            if self.orchestrator.auth.is_authenticated():
-                self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
-                return redirect(url_for("dashboard"))
-
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
             self.orchestrator.auth._save_oauth_state(state)
@@ -2352,40 +2328,86 @@ class WebServer:
         
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
-            self.logger.info("📡 WebSocket KPI conectado.")
+            # ✅ ADICIONAR LOGS DETALHADOS
+            self.logger.info("="*60)
+            self.logger.info("📡 WebSocket KPI TENTANDO CONECTAR...")
+            self.logger.info(f"   • Cliente: {request.remote_addr}")
+            self.logger.info(f"   • Headers: {dict(request.headers)}")
+            self.logger.info("="*60)
             
-            # 1. Definição do Callback
+            # ✅ Limite de callbacks para evitar DoS acidental
+            global kpi_update_callbacks, kpi_update_lock
+
+            self.logger.info("📡 WebSocket KPI conectado.")
+            self.logger.debug(f"   • Total de callbacks ativos: {len(kpi_update_callbacks)}")
+            self.logger.debug(f"   • Autenticado: {self.orchestrator.auth.is_authenticated()}")
+            self.logger.debug(f"   • Worker rodando: {self.orchestrator.is_running()}")
+            if len(kpi_update_callbacks) >= 10:
+                self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
+                return
+
+            # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
-                    if not ws.connected: raise ConnectionClosed() # Verificação extra
+                    self.logger.debug(f"🔔 Enviando payload: {list(payload.keys())}")
                     ws.send(json.dumps(payload))
-                except Exception:
-                    raise ConnectionClosed()
-
-            # 2. Registro e Envio Imediato (CRÍTICO)
+                except ConnectionClosed:
+                    raise
+                except Exception as e:
+                    self.logger.exception("Erro enviando via WS.")
+                    raise ConnectionClosed()  # Força desconexão
+            
+            # ✅ ADICIONAR CALLBACK **ANTES** DO BROADCAST
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
+                self.logger.info(f"✅ Callback adicionado. Total: {len(kpi_update_callbacks)}")
             
+            # Envia o estado inicial completo
             try:
-                # Força o envio do estado ATUAL imediatamente após conectar
-                current_stats = self.orchestrator.sales._get_state_for_save()
+                self.logger.info("🔄 Preparando estado inicial...")
+                sales_stats = self.orchestrator.sales._get_state_for_save()
                 
-                # Payload inicial robusto
-                initial_payload = {
-                    "type": "full_update",
-                    "authenticated": self.orchestrator.auth.is_authenticated(), # Verifica autenticação real
-                    "worker_running": self.orchestrator.is_running(),
-                    "sales_stats": current_stats or {},
-                    "auth_url": self.orchestrator.auth.get_authorization_url()
-                }
+                # ✅ CORREÇÃO: Garante que sales_stats nunca seja None
+                if not sales_stats or not isinstance(sales_stats, dict):
+                    self.logger.warning("⚠️ sales_stats vazio. Usando valores padrão.")
+                    sales_stats = {
+                        "daily": 0,
+                        "weekly": 0,
+                        "monthly": 0,
+                        "last_update": datetime.now(timezone.utc).isoformat()
+                    }
                 
-                ws.send(json.dumps(initial_payload)) # Envia o "aperto de mão"
+                # Tenta usar cache se disponível
+                component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
                 
-                while True:
-                    ws.receive(timeout=60) # Mantém vivo
+                if not component_usage:
+                    self.logger.info("🔄 Cache de componentes vazio. Calculando...")
+                    try:
+                        component_usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = component_usage
+                    except Exception as calc_error:
+                        self.logger.error(f"Falha ao calcular componentes: {calc_error}")
+                        component_usage = {"components": [], "daily_breakdown": []}
+                
+                # ✅ AGORA O CALLBACK JÁ ESTÁ REGISTRADO, ENTÃO O BROADCAST FUNCIONARÁ
+                self.logger.info("📤 Enviando broadcast...")
+                self.orchestrator.broadcast_kpi_update(
+                    sales_stats=sales_stats,
+                    component_usage=component_usage
+                )
+                self.logger.info("✅ Estado inicial enviado ao WebSocket")
+                
             except Exception as e:
-                self.logger.debug(f"WebSocket cliente desconectado: {e}")
+                self.logger.exception("❌ Erro ao enviar estado inicial via WS.")
+                
+            try:
+                while True:
+                    # Mantém a conexão aberta
+                    ws.receive(timeout=60)
+            except ConnectionClosed:
+                self.logger.info("WebSocket KPI desconectado pelo cliente.")
             finally:
+                # Remove o callback ao desconectar
                 with kpi_update_lock:
                     if kpi_callback in kpi_update_callbacks:
                         kpi_update_callbacks.remove(kpi_callback)
@@ -3675,33 +3697,34 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             };
         }
 
-        /* ✅ DESIGN: Verificação Híbrida (WebSocket + REST) */
+        setupKpiWebSocket();
+
+        // ✅ ADICIONAR AQUI: Verificação inicial de autenticação
         async function checkInitialAuth() {
             try {
-                console.log("🕵️ Verificando status via REST API...");
                 const response = await fetch('/api/status');
+                const data = await response.json();
                 
-                if (response.ok) {
-                    const data = await response.json();
-                    console.log("✅ Status REST recebido:", data);
-                    
-                    // Se a API diz que está autenticado, força a atualização da UI
-                    // mesmo que o WebSocket ainda não tenha conectado.
-                    const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
-                    updateAuthStatus(data.authenticated, authUrl);
-                    
-                    if (data.authenticated) {
-                        // Se já estamos autenticados, carregamos os dados iniciais
-                        loadKits();
-                        loadKPIChart();
-                    }
+                // Pega a URL de autenticação do meta tag ou usa padrão
+                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
+                
+                updateAuthStatus(data.authenticated, authUrl);
+                
+                // Se autenticado, força um reload de dados
+                if (data.authenticated) {
+                    console.log("✅ Autenticado! Carregando dados...");
+                } else {
+                    console.log("❌ Não autenticado. Aguardando login...");
                 }
             } catch (error) {
-                console.error("❌ Erro ao verificar autenticação inicial via REST:", error);
+                console.error("Erro ao verificar autenticação inicial:", error);
+                // Em caso de erro, assume não autenticado
+                updateAuthStatus(false, '/auth');
             }
         }
 
-
+        // Executa verificação inicial após 500ms (aguarda WebSocket conectar)
+        setTimeout(checkInitialAuth, 500);
 
         // ✅ ADICIONAR: Timeout de segurança
         let authCheckTimeout = setTimeout(() => {
@@ -3953,16 +3976,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* ✅ DESIGN: Inicialização */
         document.addEventListener('DOMContentLoaded', () => {
-            console.log("🚀 Inicializando Dashboard...");
+            loadKits();
 
-            // 1. Tenta conectar WebSockets
-            setupKpiWebSocket();
-            
-            // 2. CRÍTICO: Faz uma verificação REST imediata para destravar a UI
-            // Isto garante que se o WebSocket falhar, o painel abre na mesma.
-            checkInitialAuth();
-
-            // 3. Configura listeners das abas
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
             if (kpiTab) {
                 kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
