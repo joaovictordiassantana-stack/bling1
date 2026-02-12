@@ -1878,6 +1878,16 @@ class WebServer:
             from flask import redirect, url_for
             import secrets
             
+            # ✅ CRÍTICO: Previne múltiplas autenticações simultâneas
+            lock_file = 'auth_in_progress.lock'
+            if os.path.exists(lock_file):
+                # Verifica se lock não está expirado (>30s)
+                if time.time() - os.path.getmtime(lock_file) < 30:
+                    self.logger.warning("⚠️ Autenticação já em andamento, redirecionando...")
+                    return redirect(url_for("index"))
+                else:
+                    os.remove(lock_file)  # Remove lock expirado
+
             self.logger.info("🔎 [DEBUG-AUTH-ROUTE] Chamou /auth")
             auth = self.orchestrator.auth
             auth.reload_tokens_from_disk()
@@ -1889,6 +1899,10 @@ class WebServer:
             if is_auth:
                 self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
                 return redirect(url_for("index"))
+
+            # Cria lock ANTES de iniciar fluxo OAuth
+            with open(lock_file, 'w') as f:
+                f.write(str(time.time()))
 
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
@@ -2065,6 +2079,15 @@ class WebServer:
                 else:
                     logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
                 
+                # Remove lock de autenticação
+                lock_file = 'auth_in_progress.lock'
+                if os.path.exists(lock_file):
+                    try:
+                        os.remove(lock_file)
+                        logger.info("🔓 Lock de autenticação removido")
+                    except:
+                        pass
+
                 logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
                 return redirect('/')
             else:
