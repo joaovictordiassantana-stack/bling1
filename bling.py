@@ -1312,7 +1312,7 @@ class Orchestrator:
         # Garante que o SalesManager tenha a referência correta
         self.sales.orchestrator = self
         self._running = False
-        # self._is_processing = False # REMOVIDO: Simplificação do worker
+        self._is_processing = False # ✅ Flag de controle de processamento
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
@@ -1402,7 +1402,37 @@ class Orchestrator:
             else:
                 self.logger.info("Worker de fundo parado com sucesso.")
 
-    # wake_worker() REMOVIDO para simplificação e estabilidade.
+    def wake_worker(self):
+        """
+        Acorda o worker ou REINICIA-O se estiver morto.
+        """
+        logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
+        
+        # ✅ SEGURANÇA: Não chama wake_worker se já estiver processando
+        if self._is_processing:
+            logger.debug("⚠️ Worker já está processando. Wake ignorado para evitar duplicidade.")
+            return
+
+        # 1. Verifica se a thread do worker ainda está viva
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            logger.warning("💀 [DEBUG-WORKER] Worker encontrado morto ou não iniciado! Ressuscitando...")
+            self._running = False # Reseta flag para permitir restart
+            self.start_worker()
+            return
+
+        # 2. Se estiver vivo, apenas acorda
+        if self._running and self._stop_event:
+            logger.info("⏰ Acordando worker (interrompendo sleep)...")
+            self._stop_event.set()  # Interrompe o sleep
+            
+            # Recria o evento para o próximo ciclo
+            import time
+            time.sleep(0.1)
+            self._stop_event.clear()
+            
+            logger.info("✅ Worker acordado com sucesso!")
+        else:
+            logger.debug("⚠️ Worker não está rodando ou evento não existe")
 
     def is_running(self) -> bool:
         """Verifica se o worker está ativo."""
@@ -1418,27 +1448,81 @@ class Orchestrator:
             self.logger.exception("❌ Erro no carregamento inicial.")
             
     def _worker_loop(self):
-        import time
-        import threading
-        logger.info(f"🧠 Worker iniciado - ID: {threading.get_ident()}")
+        cycle_count = 0
         
-        while self._running:
-            try:
-                if not self.auth.is_authenticated():
-                    logger.info("⏸️ Aguardando autenticação...")
-                    time.sleep(10)
+        logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
+        
+        while not self._stop_event.is_set():
+            cycle_count += 1
+            self._is_processing = True # ✅ Inicia processamento
+            
+            logger.debug(f"")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
+            
+            # Verifica autenticação antes de tudo
+            logger.debug(f"🔍 [DEBUG-WORKER] Verificando autenticação...")
+            is_auth = self.auth.is_authenticated()
+            logger.debug(f"   • is_authenticated() = {is_auth}")
+            
+            if not is_auth:
+                logger.info(f"⏸️ [DEBUG-WORKER] Ciclo #{cycle_count}: Aguardando autenticação...")
+                logger.debug(f"   • Access Token: {'Presente' if self.auth._access_token else 'Ausente'}")
+                logger.debug(f"   • Refresh Token: {'Presente' if self.auth._refresh_token else 'Ausente'}")
+                
+                # Tenta recarregar tokens do disco antes de esperar
+                logger.debug("🔄 [DEBUG-WORKER] Tentando recarregar tokens do disco...")
+                self.auth.reload_tokens_from_disk()
+                
+                # Verifica novamente
+                is_auth_after_reload = self.auth.is_authenticated()
+                logger.debug(f"   • is_authenticated() após reload = {is_auth_after_reload}")
+                
+                if not is_auth_after_reload:
+                    logger.info("⏳ [DEBUG-WORKER] Aguardando 60s para próxima tentativa...")
+                    self._stop_event.wait(60)
                     continue
+                else:
+                    logger.info("✅ [DEBUG-WORKER] Autenticação OK após reload! Continuando ciclo...")
 
-                logger.info("🚀 Atualizando produtos...")
-                self.process_products_cache()
-
-                logger.info("🚀 Atualizando pedidos...")
+            logger.debug(f"✅ [DEBUG-WORKER] Autenticação confirmada! Iniciando processamento...")
+            
+            try:
+                # Ciclo de Produtos (Cache Pesado)
+                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
+                if cycle_count == 1 or cycle_count % 3 == 0:
+                    logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
+                    self.process_products_cache()
+                
+                # Ciclo de Vendas (KPIs)
+                logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
                 self.process_sales_orders()
+                
+                # Ciclo de Componentes
+                if cycle_count % 4 == 0:
+                    logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
+                    usage = self.calculate_component_usage()
+                    if usage.get('components'):
+                        self._component_usage_cache = usage
+                        self.broadcast_kpi_update(component_usage=usage)
 
             except Exception as e:
-                logger.exception(f"Erro no worker: {e}")
+                logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
+            finally:
+                self._is_processing = False # ✅ Finaliza processamento
 
-            time.sleep(60)
+            logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
+            logger.debug(f"")
+            
+            # Mantém 10 minutos (600s), mas pode ser interrompido por wake_worker()
+            logger.debug("💤 [DEBUG-WORKER] Entrando em sleep de 600s (ou até ser acordado)...")
+            interrupted = self._stop_event.wait(600)
+            
+            if interrupted:
+                logger.info("⏰ [DEBUG-WORKER] Sleep interrompido! Iniciando próximo ciclo imediatamente...")
+                self._stop_event.clear()  # Limpa o evento para não interromper próximos ciclos
+            else:
+                logger.debug("⏰ [DEBUG-WORKER] Sleep de 600s completado naturalmente")
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
@@ -1838,28 +1922,6 @@ class WebServer:
         # Rota principal (Dashboard)
         @self.app.route('/')
         def index():
-            import time
-            self.logger.info("🧠 [DEBUG-DASHBOARD] Entrou na rota /")
-            
-            # Garante reload antes de checar
-            self.orchestrator.auth.reload_tokens_from_disk()
-            
-            is_auth = self.orchestrator.auth.is_authenticated()
-            self.logger.info(f"🧠 Token em memória? {self.orchestrator.auth._access_token is not None}")
-            self.logger.info(f"🧠 is_authenticated()? {is_auth}")
-
-            try:
-                expires_in = self.orchestrator.auth._expires_at - time.time()
-                self.logger.info(f"🧠 Expira em: {expires_in}s")
-            except:
-                self.logger.info("🧠 Expira em: erro ou não definido")
-
-            self.logger.info("🧠 Fim debug autenticação dashboard")
-
-            if not is_auth:
-                self.logger.warning("⚠️ Dashboard detectou não autenticado. Redirecionando para /auth")
-                return redirect(url_for("auth"))
-
             auth_url = self.orchestrator.auth.get_authorization_url()
             return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
 
@@ -1869,13 +1931,10 @@ class WebServer:
             from flask import redirect, url_for
             import secrets
             
-            self.logger.info("🔎 [DEBUG-AUTH-ROUTE] Chamou /auth")
-            self.logger.info(f"🔎 Já autenticado? {self.orchestrator.auth.is_authenticated()}")
-            
             # ✅ SEGURANÇA: Bloqueia nova autenticação se já estiver autenticado
             if self.orchestrator.auth.is_authenticated():
                 self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
-                return redirect(url_for("index"))
+                return redirect(url_for("dashboard"))
 
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
@@ -2051,6 +2110,9 @@ class WebServer:
                     logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
                 else:
                     logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
+                    # 🔧 NOVO: Acorda o worker imediatamente
+                    logger.debug("⏰ [DEBUG-CALLBACK] Acordando worker para processar imediatamente...")
+                    self.orchestrator.wake_worker()
                 
                 logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
                 return redirect('/')
