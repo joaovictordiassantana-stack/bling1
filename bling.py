@@ -896,7 +896,7 @@ class AuthManager:
 
     def is_authenticated(self) -> bool:
         """Verifica se o token de acesso é válido ou pode ser renovado."""
-        if self._access_token and self._expires_at > time.time() + 60: # 60s de buffer
+        if self._access_token and self._expires_at > time.time() + 300: # 60s de buffer
             return True
         
         if self._refresh_token:
@@ -906,7 +906,7 @@ class AuthManager:
 
     def get_access_token(self) -> Optional[str]:
         """Retorna o token de acesso, renovando se necessário."""
-        if self._access_token and self._expires_at > time.time() + 60:
+        if self._access_token and self._expires_at > time.time() + 300:
             return self._access_token
             
         if self._refresh_token:
@@ -969,7 +969,7 @@ class AuthManager:
             disk_expires = disk_data.get('expires_at', 0)
             
             # Se o arquivo já tem um token válido (renovado por outro worker/thread), usa ele!
-            if disk_access and disk_expires > time.time() + 60:
+            if disk_access and disk_expires > time.time() + 300:
                 self.logger.info("Token já foi renovado por outro processo. Carregando do disco.")
                 self._access_token = disk_access
                 self._refresh_token = disk_data.get('refresh_token')
@@ -1023,8 +1023,9 @@ class AuthManager:
                 data=data,
                 timeout=self.config.AUTH_TIMEOUT
             )
+            if not response.ok:
+                self.logger.error(f"❌ Erro na resposta do Bling ({response.status_code}): {response.text}")
             response.raise_for_status()
-            
             token_data = response.json()
             
             self._access_token = token_data.get('access_token')
@@ -1838,7 +1839,23 @@ class WebServer:
         # Rota principal (Dashboard)
         @self.app.route('/')
         def index():
-            auth_url = self.orchestrator.auth.get_authorization_url()
+            self.logger.info("🧠 [DEBUG-DASHBOARD] Entrou na rota /")
+            auth = self.orchestrator.auth
+            
+            # Força recarga do disco para garantir que o worker e a web thread vejam o mesmo token
+            auth.reload_tokens_from_disk()
+            
+            is_auth = auth.is_authenticated()
+            self.logger.info(f"🧠 Token em memória? {auth._access_token is not None}")
+            self.logger.info(f"🧠 is_authenticated()? {is_auth}")
+            
+            try:
+                expires_in = auth._expires_at - time.time()
+                self.logger.info(f"🧠 Expira em: {expires_in:.0f}s")
+            except:
+                self.logger.info("🧠 Expira em: erro")
+            
+            auth_url = auth.get_authorization_url()
             return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
 
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
@@ -1847,8 +1864,15 @@ class WebServer:
             from flask import redirect, url_for
             import secrets
             
+            self.logger.info("🔎 [DEBUG-AUTH-ROUTE] Chamou /auth")
+            auth = self.orchestrator.auth
+            auth.reload_tokens_from_disk()
+            
+            is_auth = auth.is_authenticated()
+            self.logger.info(f"🔎 Já autenticado? {is_auth}")
+            
             # ✅ SEGURANÇA: Bloqueia nova autenticação se já estiver autenticado
-            if self.orchestrator.auth.is_authenticated():
+            if is_auth:
                 self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
                 return redirect(url_for("index"))
 
@@ -1974,7 +1998,7 @@ class WebServer:
             state = request.args.get('state')
             
             # ✅ ADICIONAR AQUI: Prevenir duplo processamento
-            with WebServer.code_lock:
+            with WebServer.webhook_lock:
                 if code in WebServer.used_codes:
                     logger.warning(f"⚠️ Code {code[:10]}... já foi processado. Ignorando.")
                     return redirect('/')
