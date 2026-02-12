@@ -1934,7 +1934,7 @@ class WebServer:
             # ✅ SEGURANÇA: Bloqueia nova autenticação se já estiver autenticado
             if self.orchestrator.auth.is_authenticated():
                 self.logger.info("Bloqueando tentativa de re-autenticação: Já autenticado.")
-                return redirect(url_for("dashboard"))
+                return redirect(url_for("index"))
 
             # 1. GERAÇÃO DO STATE (REGRA DE OURO)
             state = secrets.token_urlsafe(32)
