@@ -433,7 +433,7 @@ class Config:
     
     # Retry e Timeout
     REQUEST_TIMEOUT: int = 30
-    AUTH_TIMEOUT: int = 3 # Timeout curto para auth
+    AUTH_TIMEOUT: int = 15 # Aumentado de 3 para 15 para evitar ReadTimeout em redes lentas
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
@@ -821,13 +821,12 @@ class AuthManager:
     
     def __init__(self, config: Config):
         self.config = config
-        
-        # --- ADICIONE ESTA VERIFICAÇÃO ---
-        if not self.config.REDIRECT_URI:
-            raise ValueError("CRÍTICO: BLING_REDIRECT_URI não configurada nas variáveis de ambiente!")
-        # ---------------------------------
-
         self.logger = logging.getLogger('bling_automacao')
+        
+        # --- VERIFICAÇÃO DE REDIRECT_URI ---
+        if not self.config.REDIRECT_URI:
+            self.logger.warning("⚠️ BLING_REDIRECT_URI não configurada. O fluxo de autenticação OAuth pode falhar.")
+        # ---------------------------------
         self._tokens = self._load_tokens()
         self._access_token = self._tokens.get('access_token')
         self._refresh_token = self._tokens.get('refresh_token')
@@ -1037,6 +1036,8 @@ class AuthManager:
             
         except requests.exceptions.HTTPError as e:
             self.logger.exception(f"Erro HTTP na requisição de token. Resposta: {safe_dict(response.text)}")
+        except requests.exceptions.ReadTimeout:
+            self.logger.error(f"Timeout de leitura (ReadTimeout) ao conectar com o Bling. O servidor demorou mais de {self.config.AUTH_TIMEOUT}s para responder.")
         except RequestException as e:
             # Garante que 'response' não é acessado aqui
             self.logger.exception(f"Erro de conexão na requisição de token.")
