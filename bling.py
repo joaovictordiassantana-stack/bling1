@@ -221,7 +221,9 @@ def setup_logging():
         
     return logger, error_logger
 
-logger, error_logger = setup_logging()
+logger = None
+error_logger = None
+memory_handler = None
 
 # ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
 def cleanup_kpi_callbacks():
@@ -841,9 +843,18 @@ class AuthManager:
         
         if not self._access_token and not self._refresh_token:
             self.logger.warning("⚠️ Nenhum token encontrado no arquivo ou ambiente. Necessário realizar autenticação OAuth.")
-        elif not self._access_token and self._refresh_token:
+        if not self._access_token and self._refresh_token:
             self.logger.info("Refresh Token encontrado. Tentativa de renovação será feita na primeira requisição.") 
         
+        # ✅ ADICIONAR NO FINAL DO __init__:
+        # Carrega tokens do disco automaticamente no início
+        try:
+            self.reload_tokens_from_disk()
+            if self.is_authenticated():
+                self.logger.info("✅ Tokens carregados automaticamente do disco no início")
+        except Exception as e:
+            self.logger.debug(f"Sem tokens salvos no disco (primeira execução): {e}")
+
     def _load_tokens(self) -> Dict[str, Any]:
         """Carrega tokens do arquivo de forma segura."""
         return load_tokens_safe(self.config.TOKENS_FILE)
@@ -1107,6 +1118,17 @@ class SalesManager:
             }
 
     def _get_state_for_save(self) -> Dict[str, Any]:
+        """Retorna o estado atual das estatísticas de vendas"""
+        
+        # ✅ ADICIONAR AQUI: Verifica se há dados válidos
+        if self.daily_count is None or (isinstance(self.daily_count, dict) and not self.daily_count):
+             return {
+                "daily": 0,
+                "weekly": 0,
+                "monthly": 0,
+                "last_update": datetime.now(timezone.utc).isoformat()
+            }
+
         with self.lock:
             return {
                 "daily": self.daily_count,
@@ -2011,6 +2033,20 @@ class WebServer:
             code = request.args.get('code')
             state = request.args.get('state')
             
+            # ✅ ADICIONAR AQUI: Prevenir duplo processamento
+            with WebServer.code_lock:
+                if code in WebServer.used_codes:
+                    logger.warning(f"⚠️ Code {code[:10]}... já foi processado. Ignorando.")
+                    return redirect('/')
+                
+                WebServer.used_codes.add(code)
+                # Limpa codes antigos (mantém apenas últimos 10)
+                if len(WebServer.used_codes) > 10:
+                    # WebServer.used_codes é um set, pop() remove um elemento arbitrário.
+                    # Para manter os últimos 10, poderíamos usar uma lista ou deque,
+                    # mas como o objetivo é apenas evitar reprocessamento imediato, pop() serve.
+                    WebServer.used_codes.pop()
+            
             logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
             logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
             logger.debug(f"   • State: {state[:20]}..." if state else "   • State: Ausente")
@@ -2151,7 +2187,16 @@ class WebServer:
             }
             return jsonify(status), 200
 
-        @self.app.route('/api/force-load', methods=['POST'])
+        @self.app.route("/api/status")
+        def api_status():
+            """Retorna status de autenticação e worker para o front-end"""
+            return jsonify({
+                "authenticated": self.orchestrator.auth.is_authenticated(),
+                "worker_running": self.orchestrator.is_running(),
+                "cache_loaded": self.orchestrator.is_cache_loaded()
+            })
+
+        @self.app.route("/api/force-load", methods=["POST"])
         @token_required
         def api_force_load(token):
             """Força o recarregamento do cache de produtos/kits em uma thread separada."""
@@ -2239,6 +2284,15 @@ class WebServer:
         def ws_logs(ws):
             self.logger.info("📡 WebSocket logs conectado.")
             
+            # ✅ ADICIONAR VERIFICAÇÃO:
+            if memory_handler is None:
+                self.logger.error("❌ memory_handler não inicializado!")
+                try:
+                    ws.send(json.dumps({"error": "Logger não inicializado"}))
+                except:
+                    pass
+                return
+            
             # ✅ Limite de callbacks para evitar DoS acidental
             if len(memory_handler.ws_callbacks) >= 10:
                 self.logger.warning("Limite de 10 conexões de log WS atingido. Conexão recusada.")
@@ -2274,10 +2328,20 @@ class WebServer:
         
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
-            self.logger.info("📡 WebSocket KPI conectado.")
+            # ✅ ADICIONAR LOGS DETALHADOS
+            self.logger.info("="*60)
+            self.logger.info("📡 WebSocket KPI TENTANDO CONECTAR...")
+            self.logger.info(f"   • Cliente: {request.remote_addr}")
+            self.logger.info(f"   • Headers: {dict(request.headers)}")
+            self.logger.info("="*60)
             
             # ✅ Limite de callbacks para evitar DoS acidental
             global kpi_update_callbacks, kpi_update_lock
+
+            self.logger.info("📡 WebSocket KPI conectado.")
+            self.logger.debug(f"   • Total de callbacks ativos: {len(kpi_update_callbacks)}")
+            self.logger.debug(f"   • Autenticado: {self.orchestrator.auth.is_authenticated()}")
+            self.logger.debug(f"   • Worker rodando: {self.orchestrator.is_running()}")
             if len(kpi_update_callbacks) >= 10:
                 self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
                 return
@@ -2285,18 +2349,33 @@ class WebServer:
             # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
+                    self.logger.debug(f"🔔 Enviando payload: {list(payload.keys())}")
                     ws.send(json.dumps(payload))
                 except ConnectionClosed:
-                    # ✅ ADICIONE: Sinaliza para remover este callback
                     raise
                 except Exception as e:
                     self.logger.exception("Erro enviando via WS.")
                     raise ConnectionClosed()  # Força desconexão
-                
-            # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
-            # 1. Envia o estado inicial completo
+            
+            # ✅ ADICIONAR CALLBACK **ANTES** DO BROADCAST
+            with kpi_update_lock:
+                kpi_update_callbacks.append(kpi_callback)
+                self.logger.info(f"✅ Callback adicionado. Total: {len(kpi_update_callbacks)}")
+            
+            # Envia o estado inicial completo
             try:
+                self.logger.info("🔄 Preparando estado inicial...")
                 sales_stats = self.orchestrator.sales._get_state_for_save()
+                
+                # ✅ CORREÇÃO: Garante que sales_stats nunca seja None
+                if not sales_stats or not isinstance(sales_stats, dict):
+                    self.logger.warning("⚠️ sales_stats vazio. Usando valores padrão.")
+                    sales_stats = {
+                        "daily": 0,
+                        "weekly": 0,
+                        "monthly": 0,
+                        "last_update": datetime.now(timezone.utc).isoformat()
+                    }
                 
                 # Tenta usar cache se disponível
                 component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
@@ -2310,6 +2389,8 @@ class WebServer:
                         self.logger.error(f"Falha ao calcular componentes: {calc_error}")
                         component_usage = {"components": [], "daily_breakdown": []}
                 
+                # ✅ AGORA O CALLBACK JÁ ESTÁ REGISTRADO, ENTÃO O BROADCAST FUNCIONARÁ
+                self.logger.info("📤 Enviando broadcast...")
                 self.orchestrator.broadcast_kpi_update(
                     sales_stats=sales_stats,
                     component_usage=component_usage
@@ -2317,20 +2398,16 @@ class WebServer:
                 self.logger.info("✅ Estado inicial enviado ao WebSocket")
                 
             except Exception as e:
-                self.logger.exception("Erro ao enviar estado inicial via WS.")
-                
-            # 2. Adiciona o callback à lista global
-            with kpi_update_lock:
-                kpi_update_callbacks.append(kpi_callback)
+                self.logger.exception("❌ Erro ao enviar estado inicial via WS.")
                 
             try:
                 while True:
                     # Mantém a conexão aberta
                     ws.receive(timeout=60)
             except ConnectionClosed:
-                pass
+                self.logger.info("WebSocket KPI desconectado pelo cliente.")
             finally:
-                # 3. Remove o callback ao desconectar
+                # Remove o callback ao desconectar
                 with kpi_update_lock:
                     if kpi_callback in kpi_update_callbacks:
                         kpi_update_callbacks.remove(kpi_callback)
@@ -3216,6 +3293,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('auth-link').classList.add('d-none');
                 document.getElementById('content-tabs').classList.remove('hidden');
                 document.getElementById('auth-required-tabs').classList.add('hidden');
+                
+                // ✅ ADICIONAR: Emite evento de confirmação
+                window.dispatchEvent(new Event('auth-confirmed'));
+                
             } else {
                 badge.className = 'badge bg-danger';
                 badge.textContent = '🔴 Offline';
@@ -3618,6 +3699,49 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         setupKpiWebSocket();
 
+        // ✅ ADICIONAR AQUI: Verificação inicial de autenticação
+        async function checkInitialAuth() {
+            try {
+                const response = await fetch('/api/status');
+                const data = await response.json();
+                
+                // Pega a URL de autenticação do meta tag ou usa padrão
+                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
+                
+                updateAuthStatus(data.authenticated, authUrl);
+                
+                // Se autenticado, força um reload de dados
+                if (data.authenticated) {
+                    console.log("✅ Autenticado! Carregando dados...");
+                } else {
+                    console.log("❌ Não autenticado. Aguardando login...");
+                }
+            } catch (error) {
+                console.error("Erro ao verificar autenticação inicial:", error);
+                // Em caso de erro, assume não autenticado
+                updateAuthStatus(false, '/auth');
+            }
+        }
+
+        // Executa verificação inicial após 500ms (aguarda WebSocket conectar)
+        setTimeout(checkInitialAuth, 500);
+
+        // ✅ ADICIONAR: Timeout de segurança
+        let authCheckTimeout = setTimeout(() => {
+            const badge = document.getElementById('status-badge');
+            if (!isAuthenticated && badge.textContent === '⏳ CARREGANDO...') {
+                console.warn("⚠️ Timeout de autenticação. Forçando estado não autenticado.");
+                const authUrl = document.querySelector('meta[name="auth-url"]')?.content || '/auth';
+                updateAuthStatus(false, authUrl);
+                showToast('Aviso', 'Não foi possível verificar autenticação. Por favor, faça login.', 'warning');
+            }
+        }, 5000); // 5 segundos
+
+        // Limpa o timeout quando autenticação for confirmada
+        window.addEventListener('auth-confirmed', () => {
+            clearTimeout(authCheckTimeout);
+        });
+
         /* ✅ DESIGN: Busca de Produtos */
         const btnSearch = document.getElementById('btn-search');
         btnSearch.onclick = async () => {
@@ -3909,6 +4033,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
     
+    global logger, error_logger, memory_handler
+    
+    if logger is None:
+        logger, error_logger = setup_logging()
+    
     # 1. Inicializa as dependências na ordem correta
     config = Config()
     
@@ -3934,12 +4063,19 @@ def create_app() -> Flask:
     flask_app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'sw-moveis-mdf-secure-key-2025')
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
-    WebServer(config, orchestrator, flask_app) 
+    WebServer(config, orchestrator, flask_app)
     
-    # 5. LÓGICA DE INÍCIO DO WORKER (REMOVIDA DO STARTUP)
-    # O worker não deve iniciar automaticamente no startup.
-    # Ele deve ser iniciado apenas após a autenticação ou sob demanda.
-    # A chamada para orchestrator.start() e start_cleanup_timer() foi removida daqui.
+    # ✅ ADICIONAR: Atribui orchestrator ao app
+    flask_app.orchestrator = orchestrator 
+    
+    # 5. Iniciar worker automaticamente
+    if not orchestrator.is_running():
+        try:
+            orchestrator.start_worker()
+            start_cleanup_timer()
+            logger.info("✅ Worker de fundo iniciado automaticamente no startup.")
+        except Exception as e:
+            logger.error(f"❌ Erro ao iniciar worker: {e}")
     
     return flask_app
 
@@ -3948,14 +4084,5 @@ app = create_app()
 
 if __name__ == '__main__':
     # Apenas para testes locais
-    
-    # Lógica de worker para ambiente local (apenas 1 processo)
-    # Garante que o worker inicie no ambiente local
-    orchestrator = app.orchestrator # Acessa o orchestrator criado em create_app
-    if not orchestrator.is_running():
-        orchestrator.start_worker()
-        start_cleanup_timer()
-        logger.info("✅ Worker de fundo iniciado em modo local.")
-        
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
