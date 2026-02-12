@@ -1398,20 +1398,25 @@ class Orchestrator:
 
     def wake_worker(self):
         """
-        Acorda o worker imediatamente se estiver dormindo.
-        
-        Útil após OAuth para forçar início imediato do processamento
-        sem esperar os 60 segundos de sleep.
+        Acorda o worker ou REINICIA-O se estiver morto.
         """
         logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
         
+        # 1. Verifica se a thread do worker ainda está viva
+        if self._worker_thread is None or not self._worker_thread.is_alive():
+            logger.warning("💀 [DEBUG-WORKER] Worker encontrado morto ou não iniciado! Ressuscitando...")
+            self._running = False # Reseta flag para permitir restart
+            self.start_worker()
+            return
+
+        # 2. Se estiver vivo, apenas acorda
         if self._running and self._stop_event:
             logger.info("⏰ Acordando worker (interrompendo sleep)...")
             self._stop_event.set()  # Interrompe o sleep
             
             # Recria o evento para o próximo ciclo
             import time
-            time.sleep(0.1)  # Pequena pausa para garantir que o worker processou
+            time.sleep(0.1)
             self._stop_event.clear()
             
             logger.info("✅ Worker acordado com sucesso!")
@@ -3929,10 +3934,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* ✅ DESIGN: Inicialização */
         document.addEventListener('DOMContentLoaded', () => {
+            console.log("🚀 Inicializando Dashboard...");
+
             // 1. Tenta conectar WebSockets
             setupKpiWebSocket();
             
-            // 2. Faz uma verificação REST imediata para destravar a UI rapidamente
+            // 2. CRÍTICO: Faz uma verificação REST imediata para destravar a UI
+            // Isto garante que se o WebSocket falhar, o painel abre na mesma.
             checkInitialAuth();
 
             // 3. Configura listeners das abas
