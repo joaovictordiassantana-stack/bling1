@@ -1772,6 +1772,9 @@ class Orchestrator:
         """
         global kpi_update_callbacks, kpi_update_lock
         
+        # ✅ CRÍTICO: Recarrega tokens antes de verificar autenticação
+        self.auth.reload_tokens_from_disk()
+        
         # 1. Monta o payload base
         payload = {
             "type": "full_update",
@@ -2343,6 +2346,9 @@ class WebServer:
                 kpi_update_callbacks.append(kpi_callback)
             
             try:
+                # ✅ CRÍTICO: Recarrega tokens ANTES de verificar autenticação
+                self.orchestrator.auth.reload_tokens_from_disk()
+                
                 # Força o envio do estado ATUAL imediatamente após conectar
                 current_stats = self.orchestrator.sales._get_state_for_save()
                 
