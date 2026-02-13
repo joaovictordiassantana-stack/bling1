@@ -1450,6 +1450,8 @@ class Orchestrator:
     def _worker_loop(self):
         cycle_count = 0
         
+        import threading
+        logger.info(f"🧠 Worker ID: {threading.get_ident()}")
         logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
         
         while not self._stop_event.is_set():
@@ -1490,6 +1492,7 @@ class Orchestrator:
                 # Ciclo de Produtos (Cache Pesado)
                 # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
                 if cycle_count == 1 or cycle_count % 3 == 0:
+                    logger.info("🚀 Iniciando atualização real de produtos...")
                     logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
                     self.process_products_cache()
                 
