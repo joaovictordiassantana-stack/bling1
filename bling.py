@@ -1023,7 +1023,7 @@ class AuthManager:
                 data=data,
                 timeout=self.config.AUTH_TIMEOUT
             )
-                        if not response.ok:
+            if not response.ok:
                 self.logger.error(f"❌ Erro na resposta do Bling ({response.status_code}): {response.text}")
             response.raise_for_status()
             token_data = response.json()
@@ -1837,7 +1837,7 @@ class WebServer:
         """Configura todas as rotas HTTP."""
         
         # Rota principal (Dashboard)
-                @self.app.route('/')
+        @self.app.route('/')
         def index():
             self.logger.info("🧠 [DEBUG-DASHBOARD] Entrou na rota /")
             auth = self.orchestrator.auth
@@ -1859,7 +1859,7 @@ class WebServer:
             return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
 
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
-                @self.app.route('/auth')
+        @self.app.route('/auth')
         def auth():
             from flask import redirect, url_for
             import secrets
@@ -1998,7 +1998,7 @@ class WebServer:
             state = request.args.get('state')
             
             # ✅ ADICIONAR AQUI: Prevenir duplo processamento
-            with WebServer.code_lock:
+            with WebServer.webhook_lock:
                 if code in WebServer.used_codes:
                     logger.warning(f"⚠️ Code {code[:10]}... já foi processado. Ignorando.")
                     return redirect('/')
