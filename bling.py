@@ -1049,24 +1049,33 @@ class SalesManager:
         self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
 class ProductionTimer:
-    """Gerencia cronômetros de produção persistentes."""
+    """Gerencia cronômetros de produção e histórico mensal."""
     FILE_PATH = Path('production_timers.json')
+    HISTORY_PATH = Path('production_history.json') # Novo arquivo para histórico
 
     def __init__(self):
         self.timers = self._load()
+        self._auto_pause_on_restart() # Pausa timers abertos ao reiniciar o server
 
     def _load(self):
-        if not self.FILE_PATH.exists():
-            return {}
+        if not self.FILE_PATH.exists(): return {}
         try:
-            with open(self.FILE_PATH, 'r') as f:
-                return json.load(f)
-        except:
-            return {}
+            with open(self.FILE_PATH, 'r') as f: return json.load(f)
+        except: return {}
 
     def _save(self):
-        with open(self.FILE_PATH, 'w') as f:
-            json.dump(self.timers, f)
+        with open(self.FILE_PATH, 'w') as f: json.dump(self.timers, f)
+
+    def _auto_pause_on_restart(self):
+        """Se o servidor reiniciou, pausa tudo para não contar tempo fantasma."""
+        changed = False
+        for k, v in self.timers.items():
+            if v['state'] == 'running':
+                v['state'] = 'paused'
+                # Opcional: Adicionar um tempo estimado ou apenas pausar
+                v['start_ts'] = 0 
+                changed = True
+        if changed: self._save()
 
     def start(self, produto_nome):
         now = time.time()
@@ -1074,7 +1083,7 @@ class ProductionTimer:
             self.timers[produto_nome] = {'start_ts': now, 'accumulated': 0, 'state': 'running'}
         else:
             t = self.timers[produto_nome]
-            if t['state'] == 'paused':
+            if t['state'] != 'running':
                 t['start_ts'] = now
                 t['state'] = 'running'
         self._save()
@@ -1083,13 +1092,26 @@ class ProductionTimer:
     def pause(self, produto_nome):
         if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
             t = self.timers[produto_nome]
-            now = time.time()
-            elapsed = now - t['start_ts']
-            t['accumulated'] += elapsed
+            t['accumulated'] += (time.time() - t['start_ts'])
             t['start_ts'] = 0
             t['state'] = 'paused'
             self._save()
         return self.get_status(produto_nome)
+
+    def stop_and_log(self, produto_nome):
+        """Finaliza a produção e salva no histórico mensal."""
+        status = self.pause(produto_nome) # Garante que calculou o final
+        total_seconds = status['elapsed']
+        
+        # Salva no histórico mensal
+        self._add_to_history(produto_nome, total_seconds)
+        
+        # Remove do timer ativo
+        if produto_nome in self.timers:
+            del self.timers[produto_nome]
+            self._save()
+            
+        return {'elapsed': 0, 'state': 'stopped'}
 
     def reset(self, produto_nome):
         if produto_nome in self.timers:
@@ -1100,13 +1122,38 @@ class ProductionTimer:
     def get_status(self, produto_nome):
         if produto_nome not in self.timers:
             return {'elapsed': 0, 'state': 'stopped'}
-        
         t = self.timers[produto_nome]
         total = t['accumulated']
         if t['state'] == 'running':
             total += (time.time() - t['start_ts'])
-        
         return {'elapsed': int(total), 'state': t['state']}
+
+    def _add_to_history(self, produto, segundos):
+        """Registra o tempo no arquivo de histórico do mês atual."""
+        try:
+            if self.HISTORY_PATH.exists():
+                with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
+            else: history = {}
+            
+            mes_chave = datetime.now().strftime('%Y-%m') # Chave mensal (ex: 2026-02)
+            
+            if mes_chave not in history: history[mes_chave] = {}
+            if produto not in history[mes_chave]: history[mes_chave][produto] = 0
+            
+            history[mes_chave][produto] += segundos
+            
+            with open(self.HISTORY_PATH, 'w') as f: json.dump(history, f)
+        except Exception as e:
+            print(f"Erro ao salvar histórico: {e}")
+
+    def get_monthly_history(self):
+        """Retorna o histórico do mês atual."""
+        if not self.HISTORY_PATH.exists(): return {}
+        try:
+            with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
+            mes_chave = datetime.now().strftime('%Y-%m')
+            return history.get(mes_chave, {})
+        except: return {}
 
 # Instancie globalmente
 production_timer = ProductionTimer()
@@ -1436,7 +1483,7 @@ class Orchestrator:
             self.sales._recalculation_running = False
 
     def process_products_cache(self):
-        """Busca e armazena em cache todos os produtos, variações e kits."""
+        """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
         if not self.auth.is_authenticated():
             return
             
@@ -1447,8 +1494,7 @@ class Orchestrator:
         
         while True:
             try:
-                self.logger.info(f"Buscando produtos página {page}...")
-                # Inclui variações na busca se a API suportar o parâmetro
+                # Busca produtos incluindo imagens e variações
                 response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
                 if not response: break
             except Exception as e:
@@ -1462,10 +1508,17 @@ class Orchestrator:
                 p_id = p.get("id")
                 if not p_id: continue
 
-                # 1. Processa o produto principal
+                # --- LÓGICA DE EXTRAÇÃO DE IMAGEM ROBUSTA (V3) ---
+                img_url = "/static/no-image.png" # Placeholder padrão
+                imagens = p.get("imagens", [])
+                if isinstance(imagens, list) and len(imagens) > 0:
+                    img_url = imagens[0].get("link") # Pega a primeira imagem da lista
+                elif p.get("imagemURL"):
+                    img_url = p.get("imagemURL")
+                # -------------------------------------------------
+
                 sku_val = p.get("codigo") or p.get("sku") or str(p_id)
                 
-                # Busca estoque detalhado se disponível na listagem, senão tenta obter saldo
                 estoque = p.get("estoque", {})
                 saldo = 0
                 if isinstance(estoque, dict):
@@ -1478,12 +1531,11 @@ class Orchestrator:
                     "nome": p.get("nome"),
                     "sku": sku_val,
                     "estoqueAtual": saldo,
-                    "imagem": p.get("imagemURL") or p.get("imagem", {}).get("link"),
+                    "imagem": img_url, # Usa a URL tratada
                     "tipo": p.get("tipo", "P"),
                     "componentes": []
                 }
 
-                # 2. Se for KIT, precisamos dos componentes (exige busca detalhada)
                 if produto_normalizado["tipo"] == "K":
                     try:
                         detalhe = self.api.get(f'produtos/{p_id}')
@@ -1496,11 +1548,9 @@ class Orchestrator:
                 else:
                     all_products.append(produto_normalizado)
 
-                # 3. PROCESSAMENTO DE VARIAÇÕES (CRÍTICO)
-                # Na API v3, variações podem vir em 'variacoes' dentro do produto pai
+                # Processamento de Variações
                 variacoes = p.get("variacoes", [])
                 if variacoes:
-                    self.logger.debug(f"Processando {len(variacoes)} variações para o produto {sku_val}")
                     for v in variacoes:
                         v_id = v.get("id")
                         v_sku = v.get("codigo") or v.get("sku")
@@ -1513,12 +1563,18 @@ class Orchestrator:
                         else:
                             v_saldo = v_estoque or 0
 
+                        # Tenta pegar imagem da variação, se não tiver, usa a do pai
+                        v_img_url = produto_normalizado["imagem"]
+                        v_imagens = v.get("imagens", [])
+                        if isinstance(v_imagens, list) and len(v_imagens) > 0:
+                            v_img_url = v_imagens[0].get("link")
+
                         var_normalizada = {
                             "id": v_id,
                             "nome": f"{p.get('nome')} - {v.get('nome', '')}".strip(),
                             "sku": v_sku,
                             "estoqueAtual": v_saldo,
-                            "imagem": v.get("imagemURL") or produto_normalizado["imagem"],
+                            "imagem": v_img_url,
                             "tipo": "P",
                             "pai_id": p_id
                         }
@@ -1526,110 +1582,77 @@ class Orchestrator:
 
             if len(data) < 100: break
             page += 1
-            time.sleep(0.8)
+            time.sleep(0.5)
 
         with self._cache_lock:
-            # Limpa caches atuais
-            self._products_cache = {}
-            self._kits_cache = {}
+            self._products_cache = {str(p["id"]): p for p in all_products}
+            # Adiciona também busca por SKU
+            for p in all_products: self._products_cache[str(p["sku"])] = p
             
-            # Mapeia produtos por SKU e ID
-            for p in all_products:
-                self._products_cache[str(p["sku"])] = p
-                self._products_cache[str(p["id"])] = p
-            
-            # Mapeia kits por SKU e ID
-            for k in all_kits:
-                self._kits_cache[str(k["sku"])] = k
-                self._kits_cache[str(k["id"])] = k
+            self._kits_cache = {str(k["id"]): k for k in all_kits}
+            for k in all_kits: self._kits_cache[str(k["sku"])] = k
             
             save_products_cache(self.config.PRODUCTS_CACHE_FILE, all_products, all_kits)
             
-        self.logger.info(f"✅ Cache atualizado: {len(all_products)} produtos/variações, {len(all_kits)} kits.")
+        self.logger.info(f"✅ Cache atualizado: {len(all_products)} produtos, {len(all_kits)} kits.")
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self) -> Dict[str, Any]:
-        """Calcula insumos baseado APENAS no código interno e vendas do Mês Atual."""
-        
-        # Define o intervalo: Primeiro dia do mês atual até agora
+        """Calcula insumos baseado em vendas e integra histórico de produção mensal."""
         agora = datetime.now()
         inicio_mes = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         
         insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0, "un": ""})
         produtos_vendidos = defaultdict(int)
-        daily_usage = defaultdict(lambda: defaultdict(float))
         
-        # Pega o histórico de vendas (que já é buscado pelo worker)
-        # Filtra apenas o que foi vendido DEPOIS do dia 1 do mês
+        # 1. Processa Vendas do Mês
         with self.sales.lock:
             todos_pedidos = self.sales._sales_history
             
         for pedido in todos_pedidos:
-            data_str = pedido.get('data')
-            if not data_str: continue
-            
-            # Converte string para datetime para comparar
             try:
-                # Tenta ISO format primeiro, depois fallback
-                dt_pedido = datetime.fromisoformat(data_str.split(' ')[0].replace('T', ' '))
-                day_key = dt_pedido.strftime('%Y-%m-%d')
+                dt_pedido = datetime.fromisoformat(pedido.get('data', '').split(' ')[0].replace('T', ' '))
+                if dt_pedido < inicio_mes: continue
             except: continue
-            
-            # FILTRO CRUCIAL: Apenas mês atual
-            if dt_pedido < inicio_mes:
-                continue
 
-            itens = pedido.get('itens', [])
-            for item in safe_iter(itens):
+            for item in safe_iter(pedido.get('itens', [])):
                 nome = (item.get('descricao') or item.get('nome') or "").upper()
                 qtd = float(item.get('quantidade', 0))
-                
                 if qtd <= 0: continue
 
-                # Regra: Se tem "CADEIRA" no nome, explode a lista técnica
                 if "CADEIRA" in nome:
                     produtos_vendidos[nome] += int(qtd)
-                    
-                    # Usa a lista hardcoded RECIPE_CADEIRA (definida no início do arquivo)
-                    for componente in RECIPE_CADEIRA:
-                        nome_comp = componente['nome']
-                        qtd_comp = componente['qtd'] * qtd
-                        un = componente['un']
-                        
-                        insumos_totais[nome_comp]["nome"] = nome_comp
-                        insumos_totais[nome_comp]["quantidade"] += qtd_comp
-                        insumos_totais[nome_comp]["un"] = un
-                        
-                        daily_usage[day_key][nome_comp] += qtd_comp
+                    for comp in RECIPE_CADEIRA:
+                        n, q, u = comp['nome'], comp['qtd'] * qtd, comp['un']
+                        insumos_totais[n].update({"nome": n, "un": u})
+                        insumos_totais[n]["quantidade"] += q
                 else:
-                    # Se não for cadeira, apenas registra o próprio produto como insumo (venda direta)
-                    insumos_totais[nome]["nome"] = nome
+                    insumos_totais[nome].update({"nome": nome, "un": "Unid"})
                     insumos_totais[nome]["quantidade"] += qtd
-                    insumos_totais[nome]["un"] = "Unid"
-                    daily_usage[day_key][nome] += qtd
-        
-        # Formata para lista
-        lista_final = []
-        for data in insumos_totais.values():
-            lista_final.append({
-                "nome": data["nome"],
-                "quantidade": round(data["quantidade"], 2),
-                "un": data["un"]
-            })
+
+        # 2. Integra Histórico de Produção (Tempo -> Insumos)
+        history = production_timer.get_monthly_history()
+        production_stats = []
+        for prod_nome, segundos in history.items():
+            horas = round(segundos / 3600, 2)
+            production_stats.append({"produto": prod_nome, "horas": horas})
+            
+            # Se for cadeira, adiciona insumos proporcionais (exemplo: 1 cadeira por hora de produção)
+            if "CADEIRA" in prod_nome.upper():
+                qtd_estimada = horas # 1 por hora
+                for comp in RECIPE_CADEIRA:
+                    n, q, u = comp['nome'], comp['qtd'] * qtd_estimada, comp['un']
+                    insumos_totais[n].update({"nome": n, "un": u})
+                    insumos_totais[n]["quantidade"] += q
+
+        lista_final = [{"nome": d["nome"], "quantidade": round(d["quantidade"], 2), "un": d["un"]} 
+                      for d in insumos_totais.values()]
         lista_final.sort(key=lambda x: x['quantidade'], reverse=True)
-        
-        # Formata consumo diário
-        daily_breakdown = []
-        for day in sorted(daily_usage.keys(), reverse=True):
-            day_items = []
-            for nome, qty in daily_usage[day].items():
-                day_items.append({"nome": nome, "quantidade": round(qty, 2)})
-            daily_breakdown.append({"data": day, "componentes": day_items})
-        
+
         return {
             "components": lista_final,
-            "daily_breakdown": daily_breakdown[:7],
-            "produtos_vendidos": dict(produtos_vendidos),
+            "production_history": production_stats,
+            "products_sold": dict(produtos_vendidos),
             "mes_referencia": agora.strftime("%m/%Y")
         }
 
@@ -1806,7 +1829,7 @@ class WebServer:
         @self.app.route('/api/timer/action', methods=['POST'])
         def api_timer_action():
             data = request.json
-            action = data.get('action') # start, pause, reset, get
+            action = data.get('action') # start, pause, reset, finish
             produto = data.get('produto')
             
             if action == 'start':
@@ -1815,6 +1838,8 @@ class WebServer:
                 status = production_timer.pause(produto)
             elif action == 'reset':
                 status = production_timer.reset(produto)
+            elif action == 'finish':
+                status = production_timer.stop_and_log(produto)
             else:
                 status = production_timer.get_status(produto)
                 
