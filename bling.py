@@ -1212,8 +1212,121 @@ class ProductionTimer:
             return history.get(mes_chave, [])
         except: return []
 
-# Instancie globalmente
+class ComponentConsumptionManager:
+    """
+    Gerencia o consumo real de insumos/componentes registrado via checklist.
+    Reinicia automaticamente todo mês.
+    """
+    FILE_PATH = Path('component_consumption.json')
+
+    def __init__(self):
+        self.data = self._load()
+        self._ensure_current_month()
+
+    def _current_month_key(self):
+        return datetime.now().strftime('%Y-%m')
+
+    def _load(self):
+        if not self.FILE_PATH.exists():
+            return {}
+        try:
+            with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save(self):
+        temp = self.FILE_PATH.with_suffix('.tmp')
+        try:
+            with open(temp, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+            shutil.move(str(temp), str(self.FILE_PATH))
+        except Exception as e:
+            logger.error(f"Erro ao salvar consumo: {e}")
+
+    def _ensure_current_month(self):
+        """Garante que existe a estrutura para o mês atual."""
+        key = self._current_month_key()
+        if key not in self.data:
+            self.data[key] = {
+                'components': {},   # nome -> {qtd, un, registros: [...]}
+                'checklist_logs': []  # Histórico de cada item marcado
+            }
+            self._save()
+
+    def register_component(self, component_name: str, qty: float, unit: str, product_name: str):
+        """Registra uso de um componente via checklist."""
+        self._ensure_current_month()
+        key = self._current_month_key()
+        month_data = self.data[key]
+
+        if component_name not in month_data['components']:
+            month_data['components'][component_name] = {'qtd': 0, 'un': unit, 'registros': []}
+
+        comp = month_data['components'][component_name]
+        comp['qtd'] = round(comp['qtd'] + qty, 3)
+        comp['un'] = unit
+
+        registro = {
+            'produto': product_name,
+            'qtd': qty,
+            'timestamp': datetime.now().isoformat()
+        }
+        comp['registros'].append(registro)
+
+        # Log geral
+        month_data['checklist_logs'].append({
+            'componente': component_name,
+            'produto': product_name,
+            'qtd': qty,
+            'un': unit,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        self._save()
+        return comp
+
+    def unregister_component(self, component_name: str, qty: float, product_name: str):
+        """Remove o registro de um componente (desmarcou o checkbox)."""
+        self._ensure_current_month()
+        key = self._current_month_key()
+        month_data = self.data[key]
+
+        if component_name in month_data['components']:
+            comp = month_data['components'][component_name]
+            comp['qtd'] = max(0, round(comp['qtd'] - qty, 3))
+            # Remove o último registro deste produto
+            comp['registros'] = [r for r in comp['registros'] if r['produto'] != product_name]
+            self._save()
+
+    def get_current_month(self):
+        """Retorna os dados do mês atual."""
+        self._ensure_current_month()
+        key = self._current_month_key()
+        return self.data[key]
+
+    def get_all_months(self):
+        """Retorna histórico de todos os meses."""
+        return self.data
+
+    def get_month_summary(self):
+        """Resumo formatado para o frontend."""
+        month = self.get_current_month()
+        summary = []
+        for nome, info in month['components'].items():
+            summary.append({
+                'nome': nome,
+                'qtd_total': info['qtd'],
+                'un': info['un'],
+                'num_registros': len(info['registros']),
+                'registros': info['registros'][-5:]  # Últimos 5
+            })
+        return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
+
+
+# Instâncias globais
 production_timer = ProductionTimer()
+component_consumption = ComponentConsumptionManager()
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -1926,6 +2039,52 @@ class WebServer:
                 status = production_timer.get_status(produto)
                 
             return jsonify(status)
+
+        @self.app.route('/api/consumption/register', methods=['POST'])
+        def api_consumption_register():
+            """Registra ou remove consumo de componente via checklist."""
+            data = request.json
+            component_name = data.get('component_name', '')
+            qty = float(data.get('qty', 0))
+            unit = data.get('unit', 'un')
+            product_name = data.get('product_name', '')
+            checked = data.get('checked', True)  # True = marcou, False = desmarcou
+
+            if not component_name or not product_name:
+                return jsonify({'error': 'component_name e product_name são obrigatórios'}), 400
+
+            if checked:
+                result = component_consumption.register_component(component_name, qty, unit, product_name)
+            else:
+                component_consumption.unregister_component(component_name, qty, product_name)
+                result = {'unregistered': True}
+
+            return jsonify({'success': True, 'result': result})
+
+        @self.app.route('/api/consumption/summary')
+        def api_consumption_summary():
+            """Retorna o resumo de consumo do mês atual."""
+            return jsonify({
+                'month': component_consumption._current_month_key(),
+                'summary': component_consumption.get_month_summary(),
+                'logs': component_consumption.get_current_month().get('checklist_logs', [])[-50:]
+            })
+
+        @self.app.route('/api/consumption/history')
+        def api_consumption_history():
+            """Retorna histórico de todos os meses."""
+            all_data = component_consumption.get_all_months()
+            result = {}
+            for month_key, month_data in all_data.items():
+                result[month_key] = {
+                    'total_components': len(month_data.get('components', {})),
+                    'total_logs': len(month_data.get('checklist_logs', [])),
+                    'components': [
+                        {'nome': k, 'qtd': v['qtd'], 'un': v['un']}
+                        for k, v in month_data.get('components', {}).items()
+                    ]
+                }
+            return jsonify(result)
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
@@ -3029,17 +3188,55 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                     </div>
 
-                    <!-- Tab: Componentes -->
+                    <!-- Tab: Componentes (Consumo & Produção) -->
                     <div class="tab-pane fade" id="component-usage" role="tabpanel">
-                        <div class="card">
-                            <div class="card-header">
-                                <h5 class="mb-0">🔧 Consumo de Componentes (Últimos 30 dias)</h5>
-                                <small class="text-white-50">Atualizado conforme pedidos são processados</small>
-                            </div>
-                            <div class="card-body">
-                                <div id="component-usage-content">
-                                    <p class="text-center text-muted">⏳ Carregando dados...</p>
+                        <!-- Seção: Produção em Andamento -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
+                                <div>
+                                    <h5 class="mb-0">⚙️ Produção em Andamento</h5>
+                                    <small class="text-white-50">Timers ativos — persistem mesmo após reinício</small>
                                 </div>
+                                <button class="btn btn-sm btn-outline-light" onclick="refreshComponentTab()">🔄 Atualizar</button>
+                            </div>
+                            <div class="card-body" id="active-timers-section">
+                                <p class="text-center text-muted py-3">⏳ Carregando timers...</p>
+                            </div>
+                        </div>
+
+                        <!-- Seção: Consumo Mensal de Insumos (via Checklist) -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #065f46 0%, #059669 100%);">
+                                <div>
+                                    <h5 class="mb-0">📊 Consumo de Insumos & Componentes</h5>
+                                    <small class="text-white-50" id="consumption-month-label">Mês atual • Reinicia todo mês</small>
+                                </div>
+                                <span class="badge bg-light text-dark" id="consumption-total-badge">0 itens registrados</span>
+                            </div>
+                            <div class="card-body p-0" id="consumption-table-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando consumo...</div>
+                            </div>
+                        </div>
+
+                        <!-- Seção: Produtos Vendidos no Mês -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header" style="background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);">
+                                <h5 class="mb-0">🛒 Produtos Vendidos (Mês Atual)</h5>
+                                <small class="text-white-50">Baseado nos pedidos faturados conectados ao Bling</small>
+                            </div>
+                            <div class="card-body p-0" id="monthly-sales-section">
+                                <div class="text-center py-4 text-muted">⏳ Aguardando dados...</div>
+                            </div>
+                        </div>
+
+                        <!-- Seção: Histórico de Finalizações -->
+                        <div class="card border-0 shadow-sm">
+                            <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%);">
+                                <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
+                                <small class="text-white-50">Registro de cada produto finalizado com tempo de produção</small>
+                            </div>
+                            <div class="card-body p-0" id="production-history-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando histórico...</div>
                             </div>
                         </div>
                     </div>
@@ -3237,19 +3434,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         let timerInterval = null;
 
         function openProductionChecklist(productName) {
-            // 1. Verifica se é uma Cadeira para mostrar a lista técnica
             const isCadeira = productName.toUpperCase().includes('CADEIRA');
             let checklistHtml = '';
 
             if (isCadeira) {
                 checklistHtml = `
-                    <h6 class="text-muted mb-3">📋 Lista de Corte & Insumos (1 Unidade)</h6>
-                    <div class="row g-2 mb-4" style="max-height: 300px; overflow-y: auto;">
+                    <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
+                    <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
                         ${RECIPE_CADEIRA.map((item, i) => `
                             <div class="col-md-6">
-                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center">
-                                    <input class="form-check-input ms-1 me-2" type="checkbox" id="check${i}">
-                                    <label class="form-check-label flex-grow-1 small fw-bold" for="check${i}">
+                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
+                                     style="cursor:pointer; transition: all .2s;"
+                                     onclick="toggleChecklist(this, ${i}, '${productName}')">
+                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}" onclick="event.stopPropagation()">
+                                    <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
                                         ${item.nome} 
                                         <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
                                     </label>
@@ -3257,45 +3455,61 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         `).join('')}
                     </div>
+                    <div id="checklist-progress" class="alert alert-info py-2 small mb-0">
+                        <strong>0 / ${RECIPE_CADEIRA.length}</strong> itens marcados como usados
+                    </div>
                 `;
             } else {
-                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática (não é Cadeira).</div>`;
+                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática de insumos.</div>`;
             }
 
             const modalHtml = `
                 <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
                     <div class="modal-dialog modal-lg modal-dialog-centered">
                         <div class="modal-content border-0 shadow-2xl">
-                            <div class="modal-header bg-dark text-white">
+                            <div class="modal-header text-white" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
                                 <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
                                 <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
                             </div>
-                            <div class="modal-body bg-light">
-                                <div class="card mb-4 border-0 shadow-sm">
-                                    <div class="card-body text-center">
-                                        <h6 class="text-uppercase text-muted small letter-spacing-2">Tempo de Produção</h6>
-                                        <div id="timer-display" class="display-4 fw-bold my-2 font-monospace">00:00:00</div>
-                                        <div class="btn-group mt-2">
-                                            <button class="btn btn-success px-4" onclick="controlTimer('start', '${productName}')">▶ Iniciar</button>
-                                            <button class="btn btn-warning px-4" onclick="controlTimer('pause', '${productName}')">⏸ Pausar</button>
-                                            <button class="btn btn-danger px-4" onclick="controlTimer('reset', '${productName}')">⏹ Reiniciar/Fim</button>
+                            <div class="modal-body" style="background: #f8fafc;">
+                                <!-- Timer Section -->
+                                <div class="card mb-4 border-0" style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white;">
+                                    <div class="card-body text-center py-4">
+                                        <div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em; opacity:.7;">⏱ Tempo de Produção</div>
+                                        <div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size: 3.5rem; letter-spacing:.05em; text-shadow: 0 0 20px rgba(99,102,241,.6);">
+                                            00:00:00
                                         </div>
-                                        <div id="timer-status" class="mt-2 badge bg-secondary">Parado</div>
+                                        <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
+                                        <div class="d-flex justify-content-center gap-2">
+                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', '${productName}')">
+                                                ▶ Iniciar
+                                            </button>
+                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', '${productName}')">
+                                                ⏸ Pausar
+                                            </button>
+                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', '${productName}')">
+                                                ↺ Zerar
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
 
+                                <!-- Checklist -->
                                 ${checklistHtml}
                             </div>
-                            <div class="modal-footer bg-white">
-                                <button type="button" class="btn btn-outline-dark" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar Janela</button>
-                                <button type="button" class="btn btn-success" onclick="controlTimer('finish', '${productName}')">✅ CONCLUIR PRODUÇÃO & SALVAR</button>
+                            <div class="modal-footer bg-white d-flex justify-content-between">
+                                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
+                                    Fechar
+                                </button>
+                                <button type="button" class="btn btn-success px-4 fw-bold" onclick="controlTimer('finish', '${productName}')">
+                                    ✅ CONCLUIR & SALVAR
+                                </button>
                             </div>
                         </div>
                     </div>
                 </div>
             `;
 
-            // Remove anterior e cria novo
             const oldModal = document.getElementById('productionModal');
             if (oldModal) oldModal.remove();
             document.body.insertAdjacentHTML('beforeend', modalHtml);
@@ -3303,8 +3517,59 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
 
-            // Carrega o estado atual do timer do servidor
+            // Carrega estado atual do timer
             controlTimer('get', productName);
+        }
+
+        // Estado de checklist por produto (para saber o que está marcado)
+        const checklistState = {};
+
+        function toggleChecklist(container, idx, productName) {
+            const cb = container.querySelector('input[type=checkbox]');
+            cb.checked = !cb.checked;
+            const item = RECIPE_CADEIRA[idx];
+
+            if (cb.checked) {
+                container.style.background = '#d1fae5';
+                container.style.borderColor = '#10b981';
+                // Registra na API
+                registerConsumption(item.nome, item.qtd, item.un, productName, true);
+            } else {
+                container.style.background = '';
+                container.style.borderColor = '';
+                registerConsumption(item.nome, item.qtd, item.un, productName, false);
+            }
+
+            // Atualiza progress
+            const total = RECIPE_CADEIRA.length;
+            const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
+            const progressDiv = document.getElementById('checklist-progress');
+            if (progressDiv) {
+                progressDiv.innerHTML = `<strong>${checked} / ${total}</strong> itens marcados como usados${checked === total ? ' ✅ Tudo marcado!' : ''}`;
+                progressDiv.className = `alert py-2 small mb-0 ${checked === total ? 'alert-success' : 'alert-info'}`;
+            }
+        }
+
+        async function registerConsumption(componentName, qty, unit, productName, checked) {
+            try {
+                await fetch('/api/consumption/register', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        component_name: componentName,
+                        qty: qty,
+                        unit: unit,
+                        product_name: productName,
+                        checked: checked
+                    })
+                });
+                // Atualiza a aba de consumo se estiver visível
+                if (document.getElementById('component-usage').classList.contains('active')) {
+                    refreshComponentTab();
+                }
+            } catch(e) {
+                console.error('Erro ao registrar consumo:', e);
+            }
         }
 
         /* Lógica do Timer Conectada ao Backend */
@@ -3362,129 +3627,124 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
+        /* ✅ DESIGN: Atualizar Componentes — nova versão */
         function updateComponentUsage(usageData) {
-            const div = document.getElementById('component-usage-content');
-            
-            if (usageData.error) {
-                 div.innerHTML = `<div class="alert alert-danger">${usageData.error}</div>`;
-                 return;
-            }
-
-            // 1. CABEÇALHO DE STATUS (EM ANDAMENTO)
-            let activeHtml = '';
-            if (usageData.active_production && usageData.active_production.length > 0) {
-                activeHtml = `
-                    <div class="card bg-warning bg-opacity-10 border-warning mb-4">
-                        <div class="card-header bg-warning text-dark fw-bold">🚀 PRODUÇÃO EM ANDAMENTO (AGORA)</div>
-                        <div class="card-body p-0">
-                            <table class="table table-sm mb-0">
-                                <thead><tr><th>Produto</th><th>Tempo Decorrido</th><th>Status</th><th>Ação</th></tr></thead>
-                                <tbody>
-                                    ${usageData.active_production.map(p => `
-                                        <tr>
-                                            <td class="fw-bold">${p.produto}</td>
-                                            <td class="font-monospace">${new Date(p.tempo_decorrido * 1000).toISOString().substr(11, 8)}</td>
-                                            <td><span class="badge ${p.estado === 'running' ? 'bg-success pulse-animation' : 'bg-secondary'}">${p.estado === 'running' ? 'PRODUZINDO' : 'PAUSADO'}</span></td>
-                                            <td><button class="btn btn-sm btn-outline-dark" onclick="openProductionChecklist('${p.produto}')">Abrir</button></td>
-                                        </tr>
-                                    `).join('')}
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                `;
-            } else {
-                activeHtml = `<div class="alert alert-secondary mb-4">🏭 Nenhuma produção ativa no momento. A fábrica está parada.</div>`;
-            }
-
-            // 2. TABELA COMPARATIVA DE INSUMOS
-            let insumosHtml = `
-                <div class="row mb-3">
-                    <div class="col-md-6">
-                        <div class="card bg-dark text-white text-center p-3">
-                            <h3>${usageData.total_horas_mes}h</h3>
-                            <small>Horas Produtivas (Mês)</small>
-                        </div>
-                    </div>
-                    <div class="col-md-6">
-                         <div class="card bg-success text-white text-center p-3">
-                            <h3>${Object.values(usageData.produtos_produzidos || {}).reduce((a, b) => a + b, 0)} itens</h3>
-                            <small>Total Finalizado (Mês)</small>
-                        </div>
-                    </div>
-                </div>
-
-                <h5 class="mt-4">📋 Consumo de Materiais: Teórico (Vendas) vs Real (Produção)</h5>
-                <div class="table-responsive bg-white rounded shadow-sm border">
-                    <table class="table table-hover mb-0 align-middle">
-                        <thead class="table-light">
-                            <tr>
-                                <th>Insumo</th>
-                                <th class="text-center">Planejado (Vendas)</th>
-                                <th class="text-center">Consumido (Real)</th>
-                                <th class="text-center">Un.</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${usageData.components.map(c => `
-                                <tr>
-                                    <td class="fw-bold text-muted">${c.nome}</td>
-                                    <td class="text-center text-muted">${c.qtd_teorica}</td>
-                                    <td class="text-center fw-bold fs-5 text-primary">${c.qtd_real}</td>
-                                    <td class="text-center small">${c.un}</td>
-                                </tr>
-                            `).join('')}
-                        </tbody>
-                    </table>
-                </div>
-            `;
-            
-            // 2.5 TABELA DE PRODUTOS VENDIDOS NO MÊS
-            let vendasHtml = `
-                <h5 class="mt-5">🛒 Produtos Vendidos (Mês Atual)</h5>
-                <div class="table-responsive bg-white rounded shadow-sm border mb-4">
-                    <table class="table table-hover mb-0 align-middle">
-                        <thead class="table-light">
-                            <tr>
-                                <th>Produto</th>
-                                <th class="text-center">Quantidade Vendida</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${Object.entries(usageData.produtos_vendidos || {}).sort((a,b) => b[1] - a[1]).map(([nome, qtd]) => `
-                                <tr>
-                                    <td class="fw-bold">${nome}</td>
-                                    <td class="text-center"><span class="badge bg-info text-dark fs-6">${qtd}</span></td>
-                                </tr>
-                            `).join('')}
-                            ${Object.keys(usageData.produtos_vendidos || {}).length === 0 ? '<tr><td colspan="2" class="text-center text-muted">Nenhuma venda registrada este mês.</td></tr>' : ''}
-                        </tbody>
-                    </table>
-                </div>
-            `;
-
-            // 3. HISTÓRICO DETALHADO
-            let historyHtml = `
-                <h5 class="mt-5">📜 Histórico de Finalizações (Mês)</h5>
-                <div class="table-responsive" style="max-height: 300px; overflow-y:auto;">
-                    <table class="table table-sm table-striped small">
-                        <thead><tr><th>Data/Hora</th><th>Produto</th><th>Tempo Gasto</th></tr></thead>
-                        <tbody>
-                             ${(usageData.history_production || []).slice().reverse().map(h => `
-                                <tr>
-                                    <td>${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
-                                    <td class="fw-bold">${h.produto}</td>
-                                    <td>${new Date(h.tempo_segundos * 1000).toISOString().substr(11, 8)}</td>
-                                </tr>
-                             `).join('')}
-                        </tbody>
-                    </table>
-                </div>
-            `;
-
-            div.innerHTML = activeHtml + insumosHtml + vendasHtml + historyHtml;
+            if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
+            if (usageData && usageData.active_production) renderActiveTimers(usageData.active_production);
+            if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
+
+        async function refreshComponentTab() {
+            try {
+                const consumptionData = await fetchAPI('/api/consumption/summary');
+                renderConsumptionTable(consumptionData);
+            } catch(e) {
+                document.getElementById('consumption-table-section').innerHTML =
+                    '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
+            }
+            try {
+                const usageData = await fetchAPI('/api/components/usage');
+                if (usageData.active_production) renderActiveTimers(usageData.active_production);
+                if (usageData.history_production) renderProductionHistory(usageData.history_production);
+                if (usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
+            } catch(e) { console.error(e); }
+        }
+
+        function renderActiveTimers(activeProduction) {
+            const div = document.getElementById('active-timers-section');
+            if (!div) return;
+            if (!activeProduction || activeProduction.length === 0) {
+                div.innerHTML = `<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">🏭</div><p class="text-muted mt-2 mb-0">Nenhuma produção ativa. Clique em um produto para iniciar.</p></div>`;
+                return;
+            }
+            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead class="table-dark"><tr><th>Produto</th><th class="text-center">Tempo</th><th class="text-center">Status</th><th class="text-center">Ação</th></tr></thead>
+                <tbody>${activeProduction.map(p => `<tr>
+                    <td class="fw-bold ps-3">${p.produto}</td>
+                    <td class="text-center font-monospace fw-bold fs-5 text-primary">${formatSeconds(p.tempo_decorrido)}</td>
+                    <td class="text-center"><span class="badge ${p.estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}" style="${p.estado === 'running' ? 'animation:pulse-animation 1.5s infinite;' : ''}">${p.estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}</span></td>
+                    <td class="text-center"><button class="btn btn-sm btn-outline-primary" onclick="openProductionChecklist('${p.produto}')">Abrir Timer</button></td>
+                </tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function renderConsumptionTable(data) {
+            const tableSection = document.getElementById('consumption-table-section');
+            const monthLabel = document.getElementById('consumption-month-label');
+            const totalBadge = document.getElementById('consumption-total-badge');
+            if (!tableSection) return;
+            const monthStr = data.month || '';
+            const [year, month] = monthStr.split('-');
+            const monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+            const monthName = month ? `${monthNames[parseInt(month)-1]}/${year}` : monthStr;
+            if (monthLabel) monthLabel.textContent = `${monthName} • Reinicia todo mês`;
+            const summary = data.summary || [];
+            if (totalBadge) totalBadge.textContent = `${summary.length} insumos registrados`;
+            if (summary.length === 0) {
+                tableSection.innerHTML = `<div class="text-center py-5"><div style="font-size:3rem;opacity:.3;">📦</div><p class="text-muted mt-2">Nenhum insumo registrado ainda este mês.</p><small class="text-muted">Abra um produto e marque os itens na checklist para registrar o consumo.</small></div>`;
+                return;
+            }
+            tableSection.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead style="background:#f8fafc;"><tr><th class="ps-3">Insumo / Componente</th><th class="text-center">Qtd Usada (Mês)</th><th class="text-center">Un.</th><th class="text-center">Registros</th></tr></thead>
+                <tbody>${summary.map(item => `<tr>
+                    <td class="ps-3 fw-bold">${item.nome}</td>
+                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#059669,#10b981);color:white;padding:.4rem .9rem;">${item.qtd_total}</span></td>
+                    <td class="text-center text-muted small">${item.un}</td>
+                    <td class="text-center"><span class="badge bg-light text-dark border">${item.num_registros}x</span></td>
+                </tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function renderMonthlySales(produtosVendidos) {
+            const div = document.getElementById('monthly-sales-section');
+            if (!div) return;
+            const entries = Object.entries(produtosVendidos || {}).sort((a, b) => b[1] - a[1]);
+            if (entries.length === 0) {
+                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto vendido registrado este mês.</div>';
+                return;
+            }
+            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead style="background:#f8fafc;"><tr><th class="ps-3">Produto</th><th class="text-center">Qtd Vendida</th><th class="text-center">Insumos Teóricos</th></tr></thead>
+                <tbody>${entries.map(([nome, qtd]) => {
+                    const isCadeira = nome.includes('CADEIRA');
+                    return `<tr><td class="ps-3 fw-bold">${nome}</td>
+                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:white;padding:.4rem .9rem;">${qtd} un</span></td>
+                    <td class="text-center">${isCadeira ? `<button class="btn btn-xs btn-outline-secondary btn-sm" onclick="showTheoreticalUsage('${nome}', ${qtd})">Ver insumos</button>` : '<span class="text-muted small">—</span>'}</td></tr>`;
+                }).join('')}</tbody></table></div>`;
+        }
+
+        function renderProductionHistory(history) {
+            const div = document.getElementById('production-history-section');
+            if (!div) return;
+            const reversed = [...(history || [])].reverse();
+            if (reversed.length === 0) {
+                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado este mês.</div>';
+                return;
+            }
+            div.innerHTML = `<div class="table-responsive" style="max-height:320px;overflow-y:auto;"><table class="table table-sm table-striped align-middle mb-0">
+                <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
+                <tbody>${reversed.map(h => `<tr>
+                    <td class="ps-3 small text-muted">${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
+                    <td class="fw-bold">${h.produto}</td>
+                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos)}</td>
+                </tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function showTheoreticalUsage(productName, qty) {
+            const lines = RECIPE_CADEIRA.map(item => `<tr><td>${item.nome}</td><td class="text-center fw-bold">${(item.qtd * qty).toFixed(2)}</td><td class="text-muted small">${item.un}</td></tr>`).join('');
+            const html = `<div class="modal fade" id="theoreticalModal" tabindex="-1"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header bg-dark text-white"><h6 class="modal-title">📋 Insumos Teóricos: ${qty}x ${productName}</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body p-0"><table class="table table-sm mb-0"><thead class="table-light"><tr><th>Insumo</th><th class="text-center">Qtd Total</th><th>Un.</th></tr></thead><tbody>${lines}</tbody></table></div></div></div></div>`;
+            const old = document.getElementById('theoreticalModal');
+            if (old) old.remove();
+            document.body.insertAdjacentHTML('beforeend', html);
+            new bootstrap.Modal(document.getElementById('theoreticalModal')).show();
+        }
+
+        function formatSeconds(s) {
+            s = Math.floor(s || 0);
+            const h = Math.floor(s / 3600).toString().padStart(2, '0');
+            const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+            const sec = (s % 60).toString().padStart(2, '0');
+            return `${h}:${m}:${sec}`;
+        }
+
 
         /* ✅ DESIGN: WebSocket KPI */
         const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -3771,15 +4031,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
             if (componentUsageTab) {
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
-                    const contentDiv = document.getElementById('component-usage-content');
-
-                    if (contentDiv.innerHTML.includes('Carregando dados...')) {
-                        setTimeout(() => {
-                            if (contentDiv.innerHTML.includes('Carregando dados...')) {
-                                contentDiv.innerHTML = '<div class="alert alert-danger">⚠️ Tempo limite excedido. O cálculo de componentes pode estar demorando. Verifique os logs.</div>';
-                            }
-                        }, 30000);
-                    }
+                    refreshComponentTab();
                 });
             }
         });
