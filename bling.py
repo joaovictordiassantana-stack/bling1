@@ -77,11 +77,39 @@ class RateLimiter:
 # CONFIGURAÇÃO DE RECEITA (Adicione logo após os imports)
 # ==============================================================================
 RECIPE_CADEIRA = [
-    {"nome": "MDF 15MM BRANCO TX", "qtd": 2.5, "un": "m²"},
-    {"nome": "PARAFUSO 4.0X40", "qtd": 24, "un": "un"},
-    {"nome": "COLA BRANCA PVA", "qtd": 0.2, "un": "kg"},
-    {"nome": "LIXA GRAO 120", "qtd": 2, "un": "un"},
-    {"nome": "TINTA ACABAMENTO", "qtd": 0.5, "un": "L"}
+    {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+    {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+    {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+    {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+    {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+    {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+    {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+    {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+    {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+    {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+    {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+    {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+    {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+    {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+    {"nome": "COLA", "qtd": 1, "un": "Unid"},
+    {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+    {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+    {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+    {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+    {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+    {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+    {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+    {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+    {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+    {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+    {"nome": "BASE", "qtd": 1, "un": "Unid"}
 ]
 # Podeis ajustar os nomes e quantidades conforme a vossa realidade nobre.
 # ==============================================================================
@@ -1048,14 +1076,14 @@ class ProductionTimer:
             logger.error(f"Erro ao salvar timers: {e}")
 
     def _auto_pause_on_restart(self):
-        """Se o servidor cair, pausa os timers para não contar tempo falso."""
+        """Se o servidor cair, pausa os timers para não contar tempo falso e salva o tempo decorrido."""
         changed = False
         for k, v in self.timers.items():
             if v['state'] == 'running':
+                # Como o servidor caiu, não sabemos o exato momento, mas o arquivo JSON
+                # reflete o estado da última vez que foi salvo. Se estava 'running',
+                # pausamos para evitar contagem infinita.
                 v['state'] = 'paused'
-                # O tempo corrido até a queda já estava em 'accumulated'? 
-                # Se não, perdemos o intervalo da última sessão. 
-                # Assumimos pausa segura.
                 v['start_ts'] = 0 
                 changed = True
         if changed: self._save()
@@ -1075,6 +1103,20 @@ class ProductionTimer:
                 t['start_ts'] = now
                 t['state'] = 'running'
         self._save()
+        
+        # Inicia uma thread para salvar o progresso a cada 30 segundos enquanto estiver rodando
+        def background_saver(nome):
+            while nome in self.timers and self.timers[nome]['state'] == 'running':
+                time.sleep(30)
+                if nome in self.timers and self.timers[nome]['state'] == 'running':
+                    t = self.timers[nome]
+                    now_ts = time.time()
+                    t['accumulated'] += (now_ts - t['start_ts'])
+                    t['start_ts'] = now_ts
+                    self._save()
+        
+        Thread(target=background_saver, args=(produto_nome,), daemon=True).start()
+        
         return self.get_status(produto_nome)
 
     def pause(self, produto_nome):
@@ -1361,7 +1403,7 @@ class Orchestrator:
                 self.process_sales_orders()
                 
                 # Ciclo de Componentes
-                if cycle_count % 4 == 0:
+                if cycle_count % 2 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
                     usage = self.calculate_component_usage()
                     if usage.get('components'):
@@ -3398,6 +3440,30 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
             `;
             
+            // 2.5 TABELA DE PRODUTOS VENDIDOS NO MÊS
+            let vendasHtml = `
+                <h5 class="mt-5">🛒 Produtos Vendidos (Mês Atual)</h5>
+                <div class="table-responsive bg-white rounded shadow-sm border mb-4">
+                    <table class="table table-hover mb-0 align-middle">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Produto</th>
+                                <th class="text-center">Quantidade Vendida</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${Object.entries(usageData.produtos_vendidos || {}).sort((a,b) => b[1] - a[1]).map(([nome, qtd]) => `
+                                <tr>
+                                    <td class="fw-bold">${nome}</td>
+                                    <td class="text-center"><span class="badge bg-info text-dark fs-6">${qtd}</span></td>
+                                </tr>
+                            `).join('')}
+                            ${Object.keys(usageData.produtos_vendidos || {}).length === 0 ? '<tr><td colspan="2" class="text-center text-muted">Nenhuma venda registrada este mês.</td></tr>' : ''}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+
             // 3. HISTÓRICO DETALHADO
             let historyHtml = `
                 <h5 class="mt-5">📜 Histórico de Finalizações (Mês)</h5>
@@ -3417,7 +3483,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
             `;
 
-            div.innerHTML = activeHtml + insumosHtml + historyHtml;
+            div.innerHTML = activeHtml + insumosHtml + vendasHtml + historyHtml;
         }
 
         /* ✅ DESIGN: WebSocket KPI */
