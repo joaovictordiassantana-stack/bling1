@@ -1022,13 +1022,13 @@ class SalesManager:
         self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
 class ProductionTimer:
-    """Gerencia cronômetros de produção e histórico mensal."""
+    """Gerencia cronômetros de produção e histórico detalhado."""
     FILE_PATH = Path('production_timers.json')
-    HISTORY_PATH = Path('production_history.json') # Novo arquivo para histórico
+    HISTORY_PATH = Path('production_history.json')
 
     def __init__(self):
         self.timers = self._load()
-        self._auto_pause_on_restart() # Pausa timers abertos ao reiniciar o server
+        self._auto_pause_on_restart() # Pausa timers abertos ao reiniciar para segurança
 
     def _load(self):
         if not self.FILE_PATH.exists(): return {}
@@ -1037,15 +1037,20 @@ class ProductionTimer:
         except: return {}
 
     def _save(self):
-        with open(self.FILE_PATH, 'w') as f: json.dump(self.timers, f)
+        # Salva de forma atômica para evitar corrupção se o server cair durante a escrita
+        temp = self.FILE_PATH.with_suffix('.tmp')
+        with open(temp, 'w') as f: json.dump(self.timers, f)
+        shutil.move(str(temp), str(self.FILE_PATH))
 
     def _auto_pause_on_restart(self):
-        """Se o servidor reiniciou, pausa tudo para não contar tempo fantasma."""
+        """Se o servidor cair, pausa os timers para não contar tempo falso."""
         changed = False
         for k, v in self.timers.items():
             if v['state'] == 'running':
                 v['state'] = 'paused'
-                # Opcional: Adicionar um tempo estimado ou apenas pausar
+                # O tempo corrido até a queda já estava em 'accumulated'? 
+                # Se não, perdemos o intervalo da última sessão. 
+                # Assumimos pausa segura.
                 v['start_ts'] = 0 
                 changed = True
         if changed: self._save()
@@ -1053,7 +1058,12 @@ class ProductionTimer:
     def start(self, produto_nome):
         now = time.time()
         if produto_nome not in self.timers:
-            self.timers[produto_nome] = {'start_ts': now, 'accumulated': 0, 'state': 'running'}
+            self.timers[produto_nome] = {
+                'start_ts': now, 
+                'accumulated': 0, 
+                'state': 'running',
+                'created_at': datetime.now().isoformat()
+            }
         else:
             t = self.timers[produto_nome]
             if t['state'] != 'running':
@@ -1065,6 +1075,7 @@ class ProductionTimer:
     def pause(self, produto_nome):
         if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
             t = self.timers[produto_nome]
+            # Soma o tempo decorrido desde o start até agora
             t['accumulated'] += (time.time() - t['start_ts'])
             t['start_ts'] = 0
             t['state'] = 'paused'
@@ -1072,14 +1083,21 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def stop_and_log(self, produto_nome):
-        """Finaliza a produção e salva no histórico mensal."""
-        status = self.pause(produto_nome) # Garante que calculou o final
+        """Finaliza a produção, salva histórico detalhado e consome insumos."""
+        status = self.pause(produto_nome) # Garante cálculo final
         total_seconds = status['elapsed']
         
-        # Salva no histórico mensal
-        self._add_to_history(produto_nome, total_seconds)
+        # Registro detalhado para auditoria
+        registro = {
+            "produto": produto_nome,
+            "tempo_segundos": total_seconds,
+            "data_conclusao": datetime.now().isoformat(),
+            "timestamp": time.time()
+        }
         
-        # Remove do timer ativo
+        self._add_to_history(registro)
+        
+        # Remove do painel de "Em Andamento"
         if produto_nome in self.timers:
             del self.timers[produto_nome]
             self._save()
@@ -1101,32 +1119,51 @@ class ProductionTimer:
             total += (time.time() - t['start_ts'])
         return {'elapsed': int(total), 'state': t['state']}
 
-    def _add_to_history(self, produto, segundos):
-        """Registra o tempo no arquivo de histórico do mês atual."""
+    def get_active_timers(self):
+        """Retorna tudo que está sendo produzido agora para o Chefe ver."""
+        active = []
+        for nome, data in self.timers.items():
+            current_total = data['accumulated']
+            if data['state'] == 'running':
+                current_total += (time.time() - data['start_ts'])
+            
+            active.append({
+                "produto": nome,
+                "estado": data['state'], # running ou paused
+                "tempo_decorrido": int(current_total),
+                "inicio": data.get('created_at', '')
+            })
+        return active
+
+    def _add_to_history(self, registro):
+        """Salva no histórico mensal (Lista de eventos, não apenas soma)."""
         try:
             if self.HISTORY_PATH.exists():
                 with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
             else: history = {}
             
-            mes_chave = datetime.now().strftime('%Y-%m') # Chave mensal (ex: 2026-02)
+            mes_chave = datetime.now().strftime('%Y-%m')
             
-            if mes_chave not in history: history[mes_chave] = {}
-            if produto not in history[mes_chave]: history[mes_chave][produto] = 0
+            if mes_chave not in history: history[mes_chave] = []
             
-            history[mes_chave][produto] += segundos
+            # Adiciona o registro à lista do mês
+            history[mes_chave].append(registro)
             
-            with open(self.HISTORY_PATH, 'w') as f: json.dump(history, f)
+            # Salva atomicamente
+            temp = self.HISTORY_PATH.with_suffix('.tmp')
+            with open(temp, 'w') as f: json.dump(history, f)
+            shutil.move(str(temp), str(self.HISTORY_PATH))
         except Exception as e:
             print(f"Erro ao salvar histórico: {e}")
 
-    def get_monthly_history(self):
-        """Retorna o histórico do mês atual."""
-        if not self.HISTORY_PATH.exists(): return {}
+    def get_monthly_history_details(self):
+        """Retorna a lista detalhada do mês atual."""
+        if not self.HISTORY_PATH.exists(): return []
         try:
             with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
             mes_chave = datetime.now().strftime('%Y-%m')
-            return history.get(mes_chave, {})
-        except: return {}
+            return history.get(mes_chave, [])
+        except: return []
 
 # Instancie globalmente
 production_timer = ProductionTimer()
@@ -1571,120 +1608,98 @@ class Orchestrator:
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self) -> Dict[str, Any]:
-        """Calcula insumos baseado em vendas do Mês Atual + Tempo de Produção."""
+        """Calcula insumos (Vendas + Produção Realizada) e Status de Produção."""
         try:
-            # 1. Definição do intervalo: Mês Atual
             agora = datetime.now()
             
             # Estruturas de dados
-            insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0.0, "un": ""})
+            insumos_teoricos = defaultdict(float) # Baseado em Vendas (Bling)
+            insumos_reais = defaultdict(float)    # Baseado em Produção (Timer)
             produtos_vendidos = defaultdict(int)
-            daily_usage = defaultdict(lambda: defaultdict(float))
+            produtos_produzidos = defaultdict(int)
             
-            # 2. Acesso seguro ao histórico de vendas
+            # --- 1. PROCESSAMENTO DE VENDAS (BLING) ---
             todos_pedidos = []
             if hasattr(self, 'sales') and self.sales:
                 with self.sales.lock:
-                    # Copia a lista para evitar erros de concorrencia durante a iteração
                     todos_pedidos = list(self.sales._sales_history or [])
 
             for pedido in todos_pedidos:
                 try:
                     data_str = pedido.get('data')
                     if not data_str: continue
+                    # Parsing de data simplificado
+                    dt_pedido = datetime.strptime(data_str.split(' ')[0], "%Y-%m-%d") if '-' in data_str else datetime.strptime(data_str.split(' ')[0], "%d/%m/%Y")
                     
-                    # Correção Robusta de Data (aceita ISO e formato PT-BR)
-                    if 'T' in data_str:
-                        dt_pedido = datetime.fromisoformat(data_str.split('T')[0])
-                    elif '/' in data_str:
-                        dt_pedido = datetime.strptime(data_str.split(' ')[0], "%d/%m/%Y")
-                    else:
-                        dt_pedido = datetime.strptime(data_str.split(' ')[0], "%Y-%m-%d")
-                        
-                    # FILTRO: Apenas mês e ano atuais
-                    if dt_pedido.month != agora.month or dt_pedido.year != agora.year:
-                        continue
+                    if dt_pedido.month != agora.month or dt_pedido.year != agora.year: continue
 
-                    day_key = dt_pedido.strftime('%d/%m')
-                    itens = pedido.get('itens', [])
-                    
-                    for item in itens:
+                    for item in pedido.get('itens', []):
                         nome = (item.get('descricao') or item.get('nome') or "").upper()
-                        # Garante que quantidade seja float
-                        try:
-                            qtd = float(item.get('quantidade', 0))
-                        except:
-                            qtd = 0
-                        
-                        if qtd <= 0: continue
+                        qtd = float(item.get('quantidade', 0))
+                        if qtd > 0:
+                            produtos_vendidos[nome] += int(qtd)
+                            # Se for cadeira, calcula insumo teórico
+                            if "CADEIRA" in nome:
+                                for comp in RECIPE_CADEIRA:
+                                    insumos_teoricos[comp['nome']] += (comp['qtd'] * qtd)
+                except: continue
 
-                        # Contabiliza produto vendido
-                        produtos_vendidos[nome] += int(qtd)
+            # --- 2. PROCESSAMENTO DE PRODUÇÃO REAL (TIMER) ---
+            # Pega o histórico detalhado do mês
+            historico_producao = production_timer.get_monthly_history_details()
+            tempo_total_mes = 0
 
-                        # LÓGICA DE RECEITA (Agora segura)
-                        # Verifica se "CADEIRA" está no nome do produto vendido
-                        if "CADEIRA" in nome:
-                            # RECIPE_CADEIRA deve estar definido no escopo global (passo 1)
-                            for componente in RECIPE_CADEIRA:
-                                nome_comp = componente['nome']
-                                qtd_comp = componente['qtd'] * qtd
-                                un = componente['un']
-                                
-                                insumos_totais[nome_comp]["nome"] = nome_comp
-                                insumos_totais[nome_comp]["quantidade"] += qtd_comp
-                                insumos_totais[nome_comp]["un"] = un
-                                daily_usage[day_key][nome_comp] += qtd_comp
+            for registro in historico_producao:
+                nome_prod = registro.get('produto', '').upper()
+                tempo = registro.get('tempo_segundos', 0)
+                tempo_total_mes += tempo
                 
-                except Exception as e_item:
-                    # Se um pedido der erro, apenas loga e pula para o próximo (não trava a tela)
-                    self.logger.error(f"Erro ao processar item de pedido: {e_item}")
-                    continue
-            
-            # 3. Formatação para o Front-end
+                # Conta como produto finalizado
+                produtos_produzidos[nome_prod] += 1
+                
+                # Calcula insumo REAL gasto
+                if "CADEIRA" in nome_prod:
+                    for comp in RECIPE_CADEIRA:
+                        insumos_reais[comp['nome']] += comp['qtd'] # 1 unidade produzida
+
+            # --- 3. PEGA O QUE ESTÁ RODANDO AGORA (LIVE) ---
+            producao_ativa = production_timer.get_active_timers()
+
+            # --- 4. FORMATAÇÃO FINAL ---
             lista_insumos = []
-            for data in insumos_totais.values():
+            # Une a lista de todos os insumos possíveis
+            todos_insumos_nomes = set(list(insumos_teoricos.keys()) + list(insumos_reais.keys()))
+            
+            for nome in todos_insumos_nomes:
+                # Procura a unidade na receita original
+                unidade = "un"
+                for r in RECIPE_CADEIRA:
+                    if r['nome'] == nome:
+                        unidade = r['un']
+                        break
+                
                 lista_insumos.append({
-                    "nome": data["nome"],
-                    "quantidade": round(data["quantidade"], 2),
-                    "un": data["un"]
+                    "nome": nome,
+                    "qtd_teorica": round(insumos_teoricos[nome], 2), # Baseado em Vendas
+                    "qtd_real": round(insumos_reais[nome], 2),       # Baseado em Produção Finalizada
+                    "un": unidade
                 })
-            lista_insumos.sort(key=lambda x: x['quantidade'], reverse=True)
             
-            daily_breakdown = []
-            for day in sorted(daily_usage.keys(), reverse=True):
-                day_items = []
-                for nome, qty in daily_usage[day].items():
-                    day_items.append({"nome": nome, "quantidade": round(qty, 2)})
-                daily_breakdown.append({"data": day, "componentes": day_items})
-            
-            # 4. Integração com Timer (Segura)
-            formatted_times = []
-            total_horas_mes = 0
-            
-            # Verifica se a variável production_timer existe (foi instanciada no main)
-            # Se não, tenta pegar do app context ou ignora
-            try:
-                hist = production_timer.get_monthly_history()
-                for prod, segundos in hist.items():
-                    horas = round(segundos / 3600, 2)
-                    total_horas_mes += horas
-                    formatted_times.append({"produto": prod, "horas": horas})
-            except:
-                pass # Se o timer não estiver ativo, apenas ignora
+            lista_insumos.sort(key=lambda x: x['qtd_real'], reverse=True)
 
             return {
                 "components": lista_insumos,
-                "daily_breakdown": daily_breakdown[:15],
                 "produtos_vendidos": dict(produtos_vendidos),
-                "production_times": formatted_times,
-                "total_horas_mes": round(total_horas_mes, 2),
+                "produtos_produzidos": dict(produtos_produzidos), # Novo KPI
+                "active_production": producao_ativa,              # Lista para o Chefe ver agora
+                "history_production": historico_producao,         # Lista detalhada com data
+                "total_horas_mes": round(tempo_total_mes / 3600, 2),
                 "mes_referencia": agora.strftime("%m/%Y")
             }
 
         except Exception as e:
             self.logger.exception("Erro fatal em calculate_component_usage")
-            # Retorna um objeto de erro para o front saber que falhou, mas não fica carregando infinitamente
-            return {"components": [], "error": f"Erro interno: {str(e)}"}
+            return {"error": f"Erro interno: {str(e)}"}
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
         """
@@ -3313,88 +3328,101 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ✅ DESIGN: Atualizar Componentes (Versão Engenharia) */
         function updateComponentUsage(usageData) {
             const div = document.getElementById('component-usage-content');
-
-            if (!usageData.components || usageData.components.length === 0) {
-                div.innerHTML = '<div class="alert alert-info">Nenhum pedido de Cadeira processado este mês para gerar insumos.</div>';
-                return;
+            
+            if (usageData.error) {
+                 div.innerHTML = `<div class="alert alert-danger">${usageData.error}</div>`;
+                 return;
             }
 
-            let html = `
-                <div class="row mb-4">
-                    <div class="col-md-12">
-                        <div class="card bg-dark text-white shadow-sm">
-                            <div class="card-body">
-                                <h6 class="card-title text-uppercase small opacity-75">Produtos Vendidos (Mês)</h6>
-                                <div class="d-flex flex-wrap gap-2">
-                                    ${Object.entries(usageData.produtos_vendidos || {}).map(([nome, qtd]) => `
-                                        <span class="badge bg-primary p-2">${nome}: ${qtd}x</span>
+            // 1. CABEÇALHO DE STATUS (EM ANDAMENTO)
+            let activeHtml = '';
+            if (usageData.active_production && usageData.active_production.length > 0) {
+                activeHtml = `
+                    <div class="card bg-warning bg-opacity-10 border-warning mb-4">
+                        <div class="card-header bg-warning text-dark fw-bold">🚀 PRODUÇÃO EM ANDAMENTO (AGORA)</div>
+                        <div class="card-body p-0">
+                            <table class="table table-sm mb-0">
+                                <thead><tr><th>Produto</th><th>Tempo Decorrido</th><th>Status</th><th>Ação</th></tr></thead>
+                                <tbody>
+                                    ${usageData.active_production.map(p => `
+                                        <tr>
+                                            <td class="fw-bold">${p.produto}</td>
+                                            <td class="font-monospace">${new Date(p.tempo_decorrido * 1000).toISOString().substr(11, 8)}</td>
+                                            <td><span class="badge ${p.estado === 'running' ? 'bg-success pulse-animation' : 'bg-secondary'}">${p.estado === 'running' ? 'PRODUZINDO' : 'PAUSADO'}</span></td>
+                                            <td><button class="btn btn-sm btn-outline-dark" onclick="openProductionChecklist('${p.produto}')">Abrir</button></td>
+                                        </tr>
                                     `).join('')}
-                                </div>
-                            </div>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+            } else {
+                activeHtml = `<div class="alert alert-secondary mb-4">🏭 Nenhuma produção ativa no momento. A fábrica está parada.</div>`;
+            }
+
+            // 2. TABELA COMPARATIVA DE INSUMOS
+            let insumosHtml = `
+                <div class="row mb-3">
+                    <div class="col-md-6">
+                        <div class="card bg-dark text-white text-center p-3">
+                            <h3>${usageData.total_horas_mes}h</h3>
+                            <small>Horas Produtivas (Mês)</small>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                         <div class="card bg-success text-white text-center p-3">
+                            <h3>${Object.values(usageData.produtos_produzidos || {}).reduce((a, b) => a + b, 0)} itens</h3>
+                            <small>Total Finalizado (Mês)</small>
                         </div>
                     </div>
                 </div>
-                <h5>📊 Necessidade Consolidada de Insumos</h5>
-                <div class="table-responsive">
-                    <table class="table table-hover align-middle">
+
+                <h5 class="mt-4">📋 Consumo de Materiais: Teórico (Vendas) vs Real (Produção)</h5>
+                <div class="table-responsive bg-white rounded shadow-sm border">
+                    <table class="table table-hover mb-0 align-middle">
                         <thead class="table-light">
                             <tr>
                                 <th>Insumo</th>
-                                <th class="text-center">Quantidade Total</th>
-                                <th class="text-center">Unidade</th>
+                                <th class="text-center">Planejado (Vendas)</th>
+                                <th class="text-center">Consumido (Real)</th>
+                                <th class="text-center">Un.</th>
                             </tr>
                         </thead>
                         <tbody>
+                            ${usageData.components.map(c => `
+                                <tr>
+                                    <td class="fw-bold text-muted">${c.nome}</td>
+                                    <td class="text-center text-muted">${c.qtd_teorica}</td>
+                                    <td class="text-center fw-bold fs-5 text-primary">${c.qtd_real}</td>
+                                    <td class="text-center small">${c.un}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                </div>
+            `;
+            
+            // 3. HISTÓRICO DETALHADO
+            let historyHtml = `
+                <h5 class="mt-5">📜 Histórico de Finalizações (Mês)</h5>
+                <div class="table-responsive" style="max-height: 300px; overflow-y:auto;">
+                    <table class="table table-sm table-striped small">
+                        <thead><tr><th>Data/Hora</th><th>Produto</th><th>Tempo Gasto</th></tr></thead>
+                        <tbody>
+                             ${(usageData.history_production || []).slice().reverse().map(h => `
+                                <tr>
+                                    <td>${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
+                                    <td class="fw-bold">${h.produto}</td>
+                                    <td>${new Date(h.tempo_segundos * 1000).toISOString().substr(11, 8)}</td>
+                                </tr>
+                             `).join('')}
+                        </tbody>
+                    </table>
+                </div>
             `;
 
-            usageData.components.forEach(comp => {
-                html += `
-                    <tr>
-                        <td><strong>${comp.nome}</strong></td>
-                        <td class="text-center"><span class="badge bg-success fs-6">${comp.quantidade}</span></td>
-                        <td class="text-center text-muted">${comp.un}</td>
-                    </tr>
-                `;
-            });
-
-            html += '</tbody></table></div>';
-
-            if (usageData.daily_breakdown && usageData.daily_breakdown.length > 0) {
-                html += '<hr><h5 class="mt-4">📅 Necessidade Diária (Últimos 7 dias)</h5>';
-                html += '<div class="accordion shadow-sm" id="dailyAccordion">';
-
-                usageData.daily_breakdown.forEach((day, idx) => {
-                    const dateParts = day.data.split('-');
-                    const dateStr = `${dateParts[2]}/${dateParts[1]}/${dateParts[0]}`;
-
-                    html += `
-                        <div class="accordion-item border-0 mb-2 shadow-sm">
-                            <h2 class="accordion-header">
-                                <button class="accordion-button ${idx > 0 ? 'collapsed' : ''} bg-white fw-bold" type="button" data-bs-toggle="collapse" data-bs-target="#day${idx}">
-                                    📅 ${dateStr}
-                                </button>
-                            </h2>
-                            <div id="day${idx}" class="accordion-collapse collapse ${idx === 0 ? 'show' : ''}" data-bs-parent="#dailyAccordion">
-                                <div class="accordion-body bg-light">
-                                    <div class="row">
-                                        ${day.componentes.map(c => `
-                                            <div class="col-md-4 mb-1">
-                                                <small class="d-block p-2 bg-white rounded border">
-                                                    ${c.nome}: <strong>${c.quantidade}</strong>
-                                                </small>
-                                            </div>
-                                        `).join('')}
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                });
-
-                html += '</div>';
-            }
-
-            div.innerHTML = html;
+            div.innerHTML = activeHtml + insumosHtml + historyHtml;
         }
 
         /* ✅ DESIGN: WebSocket KPI */
