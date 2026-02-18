@@ -73,45 +73,18 @@ class RateLimiter:
                 time.sleep(self.min_interval - elapsed)
             self.last_call = time.time()
 
-# ============================================================================ 
-# 1. VARIÁVEIS GLOBAIS DE CONTROLE (LOCK) E ENGENHARIA
-# ============================================================================
-# Mapeamento de Produção - Lista Técnica (Hardcoded)
+# ==============================================================================
+# CONFIGURAÇÃO DE RECEITA (Adicione logo após os imports)
+# ==============================================================================
 RECIPE_CADEIRA = [
-    {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
-    {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
-    {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
-    {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
-    {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
-    {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
-    {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
-    {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
-    {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
-    {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
-    {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
-    {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
-    {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
-    {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
-    {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
-    {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
-    {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
-    {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
-    {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
-    {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
-    {"nome": "LINHA", "qtd": 1, "un": "Unid"},
-    {"nome": "COLA", "qtd": 1, "un": "Unid"},
-    {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
-    {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
-    {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
-    {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
-    {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
-    {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
-    {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
-    {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
-    {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
-    {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
-    {"nome": "BASE", "qtd": 1, "un": "Unid"}
+    {"nome": "MDF 15MM BRANCO TX", "qtd": 2.5, "un": "m²"},
+    {"nome": "PARAFUSO 4.0X40", "qtd": 24, "un": "un"},
+    {"nome": "COLA BRANCA PVA", "qtd": 0.2, "un": "kg"},
+    {"nome": "LIXA GRAO 120", "qtd": 2, "un": "un"},
+    {"nome": "TINTA ACABAMENTO", "qtd": 0.5, "un": "L"}
 ]
+# Podeis ajustar os nomes e quantidades conforme a vossa realidade nobre.
+# ==============================================================================
 
 # Lock global para impedir múltiplas trocas de token simultâneas (Erro Worker Timeout)
 token_exchange_lock = Lock()
@@ -1598,65 +1571,120 @@ class Orchestrator:
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self) -> Dict[str, Any]:
-        """Calcula insumos baseado em vendas e integra histórico de produção mensal."""
-        agora = datetime.now()
-        inicio_mes = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        
-        insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0, "un": ""})
-        produtos_vendidos = defaultdict(int)
-        
-        # 1. Processa Vendas do Mês
-        with self.sales.lock:
-            todos_pedidos = self.sales._sales_history
+        """Calcula insumos baseado em vendas do Mês Atual + Tempo de Produção."""
+        try:
+            # 1. Definição do intervalo: Mês Atual
+            agora = datetime.now()
             
-        for pedido in todos_pedidos:
-            try:
-                dt_pedido = datetime.fromisoformat(pedido.get('data', '').split(' ')[0].replace('T', ' '))
-                # Filtro rígido: Apenas mês e ano corrente
-                if dt_pedido.month != agora.month or dt_pedido.year != agora.year:
+            # Estruturas de dados
+            insumos_totais = defaultdict(lambda: {"nome": "", "quantidade": 0.0, "un": ""})
+            produtos_vendidos = defaultdict(int)
+            daily_usage = defaultdict(lambda: defaultdict(float))
+            
+            # 2. Acesso seguro ao histórico de vendas
+            todos_pedidos = []
+            if hasattr(self, 'sales') and self.sales:
+                with self.sales.lock:
+                    # Copia a lista para evitar erros de concorrencia durante a iteração
+                    todos_pedidos = list(self.sales._sales_history or [])
+
+            for pedido in todos_pedidos:
+                try:
+                    data_str = pedido.get('data')
+                    if not data_str: continue
+                    
+                    # Correção Robusta de Data (aceita ISO e formato PT-BR)
+                    if 'T' in data_str:
+                        dt_pedido = datetime.fromisoformat(data_str.split('T')[0])
+                    elif '/' in data_str:
+                        dt_pedido = datetime.strptime(data_str.split(' ')[0], "%d/%m/%Y")
+                    else:
+                        dt_pedido = datetime.strptime(data_str.split(' ')[0], "%Y-%m-%d")
+                        
+                    # FILTRO: Apenas mês e ano atuais
+                    if dt_pedido.month != agora.month or dt_pedido.year != agora.year:
+                        continue
+
+                    day_key = dt_pedido.strftime('%d/%m')
+                    itens = pedido.get('itens', [])
+                    
+                    for item in itens:
+                        nome = (item.get('descricao') or item.get('nome') or "").upper()
+                        # Garante que quantidade seja float
+                        try:
+                            qtd = float(item.get('quantidade', 0))
+                        except:
+                            qtd = 0
+                        
+                        if qtd <= 0: continue
+
+                        # Contabiliza produto vendido
+                        produtos_vendidos[nome] += int(qtd)
+
+                        # LÓGICA DE RECEITA (Agora segura)
+                        # Verifica se "CADEIRA" está no nome do produto vendido
+                        if "CADEIRA" in nome:
+                            # RECIPE_CADEIRA deve estar definido no escopo global (passo 1)
+                            for componente in RECIPE_CADEIRA:
+                                nome_comp = componente['nome']
+                                qtd_comp = componente['qtd'] * qtd
+                                un = componente['un']
+                                
+                                insumos_totais[nome_comp]["nome"] = nome_comp
+                                insumos_totais[nome_comp]["quantidade"] += qtd_comp
+                                insumos_totais[nome_comp]["un"] = un
+                                daily_usage[day_key][nome_comp] += qtd_comp
+                
+                except Exception as e_item:
+                    # Se um pedido der erro, apenas loga e pula para o próximo (não trava a tela)
+                    self.logger.error(f"Erro ao processar item de pedido: {e_item}")
                     continue
-            except: continue
-
-            for item in safe_iter(pedido.get('itens', [])):
-                nome = (item.get('descricao') or item.get('nome') or "").upper()
-                qtd = float(item.get('quantidade', 0))
-                if qtd <= 0: continue
-
-                if "CADEIRA" in nome:
-                    produtos_vendidos[nome] += int(qtd)
-                    for comp in RECIPE_CADEIRA:
-                        n, q, u = comp['nome'], comp['qtd'] * qtd, comp['un']
-                        insumos_totais[n].update({"nome": n, "un": u})
-                        insumos_totais[n]["quantidade"] += q
-                else:
-                    insumos_totais[nome].update({"nome": nome, "un": "Unid"})
-                    insumos_totais[nome]["quantidade"] += qtd
-
-        # 2. Integra Histórico de Produção (Tempo -> Insumos)
-        history = production_timer.get_monthly_history()
-        production_stats = []
-        for prod_nome, segundos in history.items():
-            horas = round(segundos / 3600, 2)
-            production_stats.append({"produto": prod_nome, "horas": horas})
             
-            # Se for cadeira, adiciona insumos proporcionais (exemplo: 1 cadeira por hora de produção)
-            if "CADEIRA" in prod_nome.upper():
-                qtd_estimada = horas # 1 por hora
-                for comp in RECIPE_CADEIRA:
-                    n, q, u = comp['nome'], comp['qtd'] * qtd_estimada, comp['un']
-                    insumos_totais[n].update({"nome": n, "un": u})
-                    insumos_totais[n]["quantidade"] += q
+            # 3. Formatação para o Front-end
+            lista_insumos = []
+            for data in insumos_totais.values():
+                lista_insumos.append({
+                    "nome": data["nome"],
+                    "quantidade": round(data["quantidade"], 2),
+                    "un": data["un"]
+                })
+            lista_insumos.sort(key=lambda x: x['quantidade'], reverse=True)
+            
+            daily_breakdown = []
+            for day in sorted(daily_usage.keys(), reverse=True):
+                day_items = []
+                for nome, qty in daily_usage[day].items():
+                    day_items.append({"nome": nome, "quantidade": round(qty, 2)})
+                daily_breakdown.append({"data": day, "componentes": day_items})
+            
+            # 4. Integração com Timer (Segura)
+            formatted_times = []
+            total_horas_mes = 0
+            
+            # Verifica se a variável production_timer existe (foi instanciada no main)
+            # Se não, tenta pegar do app context ou ignora
+            try:
+                hist = production_timer.get_monthly_history()
+                for prod, segundos in hist.items():
+                    horas = round(segundos / 3600, 2)
+                    total_horas_mes += horas
+                    formatted_times.append({"produto": prod, "horas": horas})
+            except:
+                pass # Se o timer não estiver ativo, apenas ignora
 
-        lista_final = [{"nome": d["nome"], "quantidade": round(d["quantidade"], 2), "un": d["un"]} 
-                      for d in insumos_totais.values()]
-        lista_final.sort(key=lambda x: x['quantidade'], reverse=True)
+            return {
+                "components": lista_insumos,
+                "daily_breakdown": daily_breakdown[:15],
+                "produtos_vendidos": dict(produtos_vendidos),
+                "production_times": formatted_times,
+                "total_horas_mes": round(total_horas_mes, 2),
+                "mes_referencia": agora.strftime("%m/%Y")
+            }
 
-        return {
-            "components": lista_final,
-            "production_history": production_stats,
-            "products_sold": dict(produtos_vendidos),
-            "mes_referencia": agora.strftime("%m/%Y")
-        }
+        except Exception as e:
+            self.logger.exception("Erro fatal em calculate_component_usage")
+            # Retorna um objeto de erro para o front saber que falhou, mas não fica carregando infinitamente
+            return {"components": [], "error": f"Erro interno: {str(e)}"}
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
         """
