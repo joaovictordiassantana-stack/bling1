@@ -1612,7 +1612,9 @@ class Orchestrator:
         for pedido in todos_pedidos:
             try:
                 dt_pedido = datetime.fromisoformat(pedido.get('data', '').split(' ')[0].replace('T', ' '))
-                if dt_pedido < inicio_mes: continue
+                # Filtro rígido: Apenas mês e ano corrente
+                if dt_pedido.month != agora.month or dt_pedido.year != agora.year:
+                    continue
             except: continue
 
             for item in safe_iter(pedido.get('itens', [])):
@@ -2877,7 +2879,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         <button class="nav-link" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
                     </li>
                     <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🔧 Componentes</button>
+                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🔧 Insumos & Produção</button>
                     </li>
                 </ul>
 
@@ -3206,6 +3208,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                             <div class="modal-footer bg-white">
                                 <button type="button" class="btn btn-outline-dark" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar Janela</button>
+                                <button type="button" class="btn btn-success" onclick="controlTimer('finish', '${productName}')">✅ CONCLUIR PRODUÇÃO & SALVAR</button>
                             </div>
                         </div>
                     </div>
