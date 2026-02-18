@@ -1037,10 +1037,15 @@ class ProductionTimer:
         except: return {}
 
     def _save(self):
-        # Salva de forma atômica para evitar corrupção se o server cair durante a escrita
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        with open(temp, 'w') as f: json.dump(self.timers, f)
-        shutil.move(str(temp), str(self.FILE_PATH))
+        """Salva o estado atual. Se o servidor cair, o arquivo .json estará seguro."""
+        temp_file = self.FILE_PATH.with_suffix('.tmp')
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(self.timers, f, indent=4)
+            # A operação de renomear é atômica no sistema operativo
+            shutil.move(str(temp_file), str(self.FILE_PATH))
+        except Exception as e:
+            logger.error(f"Erro ao salvar timers: {e}")
 
     def _auto_pause_on_restart(self):
         """Se o servidor cair, pausa os timers para não contar tempo falso."""
@@ -1608,44 +1613,48 @@ class Orchestrator:
         self.broadcast_kpi_update(cache_updated=True)
 
     def calculate_component_usage(self) -> Dict[str, Any]:
-        """Calcula insumos (Vendas + Produção Realizada) e Status de Produção."""
+        """Calcula insumos com alta performance e logs de diagnóstico."""
+        start_calc = time.time()
         try:
             agora = datetime.now()
+            mes_atual = agora.month
+            ano_atual = agora.year
             
-            # Estruturas de dados
-            insumos_teoricos = defaultdict(float) # Baseado em Vendas (Bling)
-            insumos_reais = defaultdict(float)    # Baseado em Produção (Timer)
+            insumos_teoricos = defaultdict(float)
+            insumos_reais = defaultdict(float)
             produtos_vendidos = defaultdict(int)
             produtos_produzidos = defaultdict(int)
             
-            # --- 1. PROCESSAMENTO DE VENDAS (BLING) ---
+            # 1. PROCESSAMENTO DE VENDAS (Otimizado)
             todos_pedidos = []
             if hasattr(self, 'sales') and self.sales:
                 with self.sales.lock:
-                    todos_pedidos = list(self.sales._sales_history or [])
+                    # Pegamos apenas os últimos 500 pedidos para não travar o sistema
+                    todos_pedidos = list(self.sales._sales_history or [])[-500:]
 
             for pedido in todos_pedidos:
+                data_str = pedido.get('data')
+                if not data_str: continue
+                
+                # Filtro rápido de data para evitar parsing pesado desnecessário
+                if str(ano_atual) not in data_str: continue 
+                
                 try:
-                    data_str = pedido.get('data')
-                    if not data_str: continue
-                    # Parsing de data simplificado
                     dt_pedido = datetime.strptime(data_str.split(' ')[0], "%Y-%m-%d") if '-' in data_str else datetime.strptime(data_str.split(' ')[0], "%d/%m/%Y")
-                    
-                    if dt_pedido.month != agora.month or dt_pedido.year != agora.year: continue
+                    if dt_pedido.month != mes_atual: continue
 
                     for item in pedido.get('itens', []):
                         nome = (item.get('descricao') or item.get('nome') or "").upper()
                         qtd = float(item.get('quantidade', 0))
                         if qtd > 0:
                             produtos_vendidos[nome] += int(qtd)
-                            # Se for cadeira, calcula insumo teórico
+                            # Cálculo baseado na receita (RECIPE_CADEIRA)
                             if "CADEIRA" in nome:
                                 for comp in RECIPE_CADEIRA:
                                     insumos_teoricos[comp['nome']] += (comp['qtd'] * qtd)
                 except: continue
 
-            # --- 2. PROCESSAMENTO DE PRODUÇÃO REAL (TIMER) ---
-            # Pega o histórico detalhado do mês
+            # 2. PROCESSAMENTO DE PRODUÇÃO (TIMER)
             historico_producao = production_timer.get_monthly_history_details()
             tempo_total_mes = 0
 
@@ -1653,53 +1662,39 @@ class Orchestrator:
                 nome_prod = registro.get('produto', '').upper()
                 tempo = registro.get('tempo_segundos', 0)
                 tempo_total_mes += tempo
-                
-                # Conta como produto finalizado
                 produtos_produzidos[nome_prod] += 1
                 
-                # Calcula insumo REAL gasto
                 if "CADEIRA" in nome_prod:
                     for comp in RECIPE_CADEIRA:
-                        insumos_reais[comp['nome']] += comp['qtd'] # 1 unidade produzida
+                        insumos_reais[comp['nome']] += comp['qtd']
 
-            # --- 3. PEGA O QUE ESTÁ RODANDO AGORA (LIVE) ---
-            producao_ativa = production_timer.get_active_timers()
-
-            # --- 4. FORMATAÇÃO FINAL ---
-            lista_insumos = []
-            # Une a lista de todos os insumos possíveis
-            todos_insumos_nomes = set(list(insumos_teoricos.keys()) + list(insumos_reais.keys()))
-            
-            for nome in todos_insumos_nomes:
-                # Procura a unidade na receita original
-                unidade = "un"
-                for r in RECIPE_CADEIRA:
-                    if r['nome'] == nome:
-                        unidade = r['un']
-                        break
-                
-                lista_insumos.append({
-                    "nome": nome,
-                    "qtd_teorica": round(insumos_teoricos[nome], 2), # Baseado em Vendas
-                    "qtd_real": round(insumos_reais[nome], 2),       # Baseado em Produção Finalizada
-                    "un": unidade
-                })
-            
-            lista_insumos.sort(key=lambda x: x['qtd_real'], reverse=True)
+            self.logger.debug(f"⏱️ Cálculo de componentes finalizado em {time.time() - start_calc:.2f}s")
 
             return {
-                "components": lista_insumos,
+                "components": self._format_components_list(insumos_teoricos, insumos_reais),
                 "produtos_vendidos": dict(produtos_vendidos),
-                "produtos_produzidos": dict(produtos_produzidos), # Novo KPI
-                "active_production": producao_ativa,              # Lista para o Chefe ver agora
-                "history_production": historico_producao,         # Lista detalhada com data
-                "total_horas_mes": round(tempo_total_mes / 3600, 2),
-                "mes_referencia": agora.strftime("%m/%Y")
+                "produtos_produzidos": dict(produtos_produzidos),
+                "active_production": production_timer.get_active_timers(),
+                "history_production": historico_producao,
+                "total_horas_mes": round(tempo_total_mes / 3600, 2)
             }
-
         except Exception as e:
-            self.logger.exception("Erro fatal em calculate_component_usage")
-            return {"error": f"Erro interno: {str(e)}"}
+            self.logger.error(f"❌ Erro no cálculo: {e}")
+            return {"error": str(e)}
+
+    def _format_components_list(self, teoricos, reais):
+        """Auxiliar para formatar a lista final de componentes."""
+        nomes = set(list(teoricos.keys()) + list(reais.keys()))
+        lista = []
+        for nome in nomes:
+            un = next((r['un'] for r in RECIPE_CADEIRA if r['nome'] == nome), "un")
+            lista.append({
+                "nome": nome,
+                "qtd_teorica": round(teoricos[nome], 2),
+                "qtd_real": round(reais[nome], 2),
+                "un": un
+            })
+        return sorted(lista, key=lambda x: x['qtd_real'], reverse=True)
 
     def broadcast_kpi_update(self, sales_stats: Optional[Dict[str, Any]] = None, cache_updated: bool = False, component_usage: Optional[Dict[str, Any]] = None, auth_error: bool = False):
         """
