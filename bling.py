@@ -49,6 +49,13 @@ try:
 except ImportError:
     class ConnectionClosed(Exception): pass
 
+# ============================================================================
+# CONFIGURAÇÃO DE DISCO PERSISTENTE (RENDER)
+# ============================================================================
+# Configure a variável de ambiente DATA_DIR='/data' no painel do Render.
+# Sem isso usa pasta local (efêmera — dados somem ao reiniciar).
+DATA_DIR = Path(os.environ.get('DATA_DIR', '.'))
+
 # ============================================================================ 
 # 0. RATE LIMITER GLOBAL (NÍVEL PRODUÇÃO)
 # ============================================================================
@@ -285,13 +292,13 @@ class Config:
     
     
     # Arquivos
-    TOKENS_FILE: Path = Path('tokens.json')
+    TOKENS_FILE: Path = DATA_DIR / 'tokens.json'
     
     # Token Inicial (para implantação)
     INITIAL_REFRESH_TOKEN: Optional[str] = os.environ.get('BLING_REFRESH_TOKEN')
 
-    SALES_STATS_FILE: Path = Path('sales_stats.json') # Persistência de KPIs
-    PRODUCTS_CACHE_FILE: Path = Path('products_cache.json') # Persistência de Produtos e Kits
+    SALES_STATS_FILE: Path = DATA_DIR / 'sales_stats.json'
+    PRODUCTS_CACHE_FILE: Path = DATA_DIR / 'products_cache.json'
 
 # ============================================================================ 
 # 3. UTILITÁRIOS E AUTH (FUNÇÕES SEGURAS)
@@ -1051,8 +1058,8 @@ class SalesManager:
 
 class ProductionTimer:
     """Gerencia cronômetros de produção e histórico detalhado."""
-    FILE_PATH = Path('production_timers.json')
-    HISTORY_PATH = Path('production_history.json')
+    FILE_PATH = DATA_DIR / 'production_timers.json'
+    HISTORY_PATH = DATA_DIR / 'production_history.json'
 
     def __init__(self):
         self.timers = self._load()
@@ -1217,7 +1224,7 @@ class ComponentConsumptionManager:
     Gerencia o consumo real de insumos/componentes registrado via checklist.
     Reinicia automaticamente todo mês.
     """
-    FILE_PATH = Path('component_consumption.json')
+    FILE_PATH = DATA_DIR / 'component_consumption.json'
 
     def __init__(self):
         self.data = self._load()
@@ -1790,24 +1797,31 @@ class Orchestrator:
             for pedido in todos_pedidos:
                 data_str = pedido.get('data')
                 if not data_str: continue
-                
-                # Filtro rápido de data para evitar parsing pesado desnecessário
-                if str(ano_atual) not in data_str: continue 
-                
+
                 try:
-                    dt_pedido = datetime.strptime(data_str.split(' ')[0], "%Y-%m-%d") if '-' in data_str else datetime.strptime(data_str.split(' ')[0], "%d/%m/%Y")
-                    if dt_pedido.month != mes_atual: continue
+                    # Robusto: suporta '2025-02-19', '2025-02-19 10:00', '2025-02-19T10:00'
+                    data_limpa = str(data_str).split(' ')[0].split('T')[0]
+
+                    if '-' in data_limpa:
+                        dt_pedido = datetime.strptime(data_limpa, "%Y-%m-%d")
+                    else:
+                        dt_pedido = datetime.strptime(data_limpa, "%d/%m/%Y")
+
+                    if dt_pedido.month != mes_atual or dt_pedido.year != ano_atual:
+                        continue
 
                     for item in pedido.get('itens', []):
                         nome = (item.get('descricao') or item.get('nome') or "").upper()
                         qtd = float(item.get('quantidade', 0))
+
                         if qtd > 0:
-                            produtos_vendidos[nome] += int(qtd)
-                            # Cálculo baseado na receita (RECIPE_CADEIRA)
+                            produtos_vendidos[nome] += int(qtd)  # Somatório por quantidade real
                             if "CADEIRA" in nome:
                                 for comp in RECIPE_CADEIRA:
                                     insumos_teoricos[comp['nome']] += (comp['qtd'] * qtd)
-                except: continue
+                except Exception as e:
+                    self.logger.debug(f'Erro ao ler data do pedido: {e} - Dado bruto: {data_str}')
+                    continue
 
             # 2. PROCESSAMENTO DE PRODUÇÃO (TIMER)
             historico_producao = production_timer.get_monthly_history_details()
@@ -2038,6 +2052,16 @@ class WebServer:
             else:
                 status = production_timer.get_status(produto)
                 
+            # Força recálculo e notifica TODOS os usuários via WebSocket
+            def update_and_broadcast():
+                try:
+                    usage = self.orchestrator.calculate_component_usage()
+                    self.orchestrator._component_usage_cache = usage
+                    self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                except Exception as e:
+                    self.logger.error(f'Erro no broadcast pós-timer: {e}')
+            Thread(target=update_and_broadcast, daemon=True).start()
+                
             return jsonify(status)
 
         @self.app.route('/api/consumption/register', methods=['POST'])
@@ -2058,6 +2082,16 @@ class WebServer:
             else:
                 component_consumption.unregister_component(component_name, qty, product_name)
                 result = {'unregistered': True}
+
+            # Notifica TODOS os usuários via WebSocket sobre o novo insumo registrado
+            def update_and_broadcast():
+                try:
+                    usage = self.orchestrator.calculate_component_usage()
+                    self.orchestrator._component_usage_cache = usage
+                    self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                except Exception as e:
+                    self.logger.error(f'Erro no broadcast pós-consumo: {e}')
+            Thread(target=update_and_broadcast, daemon=True).start()
 
             return jsonify({'success': True, 'result': result})
 
