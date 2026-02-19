@@ -1361,12 +1361,22 @@ class Orchestrator:
         self._component_usage_cache = None  # Inicializa o cache de componentes
         self.logger.debug("Orchestrator inicializado com cache de componentes vazio")
         
-        # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
+        # Carrega cache de produtos em background para não bloquear o startup
         if self.auth.is_authenticated():
-            self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
-            self.process_products_cache()
+            self.logger.info("📦 Agendando carga de cache de produtos em background...")
+            Thread(target=self._safe_initial_load, daemon=True).start()
         else:
             self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
+
+    def _safe_initial_load(self):
+        """Carrega cache de produtos em thread separada, sem bloquear o startup."""
+        try:
+            time.sleep(2)  # Aguarda Flask inicializar completamente
+            self.logger.info("📦 Iniciando carga inicial de produtos (background)...")
+            self.process_products_cache()
+            self.logger.info("✅ Cache inicial carregado com sucesso!")
+        except Exception as e:
+            self.logger.error(f"❌ Erro na carga inicial: {e}")
 
     def _load_cache(self):
         """Carrega o cache de produtos/kits do disco."""
@@ -1875,23 +1885,20 @@ class Orchestrator:
         # 2. Adiciona KPIs se fornecidos (com proteção contra tipos inválidos)
         if sales_stats and isinstance(sales_stats, dict):
             try:
-                # Converte a data de volta para ISO string para o WS (se já não for string)
-                stats_data = sales_stats.copy()
-                last_recalc = stats_data.get('last_recalculated')
-                
-                if isinstance(last_recalc, datetime):
-                    stats_data['last_update'] = last_recalc.isoformat()
-                else:
-                    stats_data['last_update'] = str(last_recalc)
-                    
+                stats_data = {}
+                for k, v in sales_stats.items():
+                    if isinstance(v, datetime):
+                        stats_data[k] = v.isoformat()
+                    else:
+                        stats_data[k] = v
+                # Normaliza campo de data
                 if 'last_recalculated' in stats_data:
-                    stats_data.pop('last_recalculated')
-                    
+                    stats_data['last_update'] = stats_data.pop('last_recalculated')
                 payload["sales_stats"] = stats_data
             except Exception as e:
                 self.logger.error(f"Erro ao processar sales_stats para broadcast: {e}")
         elif sales_stats:
-            self.logger.warning(f"sales_stats recebido em formato inválido ({type(sales_stats)}). Ignorando no broadcast.")
+            self.logger.warning(f"sales_stats recebido em formato inválido ({type(sales_stats)}). Ignorando.")
             
         # 3. Adiciona o uso de componentes se fornecido
         if component_usage:
@@ -2453,61 +2460,64 @@ class WebServer:
         def ws_kpi_updates(ws):
             self.logger.info("📡 WebSocket KPI conectado.")
             
-            # ✅ Limite de callbacks para evitar DoS acidental
             global kpi_update_callbacks, kpi_update_lock
-            if len(kpi_update_callbacks) >= 10:
-                self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
+            if len(kpi_update_callbacks) >= 20:
+                self.logger.warning("Limite de 20 conexões KPI WS atingido. Recusado.")
                 return
 
-            # Função de callback para enviar atualizações completas
             def kpi_callback(payload):
                 try:
                     ws.send(json.dumps(payload))
                 except ConnectionClosed:
-                    # ✅ ADICIONE: Sinaliza para remover este callback
                     raise
-                except Exception as e:
-                    self.logger.exception("Erro enviando via WS.")
-                    raise ConnectionClosed()  # Força desconexão
-                
-            # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
-            # 1. Envia o estado inicial completo
+                except Exception:
+                    raise ConnectionClosed()
+
+            # ── ENVIO INICIAL RÁPIDO ─────────────────────────────────────────
+            # NUNCA bloqueia, NUNCA calcula componentes aqui.
+            # Só envia autenticação + KPIs em cache. Componentes chegam depois.
             try:
-                sales_stats = self.orchestrator.sales._get_state_for_save()
+                is_auth = self.orchestrator.auth.is_authenticated()
+                auth_url = self.orchestrator.auth.get_authorization_url()
                 
-                # Tenta usar cache se disponível
-                component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
+                payload = {
+                    "type": "full_update",
+                    "authenticated": is_auth,
+                    "auth_error": False,
+                    "is_running": self.orchestrator.is_running(),
+                    "cache_updated": False,
+                    "auth_url": auth_url,
+                }
                 
-                if not component_usage:
-                    self.logger.info("🔄 Cache de componentes vazio. Calculando...")
-                    try:
-                        component_usage = self.orchestrator.calculate_component_usage()
-                        self.orchestrator._component_usage_cache = component_usage
-                    except Exception as calc_error:
-                        self.logger.error(f"Falha ao calcular componentes: {calc_error}")
-                        component_usage = {"components": [], "daily_breakdown": []}
-                
-                self.orchestrator.broadcast_kpi_update(
-                    sales_stats=sales_stats,
-                    component_usage=component_usage
-                )
-                self.logger.info("✅ Estado inicial enviado ao WebSocket")
-                
+                # KPIs do cache (sem lock longo — só leitura rápida)
+                try:
+                    sales_stats = self.orchestrator.sales._get_state_for_save()
+                    last_recalc = sales_stats.get('last_recalculated')
+                    if isinstance(last_recalc, datetime):
+                        sales_stats['last_update'] = last_recalc.isoformat()
+                        sales_stats.pop('last_recalculated', None)
+                    payload["sales_stats"] = sales_stats
+                except Exception:
+                    pass
+
+                ws.send(json.dumps(payload))
+                self.logger.info("✅ Estado inicial enviado ao WebSocket (rápido, sem cálculo de componentes)")
+
             except Exception as e:
-                self.logger.exception("Erro ao enviar estado inicial via WS.")
-                
-            # 2. Adiciona o callback à lista global
+                self.logger.error(f"Erro ao enviar estado inicial WS: {e}")
+                # Mesmo com erro no envio inicial, continua a conexão
+            # ────────────────────────────────────────────────────────────────
+
+            # Registra callback ANTES do loop
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
-                
+
             try:
                 while True:
-                    # Mantém a conexão aberta
                     ws.receive(timeout=60)
             except ConnectionClosed:
                 pass
             finally:
-                # 3. Remove o callback ao desconectar
                 with kpi_update_lock:
                     if kpi_callback in kpi_update_callbacks:
                         kpi_update_callbacks.remove(kpi_callback)
@@ -3999,17 +4009,67 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
             };
 
+            let _wsReconnectDelay = 2000;
             wsKpi.onclose = () => {
-                console.log("WebSocket KPI desconectado. Reconectando...");
+                console.log("WebSocket KPI desconectado. Reconectando em", _wsReconnectDelay, "ms...");
                 setTimeout(() => {
                     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
                     wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
                     setupKpiWebSocket();
-                }, 3000);
+                    _wsReconnectDelay = Math.min(_wsReconnectDelay * 1.5, 15000); // backoff até 15s
+                }, _wsReconnectDelay);
+            };
+            
+            wsKpi.onopen = () => {
+                console.log("WebSocket KPI conectado.");
+                _wsReconnectDelay = 2000; // reset backoff
             };
         }
 
         setupKpiWebSocket();
+
+        // ── WATCHDOG: garante que "CARREGANDO" nunca fica travado ──────────
+        // Se o WebSocket não responder em 8 segundos, faz fallback via HTTP
+        let _wsReceivedAny = false;
+        const _wsWatchdog = setTimeout(async () => {
+            if (_wsReceivedAny) return;
+            console.warn("⚠️ WebSocket sem resposta em 8s — ativando fallback HTTP");
+            try {
+                const res = await fetch('/_health');
+                const data = await res.json();
+                const badge = document.getElementById('status-badge');
+                const authLink = document.getElementById('auth-link');
+                const tabs = document.getElementById('content-tabs');
+                const authMsg = document.getElementById('auth-required-tabs');
+                if (data.auth_valid) {
+                    badge.className = 'badge bg-success';
+                    badge.textContent = '🟢 Online';
+                    isAuthenticated = true;
+                    if (tabs) tabs.classList.remove('hidden');
+                    if (authMsg) authMsg.classList.add('hidden');
+                    if (authLink) authLink.classList.add('d-none');
+                } else {
+                    badge.className = 'badge bg-danger';
+                    badge.textContent = '🔴 Offline';
+                    if (tabs) tabs.classList.add('hidden');
+                    if (authMsg) authMsg.classList.remove('hidden');
+                    if (authLink) authLink.classList.remove('d-none');
+                }
+            } catch(e) {
+                const badge = document.getElementById('status-badge');
+                badge.className = 'badge bg-danger';
+                badge.textContent = '🔴 Sem Conexão';
+            }
+        }, 8000);
+
+        // Cancela watchdog quando WS responder
+        wsKpi.addEventListener('message', () => {
+            if (!_wsReceivedAny) {
+                _wsReceivedAny = true;
+                clearTimeout(_wsWatchdog);
+            }
+        });
+        // ────────────────────────────────────────────────────────────────────
 
         /* ✅ DESIGN: Busca de Produtos */
         const btnSearch = document.getElementById('btn-search');
