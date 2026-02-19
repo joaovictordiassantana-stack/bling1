@@ -1130,11 +1130,10 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def stop_and_log(self, produto_nome):
-        """Finaliza a produção, salva histórico detalhado e consome insumos."""
-        status = self.pause(produto_nome) # Garante cálculo final
+        """Finaliza a produção, salva histórico detalhado."""
+        status = self.pause(produto_nome)  # Garante cálculo final antes de remover
         total_seconds = status['elapsed']
         
-        # Registro detalhado para auditoria
         registro = {
             "produto": produto_nome,
             "tempo_segundos": total_seconds,
@@ -1149,7 +1148,12 @@ class ProductionTimer:
             del self.timers[produto_nome]
             self._save()
             
-        return {'elapsed': 0, 'state': 'stopped'}
+        # Retorna o registro completo para o frontend confirmar
+        return {
+            'elapsed': 0,
+            'state': 'finished',
+            'registro': registro
+        }
 
     def reset(self, produto_nome):
         if produto_nome in self.timers:
@@ -1183,134 +1187,135 @@ class ProductionTimer:
         return active
 
     def _add_to_history(self, registro):
-        """Salva no histórico mensal (Lista de eventos, não apenas soma)."""
+        """Salva no histórico mensal — SEMPRE lê/escreve do disco para consistência entre workers."""
         try:
             if self.HISTORY_PATH.exists():
-                with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
+                with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f: history = json.load(f)
             else: history = {}
             
             mes_chave = datetime.now().strftime('%Y-%m')
-            
             if mes_chave not in history: history[mes_chave] = []
-            
-            # Adiciona o registro à lista do mês
             history[mes_chave].append(registro)
             
-            # Salva atomicamente
+            # Salva atomicamente com encoding correto
             temp = self.HISTORY_PATH.with_suffix('.tmp')
-            with open(temp, 'w') as f: json.dump(history, f)
+            with open(temp, 'w', encoding='utf-8') as f: json.dump(history, f, ensure_ascii=False, indent=2)
             shutil.move(str(temp), str(self.HISTORY_PATH))
+            logger.info(f"✅ Histórico salvo: {registro['produto']} ({registro['tempo_segundos']}s)")
         except Exception as e:
-            print(f"Erro ao salvar histórico: {e}")
+            logger.error(f"Erro ao salvar histórico de produção: {e}")
 
     def get_monthly_history_details(self):
-        """Retorna a lista detalhada do mês atual."""
+        """Retorna a lista detalhada do mês atual — SEMPRE do disco."""
         if not self.HISTORY_PATH.exists(): return []
         try:
-            with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
+            with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f: history = json.load(f)
             mes_chave = datetime.now().strftime('%Y-%m')
             return history.get(mes_chave, [])
-        except: return []
+        except Exception as e:
+            logger.error(f"Erro ao ler histórico: {e}")
+            return []
 
 class ComponentConsumptionManager:
     """
     Gerencia o consumo real de insumos/componentes registrado via checklist.
+    SEMPRE lê e escreve no disco — nunca depende de estado em RAM.
+    Isso garante consistência mesmo com múltiplos workers (Gunicorn/Render).
     Reinicia automaticamente todo mês.
     """
     FILE_PATH = Path('component_consumption.json')
-
-    def __init__(self):
-        self.data = self._load()
-        self._ensure_current_month()
+    _lock = Lock()  # Lock de arquivo para evitar race condition entre threads
 
     def _current_month_key(self):
         return datetime.now().strftime('%Y-%m')
 
-    def _load(self):
+    def _load_from_disk(self) -> dict:
+        """SEMPRE lê do disco. Nunca usa cache em memória."""
         if not self.FILE_PATH.exists():
             return {}
         try:
             with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
+        except Exception as e:
+            logger.error(f"Erro ao ler component_consumption.json: {e}")
             return {}
 
-    def _save(self):
+    def _save_to_disk(self, data: dict):
+        """Salva atomicamente no disco."""
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
+                json.dump(data, f, indent=4, ensure_ascii=False)
             shutil.move(str(temp), str(self.FILE_PATH))
         except Exception as e:
             logger.error(f"Erro ao salvar consumo: {e}")
 
-    def _ensure_current_month(self):
-        """Garante que existe a estrutura para o mês atual."""
-        key = self._current_month_key()
-        if key not in self.data:
-            self.data[key] = {
-                'components': {},   # nome -> {qtd, un, registros: [...]}
-                'checklist_logs': []  # Histórico de cada item marcado
-            }
-            self._save()
+    def _ensure_month(self, data: dict, key: str):
+        """Garante estrutura do mês no dict."""
+        if key not in data:
+            data[key] = {'components': {}, 'checklist_logs': []}
 
-    def register_component(self, component_name: str, qty: float, unit: str, product_name: str):
-        """Registra uso de um componente via checklist."""
-        self._ensure_current_month()
-        key = self._current_month_key()
-        month_data = self.data[key]
+    def register_component(self, component_name: str, qty: float, unit: str, product_name: str) -> dict:
+        """Registra uso de um componente. Thread-safe com lock de arquivo."""
+        with self._lock:
+            data = self._load_from_disk()
+            key = self._current_month_key()
+            self._ensure_month(data, key)
+            month = data[key]
 
-        if component_name not in month_data['components']:
-            month_data['components'][component_name] = {'qtd': 0, 'un': unit, 'registros': []}
+            if component_name not in month['components']:
+                month['components'][component_name] = {'qtd': 0, 'un': unit, 'registros': []}
 
-        comp = month_data['components'][component_name]
-        comp['qtd'] = round(comp['qtd'] + qty, 3)
-        comp['un'] = unit
-
-        registro = {
-            'produto': product_name,
-            'qtd': qty,
-            'timestamp': datetime.now().isoformat()
-        }
-        comp['registros'].append(registro)
-
-        # Log geral
-        month_data['checklist_logs'].append({
-            'componente': component_name,
-            'produto': product_name,
-            'qtd': qty,
-            'un': unit,
-            'timestamp': datetime.now().isoformat()
-        })
-
-        self._save()
-        return comp
+            comp = month['components'][component_name]
+            comp['qtd'] = round(comp['qtd'] + qty, 3)
+            comp['un'] = unit
+            comp['registros'].append({
+                'produto': product_name,
+                'qtd': qty,
+                'timestamp': datetime.now().isoformat()
+            })
+            month['checklist_logs'].append({
+                'componente': component_name,
+                'produto': product_name,
+                'qtd': qty,
+                'un': unit,
+                'timestamp': datetime.now().isoformat()
+            })
+            self._save_to_disk(data)
+            return comp
 
     def unregister_component(self, component_name: str, qty: float, product_name: str):
-        """Remove o registro de um componente (desmarcou o checkbox)."""
-        self._ensure_current_month()
+        """Remove registro de um componente (desmarcou checkbox). Thread-safe."""
+        with self._lock:
+            data = self._load_from_disk()
+            key = self._current_month_key()
+            self._ensure_month(data, key)
+            month = data[key]
+
+            if component_name in month['components']:
+                comp = month['components'][component_name]
+                comp['qtd'] = max(0, round(comp['qtd'] - qty, 3))
+                # Remove registros do produto (os mais recentes primeiro)
+                removed = False
+                for i in range(len(comp['registros']) - 1, -1, -1):
+                    if comp['registros'][i]['produto'] == product_name and not removed:
+                        comp['registros'].pop(i)
+                        removed = True
+                self._save_to_disk(data)
+
+    def get_current_month(self) -> dict:
+        """Lê mês atual do disco."""
+        data = self._load_from_disk()
         key = self._current_month_key()
-        month_data = self.data[key]
+        self._ensure_month(data, key)
+        return data[key]
 
-        if component_name in month_data['components']:
-            comp = month_data['components'][component_name]
-            comp['qtd'] = max(0, round(comp['qtd'] - qty, 3))
-            # Remove o último registro deste produto
-            comp['registros'] = [r for r in comp['registros'] if r['produto'] != product_name]
-            self._save()
+    def get_all_months(self) -> dict:
+        """Lê histórico completo do disco."""
+        return self._load_from_disk()
 
-    def get_current_month(self):
-        """Retorna os dados do mês atual."""
-        self._ensure_current_month()
-        key = self._current_month_key()
-        return self.data[key]
-
-    def get_all_months(self):
-        """Retorna histórico de todos os meses."""
-        return self.data
-
-    def get_month_summary(self):
-        """Resumo formatado para o frontend."""
+    def get_month_summary(self) -> list:
+        """Resumo formatado para o frontend, sempre do disco."""
         month = self.get_current_month()
         summary = []
         for nome, info in month['components'].items():
@@ -1319,10 +1324,9 @@ class ComponentConsumptionManager:
                 'qtd_total': info['qtd'],
                 'un': info['un'],
                 'num_registros': len(info['registros']),
-                'registros': info['registros'][-5:]  # Últimos 5
+                'ultimos': info['registros'][-3:]
             })
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
-
 
 # Instâncias globais
 production_timer = ProductionTimer()
@@ -2085,6 +2089,71 @@ class WebServer:
                     ]
                 }
             return jsonify(result)
+
+        @self.app.route('/api/timers/status')
+        def api_timers_status():
+            """Retorna estado ao vivo de todos os timers ativos + histórico do mês.
+            Usado para polling a cada 5s por todos os usuários conectados."""
+            active = production_timer.get_active_timers()
+            history = production_timer.get_monthly_history_details()
+            return jsonify({
+                'active': active,
+                'history': history,
+                'total_horas_mes': round(
+                    sum(h.get('tempo_segundos', 0) for h in history) / 3600, 2
+                )
+            })
+
+        @self.app.route('/api/sales/monthly-products')
+        def api_monthly_products():
+            """Retorna produtos vendidos no mês atual com quantidade (considera multiplos itens por pedido)."""
+            try:
+                from collections import defaultdict
+                agora = datetime.now()
+                mes_atual = agora.month
+                ano_atual = agora.year
+                
+                produtos_vendidos = defaultdict(int)
+                
+                todos_pedidos = []
+                with self.orchestrator.sales.lock:
+                    todos_pedidos = list(self.orchestrator.sales._sales_history or [])
+                
+                for pedido in todos_pedidos:
+                    data_str = pedido.get('data') or pedido.get('dataEmissao', '')
+                    if not data_str or str(ano_atual) not in str(data_str):
+                        continue
+                    try:
+                        dt = datetime.strptime(str(data_str).split(' ')[0], '%Y-%m-%d')
+                        if dt.month != mes_atual:
+                            continue
+                    except:
+                        continue
+                    
+                    # Processa itens do pedido — cada item pode ter quantidade > 1
+                    itens = pedido.get('itens', [])
+                    for item in itens:
+                        nome = (item.get('descricao') or item.get('nome') or '').strip()
+                        try:
+                            qtd = int(float(item.get('quantidade', 1)))
+                        except:
+                            qtd = 1
+                        if nome and qtd > 0:
+                            produtos_vendidos[nome] += qtd
+                
+                # Ordena por quantidade
+                lista = [
+                    {'nome': nome, 'qtd': qtd}
+                    for nome, qtd in sorted(produtos_vendidos.items(), key=lambda x: x[1], reverse=True)
+                ]
+                return jsonify({
+                    'mes': agora.strftime('%Y-%m'),
+                    'produtos': lista,
+                    'total_pedidos': len(todos_pedidos)
+                })
+            except Exception as e:
+                self.logger.exception("Erro em /api/sales/monthly-products")
+                return jsonify({'mes': '', 'produtos': [], 'total_pedidos': 0}), 500
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
@@ -3582,9 +3651,27 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 });
                 const data = await res.json();
                 
+                if (action === 'finish') {
+                    clearInterval(timerInterval);
+                    // Mostra confirmação clara de que foi salvo
+                    const elapsed = data.registro ? data.registro.tempo_segundos : 0;
+                    showToast('✅ Produção Concluída!', produto + ' — Tempo: ' + formatSeconds(elapsed) + ' salvo no histórico.', 'success');
+                    // Fecha o modal se aberto
+                    const modal = bootstrap.Modal.getInstance(document.getElementById('productionModal'));
+                    if (modal) modal.hide();
+                    // Atualiza a aba de componentes se visível
+                    refreshComponentTab();
+                    return;
+                }
+                
+                if (action === 'reset') {
+                    clearInterval(timerInterval);
+                    updateTimerDisplay(0, 'stopped');
+                    return;
+                }
+                
                 updateTimerDisplay(data.elapsed, data.state);
                 
-                // Se estiver rodando, inicia atualização local para feedback visual imediato
                 if (action === 'start' || (action === 'get' && data.state === 'running')) {
                     startLocalCounter(data.elapsed);
                 } else {
@@ -3592,6 +3679,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }
             } catch (e) {
                 console.error("Erro no timer:", e);
+                showToast('Erro', 'Falha ao comunicar com o servidor.', 'danger');
             }
         }
 
@@ -3627,44 +3715,117 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: Atualizar Componentes — nova versão */
+        /* ✅ DESIGN: Atualizar Componentes — via WebSocket (dados parciais) */
         function updateComponentUsage(usageData) {
-            if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
+            // Quando vem do WebSocket, só usa os dados que chegaram
+            // A atualização completa é feita pelo refreshComponentTab + polling
             if (usageData && usageData.active_production) renderActiveTimers(usageData.active_production);
             if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
+            // Para produtos vendidos, usa a API dedicada (mais precisa)
+            if (usageData && usageData.active_production !== undefined) {
+                // Carrega produtos vendidos da API dedicada em background
+                fetchAPI('/api/sales/monthly-products').then(d => {
+                    renderMonthlySales(d.produtos || [], d.mes || '', d.total_pedidos || 0);
+                }).catch(() => {});
+            }
         }
 
+        // Polling interval para atualizar timers ao vivo (todos os usuários)
+        let componentTabPolling = null;
+
         async function refreshComponentTab() {
+            // 1. Consumo de insumos (checklist)
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
             } catch(e) {
-                document.getElementById('consumption-table-section').innerHTML =
-                    '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
+                const el = document.getElementById('consumption-table-section');
+                if (el) el.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
             }
+            // 2. Timers ativos + histórico (API dedicada, mais rápida)
             try {
-                const usageData = await fetchAPI('/api/components/usage');
-                if (usageData.active_production) renderActiveTimers(usageData.active_production);
-                if (usageData.history_production) renderProductionHistory(usageData.history_production);
-                if (usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
-            } catch(e) { console.error(e); }
+                const timersData = await fetchAPI('/api/timers/status');
+                renderActiveTimers(timersData.active || []);
+                renderProductionHistory(timersData.history || []);
+            } catch(e) { console.error('timers error', e); }
+            // 3. Produtos vendidos (API dedicada com contagem por item/qtd)
+            try {
+                const salesData = await fetchAPI('/api/sales/monthly-products');
+                renderMonthlySales(salesData.produtos || [], salesData.mes || '', salesData.total_pedidos || 0);
+            } catch(e) { console.error('sales error', e); }
         }
+
+        function startComponentPolling() {
+            if (componentTabPolling) return; // Já rodando
+            componentTabPolling = setInterval(async () => {
+                // Polling leve: só timers ativos e histórico (sem refazer tudo)
+                try {
+                    const timersData = await fetchAPI('/api/timers/status');
+                    renderActiveTimers(timersData.active || []);
+                    // Atualiza histórico apenas se tem novos registros
+                    renderProductionHistory(timersData.history || []);
+                } catch(e) {}
+            }, 5000); // A cada 5 segundos
+        }
+
+        function stopComponentPolling() {
+            if (componentTabPolling) {
+                clearInterval(componentTabPolling);
+                componentTabPolling = null;
+            }
+        }
+
+        // Mapa de contadores locais para timers ao vivo
+        const _liveTimers = {};
 
         function renderActiveTimers(activeProduction) {
             const div = document.getElementById('active-timers-section');
             if (!div) return;
+
+            // Para contadores antigos
+            Object.values(_liveTimers).forEach(iv => clearInterval(iv));
+            Object.keys(_liveTimers).forEach(k => delete _liveTimers[k]);
+
             if (!activeProduction || activeProduction.length === 0) {
-                div.innerHTML = `<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">🏭</div><p class="text-muted mt-2 mb-0">Nenhuma produção ativa. Clique em um produto para iniciar.</p></div>`;
+                div.innerHTML = '<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">🏭</div><p class="text-muted mt-2 mb-0">Nenhuma produção ativa. Clique em um produto para iniciar.</p></div>';
                 return;
             }
-            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-                <thead class="table-dark"><tr><th>Produto</th><th class="text-center">Tempo</th><th class="text-center">Status</th><th class="text-center">Ação</th></tr></thead>
-                <tbody>${activeProduction.map(p => `<tr>
-                    <td class="fw-bold ps-3">${p.produto}</td>
-                    <td class="text-center font-monospace fw-bold fs-5 text-primary">${formatSeconds(p.tempo_decorrido)}</td>
-                    <td class="text-center"><span class="badge ${p.estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}" style="${p.estado === 'running' ? 'animation:pulse-animation 1.5s infinite;' : ''}">${p.estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}</span></td>
-                    <td class="text-center"><button class="btn btn-sm btn-outline-primary" onclick="openProductionChecklist('${p.produto}')">Abrir Timer</button></td>
-                </tr>`).join('')}</tbody></table></div>`;
+
+            // Cria linhas com IDs únicos para atualizar o tempo ao vivo
+            const rows = activeProduction.map((p, i) => {
+                const safeId = 'timer_row_' + i;
+                const escapedNome = p.produto.replace(/'/g, "\\'");
+                const isRunning = p.estado === 'running';
+                return '<tr>' +
+                    '<td class="fw-bold ps-3">' + p.produto + '</td>' +
+                    '<td class="text-center font-monospace fw-bold fs-5 text-primary" id="' + safeId + '">' + formatSeconds(p.tempo_decorrido) + '</td>' +
+                    '<td class="text-center"><span class="badge ' + (isRunning ? 'bg-success' : 'bg-warning text-dark') + '" ' +
+                        'style="' + (isRunning ? 'animation:pulse-animation 1.5s infinite;' : '') + '">' +
+                        (isRunning ? '🟢 PRODUZINDO' : '⏸ PAUSADO') + '</span></td>' +
+                    '<td class="text-center"><button class="btn btn-sm btn-outline-primary" onclick="openProductionChecklist(\'' + escapedNome + '\')">Abrir</button></td>' +
+                '</tr>';
+            }).join('');
+
+            div.innerHTML = '<div class="table-responsive"><table class="table table-hover align-middle mb-0">' +
+                '<thead class="table-dark"><tr><th class="ps-3">Produto</th><th class="text-center">Tempo Decorrido</th><th class="text-center">Status</th><th class="text-center">Ação</th></tr></thead>' +
+                '<tbody>' + rows + '</tbody></table></div>';
+
+            // Inicia contadores locais para timers 'running'
+            activeProduction.forEach((p, i) => {
+                if (p.estado === 'running') {
+                    let secs = p.tempo_decorrido;
+                    const el = document.getElementById('timer_row_' + i);
+                    if (!el) return;
+                    _liveTimers[i] = setInterval(() => {
+                        secs++;
+                        if (el && el.isConnected) {
+                            el.textContent = formatSeconds(secs);
+                        } else {
+                            clearInterval(_liveTimers[i]);
+                        }
+                    }, 1000);
+                }
+            });
         }
 
         function renderConsumptionTable(data) {
@@ -3693,39 +3854,97 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        function renderMonthlySales(produtosVendidos) {
+        function renderMonthlySales(produtos, mes, totalPedidos) {
             const div = document.getElementById('monthly-sales-section');
             if (!div) return;
-            const entries = Object.entries(produtosVendidos || {}).sort((a, b) => b[1] - a[1]);
+
+            // Aceita tanto lista [{nome,qtd}] quanto dict legado {nome: qtd}
+            let entries = [];
+            if (Array.isArray(produtos)) {
+                entries = produtos; // já ordenado pelo backend
+            } else {
+                entries = Object.entries(produtos || {}).map(([nome, qtd]) => ({nome, qtd}))
+                                .sort((a, b) => b.qtd - a.qtd);
+            }
+
+            // Header info
+            const monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+            let mesLabel = '';
+            if (mes) {
+                const [y, m] = mes.split('-');
+                mesLabel = m ? monthNames[parseInt(m)-1] + '/' + y : mes;
+            }
+
             if (entries.length === 0) {
                 div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto vendido registrado este mês.</div>';
                 return;
             }
-            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-                <thead style="background:#f8fafc;"><tr><th class="ps-3">Produto</th><th class="text-center">Qtd Vendida</th><th class="text-center">Insumos Teóricos</th></tr></thead>
-                <tbody>${entries.map(([nome, qtd]) => {
-                    const isCadeira = nome.includes('CADEIRA');
-                    return `<tr><td class="ps-3 fw-bold">${nome}</td>
-                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:white;padding:.4rem .9rem;">${qtd} un</span></td>
-                    <td class="text-center">${isCadeira ? `<button class="btn btn-xs btn-outline-secondary btn-sm" onclick="showTheoreticalUsage('${nome}', ${qtd})">Ver insumos</button>` : '<span class="text-muted small">—</span>'}</td></tr>`;
+
+            const headerInfo = (totalPedidos > 0 || mesLabel) ? 
+                `<div class="px-3 py-2 border-bottom d-flex align-items-center gap-3 bg-light">
+                    <span class="small text-muted">📅 ${mesLabel}</span>
+                    <span class="small text-muted">•</span>
+                    <span class="small text-muted">${totalPedidos} pedido(s) faturado(s)</span>
+                </div>` : '';
+
+            div.innerHTML = headerInfo + `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead style="background:#f8fafc;"><tr>
+                    <th class="ps-3">Produto</th>
+                    <th class="text-center">Qtd Vendida</th>
+                    <th class="text-center">Insumos Teóricos</th>
+                </tr></thead>
+                <tbody>${entries.map(item => {
+                    const nome = item.nome || item[0] || '';
+                    const qtd = item.qtd || item[1] || 0;
+                    const isCadeira = nome.toUpperCase().includes('CADEIRA');
+                    const escapedNome = nome.replace(/'/g, "\\'");
+                    return '<tr>' +
+                        '<td class="ps-3 fw-bold">' + nome + '</td>' +
+                        '<td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:white;padding:.4rem .9rem;">' + qtd + ' un</span></td>' +
+                        '<td class="text-center">' + (isCadeira ?
+                            '<button class="btn btn-xs btn-outline-secondary btn-sm" onclick="showTheoreticalUsage(\'' + escapedNome + '\',' + qtd + ')">Ver insumos</button>' :
+                            '<span class="text-muted small">—</span>') + '</td>' +
+                    '</tr>';
                 }).join('')}</tbody></table></div>`;
         }
 
         function renderProductionHistory(history) {
             const div = document.getElementById('production-history-section');
             if (!div) return;
-            const reversed = [...(history || [])].reverse();
+            const arr = history || [];
+            const reversed = [...arr].reverse();
+
             if (reversed.length === 0) {
                 div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado este mês.</div>';
                 return;
             }
-            div.innerHTML = `<div class="table-responsive" style="max-height:320px;overflow-y:auto;"><table class="table table-sm table-striped align-middle mb-0">
-                <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
-                <tbody>${reversed.map(h => `<tr>
-                    <td class="ps-3 small text-muted">${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
-                    <td class="fw-bold">${h.produto}</td>
-                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos)}</td>
-                </tr>`).join('')}</tbody></table></div>`;
+
+            // Calcula total de horas do mês
+            const totalSec = arr.reduce((acc, h) => acc + (h.tempo_segundos || 0), 0);
+            const totalHoras = (totalSec / 3600).toFixed(1);
+            const totalItens = arr.length;
+
+            const summaryBar = '<div class="px-3 py-2 border-bottom bg-light d-flex gap-4">' +
+                '<span class="small fw-bold">🏭 ' + totalItens + ' produto(s) finalizado(s)</span>' +
+                '<span class="small text-muted">⏱ ' + totalHoras + 'h produtivas no mês</span>' +
+                '</div>';
+
+            const rows = reversed.map(h => {
+                let dtStr = '—';
+                try { dtStr = new Date(h.data_conclusao).toLocaleString('pt-BR'); } catch(e) {}
+                return '<tr>' +
+                    '<td class="ps-3 small text-muted">' + dtStr + '</td>' +
+                    '<td class="fw-bold">' + (h.produto || '—') + '</td>' +
+                    '<td class="text-center font-monospace fw-bold text-primary">' + formatSeconds(h.tempo_segundos) + '</td>' +
+                '</tr>';
+            }).join('');
+
+            div.innerHTML = summaryBar +
+                '<div class="table-responsive" style="max-height:320px;overflow-y:auto;">' +
+                '<table class="table table-sm table-striped align-middle mb-0">' +
+                '<thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo</th></tr></thead>' +
+                '<tbody>' + rows + '</tbody>' +
+                '</table></div>';
         }
 
         function showTheoreticalUsage(productName, qty) {
@@ -4032,6 +4251,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (componentUsageTab) {
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
+                    startComponentPolling();
+                });
+                componentUsageTab.addEventListener('hidden.bs.tab', () => {
+                    stopComponentPolling();
                 });
             }
         });
