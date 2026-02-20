@@ -1602,51 +1602,62 @@ class PendingOrdersManager:
         Sincroniza pedidos faturados do Bling com a fila de pendentes.
         Correlaciona produtos do pedido com o cache para extrair base/cor/nome.
         Apenas adiciona novos — não sobrescreve itens já existentes.
+        
+        IMPORTANTE: A API Bling V3 na listagem /pedidos/vendas pode não trazer 'itens'.
+        Se um pedido não tiver itens, ele é ignorado (serão buscados individualmente via
+        sync_pending_with_api chamado pelo worker).
         """
-        existing_order_ids = {v.get('order_id') for v in self.data.values()}
         added = 0
         for pedido in orders:
             order_id = str(pedido.get('id', ''))
             if not order_id:
                 continue
             itens = pedido.get('itens', [])
+            if not itens:
+                continue  # sem itens na listagem — será buscado individualmente
+
             for idx, item in enumerate(itens):
-                item_key = f"{order_id}_{idx}"
-                if item_key in self.data:
-                    continue  # já existe
                 nome_raw = (item.get('descricao') or item.get('nome') or '').strip()
                 sku_raw = (item.get('codigo') or item.get('sku') or '').strip()
-                qtd = int(float(item.get('quantidade', 1)))
+                if not nome_raw and not sku_raw:
+                    continue
+                qtd = max(1, int(float(item.get('quantidade', 1))))
 
                 # Correlaciona com cache de produtos
-                produto_cache = products_cache.get(sku_raw) or products_cache.get(nome_raw.upper())
+                produto_cache = (products_cache.get(sku_raw)
+                                 or products_cache.get(sku_raw.upper())
+                                 or products_cache.get(nome_raw.upper()))
                 nome_produto = produto_cache['nome'] if produto_cache else nome_raw
                 imagem = (produto_cache or {}).get('imagem', '')
 
-                # Extrai info de base/cor do nome (padrão: "CADEIRA X - BASE Y - COR Z")
+                # Extrai base/cor do nome (padrão: "CADEIRA X - BASE Y - COR Z")
                 partes = nome_produto.split(' - ') if ' - ' in nome_produto else [nome_produto]
                 base = ''
                 cor = ''
                 for parte in partes:
-                    p = parte.strip().upper()
-                    if 'BASE' in p:
+                    pu = parte.strip().upper()
+                    if 'BASE' in pu:
                         base = parte.strip()
-                    elif 'COR' in p or 'TECIDO' in p or 'COURVIM' in p:
+                    elif any(x in pu for x in ['COR', 'TECIDO', 'COURVIM', 'LINHO', 'VELUDO']):
                         cor = parte.strip()
+
+                cliente = ''
+                contato = pedido.get('contato')
+                if isinstance(contato, dict):
+                    cliente = contato.get('nome', '') or contato.get('nomeFantasia', '')
 
                 item_data = {
                     'nome': nome_produto,
                     'nome_original': nome_raw,
                     'sku': sku_raw,
-                    'qtd': qtd,
                     'base': base,
                     'cor': cor,
                     'imagem': imagem,
                     'pedido_data': pedido.get('data') or pedido.get('dataEmissao', ''),
                     'pedido_numero': pedido.get('numero', order_id),
-                    'cliente': (pedido.get('contato') or {}).get('nome', '') if isinstance(pedido.get('contato'), dict) else '',
+                    'cliente': cliente,
                 }
-                # Adiciona uma entrada por unidade (se qtd > 1, cria múltiplas entradas)
+
                 for unit in range(qtd):
                     sub_key = f"{order_id}_{idx}_{unit}"
                     if sub_key not in self.data:
@@ -1659,6 +1670,7 @@ class PendingOrdersManager:
                             'added_at': datetime.now().isoformat()
                         }
                         added += 1
+
         if added > 0:
             self._save()
             logger.info(f"✅ PendingOrders: {added} itens novos adicionados à fila de espera.")
@@ -1988,7 +2000,12 @@ class Orchestrator:
                 try:
                     with self._cache_lock:
                         cache_flat = {**self._products_cache, **self._kits_cache}
-                    pending_orders.sync_from_orders(valid_orders, cache_flat)
+                    # Tenta sync direto (funciona se itens vierem na listagem)
+                    added = pending_orders.sync_from_orders(valid_orders, cache_flat)
+                    # Se nenhum item foi adicionado e há pedidos, busca detalhes individuais
+                    if added == 0 and valid_orders:
+                        self.logger.info("⚠️ Itens não vieram na listagem. Buscando pedidos individualmente...")
+                        Thread(target=self._fetch_orders_with_items, args=(valid_orders, cache_flat), daemon=True).start()
                 except Exception as e:
                     self.logger.warning(f"Erro ao sincronizar pending_orders: {e}")
                 
@@ -2116,6 +2133,47 @@ class Orchestrator:
             
         self.logger.info(f"✅ Cache atualizado: {len(all_products)} produtos, {len(all_kits)} kits.")
         self.broadcast_kpi_update(cache_updated=True)
+
+    def _fetch_orders_with_items(self, orders: list, cache_flat: dict):
+        """
+        Busca detalhes individuais de cada pedido para obter os itens.
+        A API Bling V3 na listagem não retorna itens — só no endpoint individual.
+        Chamado em thread separada para não bloquear o worker principal.
+        """
+        already_have = {v.get('order_id') for v in pending_orders.data.values()}
+        orders_to_fetch = [o for o in orders if str(o.get('id', '')) not in already_have]
+
+        if not orders_to_fetch:
+            self.logger.info("✅ Todos os pedidos já estão na fila de pendentes.")
+            return
+
+        self.logger.info(f"🔍 Buscando itens de {len(orders_to_fetch)} pedidos individualmente...")
+        enriched = []
+
+        for pedido in orders_to_fetch:
+            order_id = str(pedido.get('id', ''))
+            if not order_id:
+                continue
+            try:
+                resp = self.api.get(f'pedidos/vendas/{order_id}')
+                if not resp:
+                    continue
+                detail = resp.get('data', resp)
+                # Mantém campos do pedido original e adiciona itens do detalhe
+                merged = {**pedido, 'itens': detail.get('itens', [])}
+                if merged['itens']:
+                    enriched.append(merged)
+                    self.logger.debug(f"  Pedido {order_id}: {len(merged['itens'])} itens encontrados")
+                time.sleep(0.4)  # respeita rate limit
+            except Exception as e:
+                self.logger.error(f"Erro ao buscar pedido {order_id}: {e}")
+                continue
+
+        if enriched:
+            added = pending_orders.sync_from_orders(enriched, cache_flat)
+            self.logger.info(f"✅ {added} itens adicionados à fila de espera após busca individual.")
+        else:
+            self.logger.warning("⚠️ Nenhum item encontrado nos pedidos individuais.")
 
     def calculate_component_usage(self) -> Dict[str, Any]:
         """Calcula insumos com alta performance e logs de diagnóstico."""
@@ -2522,10 +2580,51 @@ class WebServer:
                 with self.orchestrator._cache_lock:
                     cache_flat = {**self.orchestrator._products_cache, **self.orchestrator._kits_cache}
                 orders = self.orchestrator.sales._sales_history or []
+                
+                # Tenta sync direto primeiro
                 added = pending_orders.sync_from_orders(orders, cache_flat)
-                return jsonify({'success': True, 'added': added, 'total_waiting': len(pending_orders.get_waiting())})
+                
+                # Se não adicionou nada, busca pedidos individualmente em background
+                if added == 0 and orders:
+                    Thread(
+                        target=self.orchestrator._fetch_orders_with_items,
+                        args=(orders, cache_flat),
+                        daemon=True
+                    ).start()
+                    return jsonify({
+                        'success': True,
+                        'added': 0,
+                        'message': f'Buscando itens de {len(orders)} pedidos individualmente... Aguarde 30s e atualize a página.',
+                        'total_waiting': len(pending_orders.get_waiting())
+                    })
+
+                return jsonify({
+                    'success': True,
+                    'added': added,
+                    'total_waiting': len(pending_orders.get_waiting())
+                })
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/debug/orders-sample')
+        @token_required
+        def api_debug_orders_sample(token):
+            """Debug: mostra estrutura dos últimos 3 pedidos para diagnóstico."""
+            orders = self.orchestrator.sales._sales_history or []
+            sample = orders[-3:] if orders else []
+            result = []
+            for o in sample:
+                result.append({
+                    'id': o.get('id'),
+                    'numero': o.get('numero'),
+                    'data': o.get('data'),
+                    'situacao': o.get('situacao'),
+                    'tem_itens': bool(o.get('itens')),
+                    'qtd_itens': len(o.get('itens', [])),
+                    'itens_sample': o.get('itens', [])[:2],
+                    'campos_disponiveis': list(o.keys())
+                })
+            return jsonify({'total_pedidos': len(orders), 'sample': result})
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
@@ -4092,10 +4191,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* ✅ Pedidos em Espera */
         async function syncAndRefreshPending() {
+            const btn = document.querySelector('[onclick="syncAndRefreshPending()"]');
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
             try {
-                showToast('Info', 'Sincronizando pedidos do Bling...', 'info');
-                await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
-            } catch(e) { /* silencioso se não autenticado */ }
+                const res = await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
+                if (res.message) {
+                    showToast('Info', res.message, 'info');
+                } else {
+                    showToast('Sucesso', `${res.added || 0} novos itens adicionados.`, 'success');
+                }
+            } catch(e) {
+                showToast('Aviso', 'Faça login para sincronizar.', 'warning');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '🔄 Sincronizar Bling'; }
+            }
             await loadPendingOrders();
         }
 
@@ -4198,21 +4307,56 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { console.error(e); }
         }
 
+        // Guarda estado dos timers ativos para o ticker automático
+        let _activeTimersState = {};
+        let _activeTimersTick = null;
+
         function renderActiveTimers(activeProduction) {
             const div = document.getElementById('active-timers-section');
             if (!div) return;
+
+            // Para ticker anterior
+            if (_activeTimersTick) { clearInterval(_activeTimersTick); _activeTimersTick = null; }
+
             if (!activeProduction || activeProduction.length === 0) {
+                _activeTimersState = {};
                 div.innerHTML = `<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">🏭</div><p class="text-muted mt-2 mb-0">Nenhuma produção ativa. Clique em um produto para iniciar.</p></div>`;
                 return;
             }
+
+            // Salva estado: tempo base (no momento do render) + estado (running/paused)
+            _activeTimersState = {};
+            activeProduction.forEach(p => {
+                _activeTimersState[p.produto] = {
+                    base: p.tempo_decorrido,       // segundos já acumulados
+                    startedAt: Date.now(),          // quando essa snapshot chegou
+                    estado: p.estado
+                };
+            });
+
+            // Monta tabela com IDs únicos para cada célula de tempo
             div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
                 <thead class="table-dark"><tr><th>Produto</th><th class="text-center">Tempo</th><th class="text-center">Status</th><th class="text-center">Ação</th></tr></thead>
-                <tbody>${activeProduction.map(p => `<tr>
-                    <td class="fw-bold ps-3">${p.produto}</td>
-                    <td class="text-center font-monospace fw-bold fs-5 text-primary">${formatSeconds(p.tempo_decorrido)}</td>
-                    <td class="text-center"><span class="badge ${p.estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}" style="${p.estado === 'running' ? 'animation:pulse-animation 1.5s infinite;' : ''}">${p.estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}</span></td>
-                    <td class="text-center"><button class="btn btn-sm btn-outline-primary" onclick="openProductionChecklist('${p.produto}')">Abrir Timer</button></td>
-                </tr>`).join('')}</tbody></table></div>`;
+                <tbody>${activeProduction.map(p => {
+                    const safeId = p.produto.replace(/[^a-zA-Z0-9]/g, '_');
+                    return `<tr>
+                        <td class="fw-bold ps-3">${p.produto}</td>
+                        <td class="text-center"><span id="atimer_${safeId}" class="font-monospace fw-bold fs-5 text-primary">${formatSeconds(p.tempo_decorrido)}</span></td>
+                        <td class="text-center"><span class="badge ${p.estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}" style="${p.estado === 'running' ? 'animation:pulse-animation 1.5s infinite;' : ''}">${p.estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}</span></td>
+                        <td class="text-center"><button class="btn btn-sm btn-outline-primary" onclick="openProductionChecklist('${p.produto}')">Abrir Timer</button></td>
+                    </tr>`;
+                }).join('')}</tbody></table></div>`;
+
+            // Ticker: atualiza só as células de tempo a cada segundo, sem re-render
+            _activeTimersTick = setInterval(() => {
+                Object.entries(_activeTimersState).forEach(([produto, s]) => {
+                    if (s.estado !== 'running') return; // pausado não incrementa
+                    const elapsed = s.base + Math.floor((Date.now() - s.startedAt) / 1000);
+                    const safeId = produto.replace(/[^a-zA-Z0-9]/g, '_');
+                    const el = document.getElementById('atimer_' + safeId);
+                    if (el) el.textContent = formatSeconds(elapsed);
+                });
+            }, 1000);
         }
 
         function renderConsumptionTable(data) {
@@ -4581,6 +4725,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
                     loadPendingOrders();
+                });
+                // Para o ticker quando sai da aba (economiza recursos)
+                componentUsageTab.addEventListener('hidden.bs.tab', () => {
+                    if (_activeTimersTick) { clearInterval(_activeTimersTick); _activeTimersTick = null; }
                 });
             }
         });
