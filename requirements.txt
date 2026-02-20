@@ -5,3 +5,4 @@ colorama
 flask-sock
 gevent
 gunicorn
+pymongo[srv]
