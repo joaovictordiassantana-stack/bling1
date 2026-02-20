@@ -1331,9 +1331,153 @@ class ComponentConsumptionManager:
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
 
 
+class PendingOrdersManager:
+    """
+    Gerencia pedidos do Bling que chegaram e estão aguardando produção.
+    Persiste em disco — sobrevive a reinícios do servidor.
+    """
+    FILE_PATH = DATA_DIR / 'pending_orders.json'
+
+    def __init__(self):
+        self.data = self._load()
+
+    def _load(self):
+        if not self.FILE_PATH.exists():
+            return {}
+        try:
+            with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
+
+    def _save(self):
+        temp = self.FILE_PATH.with_suffix('.tmp')
+        try:
+            with open(temp, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+            shutil.move(str(temp), str(self.FILE_PATH))
+        except Exception as e:
+            logger.error(f"Erro ao salvar pedidos pendentes: {e}")
+
+    def add_order_item(self, order_id: str, item_key: str, item_data: dict):
+        """Adiciona um item de pedido à fila de espera."""
+        key = f"{order_id}_{item_key}"
+        if key not in self.data:
+            self.data[key] = {
+                **item_data,
+                'order_id': str(order_id),
+                'item_key': item_key,
+                'status': 'waiting',  # waiting | in_production | done
+                'added_at': datetime.now().isoformat()
+            }
+            self._save()
+        return self.data[key]
+
+    def start_production(self, item_key: str):
+        """Move item para status 'in_production'."""
+        if item_key in self.data:
+            self.data[item_key]['status'] = 'in_production'
+            self.data[item_key]['started_at'] = datetime.now().isoformat()
+            self._save()
+        return self.data.get(item_key)
+
+    def finish_production(self, item_key: str):
+        """Move item para status 'done'."""
+        if item_key in self.data:
+            self.data[item_key]['status'] = 'done'
+            self.data[item_key]['finished_at'] = datetime.now().isoformat()
+            self._save()
+        return self.data.get(item_key)
+
+    def dismiss(self, item_key: str):
+        """Remove item da fila."""
+        if item_key in self.data:
+            del self.data[item_key]
+            self._save()
+
+    def get_waiting(self):
+        """Retorna todos os itens aguardando produção."""
+        return [v for v in self.data.values() if v.get('status') == 'waiting']
+
+    def get_in_production(self):
+        """Retorna todos os itens em produção."""
+        return [v for v in self.data.values() if v.get('status') == 'in_production']
+
+    def get_all(self):
+        return list(self.data.values())
+
+    def sync_from_orders(self, orders: list, products_cache: dict):
+        """
+        Sincroniza pedidos faturados do Bling com a fila de pendentes.
+        Correlaciona produtos do pedido com o cache para extrair base/cor/nome.
+        Apenas adiciona novos — não sobrescreve itens já existentes.
+        """
+        existing_order_ids = {v.get('order_id') for v in self.data.values()}
+        added = 0
+        for pedido in orders:
+            order_id = str(pedido.get('id', ''))
+            if not order_id:
+                continue
+            itens = pedido.get('itens', [])
+            for idx, item in enumerate(itens):
+                item_key = f"{order_id}_{idx}"
+                if item_key in self.data:
+                    continue  # já existe
+                nome_raw = (item.get('descricao') or item.get('nome') or '').strip()
+                sku_raw = (item.get('codigo') or item.get('sku') or '').strip()
+                qtd = int(float(item.get('quantidade', 1)))
+
+                # Correlaciona com cache de produtos
+                produto_cache = products_cache.get(sku_raw) or products_cache.get(nome_raw.upper())
+                nome_produto = produto_cache['nome'] if produto_cache else nome_raw
+                imagem = (produto_cache or {}).get('imagem', '')
+
+                # Extrai info de base/cor do nome (padrão: "CADEIRA X - BASE Y - COR Z")
+                partes = nome_produto.split(' - ') if ' - ' in nome_produto else [nome_produto]
+                base = ''
+                cor = ''
+                for parte in partes:
+                    p = parte.strip().upper()
+                    if 'BASE' in p:
+                        base = parte.strip()
+                    elif 'COR' in p or 'TECIDO' in p or 'COURVIM' in p:
+                        cor = parte.strip()
+
+                item_data = {
+                    'nome': nome_produto,
+                    'nome_original': nome_raw,
+                    'sku': sku_raw,
+                    'qtd': qtd,
+                    'base': base,
+                    'cor': cor,
+                    'imagem': imagem,
+                    'pedido_data': pedido.get('data') or pedido.get('dataEmissao', ''),
+                    'pedido_numero': pedido.get('numero', order_id),
+                    'cliente': (pedido.get('contato') or {}).get('nome', '') if isinstance(pedido.get('contato'), dict) else '',
+                }
+                # Adiciona uma entrada por unidade (se qtd > 1, cria múltiplas entradas)
+                for unit in range(qtd):
+                    sub_key = f"{order_id}_{idx}_{unit}"
+                    if sub_key not in self.data:
+                        self.data[sub_key] = {
+                            **item_data,
+                            'qtd': 1,
+                            'order_id': order_id,
+                            'item_key': sub_key,
+                            'status': 'waiting',
+                            'added_at': datetime.now().isoformat()
+                        }
+                        added += 1
+        if added > 0:
+            self._save()
+            logger.info(f"✅ PendingOrders: {added} itens novos adicionados à fila de espera.")
+        return added
+
+
 # Instâncias globais
 production_timer = ProductionTimer()
 component_consumption = ComponentConsumptionManager()
+pending_orders = PendingOrdersManager()
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -1648,6 +1792,14 @@ class Orchestrator:
                 
                 # 2. Recalcula as estatísticas
                 self.sales.recalculate_from_orders(self.sales._sales_history)
+                
+                # 3. Sincroniza pedidos com fila de produção pendente
+                try:
+                    with self._cache_lock:
+                        cache_flat = {**self._products_cache, **self._kits_cache}
+                    pending_orders.sync_from_orders(valid_orders, cache_flat)
+                except Exception as e:
+                    self.logger.warning(f"Erro ao sincronizar pending_orders: {e}")
                 
                 # Manda atualização pro Front (Gráfico)
                 self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
@@ -2119,6 +2271,70 @@ class WebServer:
                     ]
                 }
             return jsonify(result)
+
+        # =====================================================================
+        # ROTAS: PEDIDOS PENDENTES (FILA DE PRODUÇÃO)
+        # =====================================================================
+
+        @self.app.route('/api/pending-orders')
+        def api_pending_orders():
+            """Retorna pedidos do Bling aguardando produção, em produção e concluídos."""
+            return jsonify({
+                'waiting': pending_orders.get_waiting(),
+                'in_production': pending_orders.get_in_production(),
+                'all': pending_orders.get_all()
+            })
+
+        @self.app.route('/api/pending-orders/start', methods=['POST'])
+        def api_pending_orders_start():
+            """Move pedido de 'Em Espera' para 'Em Produção' e inicia timer."""
+            data = request.json
+            item_key = data.get('item_key', '')
+            produto_nome = data.get('produto_nome', '')
+            if not item_key:
+                return jsonify({'error': 'item_key obrigatório'}), 400
+            item = pending_orders.start_production(item_key)
+            # Inicia o timer de produção com o nome do produto
+            if produto_nome:
+                production_timer.start(produto_nome)
+            return jsonify({'success': True, 'item': item})
+
+        @self.app.route('/api/pending-orders/finish', methods=['POST'])
+        def api_pending_orders_finish():
+            """Finaliza produção de um pedido pendente."""
+            data = request.json
+            item_key = data.get('item_key', '')
+            produto_nome = data.get('produto_nome', '')
+            if not item_key:
+                return jsonify({'error': 'item_key obrigatório'}), 400
+            item = pending_orders.finish_production(item_key)
+            # Finaliza o timer
+            if produto_nome:
+                production_timer.stop_and_log(produto_nome)
+            return jsonify({'success': True, 'item': item})
+
+        @self.app.route('/api/pending-orders/dismiss', methods=['POST'])
+        def api_pending_orders_dismiss():
+            """Remove um item da fila de pendentes."""
+            data = request.json
+            item_key = data.get('item_key', '')
+            if not item_key:
+                return jsonify({'error': 'item_key obrigatório'}), 400
+            pending_orders.dismiss(item_key)
+            return jsonify({'success': True})
+
+        @self.app.route('/api/pending-orders/sync', methods=['POST'])
+        @token_required
+        def api_pending_orders_sync(token):
+            """Força sincronização imediata dos pedidos do Bling com a fila pendente."""
+            try:
+                with self.orchestrator._cache_lock:
+                    cache_flat = {**self.orchestrator._products_cache, **self.orchestrator._kits_cache}
+                orders = self.orchestrator.sales._sales_history or []
+                added = pending_orders.sync_from_orders(orders, cache_flat)
+                return jsonify({'success': True, 'added': added, 'total_waiting': len(pending_orders.get_waiting())})
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
 
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
@@ -3224,6 +3440,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                     <!-- Tab: Componentes (Consumo & Produção) -->
                     <div class="tab-pane fade" id="component-usage" role="tabpanel">
+                        <!-- Seção: Pedidos em Espera (do Bling) -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #92400e 0%, #d97706 100%);">
+                                <div>
+                                    <h5 class="mb-0">⏳ Em Espera <span id="waiting-count-badge" class="badge bg-white text-dark ms-2">0</span></h5>
+                                    <small class="text-white-50">Pedidos do Bling aguardando iniciar produção</small>
+                                </div>
+                                <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                            </div>
+                            <div class="card-body p-0" id="waiting-orders-section">
+                                <p class="text-center text-muted py-3">⏳ Carregando pedidos...</p>
+                            </div>
+                        </div>
+
                         <!-- Seção: Produção em Andamento -->
                         <div class="card mb-4 border-0 shadow-sm">
                             <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
@@ -3661,6 +3891,90 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
+        /* ✅ Pedidos em Espera */
+        async function syncAndRefreshPending() {
+            try {
+                showToast('Info', 'Sincronizando pedidos do Bling...', 'info');
+                await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
+            } catch(e) { /* silencioso se não autenticado */ }
+            await loadPendingOrders();
+        }
+
+        async function loadPendingOrders() {
+            const div = document.getElementById('waiting-orders-section');
+            const badge = document.getElementById('waiting-count-badge');
+            try {
+                const data = await fetch('/api/pending-orders').then(r => r.json());
+                const waiting = data.waiting || [];
+                if (badge) badge.textContent = waiting.length;
+                if (waiting.length === 0) {
+                    div.innerHTML = `<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">📬</div><p class="text-muted mt-2 mb-0">Nenhum pedido aguardando produção.</p><small class="text-muted">Os pedidos faturados no Bling aparecem aqui automaticamente.</small></div>`;
+                    return;
+                }
+                let html = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                    <thead class="table-warning"><tr>
+                        <th class="ps-3">Produto</th>
+                        <th>Base</th>
+                        <th>Cor/Tecido</th>
+                        <th>Pedido Nº</th>
+                        <th>Cliente</th>
+                        <th class="text-center">Ações</th>
+                    </tr></thead><tbody>`;
+                waiting.forEach(item => {
+                    const imgHtml = item.imagem ? `<img src="${item.imagem}" style="width:40px;height:40px;object-fit:contain;border-radius:4px;margin-right:8px;" onerror="this.style.display='none'">` : '';
+                    const nomeSafe = (item.nome || item.nome_original || 'N/D').replace(/'/g, '&#39;');
+                    html += `<tr>
+                        <td class="ps-3 fw-bold">${imgHtml}${nomeSafe}</td>
+                        <td class="text-muted small">${item.base || '—'}</td>
+                        <td class="text-muted small">${item.cor || '—'}</td>
+                        <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
+                        <td class="text-muted small">${item.cliente || '—'}</td>
+                        <td class="text-center">
+                            <button class="btn btn-sm btn-success me-1" onclick="startPendingOrder('${item.item_key}', encodeURIComponent(item.nome || item.nome_original || ''))">
+                                ▶ Produzir
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="dismissPendingOrder('${item.item_key}')">✕</button>
+                        </td>
+                    </tr>`;
+                });
+                html += '</tbody></table></div>';
+                div.innerHTML = html;
+            } catch(e) {
+                div.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar pedidos pendentes.</div>';
+            }
+        }
+
+        async function startPendingOrder(itemKey, produtoNomeEncoded) {
+            const produtoNome = decodeURIComponent(produtoNomeEncoded);
+            try {
+                await fetch('/api/pending-orders/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
+                });
+                showToast('Sucesso', `Produção iniciada: ${produtoNome}`, 'success');
+                openProductionChecklist(produtoNome);
+                await loadPendingOrders();
+                await refreshComponentTab();
+            } catch(e) {
+                showToast('Erro', 'Falha ao iniciar produção', 'danger');
+            }
+        }
+
+        async function dismissPendingOrder(itemKey) {
+            if (!confirm('Remover este pedido da fila?')) return;
+            try {
+                await fetch('/api/pending-orders/dismiss', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey })
+                });
+                await loadPendingOrders();
+            } catch(e) {
+                showToast('Erro', 'Falha ao remover pedido', 'danger');
+            }
+        }
+
         /* ✅ DESIGN: Atualizar Componentes — nova versão */
         function updateComponentUsage(usageData) {
             if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
@@ -3669,6 +3983,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function refreshComponentTab() {
+            loadPendingOrders();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
@@ -4066,6 +4381,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (componentUsageTab) {
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
+                    loadPendingOrders();
                 });
             }
         });
