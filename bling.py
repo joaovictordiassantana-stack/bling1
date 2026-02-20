@@ -50,10 +50,103 @@ except ImportError:
     class ConnectionClosed(Exception): pass
 
 # ============================================================================
-# CONFIGURAÇÃO DE DISCO PERSISTENTE (RENDER)
+# MONGODB — Camada de Persistência Central
 # ============================================================================
-# Configure a variável de ambiente DATA_DIR='/data' no painel do Render.
-# Sem isso usa pasta local (efêmera — dados somem ao reiniciar).
+# Defina MONGODB_URI nas variáveis de ambiente do Render.
+# Se não definida, cai para arquivos locais (modo legado).
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import PyMongoError
+    _MONGO_URI = os.environ.get('MONGODB_URI', '')
+    if _MONGO_URI:
+        _mongo_client = MongoClient(_MONGO_URI, serverSelectionTimeoutMS=5000)
+        _mongo_db = _mongo_client.get_database('sw_moveis')
+        _mongo_client.admin.command('ping')  # testa conexão na inicialização
+        MONGO_AVAILABLE = True
+    else:
+        MONGO_AVAILABLE = False
+        _mongo_db = None
+except Exception as _mongo_err:
+    MONGO_AVAILABLE = False
+    _mongo_db = None
+
+
+class MongoStore:
+    """
+    Camada de acesso unificada ao MongoDB.
+    Cada coleção pode ter múltiplos documentos identificados por _id.
+    Usado como backend persistente para timers, consumo, pedidos, tokens e stats.
+    """
+    @staticmethod
+    def get(collection: str, doc_id: str = 'main') -> dict:
+        if not MONGO_AVAILABLE:
+            return {}
+        try:
+            doc = _mongo_db[collection].find_one({'_id': doc_id})
+            if doc:
+                doc.pop('_id', None)
+            return doc or {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def set(collection: str, data: dict, doc_id: str = 'main') -> bool:
+        if not MONGO_AVAILABLE:
+            return False
+        try:
+            payload = {k: v for k, v in data.items() if k != '_id'}
+            _mongo_db[collection].update_one(
+                {'_id': doc_id},
+                {'$set': payload},
+                upsert=True
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def get_all(collection: str) -> dict:
+        """Retorna todos os docs da coleção como dict keyed by _id."""
+        if not MONGO_AVAILABLE:
+            return {}
+        try:
+            result = {}
+            for doc in _mongo_db[collection].find():
+                key = str(doc.pop('_id'))
+                result[key] = doc
+            return result
+        except Exception:
+            return {}
+
+    @staticmethod
+    def upsert(collection: str, doc_id: str, data: dict) -> bool:
+        if not MONGO_AVAILABLE:
+            return False
+        try:
+            payload = {k: v for k, v in data.items() if k != '_id'}
+            _mongo_db[collection].update_one(
+                {'_id': doc_id},
+                {'$set': payload},
+                upsert=True
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def remove(collection: str, doc_id: str) -> bool:
+        if not MONGO_AVAILABLE:
+            return False
+        try:
+            _mongo_db[collection].delete_one({'_id': doc_id})
+            return True
+        except Exception:
+            return False
+
+
+# ============================================================================
+# CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
+# ============================================================================
 DATA_DIR = Path(os.environ.get('DATA_DIR', '.'))
 
 # ============================================================================ 
@@ -318,6 +411,14 @@ def atomic_write_json(data: dict, path: Path):
             os.remove(temp_path)
 
 def load_tokens_safe(path: Path | str = "tokens.json"):
+    # MongoDB primeiro
+    if MONGO_AVAILABLE:
+        try:
+            data = MongoStore.get('auth_tokens', 'tokens')
+            if data:
+                return data
+        except Exception:
+            pass
     if isinstance(path, str): path = Path(path)
     if not path.exists():
         try:
@@ -335,18 +436,37 @@ def load_tokens_safe(path: Path | str = "tokens.json"):
         return {}
 
 def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
+    # MongoDB primeiro
+    if MONGO_AVAILABLE:
+        try:
+            MongoStore.set('auth_tokens', data, 'tokens')
+            logger.info("Tokens salvos no MongoDB.")
+            return
+        except Exception as e:
+            logger.error(f"Erro ao salvar tokens no MongoDB: {e}")
     if isinstance(path, str): path = Path(path)
-    atomic_write_json(data, path) # Usa a nova função segura
-    logger.info("Tokens salvos com sucesso (Atômico).")
+    atomic_write_json(data, path)
+    logger.info("Tokens salvos em arquivo (fallback).")
 
 def load_stats_safe(path: Path):
-    """Carrega as estatísticas de vendas de forma segura."""
+    """Carrega as estatísticas de vendas — MongoDB primeiro, arquivo fallback."""
+    if MONGO_AVAILABLE:
+        try:
+            data = MongoStore.get('sales_stats', 'stats')
+            if data:
+                if 'last_recalculated' in data and isinstance(data['last_recalculated'], str):
+                    try:
+                        data['last_recalculated'] = datetime.fromisoformat(data['last_recalculated'])
+                    except Exception:
+                        pass
+                return data
+        except Exception:
+            pass
     if not path.exists():
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # Converte a string ISO de volta para datetime
             if data and 'last_recalculated' in data and isinstance(data['last_recalculated'], str):
                  data['last_recalculated'] = datetime.fromisoformat(data['last_recalculated'])
             return data
@@ -355,13 +475,19 @@ def load_stats_safe(path: Path):
         return None
 
 def save_stats(data: Dict[str, Any], path: Path):
-    """Salva as estatísticas de vendas, convertendo datetime para string ISO."""
+    """Salva as estatísticas de vendas — MongoDB primeiro, arquivo fallback."""
     data_to_save = data.copy()
     if 'last_recalculated' in data_to_save and isinstance(data_to_save['last_recalculated'], datetime):
         data_to_save['last_recalculated'] = data_to_save['last_recalculated'].isoformat()
-
-    atomic_write_json(data_to_save, path) # Usa a nova função segura
-    logger.info("Estatísticas de KPIs salvas com sucesso (Atômico).")
+    if MONGO_AVAILABLE:
+        try:
+            MongoStore.set('sales_stats', data_to_save, 'stats')
+            logger.info("Estatísticas salvas no MongoDB.")
+            return
+        except Exception as e:
+            logger.error(f"Erro ao salvar stats no MongoDB: {e}")
+    atomic_write_json(data_to_save, path)
+    logger.info("Estatísticas salvas em arquivo (fallback).")
 
 def safe_dict(data):
     """
@@ -378,12 +504,17 @@ def safe_dict(data):
 
 def load_products_cache(cache_file):
     """
-    Carrega cache de produtos e kits do disco.
-    Retorna dict vazio se não existir ou falhar.
+    Carrega cache de produtos e kits — MongoDB primeiro, arquivo fallback.
     """
+    if MONGO_AVAILABLE:
+        try:
+            data = MongoStore.get('products_cache', 'cache')
+            if data and (data.get('products') or data.get('kits')):
+                return data
+        except Exception:
+            pass
     if not cache_file or not os.path.exists(cache_file):
         return {}
-
     try:
         with open(cache_file, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -404,19 +535,24 @@ def save_products_cache(cache_file, products, kits):
         logger.warning("⛔ Cache vazio ignorado. Não salvando no disco. Isto indica que a API não retornou produtos ou que o parsing falhou.")
         return
         
+    payload = {
+        "updated_at": datetime.now().isoformat(),
+        "products": products or [],
+        "kits": kits or []
+    }
+    if MONGO_AVAILABLE:
+        try:
+            MongoStore.set('products_cache', payload, 'cache')
+            logger.info(f"Cache de produtos salvo no MongoDB. Total: {total_produtos}")
+            return
+        except Exception as e:
+            logger.error(f"Erro ao salvar cache no MongoDB: {e}")
     try:
-        payload = {
-            "updated_at": datetime.now().isoformat(),
-            "products": products or [],
-            "kits": kits or []
-        }
-        atomic_write_json(payload, cache_file) # Usa a nova função segura
-        
+        atomic_write_json(payload, cache_file)
         skus = [p.get('sku') for p in (products or [])[:5]] + [k.get('sku') for k in (kits or [])[:5]]
-        logger.info(f"Cache salvo com sample skus: {skus}")
-        logger.info(f"Cache de produtos e kits salvo com sucesso (Atômico). Total: {total_produtos}")
+        logger.info(f"Cache salvo em arquivo com sample skus: {skus}. Total: {total_produtos}")
     except Exception as e:
-        logger.exception("Erro ao salvar cache de produtos.")
+        logger.exception("Erro ao salvar cache de produtos em arquivo.")
 
 def safe_iter(data):
     """Garante que o dado é iterável (lista ou tupla), senão retorna lista vazia."""
@@ -1066,21 +1202,34 @@ class ProductionTimer:
         self._auto_pause_on_restart() # Pausa timers abertos ao reiniciar para segurança
 
     def _load(self):
+        # Tenta MongoDB primeiro, fallback para arquivo
+        if MONGO_AVAILABLE:
+            try:
+                data = MongoStore.get('production_timers', 'timers')
+                return data.get('timers', {})
+            except Exception:
+                pass
         if not self.FILE_PATH.exists(): return {}
         try:
             with open(self.FILE_PATH, 'r') as f: return json.load(f)
         except: return {}
 
     def _save(self):
-        """Salva o estado atual. Se o servidor cair, o arquivo .json estará seguro."""
+        """Salva no MongoDB (principal) e arquivo (fallback)."""
+        if MONGO_AVAILABLE:
+            try:
+                MongoStore.set('production_timers', {'timers': self.timers}, 'timers')
+                return
+            except Exception as e:
+                logger.error(f"Erro ao salvar timers no MongoDB: {e}")
+        # Fallback arquivo
         temp_file = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.timers, f, indent=4)
-            # A operação de renomear é atômica no sistema operativo
             shutil.move(str(temp_file), str(self.FILE_PATH))
         except Exception as e:
-            logger.error(f"Erro ao salvar timers: {e}")
+            logger.error(f"Erro ao salvar timers em arquivo: {e}")
 
     def _auto_pause_on_restart(self):
         """Se o servidor cair, pausa os timers para não contar tempo falso e salva o tempo decorrido."""
@@ -1190,32 +1339,43 @@ class ProductionTimer:
         return active
 
     def _add_to_history(self, registro):
-        """Salva no histórico mensal (Lista de eventos, não apenas soma)."""
+        """Salva no histórico mensal — MongoDB principal, arquivo fallback."""
+        mes_chave = datetime.now().strftime('%Y-%m')
+        if MONGO_AVAILABLE:
+            try:
+                _mongo_db['production_history'].update_one(
+                    {'_id': mes_chave},
+                    {'$push': {'registros': registro}},
+                    upsert=True
+                )
+                return
+            except Exception as e:
+                logger.error(f"Erro ao salvar histórico no MongoDB: {e}")
+        # Fallback arquivo
         try:
             if self.HISTORY_PATH.exists():
                 with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
             else: history = {}
-            
-            mes_chave = datetime.now().strftime('%Y-%m')
-            
             if mes_chave not in history: history[mes_chave] = []
-            
-            # Adiciona o registro à lista do mês
             history[mes_chave].append(registro)
-            
-            # Salva atomicamente
             temp = self.HISTORY_PATH.with_suffix('.tmp')
             with open(temp, 'w') as f: json.dump(history, f)
             shutil.move(str(temp), str(self.HISTORY_PATH))
         except Exception as e:
-            print(f"Erro ao salvar histórico: {e}")
+            logger.error(f"Erro ao salvar histórico em arquivo: {e}")
 
     def get_monthly_history_details(self):
-        """Retorna a lista detalhada do mês atual."""
+        """Retorna a lista detalhada do mês atual — MongoDB ou arquivo."""
+        mes_chave = datetime.now().strftime('%Y-%m')
+        if MONGO_AVAILABLE:
+            try:
+                doc = _mongo_db['production_history'].find_one({'_id': mes_chave})
+                return (doc or {}).get('registros', [])
+            except Exception:
+                pass
         if not self.HISTORY_PATH.exists(): return []
         try:
             with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
-            mes_chave = datetime.now().strftime('%Y-%m')
             return history.get(mes_chave, [])
         except: return []
 
@@ -1234,6 +1394,12 @@ class ComponentConsumptionManager:
         return datetime.now().strftime('%Y-%m')
 
     def _load(self):
+        if MONGO_AVAILABLE:
+            try:
+                doc = MongoStore.get('component_consumption', 'main')
+                return doc.get('data', {})
+            except Exception:
+                pass
         if not self.FILE_PATH.exists():
             return {}
         try:
@@ -1243,13 +1409,19 @@ class ComponentConsumptionManager:
             return {}
 
     def _save(self):
+        if MONGO_AVAILABLE:
+            try:
+                MongoStore.set('component_consumption', {'data': self.data}, 'main')
+                return
+            except Exception as e:
+                logger.error(f"Erro ao salvar consumo no MongoDB: {e}")
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
             shutil.move(str(temp), str(self.FILE_PATH))
         except Exception as e:
-            logger.error(f"Erro ao salvar consumo: {e}")
+            logger.error(f"Erro ao salvar consumo em arquivo: {e}")
 
     def _ensure_current_month(self):
         """Garante que existe a estrutura para o mês atual."""
@@ -1334,7 +1506,7 @@ class ComponentConsumptionManager:
 class PendingOrdersManager:
     """
     Gerencia pedidos do Bling que chegaram e estão aguardando produção.
-    Persiste em disco — sobrevive a reinícios do servidor.
+    Persiste no MongoDB (principal) ou arquivo (fallback).
     """
     FILE_PATH = DATA_DIR / 'pending_orders.json'
 
@@ -1342,6 +1514,11 @@ class PendingOrdersManager:
         self.data = self._load()
 
     def _load(self):
+        if MONGO_AVAILABLE:
+            try:
+                return MongoStore.get_all('pending_orders')
+            except Exception:
+                pass
         if not self.FILE_PATH.exists():
             return {}
         try:
@@ -1351,13 +1528,21 @@ class PendingOrdersManager:
             return {}
 
     def _save(self):
+        if MONGO_AVAILABLE:
+            try:
+                # Cada item da fila é um documento separado no MongoDB
+                for key, val in self.data.items():
+                    MongoStore.upsert('pending_orders', key, val)
+                return
+            except Exception as e:
+                logger.error(f"Erro ao salvar pending_orders no MongoDB: {e}")
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
             shutil.move(str(temp), str(self.FILE_PATH))
         except Exception as e:
-            logger.error(f"Erro ao salvar pedidos pendentes: {e}")
+            logger.error(f"Erro ao salvar pedidos pendentes em arquivo: {e}")
 
     def add_order_item(self, order_id: str, item_key: str, item_data: dict):
         """Adiciona um item de pedido à fila de espera."""
@@ -1393,7 +1578,13 @@ class PendingOrdersManager:
         """Remove item da fila."""
         if item_key in self.data:
             del self.data[item_key]
-            self._save()
+            if MONGO_AVAILABLE:
+                try:
+                    MongoStore.remove('pending_orders', item_key)
+                except Exception:
+                    pass
+            else:
+                self._save()
 
     def get_waiting(self):
         """Retorna todos os itens aguardando produção."""
@@ -2470,6 +2661,14 @@ class WebServer:
             all_list = [normalize_for_api(p) for p in kits + products]
             return jsonify(all_list)
 
+
+        @self.app.route('/api/mongo-status')
+        def api_mongo_status():
+            """Retorna status da conexão MongoDB."""
+            return jsonify({
+                'mongodb_available': MONGO_AVAILABLE,
+                'storage_backend': 'MongoDB' if MONGO_AVAILABLE else 'Arquivo Local (efêmero)'
+            })
 
         @self.app.route('/_health')
         def health_check():
