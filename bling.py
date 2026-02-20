@@ -57,7 +57,7 @@ except ImportError:
 try:
     from pymongo import MongoClient
     from pymongo.errors import PyMongoError
-    _MONGO_URI = os.environ.get('MONGODB_URI', '')
+    _MONGO_URI = os.environ.get('MONGODB_URI', '') or os.environ.get('MONGO_URI', '')
     if _MONGO_URI:
         _mongo_client = MongoClient(_MONGO_URI, serverSelectionTimeoutMS=5000)
         _mongo_db = _mongo_client.get_database('sw_moveis')
@@ -223,55 +223,18 @@ kpi_update_lock = Lock()
 # 1. LOGS AVANÇADOS
 # ============================================================================
 
+# InMemoryLogHandler removido — logs em tempo real não são mais usados no frontend.
+
 class InMemoryLogHandler(logging.Handler):
-    """Handler de log que armazena os registros em memória para o WebSocket."""
-    def __init__(self, max_logs=50):  # ✅ Reduz de 100 para 50
+    """Stub mínimo mantido para não quebrar referências existentes."""
+    def __init__(self, max_logs=50):
         super().__init__()
         self.logs = []
         self.max_logs = max_logs
-        self.formatter = logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%dT%H:%M:%S'
-        )
-        # ✅ ADICIONE: Lista de callbacks ativos
         self.ws_callbacks = []
         self.ws_lock = Lock()
-        
-    def emit(self, record):
-        try:
-            log_entry = {
-                'timestamp': self.formatter.formatTime(record),
-                'level': record.levelname,
-                'message': self.format(record),
-                'name': record.name
-            }
-            self.logs.append(log_entry)
-            if len(self.logs) > self.max_logs:
-                self.logs.pop(0)
-            
-            # ✅ ADICIONE: Notifica todos os WebSockets ativos
-            with self.ws_lock:
-                dead_callbacks = []
-                for cb in self.ws_callbacks:
-                    try:
-                        cb(log_entry)
-                    except Exception:
-                        logger.exception("Erro ao notificar callback WebSocket")
-                        dead_callbacks.append(cb)
-                
-                # Remove callbacks mortos
-                for cb in dead_callbacks:
-                    self.ws_callbacks.remove(cb)
-
-        except Exception:
-            self.handleError(record)
-    
-    def get_logs(self, limit: Optional[int] = None) -> List[Dict[str, str]]:
-        if limit:
-            return self.logs[-limit:]
-        return self.logs.copy()
-        
-    # ✅ ADICIONE: Métodos para gerenciar callbacks
+    def emit(self, record): pass
+    def get_logs(self, limit=None): return []
     def add_ws_callback(self, callback):
         with self.ws_lock:
             self.ws_callbacks.append(callback)
@@ -1567,10 +1530,11 @@ class PendingOrdersManager:
         return self.data.get(item_key)
 
     def finish_production(self, item_key: str):
-        """Move item para status 'done'."""
+        """Move item para status 'done' — persiste no MongoDB para não sumir ao reiniciar."""
         if item_key in self.data:
             self.data[item_key]['status'] = 'done'
             self.data[item_key]['finished_at'] = datetime.now().isoformat()
+            self.data[item_key]['mes_conclusao'] = datetime.now().strftime('%Y-%m')
             self._save()
         return self.data.get(item_key)
 
@@ -1594,24 +1558,72 @@ class PendingOrdersManager:
         """Retorna todos os itens em produção."""
         return [v for v in self.data.values() if v.get('status') == 'in_production']
 
+    def get_done(self):
+        """Retorna todos os itens concluídos este mês."""
+        return [v for v in self.data.values() if v.get('status') == 'done']
+
     def get_all(self):
         return list(self.data.values())
 
+    def reset_if_new_month(self):
+        """
+        Todo início de mês remove itens 'done' e 'waiting' do mês anterior.
+        Itens em produção (in_production) são pausados para não se perder.
+        """
+        agora = datetime.now()
+        mes_atual = f"{agora.year}-{agora.month:02d}"
+        to_remove = []
+        for key, item in self.data.items():
+            added = item.get('added_at', '')
+            if not added:
+                continue
+            try:
+                dt = datetime.fromisoformat(added)
+                item_mes = f"{dt.year}-{dt.month:02d}"
+                if item_mes != mes_atual and item.get('status') in ('done', 'waiting'):
+                    to_remove.append(key)
+            except Exception:
+                pass
+        if to_remove:
+            for key in to_remove:
+                del self.data[key]
+                if MONGO_AVAILABLE:
+                    try:
+                        MongoStore.remove('pending_orders', key)
+                    except Exception:
+                        pass
+            if to_remove and not MONGO_AVAILABLE:
+                self._save()
+            logger.info(f"🗓️ Reset mensal: {len(to_remove)} itens antigos removidos da fila.")
+        return len(to_remove)
+
     def sync_from_orders(self, orders: list, products_cache: dict):
         """
-        Sincroniza pedidos faturados do Bling com a fila de pendentes.
-        Correlaciona produtos do pedido com o cache para extrair base/cor/nome.
-        Apenas adiciona novos — não sobrescreve itens já existentes.
-        
-        IMPORTANTE: A API Bling V3 na listagem /pedidos/vendas pode não trazer 'itens'.
-        Se um pedido não tiver itens, ele é ignorado (serão buscados individualmente via
-        sync_pending_with_api chamado pelo worker).
+        Sincroniza pedidos do Bling com a fila — apenas pedidos do mês atual.
+        Itens concluídos (status=done) são mantidos como histórico mas não re-adicionados.
         """
         added = 0
+        agora = datetime.now()
+        mes_atual = agora.month
+        ano_atual = agora.year
+
         for pedido in orders:
             order_id = str(pedido.get('id', ''))
             if not order_id:
                 continue
+
+            # ── Filtro: apenas pedidos do mês atual ─────────────────────────
+            data_str = pedido.get('data') or pedido.get('dataEmissao') or ''
+            if data_str:
+                try:
+                    data_limpa = str(data_str).split(' ')[0].split('T')[0]
+                    dt = (datetime.strptime(data_limpa, '%Y-%m-%d') if '-' in data_limpa
+                          else datetime.strptime(data_limpa, '%d/%m/%Y'))
+                    if dt.month != mes_atual or dt.year != ano_atual:
+                        continue  # Ignora pedidos de outros meses
+                except Exception:
+                    pass  # Se não conseguir parsear a data, deixa passar
+
             itens = pedido.get('itens', [])
             if not itens:
                 continue  # sem itens na listagem — será buscado individualmente
@@ -1681,6 +1693,13 @@ class PendingOrdersManager:
 production_timer = ProductionTimer()
 component_consumption = ComponentConsumptionManager()
 pending_orders = PendingOrdersManager()
+# Reset mensal ao iniciar — remove itens antigos concluídos/em espera
+try:
+    _removed = pending_orders.reset_if_new_month()
+    if _removed:
+        logger.info(f"♻️ Início: {_removed} itens antigos removidos da fila de produção.")
+except Exception as _e:
+    logger.warning(f"reset_if_new_month falhou: {_e}")
 
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
@@ -2527,10 +2546,11 @@ class WebServer:
 
         @self.app.route('/api/pending-orders')
         def api_pending_orders():
-            """Retorna pedidos do Bling aguardando produção, em produção e concluídos."""
+            """Retorna pedidos: aguardando, em produção e concluídos do mês."""
             return jsonify({
                 'waiting': pending_orders.get_waiting(),
                 'in_production': pending_orders.get_in_production(),
+                'done': pending_orders.get_done(),
                 'all': pending_orders.get_all()
             })
 
@@ -2577,6 +2597,9 @@ class WebServer:
         def api_pending_orders_sync(token):
             """Força sincronização imediata dos pedidos do Bling com a fila pendente."""
             try:
+                # Reset mensal antes de sincronizar
+                pending_orders.reset_if_new_month()
+
                 with self.orchestrator._cache_lock:
                     cache_flat = {**self.orchestrator._products_cache, **self.orchestrator._kits_cache}
                 orders = self.orchestrator.sales._sales_history or []
@@ -2891,43 +2914,8 @@ class WebServer:
     def _setup_websockets(self):
         """Configura os WebSockets para logs e atualizações de KPI."""
         
-        @self.sock.route('/ws/logs')
-        def ws_logs(ws):
-            self.logger.info("📡 WebSocket logs conectado.")
-            
-            # ✅ Limite de callbacks para evitar DoS acidental
-            if len(memory_handler.ws_callbacks) >= 10:
-                self.logger.warning("Limite de 10 conexões de log WS atingido. Conexão recusada.")
-                return
+        # /ws/logs removido — logs em tempo real não são mais usados.
 
-            # ✅ Callback seguro para este WebSocket específico
-            def ws_callback(log_entry):
-                try:
-                    ws.send(json.dumps({"logs": [log_entry]}))
-                except ConnectionClosed:
-                    raise  # Propaga para remoção automática
-                except Exception as e:
-                    self.logger.exception("Erro enviando log via WS.")
-                    raise ConnectionClosed() # Força desconexão
-            
-            try:
-                # Envia logs históricos
-                ws.send(json.dumps({"logs": memory_handler.get_logs()}))
-                
-                # ✅ Registra callback
-                memory_handler.add_ws_callback(ws_callback)
-                
-                while True:
-                    # Mantém a conexão aberta, esperando por mensagens (pode ser um ping/pong)
-                    ws.receive(timeout=60) 
-            except ConnectionClosed:
-                pass
-            finally:
-                # ✅ Remove callback ao desconectar
-                memory_handler.remove_ws_callback(ws_callback)
-                self.logger.debug("WebSocket logs desconectado")
-
-        
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
             self.logger.info("📡 WebSocket KPI conectado.")
@@ -3183,7 +3171,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /* ✅ DESIGN: Log Box */
-        .log-box {
+        /* .log-box removido — logs em tempo real desativados */
+        ._log_box_unused {
             font-family: 'Fira Code', monospace;
             font-size: 0.8rem;
             background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
@@ -3638,19 +3627,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- ✅ DESIGN: Logs em Tempo Real -->
-        <div class="row mb-5">
-            <div class="col-12">
-                <div class="card">
-                    <div class="card-header">
-                        <h5 class="mb-0">📋 Logs em Tempo Real</h5>
-                    </div>
-                    <div class="card-body p-0">
-                        <div id="logs-content" class="log-box"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
+        <!-- Logs em tempo real removidos -->
 
         <!-- ✅ DESIGN: Tabs com Navegação -->
         <div class="row">
@@ -3877,11 +3854,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        /* ✅ DESIGN: Formatação de Logs */
-        function formatLog(log) {
-            const levelClass = `log-level-${log.level}`;
-            return `<div class="log-entry ${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
-        }
+        // formatLog removido — logs em tempo real desativados
 
         /* ✅ DESIGN: Formatação de Data/Hora */
         function formatDateTime(isoString) {
@@ -3901,17 +3874,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: WebSocket Logs */
-        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
-        ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            const box = document.getElementById('logs-content');
-            if(data.logs) {
-                data.logs.forEach(l => box.innerHTML += formatLog(l));
-                box.scrollTop = box.scrollHeight;
-            }
-        }
+        // WebSocket de logs removido — não mais necessário
 
         /* ✅ DESIGN: Atualizar Status de Autenticação */
         function updateAuthStatus(authenticated, authUrl) {
@@ -4245,6 +4208,27 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </td>
                     </tr>`;
                 });
+
+                // Itens concluídos do mês
+                const done = data.done || [];
+                if (done.length > 0) {
+                    html += `</tbody></table></div>`;
+                    html += `<div class="px-3 pt-3 pb-1"><small class="fw-bold text-success">✅ Concluídos este mês (${done.length})</small></div>`;
+                    html += `<div class="table-responsive"><table class="table table-sm align-middle mb-0"><tbody>`;
+                    done.slice().reverse().forEach(item => {
+                        const nomeSafe = (item.nome || item.nome_original || 'N/D').replace(/'/g, '&#39;');
+                        const finishedAt = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                        html += `<tr class="table-success">
+                            <td class="ps-3 fw-bold text-success">${nomeSafe}</td>
+                            <td class="text-muted small">${item.base || '—'}</td>
+                            <td class="text-muted small">${item.cor || '—'}</td>
+                            <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
+                            <td class="text-muted small">${item.cliente || '—'}</td>
+                            <td class="text-center"><span class="badge bg-success">✅ Concluído</span><br><small class="text-muted">${finishedAt}</small></td>
+                        </tr>`;
+                    });
+                }
+
                 html += '</tbody></table></div>';
                 div.innerHTML = html;
             } catch(e) {
