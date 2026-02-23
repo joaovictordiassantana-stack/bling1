@@ -316,7 +316,7 @@ def setup_logging():
     # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
     
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)  # DEBUG temporário para investigação
     # ✅ Suprime logs repetitivos
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('flask_sock').setLevel(logging.WARNING)
@@ -1222,10 +1222,10 @@ class ProductionTimer:
     def __init__(self):
         self.timers = self._load()
         self._auto_pause_on_restart()
-        # Lança background_savers para TODOS os timers existentes (running ou paused)
-        # para garantir persistência contínua
-        for nome in list(self.timers.keys()):
-            self._launch_background_saver(nome)
+        # Relança background_savers para qualquer timer que ainda esteja running
+        for nome, t in self.timers.items():
+            if t.get('state') == 'running':
+                self._launch_background_saver(nome)
 
     def _load(self):
         # Tenta MongoDB primeiro, fallback para arquivo
@@ -1298,20 +1298,19 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def _launch_background_saver(self, nome):
-        """Thread que faz checkpoint do timer a cada 30s enquanto ele existir.
-        Salva mesmo se pausado — garante persistência total em caso de queda."""
+        """Lança thread que salva progresso a cada 30s (sobrevive a qualquer estado)."""
         def background_saver():
             while True:
                 time.sleep(30)
                 if nome not in self.timers:
-                    break  # Timer removido (finalizado/zerado) — encerra thread
+                    break
                 t = self.timers[nome]
-                # Se running, faz checkpoint (acumula tempo parcial)
-                if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
-                    now_ts = time.time()
-                    elapsed = now_ts - t['start_ts']
-                    t['accumulated'] = t.get('accumulated', 0) + elapsed
-                    t['start_ts'] = now_ts
+                if t.get('state') != 'running':
+                    break
+                now_ts = time.time()
+                elapsed = now_ts - t.get('start_ts', now_ts)
+                t['accumulated'] = t.get('accumulated', 0) + elapsed
+                t['start_ts'] = now_ts
                 try:
                     self._save()
                 except Exception as e:
@@ -1329,29 +1328,27 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def stop_and_log(self, produto_nome):
-        """Finaliza produção: pausa timer, registra componentes e salva histórico."""
-        # Pausa o timer para calcular tempo total (se existir)
-        if produto_nome in self.timers:
-            status = self.pause(produto_nome)
-            total_seconds = status['elapsed']
-            checklist_marcado = self.timers[produto_nome].get('checklist', {})
-        else:
-            # Timer não existe (produto concluído direto do board sem abrir modal)
-            total_seconds = 0
-            checklist_marcado = {}
+        """Finaliza produção — salva histórico, auto-registra todos os componentes RECIPE."""
+        status = self.pause(produto_nome)
+        total_seconds = status['elapsed']
 
-        # Registra componentes da receita que NÃO foram marcados manualmente no checklist
+        # Checklist salva no timer (o que foi marcado manualmente)
+        checklist_marcado = {}
+        if produto_nome in self.timers:
+            checklist_marcado = self.timers[produto_nome].get('checklist', {})
+
+        # Auto-registra componentes ainda NÃO marcados (se for cadeira)
         if 'CADEIRA' in produto_nome.upper():
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
                 if not checklist_marcado.get(nome_comp, False):
+                    # Não foi marcado manualmente — registra automaticamente
                     try:
                         component_consumption.register_component(
                             nome_comp, comp['qtd'], comp['un'], produto_nome
                         )
                     except Exception as e:
-                        logger.error(f"Auto-registro componente '{nome_comp}': {e}")
-            logger.info(f"✅ Componentes registrados para '{produto_nome}'")
+                        logger.error(f"Auto-registro componente {nome_comp}: {e}")
 
         registro = {
             "produto": produto_nome,
@@ -1363,12 +1360,11 @@ class ProductionTimer:
 
         self._add_to_history(registro)
 
-        # Remove timer da memória
         if produto_nome in self.timers:
             del self.timers[produto_nome]
             self._save()
 
-        return {'elapsed': total_seconds, 'state': 'finished', 'registro': registro}
+        return {'elapsed': 0, 'state': 'finished', 'registro': registro}
 
     def reset(self, produto_nome):
         if produto_nome in self.timers:
@@ -1567,6 +1563,69 @@ class ComponentConsumptionManager:
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
 
 
+# ── Helpers de extração de base/cor ──────────────────────────────────────────
+
+# Palavras-chave que indicam tipo de BASE
+_BASE_KEYWORDS = [
+    'BASE QUADRADA', 'BASE REDONDA', 'BASE ESTRELA', 'BASE CROMADA',
+    'BASE PRETA', 'BASE ALUMINIO', 'BASE ALUMÍNIO', 'BASE FIXA',
+    'BASE GIRATÓRIA', 'BASE GIRATORIA', 'BASE MADEIRA', 'BASE',
+]
+# Palavras-chave de COR/MATERIAL (ordem importa: mais específicas primeiro)
+_COR_KEYWORDS = [
+    'COURVIM PRETO', 'COURVIM BRANCO', 'COURVIM CARAMELO', 'COURVIM',
+    'VELUDO PRETO', 'VELUDO CINZA', 'VELUDO AZUL', 'VELUDO VERDE',
+    'VELUDO ROSA', 'VELUDO BEGE', 'VELUDO',
+    'LINHO BEGE', 'LINHO CINZA', 'LINHO PRETO', 'LINHO',
+    'TECIDO PRETO', 'TECIDO CINZA', 'TECIDO BEGE', 'TECIDO',
+    'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO', 'MARROM',
+    'AZUL', 'VERDE', 'ROSA', 'AMARELO', 'LARANJA', 'VINHO', 'CREME',
+]
+
+def _extract_base_cor(nome: str):
+    """Extrai base e cor do nome do produto.
+    Suporta padrão "PRODUTO - BASE X - COR Y" ou busca por keywords no nome.
+    Retorna (base, cor) como strings, vazias se não encontrado.
+    """
+    nome_up = nome.upper()
+    base = ''
+    cor = ''
+
+    # Tenta separar pelas partes (separador " - " ou " / ")
+    sep = ' - ' if ' - ' in nome else (' / ' if ' / ' in nome else None)
+    if sep:
+        partes = [p.strip() for p in nome.split(sep)]
+        for parte in partes:
+            pu = parte.upper()
+            if not base and 'BASE' in pu:
+                base = parte
+            elif not cor and any(k in pu for k in ['COR', 'TECIDO', 'COURVIM', 'LINHO', 'VELUDO',
+                                                    'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO',
+                                                    'MARROM', 'AZUL', 'VERDE', 'ROSA', 'AMARELO',
+                                                    'LARANJA', 'VINHO', 'CREME']):
+                cor = parte
+
+    # Se não encontrou pelo separador, busca por keywords no nome inteiro
+    if not base:
+        for kw in _BASE_KEYWORDS:
+            if kw in nome_up:
+                # Extrai o trecho relevante
+                idx = nome_up.find(kw)
+                trecho = nome[idx:idx + len(kw) + 20].split(' - ')[0].split(' / ')[0].strip()
+                base = trecho
+                break
+
+    if not cor:
+        for kw in _COR_KEYWORDS:
+            if kw in nome_up:
+                idx = nome_up.find(kw)
+                trecho = nome[idx:idx + len(kw) + 20].split(' - ')[0].split(' / ')[0].strip()
+                cor = trecho
+                break
+
+    return base, cor
+
+
 class PendingOrdersManager:
     """
     Gerencia pedidos do Bling que chegaram e estão aguardando produção.
@@ -1694,8 +1753,7 @@ class PendingOrdersManager:
             try:
                 dt = datetime.fromisoformat(added)
                 item_mes = f"{dt.year}-{dt.month:02d}"
-                # Limpa tudo do mês anterior — fresh start todo início de mês
-                if item_mes != mes_atual:
+                if item_mes != mes_atual and item.get('status') in ('done', 'waiting'):
                     to_remove.append(key)
             except Exception:
                 pass
@@ -1757,16 +1815,8 @@ class PendingOrdersManager:
                 nome_produto = produto_cache['nome'] if produto_cache else nome_raw
                 imagem = (produto_cache or {}).get('imagem', '')
 
-                # Extrai base/cor do nome (padrão: "CADEIRA X - BASE Y - COR Z")
-                partes = nome_produto.split(' - ') if ' - ' in nome_produto else [nome_produto]
-                base = ''
-                cor = ''
-                for parte in partes:
-                    pu = parte.strip().upper()
-                    if 'BASE' in pu:
-                        base = parte.strip()
-                    elif any(x in pu for x in ['COR', 'TECIDO', 'COURVIM', 'LINHO', 'VELUDO']):
-                        cor = parte.strip()
+                # Extrai base e cor do nome do produto (suporta separadores " - " e " / ")
+                base, cor = _extract_base_cor(nome_produto)
 
                 cliente = ''
                 contato = pedido.get('contato')
@@ -1799,9 +1849,8 @@ class PendingOrdersManager:
                         added += 1
 
         if added > 0:
-            if not MONGO_AVAILABLE:
-                self._save()  # fallback: salva arquivo completo
-            logger.info(f"✅ PendingOrders: {added} novos itens adicionados à fila.")
+            self._save()
+            logger.info(f"✅ PendingOrders: {added} itens novos adicionados à fila de espera.")
         return added
 
 
@@ -2031,12 +2080,12 @@ class Orchestrator:
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
-        self.logger.debug(f"process_sales_orders chamado (force={force})")
+        self.logger.debug(f'process_sales_orders chamado (force={force})')
         
         # Evita recálculos encavalados
         with self.sales.recalculation_lock:
             if self.sales._recalculation_running and not force:
-                self.logger.debug("Recálculo já em execução, ignorando.")
+                self.logger.debug(f'Recálculo já em execução, ignorando.')
                 return
             self.sales._recalculation_running = True
             
@@ -2046,9 +2095,8 @@ class Orchestrator:
                 return
                 
             now = datetime.now()
-            # Sempre busca a partir do dia 1º do MÊS ATUAL (dinâmico — funciona em qualquer mês)
             start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            self.logger.info(f"Buscando pedidos de {start_date.strftime('%d/%m/%Y')} a {now.strftime('%d/%m/%Y')}...")
+            self.logger.info(f"Buscando pedidos: {start_date.strftime('%d/%m/%Y')} → {now.strftime('%d/%m/%Y')}")
             
             # Parâmetros compatíveis
             # Busca Janela Móvel (Últimos 30 dias)
@@ -2064,15 +2112,15 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
-                self.logger.debug(f"Buscando página {page} de pedidos...")
+                self.logger.debug(f'Buscando página {page} de pedidos...')
                 try:
                     response = self.api.get('pedidos/vendas', params=params)
                 except Exception as e:
-                    self.logger.error(f"Erro na API ao buscar pedidos: {e}")
+                    self.logger.error(f'Erro na API ao buscar pedidos: {e}')
                     break # Se der erro na API, para o loop mas processa o que já pegou
                 
                 if response is None:
-                    self.logger.debug(f"Resposta da API nula na página {page}")
+                    self.logger.debug(f'Resposta da API nula na página {page}')
                     break
     
                 # --- CORREÇÃO DE LEITURA (PARSING) ---
@@ -2092,7 +2140,7 @@ class Orchestrator:
                     data = response
                 # -------------------------------------
                 
-                self.logger.debug(f"Página {page} retornou {len(data) if data else 0} pedidos.")
+                self.logger.debug(f'Página {page} retornou {len(data) if data else 0} pedidos.')
                 
                 if not data:
                     break
@@ -2124,7 +2172,7 @@ class Orchestrator:
                     if o.get('id'):
                         valid_orders.append(o)
 
-                self.logger.debug(f"{len(valid_orders)} pedidos válidos após normalização inicial.")
+                self.logger.debug(f'{len(valid_orders)} pedidos válidos após normalização inicial.')
                 # 1. Substitui o histórico de vendas pelo resultado da busca (Reset Mensal)
                 self.sales._sales_history = valid_orders
                 
@@ -2275,11 +2323,11 @@ class Orchestrator:
         A API Bling V3 na listagem não retorna itens — só no endpoint individual.
         Chamado em thread separada para não bloquear o worker principal.
         """
-        # Considera apenas pedidos do mês atual com status waiting/in_production
+        # Pedidos que já têm pelo menos 1 item na fila (qualquer status)
+        # Evita duplicar itens de pedidos já processados
         already_have = {
             v.get('order_id')
             for v in pending_orders.data.values()
-            if v.get('status') in ('waiting', 'in_production')
         }
         agora_fetch = datetime.now()
         orders_mes = []
@@ -3073,18 +3121,18 @@ class WebServer:
             with WebServer.webhook_lock:
                 try:
                     # Log de entrada bruta para diagnóstico
-                    self.logger.debug(f"Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
-                    self.logger.debug(f"Headers do Webhook: {dict(request.headers)}")
+                    self.logger.debug(f'Webhook bruto recebido: {request.data.decode('utf-8')[:500]}')
+                    self.logger.debug(f'Headers do Webhook: {dict(request.headers)}')
 
                     # 1. Validação de Assinatura (Mantenha se configurado no Render)
                     signature = request.headers.get("X-Bling-Signature-256")
                     if self.config.WEBHOOK_SECRET and not signature:
-                        self.logger.warning("Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
+                        self.logger.warning(f'Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.')
                         return jsonify({"status": "forbidden", "reason": "missing signature"}), 403
 
                     data = request.json
                     if not data:
-                        self.logger.debug("Webhook ignorado: JSON vazio ou inválido.")
+                        self.logger.debug(f'Webhook ignorado: JSON vazio ou inválido.')
                         return jsonify({"status": "ignored"}), 200
 
                     self.logger.info(f"⚡ Webhook recebido: {str(data)[:200]}")
@@ -3094,22 +3142,22 @@ class WebServer:
 
                     # Caso 1: Webhook V3 Padrão (vem "id", "situacao", "tipo" na raiz)
                     if 'situacao' in data and 'id' in data:
-                        self.logger.debug(f"Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
+                        self.logger.debug(f'Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})')
                         should_update = True
                     
                     # Caso 2: Tipo explícito
                     elif data.get('tipo') == 'pedidoVenda':
-                        self.logger.debug("Webhook tipo pedidoVenda detectado.")
+                        self.logger.debug(f'Webhook tipo pedidoVenda detectado.')
                         should_update = True
 
                     # Caso 3: Formato antigo (V2)
                     elif 'retorno' in data and 'pedidos' in data['retorno']:
-                        self.logger.debug("Webhook V2 detectado.")
+                        self.logger.debug(f'Webhook V2 detectado.')
                         should_update = True
                     
                     # Caso 4: Callbacks de teste
                     elif data.get('test') == True:
-                        self.logger.debug("Webhook de teste recebido.")
+                        self.logger.debug(f'Webhook de teste recebido.')
                         return jsonify({"status": "ok", "message": "Test received"}), 200
 
                     if should_update:
@@ -4002,6 +4050,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         </div>
 
+                        <!-- ═══ PRODUTOS VENDIDOS NO MÊS ═══ -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header" style="background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);">
+                                <h5 class="mb-0">🛒 Produtos Vendidos (Mês Atual)</h5>
+                                <small class="text-white-50">Pedidos faturados no Bling este mês</small>
+                            </div>
+                            <div class="card-body p-0" id="monthly-sales-section">
+                                <div class="text-center py-4 text-muted">⏳ Aguardando dados...</div>
+                            </div>
+                        </div>
+
                         <!-- ═══ HISTÓRICO DE FINALIZAÇÕES ═══ -->
                         <div class="card border-0 shadow-sm">
                             <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%);">
@@ -4517,29 +4576,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             let html = '';
 
             // ── Em Espera ───────────────────────────────────────────────
-            html += `<div class="border-bottom px-3 py-2" style="background:#fef3c7;">
-                <small class="fw-bold text-warning-emphasis">⏳ EM ESPERA (${waiting.length})</small>
-            </div>`;
             if (waiting.length === 0) {
                 html += `<div class="text-center py-3 text-muted"><small>Nenhum pedido em espera. Clique em 🔄 Sincronizar Bling.</small></div>`;
             } else {
                 html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
                     <thead style="background:#fef9c3;"><tr>
-                        <th class="ps-3">Produto</th><th>Base</th><th>Cor/Tecido</th>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
                         <th>Pedido Nº</th><th>Cliente</th><th class="text-center">Ação</th>
                     </tr></thead><tbody>`;
                 waiting.forEach(item => {
-                    const img = item.imagem ? `<img src="${item.imagem}" style="width:32px;height:32px;object-fit:contain;border-radius:4px;margin-right:6px;" onerror="this.style.display='none'">` : '';
-                    const nome = (item.nome || item.nome_original || 'N/D').replace(/'/g,"&#39;");
+                    const rawNome = item.nome || item.nome_original || 'N/D';
+                    const nome = rawNome.replace(/'/g,"&#39;");
+                    const img = item.imagem
+                        ? `<img src="${item.imagem}" alt="" style="width:42px;height:42px;object-fit:contain;border-radius:6px;margin-right:8px;border:1px solid #e5e7eb;vertical-align:middle;" onerror="this.style.display='none'">`
+                        : '';
                     html += `<tr>
-                        <td class="ps-3 fw-bold">${img}${nome}</td>
+                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${img}<span style="vertical-align:middle;">${nome}</span></td>
                         <td class="text-muted small">${item.base || '—'}</td>
                         <td class="text-muted small">${item.cor || '—'}</td>
                         <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
                         <td class="text-muted small">${item.cliente || '—'}</td>
                         <td class="text-center">
                             <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
-                                onclick="startPendingOrder('${item.item_key}', encodeURIComponent('${nome}'))">▶ Produzir</button>
+                                data-key="${item.item_key}"
+                                data-nome="${(item.nome || item.nome_original || 'N/D').replace(/"/g,'&quot;')}"
+                                onclick="startPendingOrder(this.dataset.key, this.dataset.nome)">▶ Produzir</button>
                             <button class="btn btn-xs btn-outline-secondary btn-sm"
                                 onclick="dismissPendingOrder('${item.item_key}')">✕</button>
                         </td>
@@ -4558,7 +4619,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } else {
                 html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
                     <thead style="background:#f0fdf4;"><tr>
-                        <th class="ps-3">Produto</th><th>Base</th><th>Cor/Tecido</th>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
                         <th class="text-center">⏱ Tempo</th><th class="text-center">Status</th>
                         <th class="text-center">Checklist</th><th class="text-center">Ação</th>
                     </tr></thead><tbody>`;
@@ -4642,18 +4703,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }, 1000);
         }
 
-        async function startPendingOrder(itemKey, produtoNomeEncoded) {
-            const produtoNome = decodeURIComponent(produtoNomeEncoded);
+        async function startPendingOrder(itemKey, produtoNome) {
+            if (!itemKey || !produtoNome) { showToast('Erro', 'Dados inválidos', 'danger'); return; }
             try {
-                await fetch('/api/pending-orders/start', {
+                const res = await fetch('/api/pending-orders/start', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
                 });
-                showToast('Sucesso', `Produção iniciada: ${produtoNome}`, 'success');
-                openProductionChecklist(produtoNome);
+                if (!res.ok) throw new Error('Falha no servidor');
+                showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
                 await loadProductionBoard();
-            } catch(e) { showToast('Erro', 'Falha ao iniciar produção', 'danger'); }
+                openProductionChecklist(produtoNome);
+            } catch(e) {
+                console.error('startPendingOrder error:', e);
+                showToast('Erro', 'Falha ao iniciar produção', 'danger');
+            }
         }
 
         async function finishBoardItem(itemKey, produtoNome) {
@@ -4683,11 +4748,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function updateComponentUsage(usageData) {
+            if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
             if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
 
         async function refreshComponentTab() {
-            await loadProductionBoard();
+            loadProductionBoard();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
@@ -4698,8 +4764,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             try {
                 const usageData = await fetchAPI('/api/components/usage');
                 if (usageData.history_production) renderProductionHistory(usageData.history_production);
-            } catch(e) { console.error('Erro ao carregar uso de componentes:', e); }
+                if (usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
+            } catch(e) { console.error(e); }
         }
+
+        // renderActiveTimers mantido como stub (o board substituiu)
+        function renderActiveTimers(activeProduction) {}
 
         function renderConsumptionTable(data) {
             const tableSection = document.getElementById('consumption-table-section');
@@ -4727,7 +4797,23 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        // renderMonthlySales removida — guia Produtos Vendidos removida a pedido
+        function renderMonthlySales(produtosVendidos) {
+            const div = document.getElementById('monthly-sales-section');
+            if (!div) return;
+            const entries = Object.entries(produtosVendidos || {}).sort((a, b) => b[1] - a[1]);
+            if (entries.length === 0) {
+                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto vendido registrado este mês.</div>';
+                return;
+            }
+            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead style="background:#f8fafc;"><tr><th class="ps-3">Produto</th><th class="text-center">Qtd Vendida</th><th class="text-center">Insumos Teóricos</th></tr></thead>
+                <tbody>${entries.map(([nome, qtd]) => {
+                    const isCadeira = nome.includes('CADEIRA');
+                    return `<tr><td class="ps-3 fw-bold">${nome}</td>
+                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:white;padding:.4rem .9rem;">${qtd} un</span></td>
+                    <td class="text-center">${isCadeira ? `<button class="btn btn-xs btn-outline-secondary btn-sm" onclick="showTheoreticalUsage('${nome}', ${qtd})">Ver insumos</button>` : '<span class="text-muted small">—</span>'}</td></tr>`;
+                }).join('')}</tbody></table></div>`;
+        }
 
         function renderProductionHistory(history) {
             const div = document.getElementById('production-history-section');
@@ -4746,7 +4832,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-
+        function showTheoreticalUsage(productName, qty) {
+            const lines = RECIPE_CADEIRA.map(item => `<tr><td>${item.nome}</td><td class="text-center fw-bold">${(item.qtd * qty).toFixed(2)}</td><td class="text-muted small">${item.un}</td></tr>`).join('');
+            const html = `<div class="modal fade" id="theoreticalModal" tabindex="-1"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header bg-dark text-white"><h6 class="modal-title">📋 Insumos Teóricos: ${qty}x ${productName}</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body p-0"><table class="table table-sm mb-0"><thead class="table-light"><tr><th>Insumo</th><th class="text-center">Qtd Total</th><th>Un.</th></tr></thead><tbody>${lines}</tbody></table></div></div></div></div>`;
+            const old = document.getElementById('theoreticalModal');
+            if (old) old.remove();
+            document.body.insertAdjacentHTML('beforeend', html);
+            new bootstrap.Modal(document.getElementById('theoreticalModal')).show();
+        }
 
         function formatSeconds(s) {
             s = Math.floor(s || 0);
