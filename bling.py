@@ -316,7 +316,7 @@ def setup_logging():
     # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
     
-    logger.setLevel(logging.DEBUG)  # DEBUG temporário para investigação
+    logger.setLevel(logging.INFO)
     # ✅ Suprime logs repetitivos
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('flask_sock').setLevel(logging.WARNING)
@@ -868,7 +868,7 @@ class AuthManager:
         Recarrega os tokens do disco para a memória.
         Útil após OAuth ou quando outro processo atualizou os tokens.
         """
-        logger.debug("🔄 [DEBUG-AUTH] Recarregando tokens do disco...")
+        logger.debug("🔄 Recarregando tokens do disco...")
         
         try:
             disk_tokens = self._load_tokens()
@@ -877,7 +877,7 @@ class AuthManager:
             self._refresh_token = disk_tokens.get('refresh_token')
             self._expires_at = disk_tokens.get('expires_at', 0)
             
-            logger.debug(f"✅ [DEBUG-AUTH] Tokens recarregados:")
+            logger.debug(f"✅ Tokens recarregados:")
             logger.debug(f"   • Access Token: {'Presente' if self._access_token else 'Ausente'}")
             logger.debug(f"   • Refresh Token: {'Presente' if self._refresh_token else 'Ausente'}")
             logger.debug(f"   • Expira em: {self._expires_at - time.time():.0f}s")
@@ -886,7 +886,7 @@ class AuthManager:
             return True
             
         except Exception as e:
-            logger.error(f"❌ [DEBUG-AUTH] Erro ao recarregar tokens: {str(e)}", exc_info=True)
+            logger.error(f"❌ Erro ao recarregar tokens: {str(e)}", exc_info=True)
             return False
 
     def is_authenticated(self) -> bool:
@@ -1222,10 +1222,9 @@ class ProductionTimer:
     def __init__(self):
         self.timers = self._load()
         self._auto_pause_on_restart()
-        # Relança background_savers para qualquer timer que ainda esteja running
-        for nome, t in self.timers.items():
-            if t.get('state') == 'running':
-                self._launch_background_saver(nome)
+        # Relança background_savers para TODOS os timers (running ou paused) para manter persistência
+        for nome in list(self.timers.keys()):
+            self._launch_background_saver(nome)
 
     def _load(self):
         # Tenta MongoDB primeiro, fallback para arquivo
@@ -1298,19 +1297,21 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def _launch_background_saver(self, nome):
-        """Lança thread que salva progresso a cada 30s (sobrevive a qualquer estado)."""
+        """Lança thread que salva progresso a cada 30s enquanto o timer existir.
+        Persiste tempo acumulado mesmo se o timer for pausado/reiniciado."""
         def background_saver():
             while True:
                 time.sleep(30)
                 if nome not in self.timers:
-                    break
+                    break  # Timer foi removido (finalizado/zerado)
                 t = self.timers[nome]
-                if t.get('state') != 'running':
-                    break
-                now_ts = time.time()
-                elapsed = now_ts - t.get('start_ts', now_ts)
-                t['accumulated'] = t.get('accumulated', 0) + elapsed
-                t['start_ts'] = now_ts
+                state = t.get('state', 'stopped')
+                if state == 'running' and t.get('start_ts', 0) > 0:
+                    # Faz checkpoint: acumula tempo e atualiza start_ts
+                    now_ts = time.time()
+                    elapsed = now_ts - t['start_ts']
+                    t['accumulated'] = t.get('accumulated', 0) + elapsed
+                    t['start_ts'] = now_ts
                 try:
                     self._save()
                 except Exception as e:
@@ -1791,10 +1792,11 @@ class PendingOrdersManager:
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
                         }
+                        self._save_one(sub_key)
                         added += 1
 
-        if added > 0:
-            self._save()
+        if added > 0 and not MONGO_AVAILABLE:
+            self._save()  # Salva arquivo completo apenas no fallback
             logger.info(f"✅ PendingOrders: {added} itens novos adicionados à fila de espera.")
         return added
 
@@ -1921,7 +1923,7 @@ class Orchestrator:
         Útil após OAuth para forçar início imediato do processamento
         sem esperar os 60 segundos de sleep.
         """
-        logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
+        logger.debug("⏰ wake_worker() chamado")
         
         if self._running and self._stop_event:
             logger.info("⏰ Acordando worker (interrompendo sleep)...")
@@ -1952,44 +1954,32 @@ class Orchestrator:
     def _worker_loop(self):
         cycle_count = 0
         
-        logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
+        logger.info("🔄 Worker loop iniciado")
         
         while not self._stop_event.is_set():
             cycle_count += 1
-            
-            logger.debug(f"")
-            logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
+            logger.info(f"🔄 === CICLO #{cycle_count} ===")
             
             # Verifica autenticação antes de tudo
-            logger.debug(f"🔍 [DEBUG-WORKER] Verificando autenticação...")
             is_auth = self.auth.is_authenticated()
-            logger.debug(f"   • is_authenticated() = {is_auth}")
             
             if not is_auth:
-                logger.info(f"⏸️ [DEBUG-WORKER] Ciclo #{cycle_count}: Aguardando autenticação...")
-                logger.debug(f"   • Access Token: {'Presente' if self.auth._access_token else 'Ausente'}")
-                logger.debug(f"   • Refresh Token: {'Presente' if self.auth._refresh_token else 'Ausente'}")
-                
+                logger.info(f"⏸️ Ciclo #{cycle_count}: Aguardando autenticação...")
                 # Tenta recarregar tokens do disco antes de esperar
-                logger.debug("🔄 [DEBUG-WORKER] Tentando recarregar tokens do disco...")
                 self.auth.reload_tokens_from_disk()
-                
-                # Verifica novamente
                 is_auth_after_reload = self.auth.is_authenticated()
-                logger.debug(f"   • is_authenticated() após reload = {is_auth_after_reload}")
                 
                 if not is_auth_after_reload:
-                    logger.info("⏳ [DEBUG-WORKER] Aguardando 60s para próxima tentativa...")
+                    logger.info("⏳ Aguardando 60s para próxima tentativa...")
                     self._stop_event.wait(60)
                     continue
                 else:
-                    logger.info("✅ [DEBUG-WORKER] Autenticação OK após reload! Continuando ciclo...")
+                    logger.info("✅ Autenticação OK após reload! Continuando ciclo...")
 
-            logger.debug(f"✅ [DEBUG-WORKER] Autenticação confirmada! Iniciando processamento...")
+            logger.info(f"✅ Autenticação confirmada. Iniciando processamento...")
             
             try:
-                # Ciclo de Produtos (Cache Pesado)
-                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
+                # Ciclo de Produtos (Cache Pesado) — no 1º ciclo e a cada 3
                 if cycle_count == 1 or cycle_count % 3 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
                     self.process_products_cache()
@@ -2007,30 +1997,26 @@ class Orchestrator:
                         self.broadcast_kpi_update(component_usage=usage)
 
             except Exception as e:
-                logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
+                logger.exception(f"❌ Erro fatal no ciclo #{cycle_count}")
 
-            logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
-            logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
-            logger.debug(f"")
+            logger.info(f"✅ Ciclo #{cycle_count} finalizado. Dormindo 10min...")
             
-            # Mantém 10 minutos (600s), mas pode ser interrompido por wake_worker()
-            logger.debug("💤 [DEBUG-WORKER] Entrando em sleep de 600s (ou até ser acordado)...")
             interrupted = self._stop_event.wait(600)
             
             if interrupted:
-                logger.info("⏰ [DEBUG-WORKER] Sleep interrompido! Iniciando próximo ciclo imediatamente...")
-                self._stop_event.clear()  # Limpa o evento para não interromper próximos ciclos
+                logger.info("⏰ Sleep interrompido! Iniciando próximo ciclo imediatamente...")
+                self._stop_event.clear()
             else:
-                logger.debug("⏰ [DEBUG-WORKER] Sleep de 600s completado naturalmente")
+                logger.info("⏰ Sleep completado. Novo ciclo em breve.")
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
-        self.logger.debug(f"DEBUG: process_sales_orders chamado (force={force})")
+        self.logger.debug(f"process_sales_orders chamado (force={force})")
         
         # Evita recálculos encavalados
         with self.sales.recalculation_lock:
             if self.sales._recalculation_running and not force:
-                self.logger.debug("DEBUG: Recálculo já em execução, ignorando.")
+                self.logger.debug("Recálculo já em execução, ignorando.")
                 return
             self.sales._recalculation_running = True
             
@@ -2058,15 +2044,15 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
-                self.logger.debug(f"DEBUG: Buscando página {page} de pedidos...")
+                self.logger.debug(f"Buscando página {page} de pedidos...")
                 try:
                     response = self.api.get('pedidos/vendas', params=params)
                 except Exception as e:
-                    self.logger.error(f"DEBUG: Erro na API ao buscar pedidos: {e}")
+                    self.logger.error(f"Erro na API ao buscar pedidos: {e}")
                     break # Se der erro na API, para o loop mas processa o que já pegou
                 
                 if response is None:
-                    self.logger.debug(f"DEBUG: Resposta da API nula na página {page}")
+                    self.logger.debug(f"Resposta da API nula na página {page}")
                     break
     
                 # --- CORREÇÃO DE LEITURA (PARSING) ---
@@ -2086,7 +2072,7 @@ class Orchestrator:
                     data = response
                 # -------------------------------------
                 
-                self.logger.debug(f"DEBUG: Página {page} retornou {len(data) if data else 0} pedidos.")
+                self.logger.debug(f"Página {page} retornou {len(data) if data else 0} pedidos.")
                 
                 if not data:
                     break
@@ -2118,7 +2104,7 @@ class Orchestrator:
                     if o.get('id'):
                         valid_orders.append(o)
 
-                self.logger.debug(f"DEBUG: {len(valid_orders)} pedidos válidos após normalização inicial.")
+                self.logger.debug(f"{len(valid_orders)} pedidos válidos após normalização inicial.")
                 # 1. Substitui o histórico de vendas pelo resultado da busca (Reset Mensal)
                 self.sales._sales_history = valid_orders
                 
@@ -2868,53 +2854,53 @@ class WebServer:
             code = request.args.get('code')
             state = request.args.get('state')
             
-            logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
+            logger.debug("🔐 Callback OAuth recebido")
             logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
             logger.debug(f"   • State: {state[:20]}..." if state else "   • State: Ausente")
             
             if not code:
-                logger.error("❌ [DEBUG-CALLBACK] Código de autorização não recebido!")
+                logger.error("❌ Código de autorização não recebido!")
                 return "Erro: Código de autorização não recebido.", 400
                 
             # Validação do State (CSRF)
-            logger.debug("🔍 [DEBUG-CALLBACK] Validando state OAuth...")
+            logger.debug("🔍 Validando state OAuth...")
             if not self.orchestrator.auth._validate_oauth_state(state):
-                logger.error("❌ [DEBUG-CALLBACK] State inválido ou expirado!")
+                logger.error("❌ State inválido ou expirado!")
                 return "Erro: State inválido ou expirado.", 403
             
-            logger.debug("✅ [DEBUG-CALLBACK] State validado com sucesso")
+            logger.debug("✅ State validado com sucesso")
             
             # Troca o código pelo token
-            logger.debug("🔄 [DEBUG-CALLBACK] Trocando code por tokens...")
+            logger.debug("🔄 Trocando code por tokens...")
             success = self.orchestrator.auth.exchange_code_for_token(code)
             
             if success:
-                logger.info("✅ [DEBUG-CALLBACK] Tokens obtidos com sucesso!")
+                logger.info("✅ Tokens obtidos com sucesso!")
                 
                 # 🔧 CORREÇÃO CRÍTICA: Recarrega tokens na memória
-                logger.debug("🔄 [DEBUG-CALLBACK] Recarregando tokens na memória...")
+                logger.debug("🔄 Recarregando tokens na memória...")
                 self.orchestrator.auth.reload_tokens_from_disk()
                 
                 # Verifica autenticação após reload
                 is_auth = self.orchestrator.auth.is_authenticated()
-                logger.debug(f"🔍 [DEBUG-CALLBACK] is_authenticated() = {is_auth}")
+                logger.debug(f"🔍 is_authenticated() = {is_auth}")
                 
                 # Inicia o worker após autenticação bem-sucedida
                 if not self.orchestrator.is_running():
-                    logger.info("🚀 [DEBUG-CALLBACK] Iniciando worker...")
+                    logger.info("🚀 Iniciando worker...")
                     self.orchestrator.start_worker()
                     start_cleanup_timer()
-                    logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
+                    logger.info("✅ Worker iniciado com sucesso!")
                 else:
-                    logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
+                    logger.debug("ℹ️ Worker já está rodando")
                     # 🔧 NOVO: Acorda o worker imediatamente
-                    logger.debug("⏰ [DEBUG-CALLBACK] Acordando worker para processar imediatamente...")
+                    logger.debug("⏰ Acordando worker para processar imediatamente...")
                     self.orchestrator.wake_worker()
                 
-                logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
+                logger.info("🔄 Redirecionando para dashboard...")
                 return redirect('/')
             else:
-                logger.error("❌ [DEBUG-CALLBACK] Erro ao trocar código pelo token!")
+                logger.error("❌ Erro ao trocar código pelo token!")
                 return "Erro ao trocar código pelo token.", 500
 
         # Rota de Busca com correção de 404 e Imagem
@@ -3067,13 +3053,13 @@ class WebServer:
             with WebServer.webhook_lock:
                 try:
                     # Log de entrada bruta para diagnóstico
-                    self.logger.debug(f"DEBUG: Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
-                    self.logger.debug(f"DEBUG: Headers do Webhook: {dict(request.headers)}")
+                    self.logger.debug(f"Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
+                    self.logger.debug(f"Headers do Webhook: {dict(request.headers)}")
 
                     # 1. Validação de Assinatura (Mantenha se configurado no Render)
                     signature = request.headers.get("X-Bling-Signature-256")
                     if self.config.WEBHOOK_SECRET and not signature:
-                        self.logger.warning("DEBUG: Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
+                        self.logger.warning("Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
                         return jsonify({"status": "forbidden", "reason": "missing signature"}), 403
 
                     data = request.json
@@ -3088,7 +3074,7 @@ class WebServer:
 
                     # Caso 1: Webhook V3 Padrão (vem "id", "situacao", "tipo" na raiz)
                     if 'situacao' in data and 'id' in data:
-                        self.logger.debug(f"DEBUG: Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
+                        self.logger.debug(f"Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
                         should_update = True
                     
                     # Caso 2: Tipo explícito
@@ -4708,9 +4694,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { console.error(e); }
         }
 
-        // renderActiveTimers mantido como stub (o board substituiu)
-        function renderActiveTimers(activeProduction) {}
-
         function renderConsumptionTable(data) {
             const tableSection = document.getElementById('consumption-table-section');
             const monthLabel = document.getElementById('consumption-month-label');
@@ -4780,15 +4763,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             document.body.insertAdjacentHTML('beforeend', html);
             new bootstrap.Modal(document.getElementById('theoreticalModal')).show();
         }
-
-        function formatSeconds(s) {
-            s = Math.floor(s || 0);
-            const h = Math.floor(s / 3600).toString().padStart(2, '0');
-            const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
-            const sec = (s % 60).toString().padStart(2, '0');
-            return `${h}:${m}:${sec}`;
-        }
-
 
         /* ✅ DESIGN: WebSocket KPI */
         const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
