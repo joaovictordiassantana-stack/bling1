@@ -5,4 +5,4 @@ colorama
 flask-sock
 gevent
 gunicorn
-pymongo[srv]
+pymongo[srv]==4.16.0

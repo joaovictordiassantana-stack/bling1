@@ -868,7 +868,7 @@ class AuthManager:
         Recarrega os tokens do disco para a memória.
         Útil após OAuth ou quando outro processo atualizou os tokens.
         """
-        logger.debug("🔄 Recarregando tokens do disco...")
+        logger.debug("🔄 [DEBUG-AUTH] Recarregando tokens do disco...")
         
         try:
             disk_tokens = self._load_tokens()
@@ -877,7 +877,7 @@ class AuthManager:
             self._refresh_token = disk_tokens.get('refresh_token')
             self._expires_at = disk_tokens.get('expires_at', 0)
             
-            logger.debug(f"✅ Tokens recarregados:")
+            logger.debug(f"✅ [DEBUG-AUTH] Tokens recarregados:")
             logger.debug(f"   • Access Token: {'Presente' if self._access_token else 'Ausente'}")
             logger.debug(f"   • Refresh Token: {'Presente' if self._refresh_token else 'Ausente'}")
             logger.debug(f"   • Expira em: {self._expires_at - time.time():.0f}s")
@@ -886,7 +886,7 @@ class AuthManager:
             return True
             
         except Exception as e:
-            logger.error(f"❌ Erro ao recarregar tokens: {str(e)}", exc_info=True)
+            logger.error(f"❌ [DEBUG-AUTH] Erro ao recarregar tokens: {str(e)}", exc_info=True)
             return False
 
     def is_authenticated(self) -> bool:
@@ -1222,7 +1222,8 @@ class ProductionTimer:
     def __init__(self):
         self.timers = self._load()
         self._auto_pause_on_restart()
-        # Relança background_savers para TODOS os timers (running ou paused) para manter persistência
+        # Lança background_savers para TODOS os timers existentes (running ou paused)
+        # para garantir persistência contínua
         for nome in list(self.timers.keys()):
             self._launch_background_saver(nome)
 
@@ -1297,17 +1298,16 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def _launch_background_saver(self, nome):
-        """Lança thread que salva progresso a cada 30s enquanto o timer existir.
-        Persiste tempo acumulado mesmo se o timer for pausado/reiniciado."""
+        """Thread que faz checkpoint do timer a cada 30s enquanto ele existir.
+        Salva mesmo se pausado — garante persistência total em caso de queda."""
         def background_saver():
             while True:
                 time.sleep(30)
                 if nome not in self.timers:
-                    break  # Timer foi removido (finalizado/zerado)
+                    break  # Timer removido (finalizado/zerado) — encerra thread
                 t = self.timers[nome]
-                state = t.get('state', 'stopped')
-                if state == 'running' and t.get('start_ts', 0) > 0:
-                    # Faz checkpoint: acumula tempo e atualiza start_ts
+                # Se running, faz checkpoint (acumula tempo parcial)
+                if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
                     now_ts = time.time()
                     elapsed = now_ts - t['start_ts']
                     t['accumulated'] = t.get('accumulated', 0) + elapsed
@@ -1329,27 +1329,29 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def stop_and_log(self, produto_nome):
-        """Finaliza produção — salva histórico, auto-registra todos os componentes RECIPE."""
-        status = self.pause(produto_nome)
-        total_seconds = status['elapsed']
-
-        # Checklist salva no timer (o que foi marcado manualmente)
-        checklist_marcado = {}
+        """Finaliza produção: pausa timer, registra componentes e salva histórico."""
+        # Pausa o timer para calcular tempo total (se existir)
         if produto_nome in self.timers:
+            status = self.pause(produto_nome)
+            total_seconds = status['elapsed']
             checklist_marcado = self.timers[produto_nome].get('checklist', {})
+        else:
+            # Timer não existe (produto concluído direto do board sem abrir modal)
+            total_seconds = 0
+            checklist_marcado = {}
 
-        # Auto-registra componentes ainda NÃO marcados (se for cadeira)
+        # Registra componentes da receita que NÃO foram marcados manualmente no checklist
         if 'CADEIRA' in produto_nome.upper():
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
                 if not checklist_marcado.get(nome_comp, False):
-                    # Não foi marcado manualmente — registra automaticamente
                     try:
                         component_consumption.register_component(
                             nome_comp, comp['qtd'], comp['un'], produto_nome
                         )
                     except Exception as e:
-                        logger.error(f"Auto-registro componente {nome_comp}: {e}")
+                        logger.error(f"Auto-registro componente '{nome_comp}': {e}")
+            logger.info(f"✅ Componentes registrados para '{produto_nome}'")
 
         registro = {
             "produto": produto_nome,
@@ -1361,11 +1363,12 @@ class ProductionTimer:
 
         self._add_to_history(registro)
 
+        # Remove timer da memória
         if produto_nome in self.timers:
             del self.timers[produto_nome]
             self._save()
 
-        return {'elapsed': 0, 'state': 'finished', 'registro': registro}
+        return {'elapsed': total_seconds, 'state': 'finished', 'registro': registro}
 
     def reset(self, produto_nome):
         if produto_nome in self.timers:
@@ -1691,7 +1694,8 @@ class PendingOrdersManager:
             try:
                 dt = datetime.fromisoformat(added)
                 item_mes = f"{dt.year}-{dt.month:02d}"
-                if item_mes != mes_atual and item.get('status') in ('done', 'waiting'):
+                # Limpa tudo do mês anterior — fresh start todo início de mês
+                if item_mes != mes_atual:
                     to_remove.append(key)
             except Exception:
                 pass
@@ -1792,12 +1796,12 @@ class PendingOrdersManager:
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
                         }
-                        self._save_one(sub_key)
                         added += 1
 
-        if added > 0 and not MONGO_AVAILABLE:
-            self._save()  # Salva arquivo completo apenas no fallback
-            logger.info(f"✅ PendingOrders: {added} itens novos adicionados à fila de espera.")
+        if added > 0:
+            if not MONGO_AVAILABLE:
+                self._save()  # fallback: salva arquivo completo
+            logger.info(f"✅ PendingOrders: {added} novos itens adicionados à fila.")
         return added
 
 
@@ -1923,7 +1927,7 @@ class Orchestrator:
         Útil após OAuth para forçar início imediato do processamento
         sem esperar os 60 segundos de sleep.
         """
-        logger.debug("⏰ wake_worker() chamado")
+        logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
         
         if self._running and self._stop_event:
             logger.info("⏰ Acordando worker (interrompendo sleep)...")
@@ -1954,32 +1958,44 @@ class Orchestrator:
     def _worker_loop(self):
         cycle_count = 0
         
-        logger.info("🔄 Worker loop iniciado")
+        logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
         
         while not self._stop_event.is_set():
             cycle_count += 1
-            logger.info(f"🔄 === CICLO #{cycle_count} ===")
+            
+            logger.debug(f"")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
             
             # Verifica autenticação antes de tudo
+            logger.debug(f"🔍 [DEBUG-WORKER] Verificando autenticação...")
             is_auth = self.auth.is_authenticated()
+            logger.debug(f"   • is_authenticated() = {is_auth}")
             
             if not is_auth:
-                logger.info(f"⏸️ Ciclo #{cycle_count}: Aguardando autenticação...")
+                logger.info(f"⏸️ [DEBUG-WORKER] Ciclo #{cycle_count}: Aguardando autenticação...")
+                logger.debug(f"   • Access Token: {'Presente' if self.auth._access_token else 'Ausente'}")
+                logger.debug(f"   • Refresh Token: {'Presente' if self.auth._refresh_token else 'Ausente'}")
+                
                 # Tenta recarregar tokens do disco antes de esperar
+                logger.debug("🔄 [DEBUG-WORKER] Tentando recarregar tokens do disco...")
                 self.auth.reload_tokens_from_disk()
+                
+                # Verifica novamente
                 is_auth_after_reload = self.auth.is_authenticated()
+                logger.debug(f"   • is_authenticated() após reload = {is_auth_after_reload}")
                 
                 if not is_auth_after_reload:
-                    logger.info("⏳ Aguardando 60s para próxima tentativa...")
+                    logger.info("⏳ [DEBUG-WORKER] Aguardando 60s para próxima tentativa...")
                     self._stop_event.wait(60)
                     continue
                 else:
-                    logger.info("✅ Autenticação OK após reload! Continuando ciclo...")
+                    logger.info("✅ [DEBUG-WORKER] Autenticação OK após reload! Continuando ciclo...")
 
-            logger.info(f"✅ Autenticação confirmada. Iniciando processamento...")
+            logger.debug(f"✅ [DEBUG-WORKER] Autenticação confirmada! Iniciando processamento...")
             
             try:
-                # Ciclo de Produtos (Cache Pesado) — no 1º ciclo e a cada 3
+                # Ciclo de Produtos (Cache Pesado)
+                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
                 if cycle_count == 1 or cycle_count % 3 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
                     self.process_products_cache()
@@ -1997,17 +2013,21 @@ class Orchestrator:
                         self.broadcast_kpi_update(component_usage=usage)
 
             except Exception as e:
-                logger.exception(f"❌ Erro fatal no ciclo #{cycle_count}")
+                logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
 
-            logger.info(f"✅ Ciclo #{cycle_count} finalizado. Dormindo 10min...")
+            logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
+            logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
+            logger.debug(f"")
             
+            # Mantém 10 minutos (600s), mas pode ser interrompido por wake_worker()
+            logger.debug("💤 [DEBUG-WORKER] Entrando em sleep de 600s (ou até ser acordado)...")
             interrupted = self._stop_event.wait(600)
             
             if interrupted:
-                logger.info("⏰ Sleep interrompido! Iniciando próximo ciclo imediatamente...")
-                self._stop_event.clear()
+                logger.info("⏰ [DEBUG-WORKER] Sleep interrompido! Iniciando próximo ciclo imediatamente...")
+                self._stop_event.clear()  # Limpa o evento para não interromper próximos ciclos
             else:
-                logger.info("⏰ Sleep completado. Novo ciclo em breve.")
+                logger.debug("⏰ [DEBUG-WORKER] Sleep de 600s completado naturalmente")
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
@@ -2025,10 +2045,10 @@ class Orchestrator:
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
                 return
                 
-            self.logger.info("Iniciando busca de pedidos (A partir de 01/01/2026)...")
             now = datetime.now()
-            # Força o início EXATO no dia 1º do mês atual (Ex: 01/01/2026)
+            # Sempre busca a partir do dia 1º do MÊS ATUAL (dinâmico — funciona em qualquer mês)
             start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            self.logger.info(f"Buscando pedidos de {start_date.strftime('%d/%m/%Y')} a {now.strftime('%d/%m/%Y')}...")
             
             # Parâmetros compatíveis
             # Busca Janela Móvel (Últimos 30 dias)
@@ -2854,53 +2874,53 @@ class WebServer:
             code = request.args.get('code')
             state = request.args.get('state')
             
-            logger.debug("🔐 Callback OAuth recebido")
+            logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
             logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
             logger.debug(f"   • State: {state[:20]}..." if state else "   • State: Ausente")
             
             if not code:
-                logger.error("❌ Código de autorização não recebido!")
+                logger.error("❌ [DEBUG-CALLBACK] Código de autorização não recebido!")
                 return "Erro: Código de autorização não recebido.", 400
                 
             # Validação do State (CSRF)
-            logger.debug("🔍 Validando state OAuth...")
+            logger.debug("🔍 [DEBUG-CALLBACK] Validando state OAuth...")
             if not self.orchestrator.auth._validate_oauth_state(state):
-                logger.error("❌ State inválido ou expirado!")
+                logger.error("❌ [DEBUG-CALLBACK] State inválido ou expirado!")
                 return "Erro: State inválido ou expirado.", 403
             
-            logger.debug("✅ State validado com sucesso")
+            logger.debug("✅ [DEBUG-CALLBACK] State validado com sucesso")
             
             # Troca o código pelo token
-            logger.debug("🔄 Trocando code por tokens...")
+            logger.debug("🔄 [DEBUG-CALLBACK] Trocando code por tokens...")
             success = self.orchestrator.auth.exchange_code_for_token(code)
             
             if success:
-                logger.info("✅ Tokens obtidos com sucesso!")
+                logger.info("✅ [DEBUG-CALLBACK] Tokens obtidos com sucesso!")
                 
                 # 🔧 CORREÇÃO CRÍTICA: Recarrega tokens na memória
-                logger.debug("🔄 Recarregando tokens na memória...")
+                logger.debug("🔄 [DEBUG-CALLBACK] Recarregando tokens na memória...")
                 self.orchestrator.auth.reload_tokens_from_disk()
                 
                 # Verifica autenticação após reload
                 is_auth = self.orchestrator.auth.is_authenticated()
-                logger.debug(f"🔍 is_authenticated() = {is_auth}")
+                logger.debug(f"🔍 [DEBUG-CALLBACK] is_authenticated() = {is_auth}")
                 
                 # Inicia o worker após autenticação bem-sucedida
                 if not self.orchestrator.is_running():
-                    logger.info("🚀 Iniciando worker...")
+                    logger.info("🚀 [DEBUG-CALLBACK] Iniciando worker...")
                     self.orchestrator.start_worker()
                     start_cleanup_timer()
-                    logger.info("✅ Worker iniciado com sucesso!")
+                    logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
                 else:
-                    logger.debug("ℹ️ Worker já está rodando")
+                    logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
                     # 🔧 NOVO: Acorda o worker imediatamente
-                    logger.debug("⏰ Acordando worker para processar imediatamente...")
+                    logger.debug("⏰ [DEBUG-CALLBACK] Acordando worker para processar imediatamente...")
                     self.orchestrator.wake_worker()
                 
-                logger.info("🔄 Redirecionando para dashboard...")
+                logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
                 return redirect('/')
             else:
-                logger.error("❌ Erro ao trocar código pelo token!")
+                logger.error("❌ [DEBUG-CALLBACK] Erro ao trocar código pelo token!")
                 return "Erro ao trocar código pelo token.", 500
 
         # Rota de Busca com correção de 404 e Imagem
@@ -3064,7 +3084,7 @@ class WebServer:
 
                     data = request.json
                     if not data:
-                        self.logger.debug("DEBUG: Webhook ignorado: JSON vazio ou inválido.")
+                        self.logger.debug("Webhook ignorado: JSON vazio ou inválido.")
                         return jsonify({"status": "ignored"}), 200
 
                     self.logger.info(f"⚡ Webhook recebido: {str(data)[:200]}")
@@ -3079,17 +3099,17 @@ class WebServer:
                     
                     # Caso 2: Tipo explícito
                     elif data.get('tipo') == 'pedidoVenda':
-                        self.logger.debug("DEBUG: Webhook tipo pedidoVenda detectado.")
+                        self.logger.debug("Webhook tipo pedidoVenda detectado.")
                         should_update = True
 
                     # Caso 3: Formato antigo (V2)
                     elif 'retorno' in data and 'pedidos' in data['retorno']:
-                        self.logger.debug("DEBUG: Webhook V2 detectado.")
+                        self.logger.debug("Webhook V2 detectado.")
                         should_update = True
                     
                     # Caso 4: Callbacks de teste
                     elif data.get('test') == True:
-                        self.logger.debug("DEBUG: Webhook de teste recebido.")
+                        self.logger.debug("Webhook de teste recebido.")
                         return jsonify({"status": "ok", "message": "Test received"}), 200
 
                     if should_update:
@@ -3982,17 +4002,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <!-- ═══ PRODUTOS VENDIDOS NO MÊS ═══ -->
-                        <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header" style="background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);">
-                                <h5 class="mb-0">🛒 Produtos Vendidos (Mês Atual)</h5>
-                                <small class="text-white-50">Pedidos faturados no Bling este mês</small>
-                            </div>
-                            <div class="card-body p-0" id="monthly-sales-section">
-                                <div class="text-center py-4 text-muted">⏳ Aguardando dados...</div>
-                            </div>
-                        </div>
-
                         <!-- ═══ HISTÓRICO DE FINALIZAÇÕES ═══ -->
                         <div class="card border-0 shadow-sm">
                             <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%);">
@@ -4674,12 +4683,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function updateComponentUsage(usageData) {
-            if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
             if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
 
         async function refreshComponentTab() {
-            loadProductionBoard();
+            await loadProductionBoard();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
@@ -4690,8 +4698,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             try {
                 const usageData = await fetchAPI('/api/components/usage');
                 if (usageData.history_production) renderProductionHistory(usageData.history_production);
-                if (usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
-            } catch(e) { console.error(e); }
+            } catch(e) { console.error('Erro ao carregar uso de componentes:', e); }
         }
 
         function renderConsumptionTable(data) {
@@ -4720,23 +4727,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        function renderMonthlySales(produtosVendidos) {
-            const div = document.getElementById('monthly-sales-section');
-            if (!div) return;
-            const entries = Object.entries(produtosVendidos || {}).sort((a, b) => b[1] - a[1]);
-            if (entries.length === 0) {
-                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto vendido registrado este mês.</div>';
-                return;
-            }
-            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-                <thead style="background:#f8fafc;"><tr><th class="ps-3">Produto</th><th class="text-center">Qtd Vendida</th><th class="text-center">Insumos Teóricos</th></tr></thead>
-                <tbody>${entries.map(([nome, qtd]) => {
-                    const isCadeira = nome.includes('CADEIRA');
-                    return `<tr><td class="ps-3 fw-bold">${nome}</td>
-                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:white;padding:.4rem .9rem;">${qtd} un</span></td>
-                    <td class="text-center">${isCadeira ? `<button class="btn btn-xs btn-outline-secondary btn-sm" onclick="showTheoreticalUsage('${nome}', ${qtd})">Ver insumos</button>` : '<span class="text-muted small">—</span>'}</td></tr>`;
-                }).join('')}</tbody></table></div>`;
-        }
+        // renderMonthlySales removida — guia Produtos Vendidos removida a pedido
 
         function renderProductionHistory(history) {
             const div = document.getElementById('production-history-section');
@@ -4755,14 +4746,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        function showTheoreticalUsage(productName, qty) {
-            const lines = RECIPE_CADEIRA.map(item => `<tr><td>${item.nome}</td><td class="text-center fw-bold">${(item.qtd * qty).toFixed(2)}</td><td class="text-muted small">${item.un}</td></tr>`).join('');
-            const html = `<div class="modal fade" id="theoreticalModal" tabindex="-1"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header bg-dark text-white"><h6 class="modal-title">📋 Insumos Teóricos: ${qty}x ${productName}</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body p-0"><table class="table table-sm mb-0"><thead class="table-light"><tr><th>Insumo</th><th class="text-center">Qtd Total</th><th>Un.</th></tr></thead><tbody>${lines}</tbody></table></div></div></div></div>`;
-            const old = document.getElementById('theoreticalModal');
-            if (old) old.remove();
-            document.body.insertAdjacentHTML('beforeend', html);
-            new bootstrap.Modal(document.getElementById('theoreticalModal')).show();
+
+
+        function formatSeconds(s) {
+            s = Math.floor(s || 0);
+            const h = Math.floor(s / 3600).toString().padStart(2, '0');
+            const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+            const sec = (s % 60).toString().padStart(2, '0');
+            return `${h}:${m}:${sec}`;
         }
+
 
         /* ✅ DESIGN: WebSocket KPI */
         const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
