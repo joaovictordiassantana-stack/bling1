@@ -1191,7 +1191,11 @@ class ProductionTimer:
 
     def __init__(self):
         self.timers = self._load()
-        self._auto_pause_on_restart() # Pausa timers abertos ao reiniciar para segurança
+        self._auto_pause_on_restart()
+        # Relança background_savers para qualquer timer que ainda esteja running
+        for nome, t in self.timers.items():
+            if t.get('state') == 'running':
+                self._launch_background_saver(nome)
 
     def _load(self):
         # Tenta MongoDB primeiro, fallback para arquivo
@@ -1224,17 +1228,25 @@ class ProductionTimer:
             logger.error(f"Erro ao salvar timers em arquivo: {e}")
 
     def _auto_pause_on_restart(self):
-        """Se o servidor cair, pausa os timers para não contar tempo falso e salva o tempo decorrido."""
+        """
+        Ao reiniciar: pausa timers 'running' E soma o tempo que estava rodando.
+        O background_saver salva a cada 30s, então perdemos no máximo 30s.
+        Garante que o tempo acumulado não seja perdido.
+        """
         changed = False
+        now = time.time()
         for k, v in self.timers.items():
-            if v['state'] == 'running':
-                # Como o servidor caiu, não sabemos o exato momento, mas o arquivo JSON
-                # reflete o estado da última vez que foi salvo. Se estava 'running',
-                # pausamos para evitar contagem infinita.
+            if v.get('state') == 'running':
+                start_ts = v.get('start_ts', 0)
+                if start_ts and start_ts > 0:
+                    # Soma o tempo que estava rodando desde o último checkpoint
+                    v['accumulated'] = v.get('accumulated', 0) + (now - start_ts)
                 v['state'] = 'paused'
-                v['start_ts'] = 0 
+                v['start_ts'] = 0
                 changed = True
-        if changed: self._save()
+        if changed:
+            self._save()
+            logger.info(f"⏸ Restart: {sum(1 for v in self.timers.values() if v.get('state')=='paused')} timers pausados com tempo preservado.")
 
     def start(self, produto_nome):
         now = time.time()
@@ -1244,7 +1256,7 @@ class ProductionTimer:
                 'accumulated': 0,
                 'state': 'running',
                 'created_at': datetime.now().isoformat(),
-                'checklist': {}  # {nome_componente: True/False} — persiste no servidor
+                'checklist': {}
             }
         else:
             t = self.timers[produto_nome]
@@ -1252,21 +1264,28 @@ class ProductionTimer:
                 t['start_ts'] = now
                 t['state'] = 'running'
         self._save()
-        
-        # Inicia uma thread para salvar o progresso a cada 30 segundos enquanto estiver rodando
-        def background_saver(nome):
-            while nome in self.timers and self.timers[nome]['state'] == 'running':
-                time.sleep(30)
-                if nome in self.timers and self.timers[nome]['state'] == 'running':
-                    t = self.timers[nome]
-                    now_ts = time.time()
-                    t['accumulated'] += (now_ts - t['start_ts'])
-                    t['start_ts'] = now_ts
-                    self._save()
-        
-        Thread(target=background_saver, args=(produto_nome,), daemon=True).start()
-        
+        self._launch_background_saver(produto_nome)
         return self.get_status(produto_nome)
+
+    def _launch_background_saver(self, nome):
+        """Lança thread que salva progresso a cada 30s (sobrevive a qualquer estado)."""
+        def background_saver():
+            while True:
+                time.sleep(30)
+                if nome not in self.timers:
+                    break
+                t = self.timers[nome]
+                if t.get('state') != 'running':
+                    break
+                now_ts = time.time()
+                elapsed = now_ts - t.get('start_ts', now_ts)
+                t['accumulated'] = t.get('accumulated', 0) + elapsed
+                t['start_ts'] = now_ts
+                try:
+                    self._save()
+                except Exception as e:
+                    logger.error(f"background_saver erro: {e}")
+        Thread(target=background_saver, daemon=True, name=f"saver_{nome}").start()
 
     def pause(self, produto_nome):
         if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
@@ -1333,18 +1352,19 @@ class ProductionTimer:
         return {'elapsed': int(total), 'state': t['state'], 'checklist': t.get('checklist', {})}
 
     def get_active_timers(self):
-        """Retorna tudo que está sendo produzido agora para o Chefe ver."""
+        """Retorna timers ativos com tempo ao vivo calculado no servidor."""
         active = []
         for nome, data in self.timers.items():
-            current_total = data['accumulated']
-            if data['state'] == 'running':
+            current_total = data.get('accumulated', 0)
+            if data.get('state') == 'running' and data.get('start_ts', 0) > 0:
                 current_total += (time.time() - data['start_ts'])
-            
             active.append({
                 "produto": nome,
-                "estado": data['state'], # running ou paused
+                "estado": data.get('state', 'paused'),
                 "tempo_decorrido": int(current_total),
-                "inicio": data.get('created_at', '')
+                "inicio": data.get('created_at', ''),
+                "checklist_count": sum(1 for v in data.get('checklist', {}).values() if v),
+                "checklist_total": len(data.get('checklist', {})),
             })
         return active
 
@@ -1540,12 +1560,12 @@ class PendingOrdersManager:
     def _save(self):
         if MONGO_AVAILABLE:
             try:
-                # Cada item da fila é um documento separado no MongoDB
                 for key, val in self.data.items():
                     MongoStore.upsert('pending_orders', key, val)
                 return
             except Exception as e:
                 logger.error(f"Erro ao salvar pending_orders no MongoDB: {e}")
+        # Fallback arquivo
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
@@ -1553,6 +1573,19 @@ class PendingOrdersManager:
             shutil.move(str(temp), str(self.FILE_PATH))
         except Exception as e:
             logger.error(f"Erro ao salvar pedidos pendentes em arquivo: {e}")
+
+    def _save_one(self, key: str):
+        """Salva apenas um item (mais eficiente que _save completo)."""
+        if key not in self.data:
+            return
+        val = self.data[key]
+        if MONGO_AVAILABLE:
+            try:
+                MongoStore.upsert('pending_orders', key, val)
+                return
+            except Exception as e:
+                logger.error(f"Erro ao salvar item {key} no MongoDB: {e}")
+        self._save()
 
     def add_order_item(self, order_id: str, item_key: str, item_data: dict):
         """Adiciona um item de pedido à fila de espera."""
@@ -1562,10 +1595,10 @@ class PendingOrdersManager:
                 **item_data,
                 'order_id': str(order_id),
                 'item_key': item_key,
-                'status': 'waiting',  # waiting | in_production | done
+                'status': 'waiting',
                 'added_at': datetime.now().isoformat()
             }
-            self._save()
+            self._save_one(key)
         return self.data[key]
 
     def start_production(self, item_key: str):
@@ -1573,7 +1606,7 @@ class PendingOrdersManager:
         if item_key in self.data:
             self.data[item_key]['status'] = 'in_production'
             self.data[item_key]['started_at'] = datetime.now().isoformat()
-            self._save()
+            self._save_one(item_key)
         return self.data.get(item_key)
 
     def finish_production(self, item_key: str):
@@ -1582,7 +1615,7 @@ class PendingOrdersManager:
             self.data[item_key]['status'] = 'done'
             self.data[item_key]['finished_at'] = datetime.now().isoformat()
             self.data[item_key]['mes_conclusao'] = datetime.now().strftime('%Y-%m')
-            self._save()
+            self._save_one(item_key)
         return self.data.get(item_key)
 
     def dismiss(self, item_key: str):
@@ -2551,6 +2584,64 @@ class WebServer:
                 
             return jsonify(status)
 
+        @self.app.route('/api/production/board')
+        def api_production_board():
+            """
+            Retorna snapshot completo da aba de produção.
+            - waiting: pedidos do Bling aguardando alguém clicar em Produzir
+            - in_production: pedidos em andamento + tempo ao vivo do timer
+            - done: concluídos do mês (para histórico)
+            - timers_orphan: timers sem item_key (iniciados manualmente)
+            """
+            # Mapa de produto_nome -> timer
+            timers = production_timer.timers
+            timer_map = {}
+            for nome, t in timers.items():
+                total = t.get('accumulated', 0)
+                if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
+                    total += time.time() - t['start_ts']
+                timer_map[nome] = {
+                    'estado': t.get('state', 'paused'),
+                    'tempo_decorrido': int(total),
+                    'checklist': t.get('checklist', {}),
+                    'created_at': t.get('created_at', ''),
+                }
+
+            # Enriquece in_production com dados do timer
+            in_prod = []
+            for item in pending_orders.get_in_production():
+                nome = item.get('nome') or item.get('nome_original', '')
+                t_info = timer_map.get(nome, {})
+                in_prod.append({**item, **t_info})
+
+            # Timers sem pedido vinculado (iniciados manualmente)
+            nomes_com_pedido = {
+                (v.get('nome') or v.get('nome_original', ''))
+                for v in pending_orders.data.values()
+            }
+            orphan = []
+            for nome, t in timers.items():
+                if nome not in nomes_com_pedido:
+                    total = t.get('accumulated', 0)
+                    if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
+                        total += time.time() - t['start_ts']
+                    orphan.append({
+                        'nome': nome,
+                        'estado': t.get('state', 'paused'),
+                        'tempo_decorrido': int(total),
+                        'checklist': t.get('checklist', {}),
+                        'created_at': t.get('created_at', ''),
+                        'item_key': None,
+                    })
+
+            return jsonify({
+                'waiting': pending_orders.get_waiting(),
+                'in_production': in_prod,
+                'orphan_timers': orphan,
+                'done': pending_orders.get_done(),
+                'server_time': time.time(),
+            })
+
         @self.app.route('/api/checklist/state/<path:produto>', methods=['GET'])
         def api_checklist_get(produto):
             """Retorna estado salvo da checklist de um produto em produção."""
@@ -2638,7 +2729,12 @@ class WebServer:
                 'waiting': pending_orders.get_waiting(),
                 'in_production': pending_orders.get_in_production(),
                 'done': pending_orders.get_done(),
-                'all': pending_orders.get_all()
+                'all': pending_orders.get_all(),
+                'counts': {
+                    'waiting': len(pending_orders.get_waiting()),
+                    'in_production': len(pending_orders.get_in_production()),
+                    'done': len(pending_orders.get_done()),
+                }
             })
 
         @self.app.route('/api/pending-orders/start', methods=['POST'])
@@ -3837,51 +3933,51 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                     <!-- Tab: Componentes (Consumo & Produção) -->
                     <div class="tab-pane fade" id="component-usage" role="tabpanel">
-                        <!-- Seção: Pedidos em Espera (do Bling) -->
+
+                        <!-- ═══ PAINEL DE PRODUÇÃO UNIFICADO ═══ -->
                         <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #92400e 0%, #d97706 100%);">
+                            <div class="card-header d-flex justify-content-between align-items-center py-3" style="background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);">
                                 <div>
-                                    <h5 class="mb-0">⏳ Em Espera <span id="waiting-count-badge" class="badge bg-white text-dark ms-2">0</span></h5>
-                                    <small class="text-white-50">Pedidos do Bling aguardando iniciar produção</small>
+                                    <h5 class="mb-0 text-white">🏭 Painel de Produção</h5>
+                                    <small class="text-white-50">
+                                        ⏳ Em Espera <span id="waiting-count-badge" class="badge bg-warning text-dark ms-1">0</span>
+                                        &nbsp; ⚙️ Produzindo <span id="inprod-count-badge" class="badge bg-success ms-1">0</span>
+                                        &nbsp; ✅ Concluídos <span id="done-count-badge" class="badge bg-secondary ms-1">0</span>
+                                    </small>
                                 </div>
                                 <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
                             </div>
-                            <div class="card-body p-0" id="waiting-orders-section">
-                                <p class="text-center text-muted py-3">⏳ Carregando pedidos...</p>
+                            <div class="card-body p-0" id="production-board-section">
+                                <p class="text-center text-muted py-4">⏳ Carregando...</p>
                             </div>
                         </div>
 
-                        <!-- Seção: Produção em Andamento -->
-                        <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
-                                <div>
-                                    <h5 class="mb-0">⚙️ Produção em Andamento</h5>
-                                    <small class="text-white-50">Timers ativos — persistem mesmo após reinício</small>
-                                </div>
-                                <button class="btn btn-sm btn-outline-light" onclick="refreshComponentTab()">🔄 Atualizar</button>
-                            </div>
-                            <div class="card-body" id="active-timers-section">
-                                <p class="text-center text-muted py-3">⏳ Carregando timers...</p>
-                            </div>
-                        </div>
-
-                        <!-- Seção: Consumo Mensal de Insumos (via Checklist) -->
+                        <!-- ═══ CONSUMO MENSAL ═══ -->
                         <div class="card mb-4 border-0 shadow-sm">
                             <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #065f46 0%, #059669 100%);">
                                 <div>
                                     <h5 class="mb-0">📊 Consumo de Insumos & Componentes</h5>
                                     <small class="text-white-50" id="consumption-month-label">Mês atual • Reinicia todo mês</small>
                                 </div>
-                                <span class="badge bg-light text-dark" id="consumption-total-badge">0 itens registrados</span>
+                                <span class="badge bg-light text-dark" id="consumption-total-badge">0 insumos</span>
                             </div>
                             <div class="card-body p-0" id="consumption-table-section">
                                 <div class="text-center py-4 text-muted">⏳ Carregando consumo...</div>
                             </div>
                         </div>
 
-                        <!-- Produtos Vendidos removido a pedido -->
+                        <!-- ═══ PRODUTOS VENDIDOS NO MÊS ═══ -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header" style="background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);">
+                                <h5 class="mb-0">🛒 Produtos Vendidos (Mês Atual)</h5>
+                                <small class="text-white-50">Pedidos faturados no Bling este mês</small>
+                            </div>
+                            <div class="card-body p-0" id="monthly-sales-section">
+                                <div class="text-center py-4 text-muted">⏳ Aguardando dados...</div>
+                            </div>
+                        </div>
 
-                        <!-- Seção: Histórico de Finalizações -->
+                        <!-- ═══ HISTÓRICO DE FINALIZAÇÕES ═══ -->
                         <div class="card border-0 shadow-sm">
                             <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%);">
                                 <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
@@ -4332,88 +4428,193 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ Pedidos em Espera */
+        /* ════════════════════════════════════════════════════════════
+           PAINEL DE PRODUÇÃO UNIFICADO
+           - Busca /api/production/board a cada 10s automaticamente
+           - Em Espera + Em Produção + Concluídos numa única view
+           ════════════════════════════════════════════════════════════ */
+
+        let _boardTick = null;      // setInterval do ticker de tempo
+        let _boardPoll = null;      // setInterval do polling de dados
+        let _boardTimerState = {};  // snapshot do servidor para ticker local
+
         async function syncAndRefreshPending() {
             const btn = document.querySelector('[onclick="syncAndRefreshPending()"]');
             if (btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
             try {
                 const res = await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
-                if (res.message) {
-                    showToast('Info', res.message, 'info');
-                } else {
-                    showToast('Sucesso', `${res.added || 0} novos itens adicionados.`, 'success');
-                }
+                if (res.message) showToast('Info', res.message, 'info');
+                else showToast('Sucesso', `${res.added || 0} novos itens adicionados.`, 'success');
             } catch(e) {
                 showToast('Aviso', 'Faça login para sincronizar.', 'warning');
             } finally {
                 if (btn) { btn.disabled = false; btn.textContent = '🔄 Sincronizar Bling'; }
             }
-            await loadPendingOrders();
+            await loadProductionBoard();
         }
 
-        async function loadPendingOrders() {
-            const div = document.getElementById('waiting-orders-section');
-            const badge = document.getElementById('waiting-count-badge');
+        // Mantido como alias para compatibilidade com outros pontos do código
+        async function loadPendingOrders() { await loadProductionBoard(); }
+
+        async function loadProductionBoard() {
+            const div = document.getElementById('production-board-section');
+            if (!div) return;
             try {
-                const data = await fetch('/api/pending-orders').then(r => r.json());
-                const waiting = data.waiting || [];
-                if (badge) badge.textContent = waiting.length;
-                if (waiting.length === 0) {
-                    div.innerHTML = `<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">📬</div><p class="text-muted mt-2 mb-0">Nenhum pedido aguardando produção.</p><small class="text-muted">Os pedidos faturados no Bling aparecem aqui automaticamente.</small></div>`;
-                    return;
-                }
-                let html = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-                    <thead class="table-warning"><tr>
-                        <th class="ps-3">Produto</th>
-                        <th>Base</th>
-                        <th>Cor/Tecido</th>
-                        <th>Pedido Nº</th>
-                        <th>Cliente</th>
-                        <th class="text-center">Ações</th>
+                const data = await fetch('/api/production/board').then(r => r.json());
+                renderProductionBoard(data);
+            } catch(e) {
+                div.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar painel.</div>';
+            }
+        }
+
+        function renderProductionBoard(data) {
+            const div = document.getElementById('production-board-section');
+            if (!div) return;
+
+            const waiting    = data.waiting      || [];
+            const inProd     = data.in_production || [];
+            const orphans    = data.orphan_timers || [];
+            const done       = data.done          || [];
+            const serverTime = data.server_time   || (Date.now() / 1000);
+
+            // Atualiza badges
+            const wb = document.getElementById('waiting-count-badge');
+            const ib = document.getElementById('inprod-count-badge');
+            const db = document.getElementById('done-count-badge');
+            if (wb) wb.textContent = waiting.length;
+            if (ib) ib.textContent = inProd.length + orphans.length;
+            if (db) db.textContent = done.length;
+
+            // Para ticker anterior
+            if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
+            _boardTimerState = {};
+
+            let html = '';
+
+            // ── Em Espera ───────────────────────────────────────────────
+            html += `<div class="border-bottom px-3 py-2" style="background:#fef3c7;">
+                <small class="fw-bold text-warning-emphasis">⏳ EM ESPERA (${waiting.length})</small>
+            </div>`;
+            if (waiting.length === 0) {
+                html += `<div class="text-center py-3 text-muted"><small>Nenhum pedido em espera. Clique em 🔄 Sincronizar Bling.</small></div>`;
+            } else {
+                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
+                    <thead style="background:#fef9c3;"><tr>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor/Tecido</th>
+                        <th>Pedido Nº</th><th>Cliente</th><th class="text-center">Ação</th>
                     </tr></thead><tbody>`;
                 waiting.forEach(item => {
-                    const imgHtml = item.imagem ? `<img src="${item.imagem}" style="width:40px;height:40px;object-fit:contain;border-radius:4px;margin-right:8px;" onerror="this.style.display='none'">` : '';
-                    const nomeSafe = (item.nome || item.nome_original || 'N/D').replace(/'/g, '&#39;');
+                    const img = item.imagem ? `<img src="${item.imagem}" style="width:32px;height:32px;object-fit:contain;border-radius:4px;margin-right:6px;" onerror="this.style.display='none'">` : '';
+                    const nome = (item.nome || item.nome_original || 'N/D').replace(/'/g,"&#39;");
                     html += `<tr>
-                        <td class="ps-3 fw-bold">${imgHtml}${nomeSafe}</td>
+                        <td class="ps-3 fw-bold">${img}${nome}</td>
                         <td class="text-muted small">${item.base || '—'}</td>
                         <td class="text-muted small">${item.cor || '—'}</td>
                         <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
                         <td class="text-muted small">${item.cliente || '—'}</td>
                         <td class="text-center">
-                            <button class="btn btn-sm btn-success me-1" onclick="startPendingOrder('${item.item_key}', encodeURIComponent(item.nome || item.nome_original || ''))">
-                                ▶ Produzir
-                            </button>
-                            <button class="btn btn-sm btn-outline-secondary" onclick="dismissPendingOrder('${item.item_key}')">✕</button>
+                            <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
+                                onclick="startPendingOrder('${item.item_key}', encodeURIComponent('${nome}'))">▶ Produzir</button>
+                            <button class="btn btn-xs btn-outline-secondary btn-sm"
+                                onclick="dismissPendingOrder('${item.item_key}')">✕</button>
                         </td>
                     </tr>`;
                 });
-
-                // Itens concluídos do mês
-                const done = data.done || [];
-                if (done.length > 0) {
-                    html += `</tbody></table></div>`;
-                    html += `<div class="px-3 pt-3 pb-1"><small class="fw-bold text-success">✅ Concluídos este mês (${done.length})</small></div>`;
-                    html += `<div class="table-responsive"><table class="table table-sm align-middle mb-0"><tbody>`;
-                    done.slice().reverse().forEach(item => {
-                        const nomeSafe = (item.nome || item.nome_original || 'N/D').replace(/'/g, '&#39;');
-                        const finishedAt = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
-                        html += `<tr class="table-success">
-                            <td class="ps-3 fw-bold text-success">${nomeSafe}</td>
-                            <td class="text-muted small">${item.base || '—'}</td>
-                            <td class="text-muted small">${item.cor || '—'}</td>
-                            <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
-                            <td class="text-muted small">${item.cliente || '—'}</td>
-                            <td class="text-center"><span class="badge bg-success">✅ Concluído</span><br><small class="text-muted">${finishedAt}</small></td>
-                        </tr>`;
-                    });
-                }
-
-                html += '</tbody></table></div>';
-                div.innerHTML = html;
-            } catch(e) {
-                div.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar pedidos pendentes.</div>';
+                html += `</tbody></table></div>`;
             }
+
+            // ── Em Produção ─────────────────────────────────────────────
+            const allInProd = [...inProd, ...orphans];
+            html += `<div class="border-bottom border-top px-3 py-2 mt-1" style="background:#dcfce7;">
+                <small class="fw-bold text-success">⚙️ EM PRODUÇÃO (${allInProd.length})</small>
+            </div>`;
+            if (allInProd.length === 0) {
+                html += `<div class="text-center py-3 text-muted"><small>Nenhuma produção em andamento.</small></div>`;
+            } else {
+                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
+                    <thead style="background:#f0fdf4;"><tr>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor/Tecido</th>
+                        <th class="text-center">⏱ Tempo</th><th class="text-center">Status</th>
+                        <th class="text-center">Checklist</th><th class="text-center">Ação</th>
+                    </tr></thead><tbody>`;
+                allInProd.forEach(item => {
+                    const nome    = item.nome || item.nome_original || item.produto || 'N/D';
+                    const nomeSafe = nome.replace(/'/g,"&#39;");
+                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g,'_');
+                    const elapsed = item.tempo_decorrido || 0;
+                    const estado  = item.estado || 'paused';
+                    const itemKey = item.item_key || null;
+                    const base    = item.base || '—';
+                    const cor     = item.cor  || '—';
+                    const chkDone = Object.values(item.checklist || {}).filter(Boolean).length;
+                    const chkTotal= RECIPE_CADEIRA.length;
+
+                    // Guarda estado para ticker local
+                    _boardTimerState[nome] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
+
+                    const finishBtn = itemKey
+                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="finishBoardItem('${itemKey}','${nomeSafe}')">✅ Concluir</button>`
+                        : `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="controlTimer('finish','${nomeSafe}')">✅ Concluir</button>`;
+
+                    html += `<tr>
+                        <td class="ps-3 fw-bold">${nomeSafe}</td>
+                        <td class="text-muted small">${base}</td>
+                        <td class="text-muted small">${cor}</td>
+                        <td class="text-center">
+                            <span id="btimer_${safeId}" class="font-monospace fw-bold text-primary" style="font-size:1.1rem;">${formatSeconds(elapsed)}</span>
+                        </td>
+                        <td class="text-center">
+                            <span class="badge ${estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}"
+                                style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
+                                ${estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}
+                            </span>
+                        </td>
+                        <td class="text-center">
+                            <span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>
+                        </td>
+                        <td class="text-center">
+                            <button class="btn btn-xs btn-outline-primary btn-sm" onclick="openProductionChecklist('${nomeSafe}')">🛠 Abrir</button>
+                            ${finishBtn}
+                        </td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div>`;
+            }
+
+            // ── Concluídos ──────────────────────────────────────────────
+            if (done.length > 0) {
+                html += `<div class="border-top px-3 py-2 mt-1" style="background:#f0fdf4;">
+                    <small class="fw-bold text-success">✅ CONCLUÍDOS ESTE MÊS (${done.length})</small>
+                </div>
+                <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+                    <tbody>`;
+                done.slice().reverse().forEach(item => {
+                    const nome = (item.nome || item.nome_original || 'N/D').replace(/'/g,'&#39;');
+                    const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                    html += `<tr class="table-success">
+                        <td class="ps-3 fw-bold text-success">${nome}</td>
+                        <td class="text-muted small">${item.base || '—'}</td>
+                        <td class="text-muted small">${item.cor  || '—'}</td>
+                        <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
+                        <td class="text-muted small">${item.cliente || '—'}</td>
+                        <td class="text-center"><span class="badge bg-success">✅ Concluído</span><br><small class="text-muted">${fin}</small></td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div>`;
+            }
+
+            div.innerHTML = html;
+
+            // ── Ticker local (1s) ────────────────────────────────────────
+            _boardTick = setInterval(() => {
+                Object.entries(_boardTimerState).forEach(([nome, s]) => {
+                    if (s.estado !== 'running') return;
+                    const elapsed = s.base + (Date.now() / 1000 - s.startedAt);
+                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g, '_');
+                    const el = document.getElementById('btimer_' + safeId);
+                    if (el) el.textContent = formatSeconds(Math.floor(elapsed));
+                });
+            }, 1000);
         }
 
         async function startPendingOrder(itemKey, produtoNomeEncoded) {
@@ -4426,11 +4627,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 });
                 showToast('Sucesso', `Produção iniciada: ${produtoNome}`, 'success');
                 openProductionChecklist(produtoNome);
-                await loadPendingOrders();
+                await loadProductionBoard();
+            } catch(e) { showToast('Erro', 'Falha ao iniciar produção', 'danger'); }
+        }
+
+        async function finishBoardItem(itemKey, produtoNome) {
+            if (!confirm(`Concluir produção de "${produtoNome}"?`)) return;
+            try {
+                await fetch('/api/pending-orders/finish', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
+                });
+                showToast('✅ Concluído!', produtoNome, 'success');
+                await loadProductionBoard();
                 await refreshComponentTab();
-            } catch(e) {
-                showToast('Erro', 'Falha ao iniciar produção', 'danger');
-            }
+            } catch(e) { showToast('Erro', 'Falha ao concluir', 'danger'); }
         }
 
         async function dismissPendingOrder(itemKey) {
@@ -4441,21 +4653,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ item_key: itemKey })
                 });
-                await loadPendingOrders();
-            } catch(e) {
-                showToast('Erro', 'Falha ao remover pedido', 'danger');
-            }
+                await loadProductionBoard();
+            } catch(e) { showToast('Erro', 'Falha ao remover pedido', 'danger'); }
         }
 
-        /* ✅ DESIGN: Atualizar Componentes — nova versão */
         function updateComponentUsage(usageData) {
             if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
-            if (usageData && usageData.active_production) renderActiveTimers(usageData.active_production);
             if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
 
         async function refreshComponentTab() {
-            loadPendingOrders();
+            loadProductionBoard();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
@@ -4465,63 +4673,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
             try {
                 const usageData = await fetchAPI('/api/components/usage');
-                if (usageData.active_production) renderActiveTimers(usageData.active_production);
                 if (usageData.history_production) renderProductionHistory(usageData.history_production);
                 if (usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
             } catch(e) { console.error(e); }
         }
 
-        // Guarda estado dos timers ativos para o ticker automático
-        let _activeTimersState = {};
-        let _activeTimersTick = null;
-
-        function renderActiveTimers(activeProduction) {
-            const div = document.getElementById('active-timers-section');
-            if (!div) return;
-
-            // Para ticker anterior
-            if (_activeTimersTick) { clearInterval(_activeTimersTick); _activeTimersTick = null; }
-
-            if (!activeProduction || activeProduction.length === 0) {
-                _activeTimersState = {};
-                div.innerHTML = `<div class="text-center py-4"><div style="font-size:2.5rem;opacity:.3;">🏭</div><p class="text-muted mt-2 mb-0">Nenhuma produção ativa. Clique em um produto para iniciar.</p></div>`;
-                return;
-            }
-
-            // Salva estado: tempo base (no momento do render) + estado (running/paused)
-            _activeTimersState = {};
-            activeProduction.forEach(p => {
-                _activeTimersState[p.produto] = {
-                    base: p.tempo_decorrido,       // segundos já acumulados
-                    startedAt: Date.now(),          // quando essa snapshot chegou
-                    estado: p.estado
-                };
-            });
-
-            // Monta tabela com IDs únicos para cada célula de tempo
-            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-                <thead class="table-dark"><tr><th>Produto</th><th class="text-center">Tempo</th><th class="text-center">Status</th><th class="text-center">Ação</th></tr></thead>
-                <tbody>${activeProduction.map(p => {
-                    const safeId = p.produto.replace(/[^a-zA-Z0-9]/g, '_');
-                    return `<tr>
-                        <td class="fw-bold ps-3">${p.produto}</td>
-                        <td class="text-center"><span id="atimer_${safeId}" class="font-monospace fw-bold fs-5 text-primary">${formatSeconds(p.tempo_decorrido)}</span></td>
-                        <td class="text-center"><span class="badge ${p.estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}" style="${p.estado === 'running' ? 'animation:pulse-animation 1.5s infinite;' : ''}">${p.estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}</span></td>
-                        <td class="text-center"><button class="btn btn-sm btn-outline-primary" onclick="openProductionChecklist('${p.produto}')">Abrir Timer</button></td>
-                    </tr>`;
-                }).join('')}</tbody></table></div>`;
-
-            // Ticker: atualiza só as células de tempo a cada segundo, sem re-render
-            _activeTimersTick = setInterval(() => {
-                Object.entries(_activeTimersState).forEach(([produto, s]) => {
-                    if (s.estado !== 'running') return; // pausado não incrementa
-                    const elapsed = s.base + Math.floor((Date.now() - s.startedAt) / 1000);
-                    const safeId = produto.replace(/[^a-zA-Z0-9]/g, '_');
-                    const el = document.getElementById('atimer_' + safeId);
-                    if (el) el.textContent = formatSeconds(elapsed);
-                });
-            }, 1000);
-        }
+        // renderActiveTimers mantido como stub (o board substituiu)
+        function renderActiveTimers(activeProduction) {}
 
         function renderConsumptionTable(data) {
             const tableSection = document.getElementById('consumption-table-section');
@@ -4880,19 +5038,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             loadKits();
 
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
-            if (kpiTab) {
-                kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
-            }
+            if (kpiTab) kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
 
             const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
             if (componentUsageTab) {
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
-                    loadPendingOrders();
+                    loadProductionBoard();
+                    // Inicia polling automático a cada 10s (atualiza timers ao vivo para todos)
+                    if (!_boardPoll) {
+                        _boardPoll = setInterval(loadProductionBoard, 10000);
+                    }
                 });
-                // Para o ticker quando sai da aba (economiza recursos)
                 componentUsageTab.addEventListener('hidden.bs.tab', () => {
-                    if (_activeTimersTick) { clearInterval(_activeTimersTick); _activeTimersTick = null; }
+                    // Para polling e ticker ao sair da aba (economiza recursos)
+                    if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
+                    if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
                 });
             }
         });
