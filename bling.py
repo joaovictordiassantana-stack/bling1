@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 
+# ============================================================================
+# GEVENT MONKEY PATCH — DEVE SER A PRIMEIRA COISA A EXECUTAR
+# Gunicorn 25.1.0 criou um control server baseado em asyncio.
+# Com worker gevent, asyncio.get_event_loop() falha: "no running event loop".
+# Solução: monkey_patch antes de tudo + forçar criação do event loop asyncio.
+# ============================================================================
+try:
+    from gevent import monkey as _gm
+    _gm.patch_all(thread=True, socket=True, dns=True, time=True,
+                  select=True, ssl=True, subprocess=True, signal=True,
+                  builtins=False, os=True)
+    import asyncio as _aio
+    try:
+        _aio.get_event_loop()
+    except RuntimeError:
+        _aio.set_event_loop(_aio.new_event_loop())
+    del _gm, _aio
+except ImportError:
+    pass  # Sem gevent instalado — modo local com threads puras
+
 """
 ================================================================================
 bling.py - Sistema de Automação Bling com OAuth 2.0 e Dashboard Web Premium
@@ -43,11 +63,21 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
-# Importação necessária para tratamento correto do WebSocket
 try:
     from simple_websocket import ConnectionClosed
 except ImportError:
     class ConnectionClosed(Exception): pass
+
+# Filtro: suprime log de erro residual do gunicorn control server
+# Caso o event loop não seja encontrado mesmo após o patch acima
+import logging as _log_setup
+for _guni_logger in ('gunicorn.arbiter', 'gunicorn.error', 'gunicorn'):
+    _log_setup.getLogger(_guni_logger).addFilter(
+        type('_SuppressNoLoop', (_log_setup.Filter,), {
+            'filter': staticmethod(lambda r: 'no running event loop' not in r.getMessage())
+        })()
+    )
+del _log_setup, _guni_logger
 
 # ============================================================================
 # MONGODB — Camada de Persistência Central
