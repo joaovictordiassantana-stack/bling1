@@ -1222,10 +1222,9 @@ class ProductionTimer:
     def __init__(self):
         self.timers = self._load()
         self._auto_pause_on_restart()
-        # Relança background_savers para qualquer timer que ainda esteja running
-        for nome, t in self.timers.items():
-            if t.get('state') == 'running':
-                self._launch_background_saver(nome)
+        # Lança savers para TODOS os timers existentes (running ou paused)
+        for nome in list(self.timers.keys()):
+            self._launch_background_saver(nome)
 
     def _load(self):
         # Tenta MongoDB primeiro, fallback para arquivo
@@ -1298,19 +1297,17 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def _launch_background_saver(self, nome):
-        """Lança thread que salva progresso a cada 30s (sobrevive a qualquer estado)."""
+        """Thread que faz checkpoint do timer a cada 30s enquanto existir (running ou paused)."""
         def background_saver():
             while True:
                 time.sleep(30)
                 if nome not in self.timers:
-                    break
+                    break  # Timer foi removido (concluído/zerado)
                 t = self.timers[nome]
-                if t.get('state') != 'running':
-                    break
-                now_ts = time.time()
-                elapsed = now_ts - t.get('start_ts', now_ts)
-                t['accumulated'] = t.get('accumulated', 0) + elapsed
-                t['start_ts'] = now_ts
+                if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
+                    now_ts = time.time()
+                    t['accumulated'] = t.get('accumulated', 0) + (now_ts - t['start_ts'])
+                    t['start_ts'] = now_ts
                 try:
                     self._save()
                 except Exception as e:
@@ -1328,27 +1325,29 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def stop_and_log(self, produto_nome):
-        """Finaliza produção — salva histórico, auto-registra todos os componentes RECIPE."""
-        status = self.pause(produto_nome)
-        total_seconds = status['elapsed']
-
-        # Checklist salva no timer (o que foi marcado manualmente)
+        """Finaliza produção: pausa timer, registra componentes e salva histórico."""
+        # Recupera checklist antes de pausar
         checklist_marcado = {}
         if produto_nome in self.timers:
             checklist_marcado = self.timers[produto_nome].get('checklist', {})
+            status = self.pause(produto_nome)
+            total_seconds = status['elapsed']
+        else:
+            # Timer não existe (concluído direto do board sem abrir modal)
+            total_seconds = 0
 
-        # Auto-registra componentes ainda NÃO marcados (se for cadeira)
+        # Registra componentes da receita não marcados manualmente
         if 'CADEIRA' in produto_nome.upper():
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
                 if not checklist_marcado.get(nome_comp, False):
-                    # Não foi marcado manualmente — registra automaticamente
                     try:
                         component_consumption.register_component(
                             nome_comp, comp['qtd'], comp['un'], produto_nome
                         )
                     except Exception as e:
-                        logger.error(f"Auto-registro componente {nome_comp}: {e}")
+                        logger.error(f"Auto-registro componente '{nome_comp}': {e}")
+            logger.info(f"✅ Componentes registrados para '{produto_nome}'")
 
         registro = {
             "produto": produto_nome,
@@ -1357,14 +1356,13 @@ class ProductionTimer:
             "timestamp": time.time(),
             "checklist": checklist_marcado
         }
-
         self._add_to_history(registro)
 
         if produto_nome in self.timers:
             del self.timers[produto_nome]
             self._save()
 
-        return {'elapsed': 0, 'state': 'finished', 'registro': registro}
+        return {'elapsed': total_seconds, 'state': 'finished', 'registro': registro}
 
     def reset(self, produto_nome):
         if produto_nome in self.timers:
@@ -1563,64 +1561,71 @@ class ComponentConsumptionManager:
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
 
 
-# ── Helpers de extração de base/cor ──────────────────────────────────────────
-
-# Palavras-chave que indicam tipo de BASE
-_BASE_KEYWORDS = [
-    'BASE QUADRADA', 'BASE REDONDA', 'BASE ESTRELA', 'BASE CROMADA',
-    'BASE PRETA', 'BASE ALUMINIO', 'BASE ALUMÍNIO', 'BASE FIXA',
-    'BASE GIRATÓRIA', 'BASE GIRATORIA', 'BASE MADEIRA', 'BASE',
-]
-# Palavras-chave de COR/MATERIAL (ordem importa: mais específicas primeiro)
-_COR_KEYWORDS = [
-    'COURVIM PRETO', 'COURVIM BRANCO', 'COURVIM CARAMELO', 'COURVIM',
-    'VELUDO PRETO', 'VELUDO CINZA', 'VELUDO AZUL', 'VELUDO VERDE',
-    'VELUDO ROSA', 'VELUDO BEGE', 'VELUDO',
-    'LINHO BEGE', 'LINHO CINZA', 'LINHO PRETO', 'LINHO',
-    'TECIDO PRETO', 'TECIDO CINZA', 'TECIDO BEGE', 'TECIDO',
-    'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO', 'MARROM',
-    'AZUL', 'VERDE', 'ROSA', 'AMARELO', 'LARANJA', 'VINHO', 'CREME',
-]
+# ── Extração de Base/Cor do nome do produto ──────────────────────────────────
 
 def _extract_base_cor(nome: str):
-    """Extrai base e cor do nome do produto.
-    Suporta padrão "PRODUTO - BASE X - COR Y" ou busca por keywords no nome.
-    Retorna (base, cor) como strings, vazias se não encontrado.
     """
+    Extrai a base e a cor/material a partir do nome do produto.
+    Estratégia:
+    1. Se o nome tem ' - ' como separador, analisa cada parte.
+    2. Fallback: busca por palavras-chave específicas no nome.
+    Retorna (base, cor) — strings vazias se não encontrado.
+    """
+    if not nome:
+        return '', ''
+
     nome_up = nome.upper()
     base = ''
     cor = ''
 
-    # Tenta separar pelas partes (separador " - " ou " / ")
-    sep = ' - ' if ' - ' in nome else (' / ' if ' / ' in nome else None)
-    if sep:
-        partes = [p.strip() for p in nome.split(sep)]
+    # Palavras que identificam base (do mais específico ao mais genérico)
+    BASE_TYPES = [
+        'BASE QUADRADA', 'BASE REDONDA', 'BASE ESTRELA', 'BASE CROMADA',
+        'BASE PRETA', 'BASE ALUMÍNIO', 'BASE ALUMINIO', 'BASE FIXA',
+        'BASE GIRATÓRIA', 'BASE GIRATORIA', 'BASE MADEIRA', 'BASE INOX',
+    ]
+    # Palavras que identificam cor/material
+    COR_TYPES = [
+        'COURVIM PRETO', 'COURVIM BRANCO', 'COURVIM CARAMELO', 'COURVIM CINZA', 'COURVIM',
+        'VELUDO PRETO', 'VELUDO CINZA', 'VELUDO AZUL', 'VELUDO VERDE',
+        'VELUDO ROSA', 'VELUDO BEGE', 'VELUDO VINHO', 'VELUDO',
+        'LINHO BEGE', 'LINHO CINZA', 'LINHO PRETO', 'LINHO',
+        'TECIDO PRETO', 'TECIDO CINZA', 'TECIDO BEGE', 'TECIDO',
+        'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO', 'MARROM',
+        'AZUL', 'VERDE', 'ROSA', 'AMARELO', 'LARANJA', 'VINHO', 'CREME',
+    ]
+
+    # Tenta separar pelas partes com " - "
+    if ' - ' in nome:
+        partes = [p.strip() for p in nome.split(' - ')]
         for parte in partes:
             pu = parte.upper()
-            if not base and 'BASE' in pu:
-                base = parte
-            elif not cor and any(k in pu for k in ['COR', 'TECIDO', 'COURVIM', 'LINHO', 'VELUDO',
-                                                    'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO',
-                                                    'MARROM', 'AZUL', 'VERDE', 'ROSA', 'AMARELO',
-                                                    'LARANJA', 'VINHO', 'CREME']):
-                cor = parte
-
-    # Se não encontrou pelo separador, busca por keywords no nome inteiro
-    if not base:
-        for kw in _BASE_KEYWORDS:
-            if kw in nome_up:
-                # Extrai o trecho relevante
-                idx = nome_up.find(kw)
-                trecho = nome[idx:idx + len(kw) + 20].split(' - ')[0].split(' / ')[0].strip()
-                base = trecho
+            # Parte é base se começa com BASE ou contém tipo de base
+            if not base:
+                for bt in BASE_TYPES:
+                    if pu.startswith(bt) or pu == bt:
+                        base = parte
+                        break
+                # fallback simples: parte curta que começa com "BASE "
+                if not base and pu.startswith('BASE ') and len(parte) < 30:
+                    base = parte
+            # Parte é cor se contém material/cor (e não é a parte do nome do produto)
+            if not cor and not base == parte:
+                for ct in COR_TYPES:
+                    if ct in pu:
+                        # Pega só o trecho relevante (não a parte inteira se for grande)
+                        idx = pu.find(ct)
+                        cor = parte[idx:idx+len(ct)].strip()
+                        break
+    else:
+        # Sem separador: busca por keywords no nome completo
+        for bt in BASE_TYPES:
+            if bt in nome_up:
+                base = bt.title()  # ex: "Base Quadrada"
                 break
-
-    if not cor:
-        for kw in _COR_KEYWORDS:
-            if kw in nome_up:
-                idx = nome_up.find(kw)
-                trecho = nome[idx:idx + len(kw) + 20].split(' - ')[0].split(' / ')[0].strip()
-                cor = trecho
+        for ct in COR_TYPES:
+            if ct in nome_up:
+                cor = ct.title()   # ex: "Preto"
                 break
 
     return base, cor
@@ -1753,7 +1758,7 @@ class PendingOrdersManager:
             try:
                 dt = datetime.fromisoformat(added)
                 item_mes = f"{dt.year}-{dt.month:02d}"
-                if item_mes != mes_atual and item.get('status') in ('done', 'waiting'):
+                if item_mes != mes_atual:  # Limpa tudo do mês anterior
                     to_remove.append(key)
             except Exception:
                 pass
@@ -1815,7 +1820,7 @@ class PendingOrdersManager:
                 nome_produto = produto_cache['nome'] if produto_cache else nome_raw
                 imagem = (produto_cache or {}).get('imagem', '')
 
-                # Extrai base e cor do nome do produto (suporta separadores " - " e " / ")
+                # Extrai base e cor do nome do produto
                 base, cor = _extract_base_cor(nome_produto)
 
                 cliente = ''
@@ -1849,8 +1854,9 @@ class PendingOrdersManager:
                         added += 1
 
         if added > 0:
-            self._save()
-            logger.info(f"✅ PendingOrders: {added} itens novos adicionados à fila de espera.")
+            if not MONGO_AVAILABLE:
+                self._save()
+            logger.info(f"✅ PendingOrders: {added} novos itens adicionados.")
         return added
 
 
@@ -2080,12 +2086,12 @@ class Orchestrator:
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
-        self.logger.debug(f'process_sales_orders chamado (force={force})')
+        self.logger.debug(f"DEBUG: process_sales_orders chamado (force={force})")
         
         # Evita recálculos encavalados
         with self.sales.recalculation_lock:
             if self.sales._recalculation_running and not force:
-                self.logger.debug(f'Recálculo já em execução, ignorando.')
+                self.logger.debug("DEBUG: Recálculo já em execução, ignorando.")
                 return
             self.sales._recalculation_running = True
             
@@ -2096,7 +2102,7 @@ class Orchestrator:
                 
             now = datetime.now()
             start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            self.logger.info(f"Buscando pedidos: {start_date.strftime('%d/%m/%Y')} → {now.strftime('%d/%m/%Y')}")
+            self.logger.info(f"Buscando pedidos: {start_date.strftime('%d/%m/%Y')} → hoje")
             
             # Parâmetros compatíveis
             # Busca Janela Móvel (Últimos 30 dias)
@@ -2112,15 +2118,15 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
-                self.logger.debug(f'Buscando página {page} de pedidos...')
+                self.logger.debug(f"DEBUG: Buscando página {page} de pedidos...")
                 try:
                     response = self.api.get('pedidos/vendas', params=params)
                 except Exception as e:
-                    self.logger.error(f'Erro na API ao buscar pedidos: {e}')
+                    self.logger.error(f"DEBUG: Erro na API ao buscar pedidos: {e}")
                     break # Se der erro na API, para o loop mas processa o que já pegou
                 
                 if response is None:
-                    self.logger.debug(f'Resposta da API nula na página {page}')
+                    self.logger.debug(f"DEBUG: Resposta da API nula na página {page}")
                     break
     
                 # --- CORREÇÃO DE LEITURA (PARSING) ---
@@ -2140,7 +2146,7 @@ class Orchestrator:
                     data = response
                 # -------------------------------------
                 
-                self.logger.debug(f'Página {page} retornou {len(data) if data else 0} pedidos.')
+                self.logger.debug(f"DEBUG: Página {page} retornou {len(data) if data else 0} pedidos.")
                 
                 if not data:
                     break
@@ -2172,7 +2178,7 @@ class Orchestrator:
                     if o.get('id'):
                         valid_orders.append(o)
 
-                self.logger.debug(f'{len(valid_orders)} pedidos válidos após normalização inicial.')
+                self.logger.debug(f"DEBUG: {len(valid_orders)} pedidos válidos após normalização inicial.")
                 # 1. Substitui o histórico de vendas pelo resultado da busca (Reset Mensal)
                 self.sales._sales_history = valid_orders
                 
@@ -2323,12 +2329,8 @@ class Orchestrator:
         A API Bling V3 na listagem não retorna itens — só no endpoint individual.
         Chamado em thread separada para não bloquear o worker principal.
         """
-        # Pedidos que já têm pelo menos 1 item na fila (qualquer status)
-        # Evita duplicar itens de pedidos já processados
-        already_have = {
-            v.get('order_id')
-            for v in pending_orders.data.values()
-        }
+        # Todos os order_ids já presentes (qualquer status) — evita re-buscar e duplicar
+        already_have = {v.get('order_id') for v in pending_orders.data.values()}
         agora_fetch = datetime.now()
         orders_mes = []
         for o in orders:
@@ -3121,18 +3123,18 @@ class WebServer:
             with WebServer.webhook_lock:
                 try:
                     # Log de entrada bruta para diagnóstico
-                    self.logger.debug(f'Webhook bruto recebido: {request.data.decode('utf-8')[:500]}')
-                    self.logger.debug(f'Headers do Webhook: {dict(request.headers)}')
+                    self.logger.debug(f"DEBUG: Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
+                    self.logger.debug(f"DEBUG: Headers do Webhook: {dict(request.headers)}")
 
                     # 1. Validação de Assinatura (Mantenha se configurado no Render)
                     signature = request.headers.get("X-Bling-Signature-256")
                     if self.config.WEBHOOK_SECRET and not signature:
-                        self.logger.warning(f'Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.')
+                        self.logger.warning("DEBUG: Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
                         return jsonify({"status": "forbidden", "reason": "missing signature"}), 403
 
                     data = request.json
                     if not data:
-                        self.logger.debug(f'Webhook ignorado: JSON vazio ou inválido.')
+                        self.logger.debug("DEBUG: Webhook ignorado: JSON vazio ou inválido.")
                         return jsonify({"status": "ignored"}), 200
 
                     self.logger.info(f"⚡ Webhook recebido: {str(data)[:200]}")
@@ -3142,22 +3144,22 @@ class WebServer:
 
                     # Caso 1: Webhook V3 Padrão (vem "id", "situacao", "tipo" na raiz)
                     if 'situacao' in data and 'id' in data:
-                        self.logger.debug(f'Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})')
+                        self.logger.debug(f"DEBUG: Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
                         should_update = True
                     
                     # Caso 2: Tipo explícito
                     elif data.get('tipo') == 'pedidoVenda':
-                        self.logger.debug(f'Webhook tipo pedidoVenda detectado.')
+                        self.logger.debug("DEBUG: Webhook tipo pedidoVenda detectado.")
                         should_update = True
 
                     # Caso 3: Formato antigo (V2)
                     elif 'retorno' in data and 'pedidos' in data['retorno']:
-                        self.logger.debug(f'Webhook V2 detectado.')
+                        self.logger.debug("DEBUG: Webhook V2 detectado.")
                         should_update = True
                     
                     # Caso 4: Callbacks de teste
                     elif data.get('test') == True:
-                        self.logger.debug(f'Webhook de teste recebido.')
+                        self.logger.debug("DEBUG: Webhook de teste recebido.")
                         return jsonify({"status": "ok", "message": "Test received"}), 200
 
                     if should_update:
@@ -4050,17 +4052,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <!-- ═══ PRODUTOS VENDIDOS NO MÊS ═══ -->
-                        <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header" style="background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);">
-                                <h5 class="mb-0">🛒 Produtos Vendidos (Mês Atual)</h5>
-                                <small class="text-white-50">Pedidos faturados no Bling este mês</small>
-                            </div>
-                            <div class="card-body p-0" id="monthly-sales-section">
-                                <div class="text-center py-4 text-muted">⏳ Aguardando dados...</div>
-                            </div>
-                        </div>
-
                         <!-- ═══ HISTÓRICO DE FINALIZAÇÕES ═══ -->
                         <div class="card border-0 shadow-sm">
                             <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%);">
@@ -4587,22 +4578,25 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 waiting.forEach(item => {
                     const rawNome = item.nome || item.nome_original || 'N/D';
                     const nome = rawNome.replace(/'/g,"&#39;");
-                    const img = item.imagem
-                        ? `<img src="${item.imagem}" alt="" style="width:42px;height:42px;object-fit:contain;border-radius:6px;margin-right:8px;border:1px solid #e5e7eb;vertical-align:middle;" onerror="this.style.display='none'">`
+                    // Só mostra imagem se for URL real (não placeholder /static/no-image.png)
+                    const imgUrl = (item.imagem && !item.imagem.includes('no-image')) ? item.imagem : '';
+                    const imgTag = imgUrl
+                        ? `<img src="${imgUrl}" alt="" style="width:40px;height:40px;object-fit:contain;border-radius:5px;border:1px solid #e5e7eb;margin-right:8px;vertical-align:middle;" onerror="this.remove()">`
                         : '';
                     html += `<tr>
-                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${img}<span style="vertical-align:middle;">${nome}</span></td>
+                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
                         <td class="text-muted small">${item.base || '—'}</td>
                         <td class="text-muted small">${item.cor || '—'}</td>
                         <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
                         <td class="text-muted small">${item.cliente || '—'}</td>
                         <td class="text-center">
                             <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
-                                data-key="${item.item_key}"
-                                data-nome="${(item.nome || item.nome_original || 'N/D').replace(/"/g,'&quot;')}"
-                                onclick="startPendingOrder(this.dataset.key, this.dataset.nome)">▶ Produzir</button>
+                                data-ikey="${item.item_key}"
+                                data-pnome="${(item.nome || item.nome_original || '').replace(/"/g,'')}"
+                                onclick="startPendingOrder(this.dataset.ikey, this.dataset.pnome)">▶ Produzir</button>
                             <button class="btn btn-xs btn-outline-secondary btn-sm"
-                                onclick="dismissPendingOrder('${item.item_key}')">✕</button>
+                                data-dkey="${item.item_key}"
+                                onclick="dismissPendingOrder(this.dataset.dkey)">✕</button>
                         </td>
                     </tr>`;
                 });
@@ -4704,19 +4698,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function startPendingOrder(itemKey, produtoNome) {
-            if (!itemKey || !produtoNome) { showToast('Erro', 'Dados inválidos', 'danger'); return; }
+            if (!itemKey || !produtoNome) {
+                showToast('Erro', 'Dados do pedido inválidos', 'danger');
+                return;
+            }
             try {
                 const res = await fetch('/api/pending-orders/start', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
                 });
-                if (!res.ok) throw new Error('Falha no servidor');
-                showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
+                if (!res.ok) throw new Error('Servidor retornou erro');
                 await loadProductionBoard();
                 openProductionChecklist(produtoNome);
+                showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
             } catch(e) {
-                console.error('startPendingOrder error:', e);
+                console.error('startPendingOrder:', e);
                 showToast('Erro', 'Falha ao iniciar produção', 'danger');
             }
         }
@@ -4748,12 +4745,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function updateComponentUsage(usageData) {
-            if (usageData && usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
             if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
 
         async function refreshComponentTab() {
-            loadProductionBoard();
+            await loadProductionBoard();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
@@ -4764,8 +4760,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             try {
                 const usageData = await fetchAPI('/api/components/usage');
                 if (usageData.history_production) renderProductionHistory(usageData.history_production);
-                if (usageData.produtos_vendidos) renderMonthlySales(usageData.produtos_vendidos);
-            } catch(e) { console.error(e); }
+            } catch(e) { console.error('Erro ao carregar histórico:', e); }
         }
 
         // renderActiveTimers mantido como stub (o board substituiu)
@@ -4797,23 +4792,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        function renderMonthlySales(produtosVendidos) {
-            const div = document.getElementById('monthly-sales-section');
-            if (!div) return;
-            const entries = Object.entries(produtosVendidos || {}).sort((a, b) => b[1] - a[1]);
-            if (entries.length === 0) {
-                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto vendido registrado este mês.</div>';
-                return;
-            }
-            div.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
-                <thead style="background:#f8fafc;"><tr><th class="ps-3">Produto</th><th class="text-center">Qtd Vendida</th><th class="text-center">Insumos Teóricos</th></tr></thead>
-                <tbody>${entries.map(([nome, qtd]) => {
-                    const isCadeira = nome.includes('CADEIRA');
-                    return `<tr><td class="ps-3 fw-bold">${nome}</td>
-                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:white;padding:.4rem .9rem;">${qtd} un</span></td>
-                    <td class="text-center">${isCadeira ? `<button class="btn btn-xs btn-outline-secondary btn-sm" onclick="showTheoreticalUsage('${nome}', ${qtd})">Ver insumos</button>` : '<span class="text-muted small">—</span>'}</td></tr>`;
-                }).join('')}</tbody></table></div>`;
-        }
+
 
         function renderProductionHistory(history) {
             const div = document.getElementById('production-history-section');
@@ -4832,14 +4811,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        function showTheoreticalUsage(productName, qty) {
-            const lines = RECIPE_CADEIRA.map(item => `<tr><td>${item.nome}</td><td class="text-center fw-bold">${(item.qtd * qty).toFixed(2)}</td><td class="text-muted small">${item.un}</td></tr>`).join('');
-            const html = `<div class="modal fade" id="theoreticalModal" tabindex="-1"><div class="modal-dialog modal-dialog-scrollable"><div class="modal-content"><div class="modal-header bg-dark text-white"><h6 class="modal-title">📋 Insumos Teóricos: ${qty}x ${productName}</h6><button class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div><div class="modal-body p-0"><table class="table table-sm mb-0"><thead class="table-light"><tr><th>Insumo</th><th class="text-center">Qtd Total</th><th>Un.</th></tr></thead><tbody>${lines}</tbody></table></div></div></div></div>`;
-            const old = document.getElementById('theoreticalModal');
-            if (old) old.remove();
-            document.body.insertAdjacentHTML('beforeend', html);
-            new bootstrap.Modal(document.getElementById('theoreticalModal')).show();
-        }
+
 
         function formatSeconds(s) {
             s = Math.floor(s || 0);
