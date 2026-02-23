@@ -223,18 +223,47 @@ kpi_update_lock = Lock()
 # 1. LOGS AVANÇADOS
 # ============================================================================
 
-# InMemoryLogHandler removido — logs em tempo real não são mais usados no frontend.
-
 class InMemoryLogHandler(logging.Handler):
-    """Stub mínimo mantido para não quebrar referências existentes."""
-    def __init__(self, max_logs=50):
+    """Handler de log que armazena os registros em memória para o WebSocket."""
+    def __init__(self, max_logs=100):
         super().__init__()
         self.logs = []
         self.max_logs = max_logs
+        self.formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%dT%H:%M:%S'
+        )
         self.ws_callbacks = []
         self.ws_lock = Lock()
-    def emit(self, record): pass
-    def get_logs(self, limit=None): return []
+
+    def emit(self, record):
+        try:
+            log_entry = {
+                'timestamp': self.formatter.formatTime(record),
+                'level': record.levelname,
+                'message': self.format(record),
+                'name': record.name
+            }
+            self.logs.append(log_entry)
+            if len(self.logs) > self.max_logs:
+                self.logs.pop(0)
+            with self.ws_lock:
+                dead = []
+                for cb in self.ws_callbacks:
+                    try:
+                        cb(log_entry)
+                    except Exception:
+                        dead.append(cb)
+                for cb in dead:
+                    self.ws_callbacks.remove(cb)
+        except Exception:
+            self.handleError(record)
+
+    def get_logs(self, limit=None):
+        if limit:
+            return self.logs[-limit:]
+        return self.logs.copy()
+
     def add_ws_callback(self, callback):
         with self.ws_lock:
             self.ws_callbacks.append(callback)
@@ -1211,10 +1240,11 @@ class ProductionTimer:
         now = time.time()
         if produto_nome not in self.timers:
             self.timers[produto_nome] = {
-                'start_ts': now, 
-                'accumulated': 0, 
+                'start_ts': now,
+                'accumulated': 0,
                 'state': 'running',
-                'created_at': datetime.now().isoformat()
+                'created_at': datetime.now().isoformat(),
+                'checklist': {}  # {nome_componente: True/False} — persiste no servidor
             }
         else:
             t = self.timers[produto_nome]
@@ -1249,26 +1279,43 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def stop_and_log(self, produto_nome):
-        """Finaliza a produção, salva histórico detalhado e consome insumos."""
-        status = self.pause(produto_nome) # Garante cálculo final
+        """Finaliza produção — salva histórico, auto-registra todos os componentes RECIPE."""
+        status = self.pause(produto_nome)
         total_seconds = status['elapsed']
-        
-        # Registro detalhado para auditoria
+
+        # Checklist salva no timer (o que foi marcado manualmente)
+        checklist_marcado = {}
+        if produto_nome in self.timers:
+            checklist_marcado = self.timers[produto_nome].get('checklist', {})
+
+        # Auto-registra componentes ainda NÃO marcados (se for cadeira)
+        if 'CADEIRA' in produto_nome.upper():
+            for comp in RECIPE_CADEIRA:
+                nome_comp = comp['nome']
+                if not checklist_marcado.get(nome_comp, False):
+                    # Não foi marcado manualmente — registra automaticamente
+                    try:
+                        component_consumption.register_component(
+                            nome_comp, comp['qtd'], comp['un'], produto_nome
+                        )
+                    except Exception as e:
+                        logger.error(f"Auto-registro componente {nome_comp}: {e}")
+
         registro = {
             "produto": produto_nome,
             "tempo_segundos": total_seconds,
             "data_conclusao": datetime.now().isoformat(),
-            "timestamp": time.time()
+            "timestamp": time.time(),
+            "checklist": checklist_marcado
         }
-        
+
         self._add_to_history(registro)
-        
-        # Remove do painel de "Em Andamento"
+
         if produto_nome in self.timers:
             del self.timers[produto_nome]
             self._save()
-            
-        return {'elapsed': 0, 'state': 'stopped'}
+
+        return {'elapsed': 0, 'state': 'finished', 'registro': registro}
 
     def reset(self, produto_nome):
         if produto_nome in self.timers:
@@ -1283,7 +1330,7 @@ class ProductionTimer:
         total = t['accumulated']
         if t['state'] == 'running':
             total += (time.time() - t['start_ts'])
-        return {'elapsed': int(total), 'state': t['state']}
+        return {'elapsed': int(total), 'state': t['state'], 'checklist': t.get('checklist', {})}
 
     def get_active_timers(self):
         """Retorna tudo que está sendo produzido agora para o Chefe ver."""
@@ -2159,8 +2206,28 @@ class Orchestrator:
         A API Bling V3 na listagem não retorna itens — só no endpoint individual.
         Chamado em thread separada para não bloquear o worker principal.
         """
-        already_have = {v.get('order_id') for v in pending_orders.data.values()}
-        orders_to_fetch = [o for o in orders if str(o.get('id', '')) not in already_have]
+        # Considera apenas pedidos do mês atual com status waiting/in_production
+        already_have = {
+            v.get('order_id')
+            for v in pending_orders.data.values()
+            if v.get('status') in ('waiting', 'in_production')
+        }
+        agora_fetch = datetime.now()
+        orders_mes = []
+        for o in orders:
+            data_str = o.get('data') or o.get('dataEmissao') or ''
+            if data_str:
+                try:
+                    dl = str(data_str).split(' ')[0].split('T')[0]
+                    dt = (datetime.strptime(dl, '%Y-%m-%d') if '-' in dl
+                          else datetime.strptime(dl, '%d/%m/%Y'))
+                    if dt.month == agora_fetch.month and dt.year == agora_fetch.year:
+                        orders_mes.append(o)
+                except Exception:
+                    orders_mes.append(o)
+            else:
+                orders_mes.append(o)
+        orders_to_fetch = [o for o in orders_mes if str(o.get('id', '')) not in already_have]
 
         if not orders_to_fetch:
             self.logger.info("✅ Todos os pedidos já estão na fila de pendentes.")
@@ -2483,6 +2550,26 @@ class WebServer:
             Thread(target=update_and_broadcast, daemon=True).start()
                 
             return jsonify(status)
+
+        @self.app.route('/api/checklist/state/<path:produto>', methods=['GET'])
+        def api_checklist_get(produto):
+            """Retorna estado salvo da checklist de um produto em produção."""
+            t = production_timer.timers.get(produto, {})
+            return jsonify({'checklist': t.get('checklist', {})})
+
+        @self.app.route('/api/checklist/state', methods=['POST'])
+        def api_checklist_set():
+            """Salva estado de um item da checklist no servidor (persiste)."""
+            data = request.json
+            produto = data.get('produto', '')
+            componente = data.get('componente', '')
+            checked = data.get('checked', False)
+            if produto and componente and produto in production_timer.timers:
+                if 'checklist' not in production_timer.timers[produto]:
+                    production_timer.timers[produto]['checklist'] = {}
+                production_timer.timers[produto]['checklist'][componente] = checked
+                production_timer._save()
+            return jsonify({'ok': True})
 
         @self.app.route('/api/consumption/register', methods=['POST'])
         def api_consumption_register():
@@ -2914,7 +3001,31 @@ class WebServer:
     def _setup_websockets(self):
         """Configura os WebSockets para logs e atualizações de KPI."""
         
-        # /ws/logs removido — logs em tempo real não são mais usados.
+        @self.sock.route('/ws/logs')
+        def ws_logs(ws):
+            self.logger.info("📡 WebSocket logs conectado.")
+            if len(memory_handler.ws_callbacks) >= 10:
+                self.logger.warning("Limite de conexões de log WS atingido.")
+                return
+
+            def ws_callback(log_entry):
+                try:
+                    ws.send(json.dumps({"logs": [log_entry]}))
+                except ConnectionClosed:
+                    raise
+                except Exception:
+                    raise ConnectionClosed()
+
+            try:
+                ws.send(json.dumps({"logs": memory_handler.get_logs()}))
+                memory_handler.add_ws_callback(ws_callback)
+                while True:
+                    ws.receive(timeout=60)
+            except ConnectionClosed:
+                pass
+            finally:
+                memory_handler.remove_ws_callback(ws_callback)
+                self.logger.debug("WebSocket logs desconectado")
 
         @self.sock.route('/ws/kpi-updates')
         def ws_kpi_updates(ws):
@@ -3171,8 +3282,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /* ✅ DESIGN: Log Box */
-        /* .log-box removido — logs em tempo real desativados */
-        ._log_box_unused {
+        .log-box {
             font-family: 'Fira Code', monospace;
             font-size: 0.8rem;
             background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
@@ -3627,7 +3737,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- Logs em tempo real removidos -->
+        <!-- Logs em Tempo Real -->
+        <div class="row mb-5">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">📋 Logs em Tempo Real</h5>
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="logs-content" class="log-box"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
 
         <!-- ✅ DESIGN: Tabs com Navegação -->
         <div class="row">
@@ -3757,16 +3879,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <!-- Seção: Produtos Vendidos no Mês -->
-                        <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header" style="background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);">
-                                <h5 class="mb-0">🛒 Produtos Vendidos (Mês Atual)</h5>
-                                <small class="text-white-50">Baseado nos pedidos faturados conectados ao Bling</small>
-                            </div>
-                            <div class="card-body p-0" id="monthly-sales-section">
-                                <div class="text-center py-4 text-muted">⏳ Aguardando dados...</div>
-                            </div>
-                        </div>
+                        <!-- Produtos Vendidos removido a pedido -->
 
                         <!-- Seção: Histórico de Finalizações -->
                         <div class="card border-0 shadow-sm">
@@ -3854,7 +3967,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        // formatLog removido — logs em tempo real desativados
+        function formatLog(log) {
+            const levelClass = `log-level-${log.level}`;
+            return `<div class="log-entry ${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
+        }
 
         /* ✅ DESIGN: Formatação de Data/Hora */
         function formatDateTime(isoString) {
@@ -3874,7 +3990,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // WebSocket de logs removido — não mais necessário
+        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            const box = document.getElementById('logs-content');
+            if(data.logs) {
+                data.logs.forEach(l => box.innerHTML += formatLog(l));
+                box.scrollTop = box.scrollHeight;
+            }
+        }
 
         /* ✅ DESIGN: Atualizar Status de Autenticação */
         function updateAuthStatus(authenticated, authUrl) {
@@ -4042,12 +4167,43 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
 
-            // Carrega estado atual do timer
+            // Carrega timer E estado da checklist salvo no servidor
             controlTimer('get', productName);
+            // Carrega checklist salvo para este produto
+            _loadChecklistState(productName);
         }
 
         // Estado de checklist por produto (para saber o que está marcado)
         const checklistState = {};
+
+        async function _loadChecklistState(productName) {
+            try {
+                const safe = encodeURIComponent(productName);
+                const res = await fetch(`/api/checklist/state/${safe}`);
+                const data = await res.json();
+                const saved = data.checklist || {};
+                // Restaura checkboxes marcados
+                RECIPE_CADEIRA.forEach((item, i) => {
+                    if (saved[item.nome]) {
+                        const cb = document.getElementById(`check${i}`);
+                        const container = cb && cb.closest('.checklist-item');
+                        if (cb && container) {
+                            cb.checked = true;
+                            container.style.background = '#d1fae5';
+                            container.style.borderColor = '#10b981';
+                        }
+                    }
+                });
+                // Atualiza progress bar
+                const total = RECIPE_CADEIRA.length;
+                const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
+                const progressDiv = document.getElementById('checklist-progress');
+                if (progressDiv) {
+                    progressDiv.innerHTML = `<strong>${checked} / ${total}</strong> itens marcados como usados${checked === total ? ' ✅ Tudo marcado!' : ''}`;
+                    progressDiv.className = `alert py-2 small mb-0 ${checked === total ? 'alert-success' : 'alert-info'}`;
+                }
+            } catch(e) { console.error('Erro ao carregar checklist:', e); }
+        }
 
         function toggleChecklist(container, idx, productName) {
             const cb = container.querySelector('input[type=checkbox]');
@@ -4057,13 +4213,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (cb.checked) {
                 container.style.background = '#d1fae5';
                 container.style.borderColor = '#10b981';
-                // Registra na API
                 registerConsumption(item.nome, item.qtd, item.un, productName, true);
             } else {
                 container.style.background = '';
                 container.style.borderColor = '';
                 registerConsumption(item.nome, item.qtd, item.un, productName, false);
             }
+
+            // Salva estado no servidor para persistir entre sessões
+            fetch('/api/checklist/state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ produto: productName, componente: item.nome, checked: cb.checked })
+            }).catch(e => console.error('Erro ao salvar checklist:', e));
 
             // Atualiza progress
             const total = RECIPE_CADEIRA.length;
@@ -4106,10 +4268,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     body: JSON.stringify({ action: action, produto: produto })
                 });
                 const data = await res.json();
-                
+
+                if (action === 'finish') {
+                    clearInterval(timerInterval);
+                    const elapsed = data.registro ? data.registro.tempo_segundos : 0;
+                    showToast('✅ Concluído!', `${produto} — ${formatSeconds(elapsed)} registrado.`, 'success');
+                    const modal = bootstrap.Modal.getInstance(document.getElementById('productionModal'));
+                    if (modal) modal.hide();
+                    refreshComponentTab();
+                    loadPendingOrders();
+                    return;
+                }
+
                 updateTimerDisplay(data.elapsed, data.state);
-                
-                // Se estiver rodando, inicia atualização local para feedback visual imediato
                 if (action === 'start' || (action === 'get' && data.state === 'running')) {
                     startLocalCounter(data.elapsed);
                 } else {
@@ -4117,7 +4288,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }
             } catch (e) {
                 console.error("Erro no timer:", e);
+                showToast('Erro', 'Falha ao comunicar com servidor.', 'danger');
             }
+        }
+
+        function formatSeconds(s) {
+            s = Math.floor(s || 0);
+            const h = Math.floor(s / 3600).toString().padStart(2,'0');
+            const m = Math.floor((s % 3600) / 60).toString().padStart(2,'0');
+            const sec = (s % 60).toString().padStart(2,'0');
+            return `${h}:${m}:${sec}`;
         }
 
         function startLocalCounter(startSeconds) {
