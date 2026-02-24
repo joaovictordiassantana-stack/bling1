@@ -3289,281 +3289,326 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <title>SW Móveis MDF — Gestão de Produção</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <style>
-        /* ✅ SW MÓVEIS MDF — Brand Identity 2025 */
-        @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
+        /* ══════════════════════════════════════════════════════════
+           SW MÓVEIS MDF — IDENTIDADE VISUAL 2025
+           Paleta: Jaguar | Amarelo Seletivo | Salomie | Mindaro | Gray | Nurse
+           Tipografia: Bebas Neue (títulos) + Noto Sans (corpo)
+        ══════════════════════════════════════════════════════════ */
 
         :root {
-            /* SW Brand Colors */
-            --jaguar:        #01010d;   /* preto profundo */
-            --amarelo:       #ffb600;   /* amarelo seletivo */
-            --salomie:       #fede8f;   /* amarelo suave */
-            --mindaro:       #f5f883;   /* verde-amarelo */
-            --gray:          #807f7f;   /* cinza médio */
-            --nurse:         #ecedec;   /* quase branco */
-
-            /* Functional aliases */
-            --primary:       var(--jaguar);
-            --primary-light: #1a1a2e;
-            --accent:        var(--amarelo);
-            --accent-light:  var(--salomie);
+            --jaguar:        #01010d;
+            --amarelo:       #ffb600;
+            --amarelo-dark:  #e6a400;
+            --salomie:       #fede8f;
+            --mindaro:       #f5f883;
+            --gray:          #807f7f;
+            --nurse:         #ecedec;
+            /* funcionais */
             --success:       #22c55e;
-            --warning:       var(--amarelo);
             --error:         #ef4444;
-            --bg-light:      var(--nurse);
-            --border-color:  #e0e0e0;
-            --text-muted:    var(--gray);
+            --border:        #ddddd8;
+            --bg:            #f5f5f0;
         }
 
-        /* ✅ Base */
-        * {
-            transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
-        }
+        /* ── Reset & Base ─────────────────────────────────────── */
+        *, *::before, *::after { box-sizing: border-box; }
 
         body {
-            background: #f7f7f5;
-            font-family: 'Noto Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            font-weight: 400;
-            line-height: 1.6;
+            background: var(--bg);
+            font-family: 'Noto Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 0.92rem;
+            line-height: 1.65;
             color: var(--jaguar);
+            min-height: 100vh;
         }
 
-        h1, h2, h3, h4, h5, h6 {
-            font-family: 'Noto Sans', sans-serif;
-            font-weight: 700;
-            line-height: 1.2;
-            color: var(--jaguar);
-        }
+        h1,h2,h3,h4,h5,h6 { font-weight: 700; color: var(--jaguar); margin-bottom: 0.4rem; }
 
-        /* Títulos destaque — Bebas Neue */
-        .display-title {
+        /* ── Bebas Neue para destaques ─────────────────────────── */
+        .sw-title {
             font-family: 'Bebas Neue', sans-serif;
-            letter-spacing: 0.04em;
+            letter-spacing: 0.06em;
         }
 
-        /* ✅ Navbar SW */
+        /* ── Scrollbar ─────────────────────────────────────────── */
+        ::-webkit-scrollbar { width: 7px; height: 7px; }
+        ::-webkit-scrollbar-track { background: var(--nurse); }
+        ::-webkit-scrollbar-thumb { background: var(--salomie); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--amarelo); }
+
+        /* ── Navbar ─────────────────────────────────────────────── */
         .navbar {
             background: var(--jaguar);
-            color: white;
-            box-shadow: 0 4px 20px rgba(1,1,13,0.25);
             border-bottom: 3px solid var(--amarelo);
-            animation: slideDown 0.4s ease-out;
-            padding: 0.75rem 0;
+            padding: 0;
+            min-height: 62px;
         }
 
-        @keyframes slideDown {
-            from { opacity: 0; transform: translateY(-20px); }
-            to   { opacity: 1; transform: translateY(0); }
+        .navbar-inner {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 1.5rem;
+            height: 62px;
+            gap: 1rem;
         }
 
-        .navbar-brand {
+        .navbar-brand-wrap {
+            display: flex;
+            align-items: center;
+            gap: 0.9rem;
+            text-decoration: none;
+        }
+
+        .navbar-brand-wrap img {
+            height: 40px;
+            width: auto;
+            filter: drop-shadow(0 0 8px rgba(255,182,0,0.5));
+        }
+
+        .brand-text-top {
             font-family: 'Bebas Neue', sans-serif;
-            font-size: 1.6rem;
-            letter-spacing: 0.08em;
-            color: var(--amarelo) !important;
+            font-size: 1.45rem;
+            letter-spacing: 0.1em;
+            color: var(--amarelo);
+            line-height: 1;
         }
 
-        /* ✅ Status Badge */
-        #status-badge {
-            animation: pulse-badge 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-            font-weight: 700;
-            padding: 0.4rem 1rem !important;
-            border-radius: 50px !important;
-            font-size: 0.75rem;
-            letter-spacing: 0.05em;
+        .brand-text-sub {
+            font-size: 0.6rem;
+            font-weight: 600;
+            letter-spacing: 0.18em;
             text-transform: uppercase;
+            color: rgba(255,255,255,0.4);
+            line-height: 1;
+            margin-top: 2px;
         }
 
-        @keyframes pulse-badge {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.75; }
+        .navbar-right {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
         }
 
-        #status-badge.bg-success {
-            background: linear-gradient(135deg, var(--success) 0%, #16a34a 100%) !important;
+        /* ── Status Badge ─────────────────────────────────────── */
+        #status-badge {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 0.7rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            padding: 0.38rem 1rem;
+            border-radius: 50px;
         }
 
-        #status-badge.bg-danger {
-            background: linear-gradient(135deg, var(--error) 0%, #dc2626 100%) !important;
+        #status-badge.bg-secondary { background: var(--gray) !important; }
+        #status-badge.bg-success   { background: var(--success) !important; }
+        #status-badge.bg-danger    { background: var(--error) !important; }
+
+        /* ── Auth Button ──────────────────────────────────────── */
+        .btn-auth {
+            font-family: 'Noto Sans', sans-serif;
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--jaguar) !important;
+            background: var(--amarelo);
+            border: none;
+            padding: 0.4rem 1.1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.2s;
+            text-decoration: none;
         }
 
-        #status-badge.bg-secondary {
-            background: var(--gray) !important;
+        .btn-auth:hover { background: var(--amarelo-dark); }
+
+        /* ── Page Header ──────────────────────────────────────── */
+        .page-header {
+            padding: 2.2rem 1.5rem 0;
         }
 
-        /* ✅ Cards */
+        .page-header-inner {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            border-left: 5px solid var(--amarelo);
+            padding-left: 1rem;
+        }
+
+        .page-header-title {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.9rem;
+            letter-spacing: 0.05em;
+            color: var(--jaguar);
+            margin: 0;
+        }
+
+        .page-header-sub {
+            font-size: 0.8rem;
+            color: var(--gray);
+            font-weight: 500;
+            margin: 0;
+        }
+
+        /* ── Main Container ───────────────────────────────────── */
+        .main-wrap {
+            padding: 1.75rem 1.5rem 3rem;
+        }
+
+        /* ── Cards ────────────────────────────────────────────── */
         .card {
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            background: #ffffff;
-            box-shadow: 0 2px 8px rgba(1,1,13,0.06);
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            animation: fadeInUp 0.4s ease-out;
-        }
-
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(16px); }
-            to   { opacity: 1; transform: translateY(0); }
+            background: #fff;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(1,1,13,0.05);
+            transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
         }
 
         .card:hover {
             border-color: var(--amarelo);
-            box-shadow: 0 8px 24px rgba(255,182,0,0.18);
-            transform: translateY(-3px);
+            box-shadow: 0 6px 20px rgba(255,182,0,0.15);
+            transform: translateY(-2px);
         }
 
         .card-header {
             background: var(--jaguar);
-            color: white;
-            border: none;
-            border-radius: 12px 12px 0 0;
-            font-weight: 700;
-            font-family: 'Noto Sans', sans-serif;
-            padding: 1.1rem 1.25rem;
+            color: #fff;
+            border-radius: 10px 10px 0 0 !important;
             border-bottom: 2px solid var(--amarelo);
+            padding: 0.9rem 1.2rem;
+            font-weight: 700;
         }
 
-        .card-header h5 {
-            color: white;
+        .card-header h5, .card-header .h5 {
+            color: #fff;
+            margin: 0;
+            font-size: 0.9rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
 
-        /* ✅ KPI Cards — SW Brand */
+        /* ── KPI Cards ────────────────────────────────────────── */
         .kpi-card {
             border-left: 4px solid var(--amarelo);
             position: relative;
             overflow: hidden;
-            background: #fff;
+            padding: 1.4rem !important;
         }
 
-        .kpi-card::before {
+        .kpi-card::after {
             content: '';
             position: absolute;
-            top: -30px;
-            right: -30px;
-            width: 90px;
-            height: 90px;
+            top: -20px; right: -20px;
+            width: 80px; height: 80px;
             border-radius: 50%;
             background: var(--salomie);
-            opacity: 0.35;
-            pointer-events: none;
+            opacity: 0.3;
         }
 
-        .kpi-daily    { border-left-color: var(--amarelo); }
-        .kpi-weekly   { border-left-color: var(--jaguar); }
-        .kpi-historic { border-left-color: var(--success); }
+        .kpi-daily   { border-left-color: var(--amarelo); }
+        .kpi-weekly  { border-left-color: var(--jaguar); }
+        .kpi-historic{ border-left-color: var(--success); }
 
-        .kpi-card h5 {
-            font-size: 0.78rem;
+        .kpi-label {
+            font-size: 0.68rem;
             font-weight: 700;
-            color: var(--gray);
+            letter-spacing: 0.1em;
             text-transform: uppercase;
-            letter-spacing: 0.08em;
-            margin-bottom: 0.75rem;
+            color: var(--gray);
+            margin-bottom: 0.5rem;
         }
 
-        .kpi-card h3 {
+        .kpi-value {
             font-family: 'Bebas Neue', sans-serif;
-            font-size: 2.8rem;
+            font-size: 3rem;
             letter-spacing: 0.04em;
-            margin: 0;
+            line-height: 1;
             color: var(--jaguar);
         }
 
-        .kpi-card.updating {
-            animation: pulse-update 0.6s ease-out;
+        .kpi-sub {
+            font-size: 0.72rem;
+            color: var(--gray);
+            margin-top: 0.35rem;
         }
 
-        @keyframes pulse-update {
-            0%   { background-color: #fff9e6; }
-            100% { background-color: #fff; }
+        .kpi-card.updating { animation: kpi-flash 0.5s ease; }
+
+        @keyframes kpi-flash {
+            0%   { background: #fffbee; }
+            100% { background: #fff; }
         }
 
-        /* ✅ DESIGN: Log Box */
+        /* ── Section Accent Title ─────────────────────────────── */
+        .section-title {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.1rem;
+            letter-spacing: 0.06em;
+            color: var(--jaguar);
+            display: flex;
+            align-items: center;
+            gap: 0.6rem;
+            margin-bottom: 1rem;
+        }
+
+        .section-title::before {
+            content: '';
+            width: 4px;
+            height: 22px;
+            background: var(--amarelo);
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        /* ── Log Box ──────────────────────────────────────────── */
         .log-box {
             font-family: 'Fira Code', monospace;
-            font-size: 0.8rem;
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            font-size: 0.78rem;
+            background: #0d0d1a;
             color: #d4d4d4;
-            border-radius: 8px;
+            border-radius: 0 0 10px 10px;
             padding: 1rem;
-            max-height: 400px;
+            max-height: 320px;
             overflow-y: auto;
-            line-height: 1.5;
+            line-height: 1.6;
         }
 
-        .log-box::-webkit-scrollbar {
-            width: 6px;
-        }
+        .log-entry { padding: 0.1rem 0; animation: fadeIn 0.2s ease; }
 
-        .log-box::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 3px;
-        }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
-        .log-box::-webkit-scrollbar-thumb {
-            background: rgba(255, 255, 255, 0.2);
-            border-radius: 3px;
-        }
+        .log-level-INFO    { color: #4ec9b0; }
+        .log-level-WARNING { color: #ffd700; }
+        .log-level-ERROR   { color: #f48771; }
+        .log-level-DEBUG   { color: #569cd6; }
 
-        .log-box::-webkit-scrollbar-thumb:hover {
-            background: rgba(255, 255, 255, 0.3);
-        }
-
-        .log-entry {
-            animation: slideInLog 0.3s ease-out;
-            padding: 0.25rem 0;
-        }
-
-        @keyframes slideInLog {
-            from {
-                opacity: 0;
-                transform: translateX(-12px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .log-level-INFO {
-            color: #4ec9b0;
-        }
-
-        .log-level-WARNING {
-            color: #dcdcaa;
-        }
-
-        .log-level-ERROR {
-            color: #f48771;
-        }
-
-        .log-level-DEBUG {
-            color: #569cd6;
-        }
-
-        /* ✅ Tabs — SW Brand */
+        /* ── Tabs ─────────────────────────────────────────────── */
         .nav-tabs {
-            border-bottom: 2px solid var(--border-color);
-            gap: 0.25rem;
+            border-bottom: 2px solid var(--border);
+            gap: 0.2rem;
+            flex-wrap: nowrap;
+            overflow-x: auto;
         }
 
         .nav-tabs .nav-link {
+            font-size: 0.75rem;
+            font-weight: 700;
+            letter-spacing: 0.07em;
+            text-transform: uppercase;
             color: var(--gray);
             border: none;
             border-bottom: 3px solid transparent;
-            font-weight: 600;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 0.05em;
-            transition: all 0.3s ease;
-            padding: 0.6rem 1rem;
+            padding: 0.6rem 0.9rem;
+            white-space: nowrap;
+            transition: all 0.2s;
         }
 
-        .nav-tabs .nav-link:hover {
-            color: var(--jaguar);
-            border-bottom-color: var(--amarelo);
-        }
+        .nav-tabs .nav-link:hover { color: var(--jaguar); border-bottom-color: var(--salomie); }
 
         .nav-tabs .nav-link.active {
             color: var(--jaguar);
@@ -3571,127 +3616,68 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             border-bottom: 3px solid var(--amarelo);
         }
 
-        .tab-content {
-            animation: fadeInTab 0.3s ease-out;
-        }
-
-        @keyframes fadeInTab {
-            from { opacity: 0; }
-            to   { opacity: 1; }
-        }
-
-        /* ✅ Botões — SW Brand */
+        /* ── Buttons ──────────────────────────────────────────── */
         .btn {
             font-weight: 700;
-            border-radius: 8px;
-            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
-            border: none;
-            letter-spacing: 0.04em;
+            font-size: 0.78rem;
+            letter-spacing: 0.05em;
             text-transform: uppercase;
-            font-size: 0.8rem;
+            border-radius: 7px;
+            border: none;
+            transition: all 0.2s;
         }
 
         .btn-primary {
             background: var(--amarelo);
-            color: var(--jaguar);
-            box-shadow: 0 4px 12px rgba(255,182,0,0.3);
+            color: var(--jaguar) !important;
+            box-shadow: 0 3px 10px rgba(255,182,0,0.28);
         }
 
-        .btn-primary:hover {
-            background: #e6a400;
-            transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(255,182,0,0.4);
-            color: var(--jaguar);
+        .btn-primary:hover, .btn-primary:focus {
+            background: var(--amarelo-dark);
+            color: var(--jaguar) !important;
+            transform: translateY(-1px);
         }
 
-        .btn-primary:active {
-            transform: translateY(0);
-            color: var(--jaguar);
-        }
+        .btn-success { background: var(--success); color: #fff !important; }
+        .btn-success:hover { background: #16a34a; color: #fff !important; }
+
+        .btn-danger { background: var(--error); color: #fff !important; }
 
         .btn-outline-light {
             border: 2px solid var(--amarelo);
-            color: var(--amarelo);
-            font-weight: 700;
+            color: var(--amarelo) !important;
             background: transparent;
         }
 
         .btn-outline-light:hover {
             background: var(--amarelo);
-            border-color: var(--amarelo);
-            color: var(--jaguar);
+            color: var(--jaguar) !important;
         }
 
         .btn-outline-secondary {
-            border: 2px solid var(--border-color);
-            color: var(--jaguar);
+            border: 1.5px solid var(--border);
+            color: var(--jaguar) !important;
             background: transparent;
         }
 
         .btn-outline-secondary:hover {
             background: var(--nurse);
-            border-color: var(--jaguar);
-            color: var(--jaguar);
+            border-color: var(--gray);
         }
 
-        .btn-warning {
-            background: var(--amarelo);
-            color: var(--jaguar);
-            border-color: var(--amarelo);
-        }
+        .btn-sm { font-size: 0.72rem; padding: 0.3rem 0.7rem; }
 
-        .btn-warning:hover {
-            background: #e6a400;
-            color: var(--jaguar);
-            border-color: #e6a400;
-        }
+        .btn-warning { background: var(--amarelo); color: var(--jaguar) !important; border-color: var(--amarelo); }
+        .btn-warning:hover { background: var(--amarelo-dark); border-color: var(--amarelo-dark); }
 
-        .btn-danger {
-            background: var(--error);
-            color: #fff;
-        }
-
-        /* ✅ Metric Box — SW Brand */
-        .metric-box {
-            background: var(--jaguar);
-            padding: 1.5rem;
-            border-radius: 12px;
-            color: white;
-            text-align: center;
-            box-shadow: 0 8px 16px rgba(1,1,13,0.2);
-            transition: all 0.3s ease;
-            border-bottom: 3px solid var(--amarelo);
-        }
-
-        .metric-box:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 12px 24px rgba(1,1,13,0.3);
-        }
-
-        .metric-label {
-            font-size: 0.75rem;
-            opacity: 0.7;
-            margin-bottom: 0.5rem;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-        }
-
-        .metric-value {
-            font-family: 'Bebas Neue', sans-serif;
-            font-size: 2.5rem;
-            letter-spacing: 0.04em;
-            color: var(--amarelo);
-        }
-
-        /* ✅ Input — SW Brand */
+        /* ── Forms ────────────────────────────────────────────── */
         .form-control, .form-select {
-            border: 1.5px solid var(--border-color);
-            border-radius: 8px;
-            padding: 0.7rem 1rem;
-            font-weight: 500;
-            transition: all 0.3s ease;
-            background: #fff;
+            border: 1.5px solid var(--border);
+            border-radius: 7px;
+            padding: 0.65rem 1rem;
+            font-size: 0.88rem;
+            transition: border-color 0.2s, box-shadow 0.2s;
         }
 
         .form-control:focus, .form-select:focus {
@@ -3700,148 +3686,68 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             outline: none;
         }
 
-        /* ✅ List Group — SW Brand */
+        /* ── Tables ───────────────────────────────────────────── */
+        .table { margin: 0; }
+
+        .table thead th {
+            background: var(--jaguar);
+            color: var(--amarelo);
+            font-size: 0.68rem;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            padding: 0.8rem 1rem;
+            border: none;
+        }
+
+        .table tbody tr { border-bottom: 1px solid var(--border); transition: background 0.15s; }
+        .table tbody tr:hover { background: #fffbee; }
+        .table td { padding: 0.8rem 1rem; vertical-align: middle; }
+
+        /* ── Badges ───────────────────────────────────────────── */
+        .badge {
+            font-size: 0.68rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            padding: 0.35rem 0.75rem;
+            border-radius: 50px;
+        }
+
+        .badge.bg-success { background: var(--success) !important; }
+        .badge.bg-warning { background: var(--amarelo) !important; color: var(--jaguar) !important; }
+        .badge.bg-info    { background: var(--jaguar) !important; color: var(--amarelo) !important; }
+        .badge.bg-secondary { background: var(--gray) !important; }
+        .badge.bg-light   { background: var(--nurse) !important; color: var(--jaguar) !important; }
+
+        /* ── Alerts ───────────────────────────────────────────── */
+        .alert { border: none; border-radius: 8px; border-left: 4px solid; }
+        .alert-warning { background: #fffbee; border-left-color: var(--amarelo); color: #78500e; }
+        .alert-info    { background: #eef6ff; border-left-color: #3b82f6; color: #1e3a8a; }
+        .alert-danger  { background: #fee2e2; border-left-color: var(--error); color: #7f1d1d; }
+        .alert-success { background: #dcfce7; border-left-color: var(--success); color: #14532d; }
+        .alert-secondary { background: var(--nurse); border-left-color: var(--gray); color: var(--jaguar); }
+
+        /* ── List Group ───────────────────────────────────────── */
         .list-group-item {
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            margin-bottom: 0.5rem;
-            transition: all 0.25s ease;
-            animation: fadeInUp 0.3s ease-out;
+            border: 1px solid var(--border);
+            border-radius: 8px !important;
+            margin-bottom: 0.45rem;
+            transition: all 0.2s;
         }
 
         .list-group-item:hover {
             border-color: var(--amarelo);
             background: #fffbee;
-            transform: translateX(4px);
+            transform: translateX(3px);
         }
 
-        /* ✅ DESIGN: Toast */
-        .toast {
-            animation: slideInToast 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
-            border-radius: 12px;
-            border: none;
-            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.15);
-        }
-
-        @keyframes slideInToast {
-            from {
-                opacity: 0;
-                transform: translateX(400px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
-        }
-
-        .toast.hide {
-            animation: slideOutToast 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
-        }
-
-        @keyframes slideOutToast {
-            from {
-                opacity: 1;
-                transform: translateX(0);
-            }
-            to {
-                opacity: 0;
-                transform: translateX(400px);
-            }
-        }
-
-        /* ✅ Alerts — SW Brand */
-        .alert {
-            border: none;
-            border-radius: 10px;
-            border-left: 4px solid;
-            animation: fadeInUp 0.4s ease-out;
-        }
-
-        .alert-warning {
-            background: #fffbee;
-            border-left-color: var(--amarelo);
-            color: #78500e;
-        }
-
-        .alert-info {
-            background: #eef2ff;
-            border-left-color: #6366f1;
-            color: #1e1b4b;
-        }
-
-        .alert-danger {
-            background: #fee2e2;
-            border-left-color: var(--error);
-            color: #7f1d1d;
-        }
-
-        .alert-success {
-            background: #dcfce7;
-            border-left-color: var(--success);
-            color: #14532d;
-        }
-
-        /* ✅ Table — SW Brand */
-        .table {
-            border-collapse: collapse;
-        }
-
-        .table thead th {
-            background: var(--jaguar);
-            border: none;
-            font-weight: 700;
-            color: var(--amarelo);
-            padding: 0.9rem 1rem;
-            text-transform: uppercase;
-            font-size: 0.73rem;
-            letter-spacing: 0.08em;
-        }
-
-        .table tbody tr {
-            border-bottom: 1px solid var(--border-color);
-            transition: all 0.2s ease;
-        }
-
-        .table tbody tr:hover {
-            background: #fffbee;
-        }
-
-        .table td {
-            padding: 0.9rem 1rem;
-            vertical-align: middle;
-        }
-
-        /* ✅ Badge — SW Brand */
-        .badge {
-            font-weight: 700;
-            padding: 0.4rem 0.8rem;
-            border-radius: 50px;
-            font-size: 0.72rem;
-            text-transform: uppercase;
-            letter-spacing: 0.06em;
-        }
-
-        .badge.bg-success {
-            background: var(--success) !important;
-        }
-
-        .badge.bg-info {
-            background: var(--jaguar) !important;
-            color: var(--amarelo) !important;
-        }
-
-        .badge.bg-warning {
-            background: var(--amarelo) !important;
-            color: var(--jaguar) !important;
-        }
-
-        /* ✅ Accordion — SW Brand */
+        /* ── Accordion ────────────────────────────────────────── */
         .accordion-button {
             font-weight: 700;
+            font-size: 0.82rem;
             text-transform: uppercase;
-            letter-spacing: 0.04em;
-            font-size: 0.85rem;
-            transition: all 0.3s ease;
+            letter-spacing: 0.05em;
         }
 
         .accordion-button:not(.collapsed) {
@@ -3852,205 +3758,227 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         .accordion-button:focus {
-            border-color: var(--amarelo);
             box-shadow: 0 0 0 3px rgba(255,182,0,0.15);
         }
 
-        /* ✅ DESIGN: Hidden */
-        .hidden {
-            display: none;
+        /* ── Metric Box ───────────────────────────────────────── */
+        .metric-box {
+            background: var(--jaguar);
+            border-radius: 10px;
+            padding: 1.3rem 1rem;
+            text-align: center;
+            border-bottom: 3px solid var(--amarelo);
+            box-shadow: 0 4px 14px rgba(1,1,13,0.18);
+            transition: transform 0.2s, box-shadow 0.2s;
         }
 
-        /* Remova ou oculte classes de estoque */
-        .stock-badge, .estoque-info, .stock-info-row {
-            display: none !important;
+        .metric-box:hover { transform: translateY(-3px); box-shadow: 0 8px 22px rgba(1,1,13,0.25); }
+
+        .metric-label {
+            font-size: 0.65rem;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.5);
+            margin-bottom: 0.4rem;
         }
 
-        @keyframes pulse-animation {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
-        }
-        .pulse-animation {
-            animation: pulse-animation 2s infinite;
-        }
-        .shadow-2xl {
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-        }
-        .letter-spacing-2 {
-            letter-spacing: 0.1em;
+        .metric-value {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 2.4rem;
+            letter-spacing: 0.04em;
+            color: var(--amarelo);
+            line-height: 1;
         }
 
-        /* ✅ Responsivo */
-        @media (max-width: 768px) {
-            .kpi-card h3 {
-                font-size: 2rem;
-            }
-
-            .metric-value {
-                font-size: 2rem;
-            }
-
-            .log-box {
-                max-height: 300px;
-            }
+        /* ── Toast ────────────────────────────────────────────── */
+        .toast {
+            border-radius: 10px;
+            border: none;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.18);
         }
 
-        /* ✅ SW extras: section accent lines */
-        .sw-section-title {
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            margin-bottom: 1rem;
-        }
+        /* ── Spinner personalizado ────────────────────────────── */
+        .spinner-border { color: var(--amarelo) !important; }
 
-        .sw-section-title::before {
-            content: '';
-            display: block;
-            width: 4px;
-            height: 28px;
-            background: var(--amarelo);
-            border-radius: 3px;
-            flex-shrink: 0;
-        }
-
-        /* ✅ SW: scrollbar global */
-        ::-webkit-scrollbar { width: 7px; height: 7px; }
-        ::-webkit-scrollbar-track { background: var(--nurse); }
-        ::-webkit-scrollbar-thumb { background: var(--salomie); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--amarelo); }
-
-        /* ✅ SW: production board card color overrides */
-        .board-col .card-header {
+        /* ── Modal production header ──────────────────────────── */
+        .modal-prod-header {
             background: var(--jaguar);
             border-bottom: 2px solid var(--amarelo);
         }
 
-        /* ✅ SW: progress bar */
-        .progress-bar {
-            background: var(--amarelo) !important;
-        }
-    
-        /* ✅ Footer — SW Brand */
-        footer {
-            background: var(--jaguar);
-            border-top: 3px solid var(--amarelo);
-            margin-top: 3rem;
-            animation: slideUp 0.5s ease-out;
+        /* ── Production board header colors ──────────────────── */
+        .board-header-yellow {
+            background: var(--jaguar) !important;
+            border-bottom: 2px solid var(--amarelo) !important;
         }
 
-        @keyframes slideUp {
-            from { opacity: 0; transform: translateY(20px); }
+        .board-header-green {
+            background: var(--jaguar) !important;
+            border-bottom: 2px solid var(--success) !important;
+        }
+
+        .board-header-purple {
+            background: var(--jaguar) !important;
+            border-bottom: 2px solid #a855f7 !important;
+        }
+
+        /* ── Waiting table row accent ─────────────────────────── */
+        .waiting-header { background: #fffbee !important; }
+        .waiting-header th { color: var(--jaguar) !important; background: #fffbee !important; }
+
+        .inprod-header { background: #f0fdf4 !important; }
+        .inprod-header th { color: var(--jaguar) !important; background: #f0fdf4 !important; }
+
+        /* ── Timer display ────────────────────────────────────── */
+        .timer-display {
+            font-family: 'Fira Code', monospace;
+            font-size: 3.5rem;
+            font-weight: 500;
+            color: var(--amarelo);
+            letter-spacing: 0.05em;
+            text-shadow: 0 0 20px rgba(255,182,0,0.4);
+        }
+
+        /* ── Hidden ───────────────────────────────────────────── */
+        .hidden { display: none !important; }
+
+        .stock-badge, .estoque-info, .stock-info-row { display: none !important; }
+
+        /* ── Animations ───────────────────────────────────────── */
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(14px); }
             to   { opacity: 1; transform: translateY(0); }
         }
 
-        footer p { margin-bottom: 0.25rem; }
-
-        footer small {
-            font-size: 0.8rem;
-            color: rgba(255,255,255,0.5) !important;
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-20px); }
+            to   { opacity: 1; transform: translateY(0); }
         }
 
-        footer .footer-brand {
-            font-family: 'Bebas Neue', sans-serif;
-            font-size: 1.3rem;
-            color: var(--amarelo);
-            letter-spacing: 0.06em;
+        @keyframes pulse-animation {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.5; }
         }
 
+        .pulse-animation { animation: pulse-animation 1.5s infinite; }
+
+        /* ── Responsive ───────────────────────────────────────── */
         @media (max-width: 768px) {
-            footer .col-md-6:last-child {
-                text-align: left !important;
-                margin-top: 1rem;
-            }
+            .kpi-value  { font-size: 2.2rem; }
+            .metric-value { font-size: 1.8rem; }
+            .log-box    { max-height: 240px; }
+            .navbar-inner { padding: 0 1rem; }
         }
+
+        /* ── Footer ───────────────────────────────────────────── */
+        .sw-footer {
+            background: var(--jaguar);
+            border-top: 3px solid var(--amarelo);
+            padding: 1.3rem 1.5rem;
+            margin-top: 2rem;
+            color: rgba(255,255,255,0.7);
+            font-size: 0.8rem;
+        }
+
+        .sw-footer-brand {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.25rem;
+            letter-spacing: 0.1em;
+            color: var(--amarelo);
+        }
+
+        /* ── Last recalculated bar ────────────────────────────── */
+        .recalc-bar {
+            background: var(--nurse);
+            border-radius: 8px;
+            padding: 0.5rem 1rem;
+            font-size: 0.78rem;
+            color: var(--gray);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            border-left: 3px solid var(--salomie);
+        }
+
+        .recalc-bar strong { color: var(--jaguar); }
 
     </style>
 </head>
 <body>
     <!-- ✅ Navbar SW Móveis MDF -->
-    <nav class="navbar navbar-expand-lg">
-        <div class="container-fluid px-4">
-            <a class="navbar-brand d-flex align-items-center" href="#" style="gap: 0.75rem; text-decoration:none;">
-                <img src="https://i.imgur.com/j79HO6n.png" alt="SW Móveis" style="height: 42px; width: auto; filter: brightness(1.2) drop-shadow(0 0 6px rgba(255,182,0,0.4));">
-                <div style="line-height:1.1;">
-                    <div style="font-family:'Bebas Neue',sans-serif;font-size:1.5rem;color:#ffb600;letter-spacing:0.1em;">SW MÓVEIS MDF</div>
-                    <div style="font-size:0.65rem;color:rgba(255,255,255,0.5);font-weight:600;letter-spacing:0.15em;text-transform:uppercase;">Gestão de Produção</div>
+    <nav class="navbar">
+        <div class="navbar-inner">
+            <a class="navbar-brand-wrap" href="#">
+                <img src="https://i.imgur.com/j79HO6n.png" alt="SW">
+                <div>
+                    <div class="brand-text-top">SW Móveis MDF</div>
+                    <div class="brand-text-sub">Gestão de Produção</div>
                 </div>
             </a>
-            <div class="d-flex align-items-center gap-3">
-                <span id="status-badge" class="badge bg-secondary">Carregando...</span>
-                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
+            <div class="navbar-right">
+                <span id="status-badge" class="badge bg-secondary">⏳ Carregando</span>
+                <a id="auth-link" href="{{ auth_url }}" class="btn-auth">Autenticar</a>
             </div>
         </div>
     </nav>
 
-    <!-- ✅ Header — SW Brand -->
-    <div class="container-fluid px-4 py-5">
-        <div class="row mb-5">
-            <div class="col-12">
-                <div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.5rem;">
-                    <div style="width:5px;height:40px;background:var(--amarelo);border-radius:3px;"></div>
-                    <div>
-                        <h2 class="mb-0" style="font-family:'Bebas Neue',sans-serif;font-size:2rem;letter-spacing:0.04em;color:var(--jaguar);">Pedidos de Venda</h2>
-                        <p class="mb-0" style="color:var(--gray);font-size:0.85rem;font-weight:500;">Acompanhe os pedidos abertos e fechados em tempo real</p>
-                    </div>
+    <!-- ✅ Page Header -->
+    <div class="page-header">
+        <div class="page-header-inner">
+            <div>
+                <h1 class="page-header-title">Pedidos de Venda</h1>
+                <p class="page-header-sub">Acompanhe os pedidos abertos e fechados em tempo real</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- ✅ Main Wrap -->
+    <div class="main-wrap">
+
+        <!-- KPI Cards -->
+        <div class="row mb-4 g-3">
+            <div class="col-md-4">
+                <div class="card kpi-card kpi-daily">
+                    <div class="kpi-label">Pedidos Diários</div>
+                    <div class="kpi-value" id="kpi-daily">0</div>
+                    <div class="kpi-sub">Últimas 24h</div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card kpi-card kpi-weekly">
+                    <div class="kpi-label">Pedidos Semanais</div>
+                    <div class="kpi-value" id="kpi-weekly">0</div>
+                    <div class="kpi-sub">Últimos 7 dias</div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="card kpi-card kpi-historic">
+                    <div class="kpi-label">Pedidos Mensais</div>
+                    <div class="kpi-value" id="kpi-historic">0</div>
+                    <div class="kpi-sub">Este Mês</div>
                 </div>
             </div>
         </div>
 
-        <!-- ✅ DESIGN: KPI Cards -->
-        <div class="row mb-5">
-            <div class="col-md-4 mb-4">
-                <div class="card p-4 kpi-card kpi-daily text-center">
-                    <h5>Pedidos Diários</h5>
-                    <h3 id="kpi-daily" style="color:var(--amarelo);">0</h3>
-                    <small class="text-muted">Últimas 24h</small>
-                </div>
-            </div>
-            <div class="col-md-4 mb-4">
-                <div class="card p-4 kpi-card kpi-weekly text-center">
-                    <h5>Pedidos Semanais</h5>
-                    <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
-                    <small class="text-muted">Últimos 7 dias</small>
-                </div>
-            </div>
-            <div class="col-md-4 mb-4">
-                <div class="card p-4 kpi-card kpi-historic text-center">
-                    <h5>Pedidos Mensais</h5>
-                    <h3 id="kpi-historic" style="color: var(--success);">0</h3>
-                    <small class="text-muted">Este Mês</small>
-                </div>
-            </div>
-        </div>
-
-        <!-- ✅ DESIGN: Último Recalcul -->
-        <div class="row mb-5">
-            <div class="col-12">
-                <small class="text-muted">
-                    ⏱️ Último Recálculo: <span id="last-recalculated" style="font-weight: 600;">N/D</span>
-                </small>
-            </div>
+        <!-- Last recalc bar -->
+        <div class="recalc-bar mb-4">
+            <span>⏱ Último recálculo:</span>
+            <strong id="last-recalculated">N/D</strong>
         </div>
 
         <!-- Logs em Tempo Real -->
-        <div class="row mb-5">
-            <div class="col-12">
-                <div class="card">
-                    <div class="card-header">
-                        <h5 class="mb-0">📋 Logs em Tempo Real</h5>
-                    </div>
-                    <div class="card-body p-0">
-                        <div id="logs-content" class="log-box"></div>
-                    </div>
-                </div>
+        <div class="card mb-4">
+            <div class="card-header d-flex align-items-center justify-content-between">
+                <h5 class="mb-0">📋 Logs em Tempo Real</h5>
+                <span id="log-status" class="badge bg-secondary" style="font-size:0.65rem;">Conectando...</span>
             </div>
+            <div id="logs-content" class="log-box"></div>
         </div>
 
-        <!-- ✅ DESIGN: Tabs com Navegação -->
-        <div class="row">
-            <div class="col-12">
-                <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
+        <!-- ✅ Tabs -->
+        <div>
+            <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
                     <li class="nav-item" role="presentation">
                         <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search" type="button">🔍 Busca</button>
                     </li>
@@ -4136,13 +4064,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                         <!-- ═══ PAINEL DE PRODUÇÃO UNIFICADO ═══ -->
                         <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header d-flex justify-content-between align-items-center py-3" style="background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 100%);">
+                            <div class="card-header d-flex justify-content-between align-items-center py-3 board-header-yellow">
                                 <div>
-                                    <h5 class="mb-0 text-white">🏭 Painel de Produção</h5>
-                                    <small class="text-white-50">
-                                        ⏳ Em Espera <span id="waiting-count-badge" class="badge bg-warning text-dark ms-1">0</span>
-                                        &nbsp; ⚙️ Produzindo <span id="inprod-count-badge" class="badge bg-success ms-1">0</span>
-                                        &nbsp; ✅ Concluídos <span id="done-count-badge" class="badge bg-secondary ms-1">0</span>
+                                    <h5 class="mb-0">🏭 Painel de Produção</h5>
+                                    <small style="color:rgba(255,255,255,0.5);font-size:0.72rem;">
+                                        ⏳ Em Espera <span id="waiting-count-badge" class="badge bg-warning ms-1">0</span>
+                                        &nbsp;⚙️ Produzindo <span id="inprod-count-badge" class="badge bg-success ms-1">0</span>
+                                        &nbsp;✅ Concluídos <span id="done-count-badge" class="badge bg-secondary ms-1">0</span>
                                     </small>
                                 </div>
                                 <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
@@ -4154,12 +4082,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                         <!-- ═══ CONSUMO MENSAL ═══ -->
                         <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #065f46 0%, #059669 100%);">
+                            <div class="card-header d-flex justify-content-between align-items-center board-header-green">
                                 <div>
                                     <h5 class="mb-0">📊 Consumo de Insumos & Componentes</h5>
-                                    <small class="text-white-50" id="consumption-month-label">Mês atual • Reinicia todo mês</small>
+                                    <small style="color:rgba(255,255,255,0.45);font-size:0.72rem;" id="consumption-month-label">Mês atual • Reinicia todo mês</small>
                                 </div>
-                                <span class="badge bg-light text-dark" id="consumption-total-badge">0 insumos</span>
+                                <span class="badge bg-warning" id="consumption-total-badge">0 insumos</span>
                             </div>
                             <div class="card-body p-0" id="consumption-table-section">
                                 <div class="text-center py-4 text-muted">⏳ Carregando consumo...</div>
@@ -4168,9 +4096,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                         <!-- ═══ HISTÓRICO DE FINALIZAÇÕES ═══ -->
                         <div class="card border-0 shadow-sm">
-                            <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%);">
+                            <div class="card-header board-header-purple">
                                 <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
-                                <small class="text-white-50">Registro de cada produto finalizado com tempo de produção</small>
+                                <small style="color:rgba(255,255,255,0.45);font-size:0.72rem;">Registro de cada produto finalizado com tempo de produção</small>
                             </div>
                             <div class="card-body p-0" id="production-history-section">
                                 <div class="text-center py-4 text-muted">⏳ Carregando histórico...</div>
@@ -4180,9 +4108,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </div>
         </div>
-    </div>
 
-    <!-- ✅ DESIGN: Toast Container -->
+    </div><!-- /.main-wrap -->
     <div class="toast-container position-fixed bottom-0 end-0 p-4"></div>
 
     <!-- Scripts -->
@@ -4276,55 +4203,104 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
-        ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            const box = document.getElementById('logs-content');
-            if(data.logs) {
-                data.logs.forEach(l => box.innerHTML += formatLog(l));
-                box.scrollTop = box.scrollHeight;
+        let wsLogs = null;
+
+        function connectLogs() {
+            const logStatus = document.getElementById('log-status');
+            if (logStatus) { logStatus.textContent = 'Conectando...'; logStatus.className = 'badge bg-secondary'; }
+            try {
+                wsLogs = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+                wsLogs.onopen = () => {
+                    if (logStatus) { logStatus.textContent = '🟢 Ao Vivo'; logStatus.className = 'badge bg-success'; }
+                };
+                wsLogs.onmessage = (e) => {
+                    const data = JSON.parse(e.data);
+                    const box = document.getElementById('logs-content');
+                    if (!box) return;
+                    if (data.logs) {
+                        // Popula histórico inicial
+                        data.logs.slice(-60).forEach(l => box.innerHTML += formatLog(l));
+                        box.scrollTop = box.scrollHeight;
+                    }
+                    if (data.log) {
+                        // Entrada incremental
+                        box.innerHTML += formatLog(data.log);
+                        box.scrollTop = box.scrollHeight;
+                        // Limita a 200 entradas no DOM
+                        const entries = box.querySelectorAll('.log-entry');
+                        if (entries.length > 200) entries[0].remove();
+                    }
+                };
+                wsLogs.onerror = () => {
+                    if (logStatus) { logStatus.textContent = '🔴 Erro WS'; logStatus.className = 'badge bg-danger'; }
+                };
+                wsLogs.onclose = () => {
+                    if (logStatus) { logStatus.textContent = '⚠️ Reconectando'; logStatus.className = 'badge bg-warning text-dark'; }
+                    setTimeout(connectLogs, 4000);
+                };
+            } catch(e) {
+                console.error('WebSocket logs error:', e);
+                setTimeout(connectLogs, 5000);
             }
         }
 
-        /* ✅ DESIGN: Atualizar Status de Autenticação */
+        connectLogs();
+
+        /* ✅ Auth — polling HTTP robusto (não depende só do WebSocket) */
+        async function pollAuthStatus() {
+            try {
+                const r = await fetch('/api/status');
+                if (!r.ok) return;
+                const d = await r.json();
+                updateAuthStatus(d.authenticated, d.auth_url || document.getElementById('auth-link').href);
+            } catch(e) {
+                console.warn('pollAuthStatus falhou:', e);
+            }
+        }
+
+        // Verifica imediatamente e depois a cada 5s
+        pollAuthStatus();
+        setInterval(pollAuthStatus, 5000);
+
+        /* ✅ Atualizar Status de Autenticação */
         function updateAuthStatus(authenticated, authUrl) {
             const badge = document.getElementById('status-badge');
-            isAuthenticated = authenticated;
+            const authLink = document.getElementById('auth-link');
+            isAuthenticated = !!authenticated;
 
-            if(isAuthenticated) {
-                badge.className = 'badge bg-success';
-                badge.textContent = '🟢 Online';
-                document.getElementById('auth-link').classList.add('d-none');
-                document.getElementById('content-tabs').classList.remove('hidden');
-                document.getElementById('auth-required-tabs').classList.add('hidden');
+            if (isAuthenticated) {
+                if (badge) { badge.className = 'badge bg-success'; badge.textContent = '🟢 Online'; }
+                if (authLink) authLink.classList.add('d-none');
+                const ct = document.getElementById('content-tabs');
+                const ar = document.getElementById('auth-required-tabs');
+                if (ct) ct.classList.remove('hidden');
+                if (ar) ar.classList.add('hidden');
             } else {
-                badge.className = 'badge bg-danger';
-                badge.textContent = '🔴 Offline';
-                document.getElementById('auth-link').classList.remove('d-none');
-                document.getElementById('content-tabs').classList.add('hidden');
-                document.getElementById('auth-required-tabs').classList.remove('hidden');
+                if (badge) { badge.className = 'badge bg-danger'; badge.textContent = '🔴 Offline'; }
+                if (authLink) authLink.classList.remove('d-none');
+                const ct = document.getElementById('content-tabs');
+                const ar = document.getElementById('auth-required-tabs');
+                if (ct) ct.classList.add('hidden');
+                if (ar) ar.classList.remove('hidden');
             }
-            document.getElementById('auth-link').href = authUrl;
+            if (authUrl && authLink) authLink.href = authUrl;
         }
 
-        /* ✅ DESIGN: Atualizar KPIs com Animação */
+        /* ✅ Atualizar KPIs */
         function updateKpis(dSalesStats) {
             const kpiDaily = document.getElementById('kpi-daily');
             const kpiWeekly = document.getElementById('kpi-weekly');
             const kpiHistoric = document.getElementById('kpi-historic');
 
-            kpiDaily.textContent = dSalesStats.daily;
-            kpiWeekly.textContent = dSalesStats.weekly;
-            kpiHistoric.textContent = dSalesStats.monthly;
-            document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+            if (kpiDaily) kpiDaily.textContent = dSalesStats.daily ?? 0;
+            if (kpiWeekly) kpiWeekly.textContent = dSalesStats.weekly ?? 0;
+            if (kpiHistoric) kpiHistoric.textContent = dSalesStats.monthly ?? 0;
+            const lr = document.getElementById('last-recalculated');
+            if (lr) lr.textContent = formatDateTime(dSalesStats.last_update);
 
-            // Animação de atualização
-            const cards = document.querySelectorAll('.kpi-card');
-            cards.forEach(card => {
+            document.querySelectorAll('.kpi-card').forEach(card => {
                 card.classList.add('updating');
-                setTimeout(() => {
-                    card.classList.remove('updating');
-                }, 600);
+                setTimeout(() => card.classList.remove('updating'), 500);
             });
         }
 
@@ -4402,15 +4378,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const modalHtml =
                 '<div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">' +
                 '<div class="modal-dialog modal-lg modal-dialog-centered"><div class="modal-content border-0 shadow-2xl">' +
-                '<div class="modal-header text-white" style="background:linear-gradient(135deg,#1e293b 0%,#334155 100%);">' +
+                '<div class="modal-header text-white modal-prod-header">' +
                 '<h5 class="modal-title">🛠️ Produção: ' + pnSafe + '</h5>' +
                 '<button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>' +
-                '</div><div class="modal-body" style="background:#f8fafc;">' +
-                '<div class="card mb-4 border-0" style="background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:white;">' +
+                '</div><div class="modal-body" style="background:#f5f5f0;">' +
+                '<div class="card mb-4 border-0" style="background:var(--jaguar,#01010d);border-bottom:3px solid var(--amarelo,#ffb600)!important;">' +
                 '<div class="card-body text-center py-4">' +
-                '<div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em;opacity:.7;">⏱ Tempo de Produção</div>' +
-                '<div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size:3.5rem;letter-spacing:.05em;text-shadow:0 0 20px rgba(99,102,241,.6);">00:00:00</div>' +
-                '<div id="timer-status" class="badge mb-3" style="font-size:.85rem;padding:.4rem 1rem;">Parado</div>' +
+                '<div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.12em;color:rgba(255,255,255,0.5);font-size:0.65rem;">⏱ Tempo de Produção</div>' +
+                '<div id="timer-display" class="timer-display mb-3">00:00:00</div>' +
+                '<div id="timer-status" class="badge mb-3 bg-secondary" style="font-size:.8rem;padding:.4rem 1rem;">Parado</div>' +
                 '<div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-tkey="' + tkSafe + '" data-pnome="' + pnSafe + '">' +
                 '<button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start',document.getElementById('timer-btn-group').dataset.tkey,document.getElementById('timer-btn-group').dataset.pnome)">▶ Iniciar</button>' +
                 '<button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause',document.getElementById('timer-btn-group').dataset.tkey)">⏸ Pausar</button>' +
@@ -4916,47 +4892,51 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
 
-        /* ✅ DESIGN: WebSocket KPI */
+        /* ✅ WebSocket KPI — com reconexão robusta */
         const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+        let wsKpi = null;
+        let _kpiReconnectTimer = null;
 
         function setupKpiWebSocket() {
+            if (wsKpi) { try { wsKpi.close(); } catch(e) {} }
+            wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+
             wsKpi.onmessage = (e) => {
-                const data = JSON.parse(e.data);
+                try {
+                    const data = JSON.parse(e.data);
 
-                if (data.type === 'full_update') {
-                    updateAuthStatus(data.authenticated, data.auth_url);
+                    if (data.type === 'full_update') {
+                        updateAuthStatus(data.authenticated, data.auth_url);
 
-                    if (data.sales_stats) {
-                        updateKpis(data.sales_stats);
+                        if (data.sales_stats) {
+                            updateKpis(data.sales_stats);
+                        }
+
+                        if (data.component_usage) {
+                            updateComponentUsage(data.component_usage);
+                        }
+
+                        const forceLoadButton = document.querySelector('#kits button.btn-primary');
+                        if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
+                            forceLoadButton.disabled = false;
+                            forceLoadButton.textContent = '🔄 Recarregar Lista';
+                            loadKits();
+                            showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
+                        }
                     }
-
-                    if (data.component_usage) {
-                        updateComponentUsage(data.component_usage);
-                    }
-
-                    const forceLoadButton = document.querySelector('#kits button.btn-primary');
-                    if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
-                        forceLoadButton.disabled = false;
-                        forceLoadButton.textContent = '🔄 Recarregar Lista';
-                        loadKits();
-                        showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
-                    }
+                } catch(err) {
+                    console.error('WS KPI parse error:', err);
                 }
             };
 
             wsKpi.onerror = (e) => {
                 console.error("Erro WebSocket KPI:", e);
-                showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
             };
 
             wsKpi.onclose = () => {
-                console.log("WebSocket KPI desconectado. Reconectando...");
-                setTimeout(() => {
-                    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                    wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
-                    setupKpiWebSocket();
-                }, 3000);
+                console.log("WebSocket KPI desconectado. Reconectando em 4s...");
+                if (_kpiReconnectTimer) clearTimeout(_kpiReconnectTimer);
+                _kpiReconnectTimer = setTimeout(setupKpiWebSocket, 4000);
             };
         }
 
@@ -5216,20 +5196,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     </script>
 
     <!-- ✅ Footer SW Móveis MDF -->
-    <footer class="text-white mt-5 py-4">
-        <div class="container-fluid px-4">
-            <div class="row align-items-center">
-                <div class="col-md-6">
-                    <div class="footer-brand">SW MÓVEIS MDF</div>
-                    <p class="mb-0" style="color:rgba(255,255,255,0.7);font-size:0.85rem;">Gestão Inteligente de Produção</p>
-                    <small>© 2025 — Design inteligente, funcionalidade e conforto</small>
-                </div>
-                <div class="col-md-6 text-md-end">
-                    <p class="mb-0" style="color:rgba(255,255,255,0.7);font-size:0.85rem;">
-                        Desenvolvido por <strong style="color:var(--amarelo);">João Victor Dias Santana</strong>
-                    </p>
-                    <small>Versão 4.6 — 2025</small>
-                </div>
+    <footer class="sw-footer">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.5rem;">
+            <div>
+                <div class="sw-footer-brand">SW MÓVEIS MDF</div>
+                <div>Gestão Inteligente de Produção — Design inteligente, funcionalidade e conforto</div>
+            </div>
+            <div style="text-align:right;">
+                <div>Desenvolvido por <strong style="color:var(--amarelo);">João Victor Dias Santana</strong></div>
+                <div style="color:rgba(255,255,255,0.4);">Versão 4.6 — 2025</div>
             </div>
         </div>
     </footer>
