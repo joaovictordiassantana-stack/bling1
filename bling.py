@@ -3286,172 +3286,188 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Painel SW Móveis - Gestão de Pedidos</title>
+    <title>SW Móveis MDF — Gestão de Produção</title>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
     <style>
-        /* ✅ DESIGN: Paleta Premium */
+        /* ✅ SW MÓVEIS MDF — Brand Identity 2025 */
+        @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Noto+Sans:wght@300;400;500;600;700&family=Fira+Code:wght@400;500&display=swap');
+
         :root {
-            --primary: #0f172a;
-            --primary-light: #1e293b;
-            --accent: #6366f1;
-            --accent-light: #818cf8;
-            --success: #10b981;
-            --warning: #f59e0b;
-            --error: #ef4444;
-            --bg-light: #f8fafc;
-            --border-color: #e2e8f0;
-            --text-muted: #64748b;
+            /* SW Brand Colors */
+            --jaguar:        #01010d;   /* preto profundo */
+            --amarelo:       #ffb600;   /* amarelo seletivo */
+            --salomie:       #fede8f;   /* amarelo suave */
+            --mindaro:       #f5f883;   /* verde-amarelo */
+            --gray:          #807f7f;   /* cinza médio */
+            --nurse:         #ecedec;   /* quase branco */
+
+            /* Functional aliases */
+            --primary:       var(--jaguar);
+            --primary-light: #1a1a2e;
+            --accent:        var(--amarelo);
+            --accent-light:  var(--salomie);
+            --success:       #22c55e;
+            --warning:       var(--amarelo);
+            --error:         #ef4444;
+            --bg-light:      var(--nurse);
+            --border-color:  #e0e0e0;
+            --text-muted:    var(--gray);
         }
 
-        /* ✅ DESIGN: Tipografia e Base */
+        /* ✅ Base */
         * {
             transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
         }
 
         body {
-            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-            font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #f7f7f5;
+            font-family: 'Noto Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             font-weight: 400;
             line-height: 1.6;
-            letter-spacing: -0.01em;
-            color: var(--primary);
+            color: var(--jaguar);
         }
 
         h1, h2, h3, h4, h5, h6 {
-            font-weight: 600;
-            letter-spacing: -0.02em;
+            font-family: 'Noto Sans', sans-serif;
+            font-weight: 700;
             line-height: 1.2;
+            color: var(--jaguar);
         }
 
-        /* ✅ DESIGN: Navbar com Gradiente */
+        /* Títulos destaque — Bebas Neue */
+        .display-title {
+            font-family: 'Bebas Neue', sans-serif;
+            letter-spacing: 0.04em;
+        }
+
+        /* ✅ Navbar SW */
         .navbar {
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            background: var(--jaguar);
             color: white;
-            box-shadow: 0 4px 20px rgba(15, 23, 42, 0.1);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 20px rgba(1,1,13,0.25);
+            border-bottom: 3px solid var(--amarelo);
             animation: slideDown 0.4s ease-out;
+            padding: 0.75rem 0;
         }
 
         @keyframes slideDown {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(-20px); }
+            to   { opacity: 1; transform: translateY(0); }
         }
 
         .navbar-brand {
-            font-size: 1.5rem;
-            font-weight: 700;
-            letter-spacing: -0.02em;
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.6rem;
+            letter-spacing: 0.08em;
+            color: var(--amarelo) !important;
         }
 
-        /* ✅ DESIGN: Status Badge com Animação */
+        /* ✅ Status Badge */
         #status-badge {
             animation: pulse-badge 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
-            font-weight: 600;
-            padding: 0.4rem 0.8rem !important;
+            font-weight: 700;
+            padding: 0.4rem 1rem !important;
             border-radius: 50px !important;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
         }
 
         @keyframes pulse-badge {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.8; }
+            50% { opacity: 0.75; }
         }
 
         #status-badge.bg-success {
-            background: linear-gradient(135deg, var(--success) 0%, #059669 100%) !important;
+            background: linear-gradient(135deg, var(--success) 0%, #16a34a 100%) !important;
         }
 
         #status-badge.bg-danger {
             background: linear-gradient(135deg, var(--error) 0%, #dc2626 100%) !important;
         }
 
-        /* ✅ DESIGN: Cards Premium */
+        #status-badge.bg-secondary {
+            background: var(--gray) !important;
+        }
+
+        /* ✅ Cards */
         .card {
             border: 1px solid var(--border-color);
             border-radius: 12px;
             background: #ffffff;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            box-shadow: 0 2px 8px rgba(1,1,13,0.06);
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             animation: fadeInUp 0.4s ease-out;
         }
 
         @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(16px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(16px); }
+            to   { opacity: 1; transform: translateY(0); }
         }
 
         .card:hover {
-            border-color: var(--accent);
-            box-shadow: 0 12px 24px rgba(99, 102, 241, 0.15);
-            transform: translateY(-4px);
+            border-color: var(--amarelo);
+            box-shadow: 0 8px 24px rgba(255,182,0,0.18);
+            transform: translateY(-3px);
         }
 
         .card-header {
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            background: var(--jaguar);
             color: white;
             border: none;
             border-radius: 12px 12px 0 0;
-            font-weight: 600;
-            padding: 1.25rem;
+            font-weight: 700;
+            font-family: 'Noto Sans', sans-serif;
+            padding: 1.1rem 1.25rem;
+            border-bottom: 2px solid var(--amarelo);
         }
 
-        /* ✅ DESIGN: KPI Cards */
+        .card-header h5 {
+            color: white;
+        }
+
+        /* ✅ KPI Cards — SW Brand */
         .kpi-card {
-            border-left: 4px solid;
+            border-left: 4px solid var(--amarelo);
             position: relative;
             overflow: hidden;
+            background: #fff;
         }
 
         .kpi-card::before {
             content: '';
             position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(135deg, rgba(255, 255, 255, 0.5) 0%, transparent 100%);
+            top: -30px;
+            right: -30px;
+            width: 90px;
+            height: 90px;
+            border-radius: 50%;
+            background: var(--salomie);
+            opacity: 0.35;
             pointer-events: none;
         }
 
-        .kpi-daily {
-            border-left-color: var(--accent);
-        }
-
-        .kpi-weekly {
-            border-left-color: var(--warning);
-        }
-
-        .kpi-historic {
-            border-left-color: var(--success);
-        }
+        .kpi-daily    { border-left-color: var(--amarelo); }
+        .kpi-weekly   { border-left-color: var(--jaguar); }
+        .kpi-historic { border-left-color: var(--success); }
 
         .kpi-card h5 {
-            font-size: 0.875rem;
-            font-weight: 600;
-            color: var(--text-muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: var(--gray);
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.08em;
             margin-bottom: 0.75rem;
         }
 
         .kpi-card h3 {
-            font-size: 2rem;
-            font-weight: 700;
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 2.8rem;
+            letter-spacing: 0.04em;
             margin: 0;
+            color: var(--jaguar);
         }
 
         .kpi-card.updating {
@@ -3459,12 +3475,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         @keyframes pulse-update {
-            0% {
-                background-color: #e8f5e9;
-            }
-            100% {
-                background-color: transparent;
-            }
+            0%   { background-color: #fff9e6; }
+            100% { background-color: #fff; }
         }
 
         /* ✅ DESIGN: Log Box */
@@ -3530,30 +3542,33 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             color: #569cd6;
         }
 
-        /* ✅ DESIGN: Tabs */
+        /* ✅ Tabs — SW Brand */
         .nav-tabs {
             border-bottom: 2px solid var(--border-color);
-            gap: 0.5rem;
+            gap: 0.25rem;
         }
 
         .nav-tabs .nav-link {
-            color: var(--text-muted);
+            color: var(--gray);
             border: none;
             border-bottom: 3px solid transparent;
-            font-weight: 500;
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
             transition: all 0.3s ease;
-            position: relative;
+            padding: 0.6rem 1rem;
         }
 
         .nav-tabs .nav-link:hover {
-            color: var(--accent);
-            border-bottom-color: var(--accent);
+            color: var(--jaguar);
+            border-bottom-color: var(--amarelo);
         }
 
         .nav-tabs .nav-link.active {
-            color: var(--accent);
+            color: var(--jaguar);
             background: none;
-            border-bottom-color: var(--accent);
+            border-bottom: 3px solid var(--amarelo);
         }
 
         .tab-content {
@@ -3561,106 +3576,142 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         @keyframes fadeInTab {
-            from {
-                opacity: 0;
-            }
-            to {
-                opacity: 1;
-            }
+            from { opacity: 0; }
+            to   { opacity: 1; }
         }
 
-        /* ✅ DESIGN: Botões */
+        /* ✅ Botões — SW Brand */
         .btn {
-            font-weight: 600;
+            font-weight: 700;
             border-radius: 8px;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
             border: none;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            font-size: 0.8rem;
         }
 
         .btn-primary {
-            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%);
-            color: white;
-            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+            background: var(--amarelo);
+            color: var(--jaguar);
+            box-shadow: 0 4px 12px rgba(255,182,0,0.3);
         }
 
         .btn-primary:hover {
+            background: #e6a400;
             transform: translateY(-2px);
-            box-shadow: 0 8px 20px rgba(99, 102, 241, 0.4);
-            color: white;
+            box-shadow: 0 8px 20px rgba(255,182,0,0.4);
+            color: var(--jaguar);
         }
 
         .btn-primary:active {
             transform: translateY(0);
+            color: var(--jaguar);
         }
 
         .btn-outline-light {
-            border: 2px solid rgba(255, 255, 255, 0.5);
-            color: white;
-            font-weight: 600;
+            border: 2px solid var(--amarelo);
+            color: var(--amarelo);
+            font-weight: 700;
+            background: transparent;
         }
 
         .btn-outline-light:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: white;
-            color: white;
+            background: var(--amarelo);
+            border-color: var(--amarelo);
+            color: var(--jaguar);
         }
 
-        /* ✅ DESIGN: Metric Box */
+        .btn-outline-secondary {
+            border: 2px solid var(--border-color);
+            color: var(--jaguar);
+            background: transparent;
+        }
+
+        .btn-outline-secondary:hover {
+            background: var(--nurse);
+            border-color: var(--jaguar);
+            color: var(--jaguar);
+        }
+
+        .btn-warning {
+            background: var(--amarelo);
+            color: var(--jaguar);
+            border-color: var(--amarelo);
+        }
+
+        .btn-warning:hover {
+            background: #e6a400;
+            color: var(--jaguar);
+            border-color: #e6a400;
+        }
+
+        .btn-danger {
+            background: var(--error);
+            color: #fff;
+        }
+
+        /* ✅ Metric Box — SW Brand */
         .metric-box {
-            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%);
+            background: var(--jaguar);
             padding: 1.5rem;
             border-radius: 12px;
             color: white;
             text-align: center;
-            box-shadow: 0 8px 16px rgba(99, 102, 241, 0.2);
+            box-shadow: 0 8px 16px rgba(1,1,13,0.2);
             transition: all 0.3s ease;
+            border-bottom: 3px solid var(--amarelo);
         }
 
         .metric-box:hover {
             transform: translateY(-4px);
-            box-shadow: 0 12px 24px rgba(99, 102, 241, 0.3);
+            box-shadow: 0 12px 24px rgba(1,1,13,0.3);
         }
 
         .metric-label {
-            font-size: 0.875rem;
-            opacity: 0.9;
+            font-size: 0.75rem;
+            opacity: 0.7;
             margin-bottom: 0.5rem;
-            font-weight: 500;
+            font-weight: 700;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.08em;
         }
 
         .metric-value {
-            font-size: 2rem;
-            font-weight: 700;
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 2.5rem;
+            letter-spacing: 0.04em;
+            color: var(--amarelo);
         }
 
-        /* ✅ DESIGN: Input e Search */
+        /* ✅ Input — SW Brand */
         .form-control, .form-select {
-            border: 1px solid var(--border-color);
+            border: 1.5px solid var(--border-color);
             border-radius: 8px;
-            padding: 0.75rem 1rem;
+            padding: 0.7rem 1rem;
             font-weight: 500;
             transition: all 0.3s ease;
+            background: #fff;
         }
 
         .form-control:focus, .form-select:focus {
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+            border-color: var(--amarelo);
+            box-shadow: 0 0 0 3px rgba(255,182,0,0.15);
+            outline: none;
         }
 
-        /* ✅ DESIGN: List Group */
+        /* ✅ List Group — SW Brand */
         .list-group-item {
             border: 1px solid var(--border-color);
             border-radius: 8px;
             margin-bottom: 0.5rem;
-            transition: all 0.3s ease;
+            transition: all 0.25s ease;
             animation: fadeInUp 0.3s ease-out;
         }
 
         .list-group-item:hover {
-            border-color: var(--accent);
-            background: var(--bg-light);
+            border-color: var(--amarelo);
+            background: #fffbee;
             transform: translateX(4px);
         }
 
@@ -3698,46 +3749,52 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: Alerts */
+        /* ✅ Alerts — SW Brand */
         .alert {
             border: none;
-            border-radius: 12px;
+            border-radius: 10px;
             border-left: 4px solid;
             animation: fadeInUp 0.4s ease-out;
         }
 
         .alert-warning {
-            background: linear-gradient(135deg, #fef3c7 0%, #fef08a 100%);
-            border-left-color: var(--warning);
-            color: #92400e;
+            background: #fffbee;
+            border-left-color: var(--amarelo);
+            color: #78500e;
         }
 
         .alert-info {
-            background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
-            border-left-color: var(--accent);
-            color: #0c4a6e;
+            background: #eef2ff;
+            border-left-color: #6366f1;
+            color: #1e1b4b;
         }
 
         .alert-danger {
-            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+            background: #fee2e2;
             border-left-color: var(--error);
             color: #7f1d1d;
         }
 
-        /* ✅ DESIGN: Table */
+        .alert-success {
+            background: #dcfce7;
+            border-left-color: var(--success);
+            color: #14532d;
+        }
+
+        /* ✅ Table — SW Brand */
         .table {
             border-collapse: collapse;
         }
 
         .table thead th {
-            background: var(--bg-light);
+            background: var(--jaguar);
             border: none;
-            font-weight: 600;
-            color: var(--primary);
-            padding: 1rem;
+            font-weight: 700;
+            color: var(--amarelo);
+            padding: 0.9rem 1rem;
             text-transform: uppercase;
-            font-size: 0.75rem;
-            letter-spacing: 0.05em;
+            font-size: 0.73rem;
+            letter-spacing: 0.08em;
         }
 
         .table tbody tr {
@@ -3746,47 +3803,57 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         .table tbody tr:hover {
-            background: var(--bg-light);
+            background: #fffbee;
         }
 
         .table td {
-            padding: 1rem;
+            padding: 0.9rem 1rem;
             vertical-align: middle;
         }
 
-        /* ✅ DESIGN: Badge */
+        /* ✅ Badge — SW Brand */
         .badge {
-            font-weight: 600;
+            font-weight: 700;
             padding: 0.4rem 0.8rem;
             border-radius: 50px;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.06em;
         }
 
         .badge.bg-success {
-            background: linear-gradient(135deg, var(--success) 0%, #059669 100%) !important;
+            background: var(--success) !important;
         }
 
         .badge.bg-info {
-            background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%) !important;
+            background: var(--jaguar) !important;
+            color: var(--amarelo) !important;
         }
 
-        /* ✅ DESIGN: Accordion */
+        .badge.bg-warning {
+            background: var(--amarelo) !important;
+            color: var(--jaguar) !important;
+        }
+
+        /* ✅ Accordion — SW Brand */
         .accordion-button {
-            font-weight: 600;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            font-size: 0.85rem;
             transition: all 0.3s ease;
         }
 
         .accordion-button:not(.collapsed) {
-            background: linear-gradient(135deg, var(--bg-light) 0%, #f1f5f9 100%);
-            color: var(--accent);
+            background: #fffbee;
+            color: var(--jaguar);
             box-shadow: none;
+            border-bottom: 2px solid var(--amarelo);
         }
 
         .accordion-button:focus {
-            border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+            border-color: var(--amarelo);
+            box-shadow: 0 0 0 3px rgba(255,182,0,0.15);
         }
 
         /* ✅ DESIGN: Hidden */
@@ -3814,46 +3881,81 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             letter-spacing: 0.1em;
         }
 
-        /* ✅ DESIGN: Responsivo */
+        /* ✅ Responsivo */
         @media (max-width: 768px) {
             .kpi-card h3 {
-                font-size: 1.5rem;
+                font-size: 2rem;
             }
 
             .metric-value {
-                font-size: 1.5rem;
+                font-size: 2rem;
             }
 
             .log-box {
                 max-height: 300px;
             }
         }
+
+        /* ✅ SW extras: section accent lines */
+        .sw-section-title {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1rem;
+        }
+
+        .sw-section-title::before {
+            content: '';
+            display: block;
+            width: 4px;
+            height: 28px;
+            background: var(--amarelo);
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+
+        /* ✅ SW: scrollbar global */
+        ::-webkit-scrollbar { width: 7px; height: 7px; }
+        ::-webkit-scrollbar-track { background: var(--nurse); }
+        ::-webkit-scrollbar-thumb { background: var(--salomie); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--amarelo); }
+
+        /* ✅ SW: production board card color overrides */
+        .board-col .card-header {
+            background: var(--jaguar);
+            border-bottom: 2px solid var(--amarelo);
+        }
+
+        /* ✅ SW: progress bar */
+        .progress-bar {
+            background: var(--amarelo) !important;
+        }
     
-        /* ✅ DESIGN: Footer */
+        /* ✅ Footer — SW Brand */
         footer {
-            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            background: var(--jaguar);
+            border-top: 3px solid var(--amarelo);
             margin-top: 3rem;
             animation: slideUp 0.5s ease-out;
         }
 
         @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
+            from { opacity: 0; transform: translateY(20px); }
+            to   { opacity: 1; transform: translateY(0); }
         }
 
-        footer p {
-            margin-bottom: 0.25rem;
-        }
+        footer p { margin-bottom: 0.25rem; }
 
         footer small {
             font-size: 0.8rem;
+            color: rgba(255,255,255,0.5) !important;
+        }
+
+        footer .footer-brand {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.3rem;
+            color: var(--amarelo);
+            letter-spacing: 0.06em;
         }
 
         @media (max-width: 768px) {
@@ -3866,12 +3968,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <!-- ✅ DESIGN: Navbar Premium -->
+    <!-- ✅ Navbar SW Móveis MDF -->
     <nav class="navbar navbar-expand-lg">
         <div class="container-fluid px-4">
-            <a class="navbar-brand text-white d-flex align-items-center" href="#" style="gap: 0.75rem;">
-                <img src="https://i.imgur.com/j79HO6n.png" alt="SW Móveis" style="height: 40px; width: auto; filter: brightness(1.1);">
-                <span style="font-size: 1.25rem; font-weight: 700;">SW Móveis</span>
+            <a class="navbar-brand d-flex align-items-center" href="#" style="gap: 0.75rem; text-decoration:none;">
+                <img src="https://i.imgur.com/j79HO6n.png" alt="SW Móveis" style="height: 42px; width: auto; filter: brightness(1.2) drop-shadow(0 0 6px rgba(255,182,0,0.4));">
+                <div style="line-height:1.1;">
+                    <div style="font-family:'Bebas Neue',sans-serif;font-size:1.5rem;color:#ffb600;letter-spacing:0.1em;">SW MÓVEIS MDF</div>
+                    <div style="font-size:0.65rem;color:rgba(255,255,255,0.5);font-weight:600;letter-spacing:0.15em;text-transform:uppercase;">Gestão de Produção</div>
+                </div>
             </a>
             <div class="d-flex align-items-center gap-3">
                 <span id="status-badge" class="badge bg-secondary">Carregando...</span>
@@ -3880,12 +3985,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         </div>
     </nav>
 
-    <!-- ✅ DESIGN: Container Principal -->
+    <!-- ✅ Header — SW Brand -->
     <div class="container-fluid px-4 py-5">
         <div class="row mb-5">
             <div class="col-12">
-                <h2 class="mb-1" style="font-weight: 700;">📊 Pedidos de Venda</h2>
-                <p class="text-muted mb-4">Acompanhe os pedidos abertos e fechados em tempo real</p>
+                <div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.5rem;">
+                    <div style="width:5px;height:40px;background:var(--amarelo);border-radius:3px;"></div>
+                    <div>
+                        <h2 class="mb-0" style="font-family:'Bebas Neue',sans-serif;font-size:2rem;letter-spacing:0.04em;color:var(--jaguar);">Pedidos de Venda</h2>
+                        <p class="mb-0" style="color:var(--gray);font-size:0.85rem;font-weight:500;">Acompanhe os pedidos abertos e fechados em tempo real</p>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -3894,7 +4004,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             <div class="col-md-4 mb-4">
                 <div class="card p-4 kpi-card kpi-daily text-center">
                     <h5>Pedidos Diários</h5>
-                    <h3 id="kpi-daily" class="text-primary">0</h3>
+                    <h3 id="kpi-daily" style="color:var(--amarelo);">0</h3>
                     <small class="text-muted">Últimas 24h</small>
                 </div>
             </div>
@@ -5039,15 +5149,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         datasets: [{
                             label: 'Pedidos Diários',
                             data: data.daily,
-                            borderColor: '#6366f1',
-                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                            borderColor: '#ffb600',
+                            backgroundColor: 'rgba(255, 182, 0, 0.1)',
                             tension: 0.4,
                             fill: true,
                             borderWidth: 2
                         }, {
                             label: 'Média Móvel (7 dias)',
                             data: data.moving_avg,
-                            borderColor: '#f59e0b',
+                            borderColor: '#01010d',
                             borderDash: [5, 5],
                             tension: 0.4,
                             borderWidth: 2
@@ -5105,21 +5215,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         });
     </script>
 
-    <!-- ✅ DESIGN: Footer Premium -->
-    <footer class="bg-primary text-white mt-5 py-4">
+    <!-- ✅ Footer SW Móveis MDF -->
+    <footer class="text-white mt-5 py-4">
         <div class="container-fluid px-4">
             <div class="row align-items-center">
                 <div class="col-md-6">
-                    <p class="mb-0">
-                        <strong>SW Móveis MDF</strong> - Gestão Inteligente de Pedidos
-                    </p>
-                    <small class="text-white-50">© 2025 - Desenvolvido com ❤️</small>
+                    <div class="footer-brand">SW MÓVEIS MDF</div>
+                    <p class="mb-0" style="color:rgba(255,255,255,0.7);font-size:0.85rem;">Gestão Inteligente de Produção</p>
+                    <small>© 2025 — Design inteligente, funcionalidade e conforto</small>
                 </div>
                 <div class="col-md-6 text-md-end">
-                    <p class="mb-0">
-                        <strong>Desenvolvedor:</strong> João Victor Dias Santana
+                    <p class="mb-0" style="color:rgba(255,255,255,0.7);font-size:0.85rem;">
+                        Desenvolvido por <strong style="color:var(--amarelo);">João Victor Dias Santana</strong>
                     </p>
-                    <small class="text-white-50">Versão 1.0 - 2025</small>
+                    <small>Versão 4.6 — 2025</small>
                 </div>
             </div>
         </div>
