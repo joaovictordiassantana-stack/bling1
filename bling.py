@@ -1551,81 +1551,87 @@ class ComponentConsumptionManager:
         month = self.get_current_month()
         summary = []
         for nome, info in month['components'].items():
+            todos = info.get('registros', [])
             summary.append({
                 'nome': nome,
                 'qtd_total': info['qtd'],
                 'un': info['un'],
-                'num_registros': len(info['registros']),
-                'registros': info['registros'][-5:]  # Últimos 5
+                'num_registros': len(todos),
+                'registros': todos[-5:]
             })
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
 
 
 # ── Extração de Base/Cor do nome do produto ──────────────────────────────────
 
+import re as _re_ecb
+
+_BASE_TYPES_ECB = [
+    "BASE QUADRADA", "BASE REDONDA", "BASE ESTRELA", "BASE CROMADA",
+    "BASE PRETA", "BASE ALUMINIO", "BASE ALUMÍNIO", "BASE FIXA",
+    "BASE GIRATORIA", "BASE GIRATÓRIA", "BASE MADEIRA", "BASE INOX",
+]
+_COR_TYPES_ECB = [
+    "COURVIM PRETO","COURVIM BRANCO","COURVIM CARAMELO","COURVIM CINZA",
+    "COURVIM AZUL","COURVIM VERDE","COURVIM ROSA","COURVIM VINHO","COURVIM",
+    "VELUDO PRETO","VELUDO CINZA","VELUDO AZUL","VELUDO VERDE",
+    "VELUDO ROSA","VELUDO BEGE","VELUDO VINHO","VELUDO AMARELO","VELUDO",
+    "LINHO BEGE","LINHO CINZA","LINHO PRETO","LINHO BRANCO","LINHO",
+    "TECIDO PRETO","TECIDO CINZA","TECIDO BEGE","TECIDO BRANCO","TECIDO",
+    "MARSALA","BORDO","BORDÔ","CARAMELO","NUDE","CREME",
+    "PRETO","BRANCO","CINZA","BEGE","MARROM",
+    "AZUL","VERDE","ROSA","AMARELO","LARANJA","VINHO",
+]
+
 def _extract_base_cor(nome: str):
-    """
-    Extrai a base e a cor/material a partir do nome do produto.
-    Estratégia:
-    1. Se o nome tem ' - ' como separador, analisa cada parte.
-    2. Fallback: busca por palavras-chave específicas no nome.
-    Retorna (base, cor) — strings vazias se não encontrado.
-    """
+    """Extrai base e cor do nome do produto. Suporta 'Cor:X', ' - ', keywords."""
     if not nome:
-        return '', ''
-
+        return "", ""
     nome_up = nome.upper()
-    base = ''
-    cor = ''
+    base = ""
+    cor = ""
 
-    # Palavras que identificam base (do mais específico ao mais genérico)
-    BASE_TYPES = [
-        'BASE QUADRADA', 'BASE REDONDA', 'BASE ESTRELA', 'BASE CROMADA',
-        'BASE PRETA', 'BASE ALUMÍNIO', 'BASE ALUMINIO', 'BASE FIXA',
-        'BASE GIRATÓRIA', 'BASE GIRATORIA', 'BASE MADEIRA', 'BASE INOX',
-    ]
-    # Palavras que identificam cor/material
-    COR_TYPES = [
-        'COURVIM PRETO', 'COURVIM BRANCO', 'COURVIM CARAMELO', 'COURVIM CINZA', 'COURVIM',
-        'VELUDO PRETO', 'VELUDO CINZA', 'VELUDO AZUL', 'VELUDO VERDE',
-        'VELUDO ROSA', 'VELUDO BEGE', 'VELUDO VINHO', 'VELUDO',
-        'LINHO BEGE', 'LINHO CINZA', 'LINHO PRETO', 'LINHO',
-        'TECIDO PRETO', 'TECIDO CINZA', 'TECIDO BEGE', 'TECIDO',
-        'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO', 'MARROM',
-        'AZUL', 'VERDE', 'ROSA', 'AMARELO', 'LARANJA', 'VINHO', 'CREME',
-    ]
+    # 1. Padrao "Cor:Marsala" ou "Base:Quadrada" (com ou sem espaco)
+    m_cor = _re_ecb.search(r"(?:COR|TECIDO|MATERIAL)\s*:\s*([^\s\-\/,;]+(?:\s+[^\s\-\/,;]+)?)", nome_up)
+    if m_cor:
+        s = m_cor.start(1)
+        cor = nome[s : s + len(m_cor.group(1))].strip()
 
-    # Tenta separar pelas partes com " - "
-    if ' - ' in nome:
-        partes = [p.strip() for p in nome.split(' - ')]
-        for parte in partes:
-            pu = parte.upper()
-            # Parte é base se começa com BASE ou contém tipo de base
-            if not base:
-                for bt in BASE_TYPES:
-                    if pu.startswith(bt) or pu == bt:
+    m_base = _re_ecb.search(r"BASE\s*:\s*([^\s\-\/,;]+(?:\s+[^\s\-\/,;]+)?)", nome_up)
+    if m_base:
+        s = m_base.start(1)
+        base = nome[s : s + len(m_base.group(1))].strip()
+
+    # 2. Separador " - " ou " / "
+    if not base or not cor:
+        sep = " - " if " - " in nome else (" / " if " / " in nome else None)
+        if sep:
+            for parte in [p.strip() for p in nome.split(sep)]:
+                pu = parte.upper()
+                if not base:
+                    for bt in _BASE_TYPES_ECB:
+                        if pu.startswith(bt) or pu == bt:
+                            base = parte
+                            break
+                    if not base and pu.startswith("BASE ") and len(parte) < 35:
                         base = parte
-                        break
-                # fallback simples: parte curta que começa com "BASE "
-                if not base and pu.startswith('BASE ') and len(parte) < 30:
-                    base = parte
-            # Parte é cor se contém material/cor (e não é a parte do nome do produto)
-            if not cor and not base == parte:
-                for ct in COR_TYPES:
-                    if ct in pu:
-                        # Pega só o trecho relevante (não a parte inteira se for grande)
-                        idx = pu.find(ct)
-                        cor = parte[idx:idx+len(ct)].strip()
-                        break
-    else:
-        # Sem separador: busca por keywords no nome completo
-        for bt in BASE_TYPES:
+                if not cor and parte != base:
+                    for ct in _COR_TYPES_ECB:
+                        if ct in pu:
+                            idx = nome_up.find(ct)
+                            cor = nome[idx : idx + len(ct)].strip()
+                            break
+
+    # 3. Fallback: busca keywords no nome completo
+    if not base:
+        for bt in _BASE_TYPES_ECB:
             if bt in nome_up:
-                base = bt.title()  # ex: "Base Quadrada"
+                base = bt.title()
                 break
-        for ct in COR_TYPES:
+    if not cor:
+        for ct in _COR_TYPES_ECB:
             if ct in nome_up:
-                cor = ct.title()   # ex: "Preto"
+                cor = ct.title()
                 break
 
     return base, cor
@@ -1818,10 +1824,13 @@ class PendingOrdersManager:
                                  or products_cache.get(sku_raw.upper())
                                  or products_cache.get(nome_raw.upper()))
                 nome_produto = produto_cache['nome'] if produto_cache else nome_raw
-                imagem = (produto_cache or {}).get('imagem', '')
+                _img_raw = (produto_cache or {}).get('imagem', '')
+                imagem = '' if (not _img_raw or 'no-image' in str(_img_raw)) else _img_raw
 
-                # Extrai base e cor do nome do produto
+                # Extrai base/cor — tenta nome completo, fallback para nome original do item
                 base, cor = _extract_base_cor(nome_produto)
+                if not base and not cor:
+                    base, cor = _extract_base_cor(nome_raw)
 
                 cliente = ''
                 contato = pedido.get('contato')
@@ -1851,6 +1860,7 @@ class PendingOrdersManager:
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
                         }
+                        self._save_one(sub_key)
                         added += 1
 
         if added > 0:
@@ -4266,7 +4276,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             <div class="col-md-6">
                                 <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
                                      style="cursor:pointer; transition: all .2s;"
-                                     onclick="toggleChecklist(this, ${i}, '${productName}')">
+                                     data-pname="${productName}" onclick="toggleChecklist(this, ${i}, this.dataset.pname)">
                                     <input class="form-check-input ms-1" type="checkbox" id="check${i}" onclick="event.stopPropagation()">
                                     <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
                                         ${item.nome} 
@@ -4301,14 +4311,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                             00:00:00
                                         </div>
                                         <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
-                                        <div class="d-flex justify-content-center gap-2">
-                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', '${productName}')">
+                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-produto="${productName}">
+                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', document.getElementById('timer-btn-group').dataset.produto)">
                                                 ▶ Iniciar
                                             </button>
-                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', '${productName}')">
+                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', document.getElementById('timer-btn-group').dataset.produto)">
                                                 ⏸ Pausar
                                             </button>
-                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', '${productName}')">
+                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', document.getElementById('timer-btn-group').dataset.produto)">
                                                 ↺ Zerar
                                             </button>
                                         </div>
@@ -4322,7 +4332,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
                                     Fechar
                                 </button>
-                                <button type="button" class="btn btn-success px-4 fw-bold" onclick="controlTimer('finish', '${productName}')">
+                                <button type="button" class="btn btn-success px-4 fw-bold"
+                                    onclick="controlTimer('finish', document.getElementById('timer-btn-group').dataset.produto)">
                                     ✅ CONCLUIR & SALVAR
                                 </button>
                             </div>
@@ -4365,68 +4376,61 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         }
                     }
                 });
-                // Atualiza progress bar
-                const total = RECIPE_CADEIRA.length;
-                const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
-                const progressDiv = document.getElementById('checklist-progress');
-                if (progressDiv) {
-                    progressDiv.innerHTML = `<strong>${checked} / ${total}</strong> itens marcados como usados${checked === total ? ' ✅ Tudo marcado!' : ''}`;
-                    progressDiv.className = `alert py-2 small mb-0 ${checked === total ? 'alert-success' : 'alert-info'}`;
-                }
+                _updateChecklistProgress();
             } catch(e) { console.error('Erro ao carregar checklist:', e); }
         }
 
-        function toggleChecklist(container, idx, productName) {
-            const cb = container.querySelector('input[type=checkbox]');
-            cb.checked = !cb.checked;
-            const item = RECIPE_CADEIRA[idx];
-
-            if (cb.checked) {
-                container.style.background = '#d1fae5';
-                container.style.borderColor = '#10b981';
-                registerConsumption(item.nome, item.qtd, item.un, productName, true);
-            } else {
-                container.style.background = '';
-                container.style.borderColor = '';
-                registerConsumption(item.nome, item.qtd, item.un, productName, false);
-            }
-
-            // Salva estado no servidor para persistir entre sessões
-            fetch('/api/checklist/state', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ produto: productName, componente: item.nome, checked: cb.checked })
-            }).catch(e => console.error('Erro ao salvar checklist:', e));
-
-            // Atualiza progress
+        function _updateChecklistProgress() {
             const total = RECIPE_CADEIRA.length;
             const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
             const progressDiv = document.getElementById('checklist-progress');
             if (progressDiv) {
-                progressDiv.innerHTML = `<strong>${checked} / ${total}</strong> itens marcados como usados${checked === total ? ' ✅ Tudo marcado!' : ''}`;
-                progressDiv.className = `alert py-2 small mb-0 ${checked === total ? 'alert-success' : 'alert-info'}`;
+                progressDiv.innerHTML = '<strong>' + checked + ' / ' + total + '</strong> itens marcados' + (checked === total ? ' ✅ Tudo marcado!' : '');
+                progressDiv.className = 'alert py-2 small mb-0 ' + (checked === total ? 'alert-success' : 'alert-info');
             }
+        }
+
+        function toggleChecklist(container, idx, productName) {
+            const cb = container.querySelector('input[type=checkbox]');
+            // IMPORTANTE: cb.checked já foi atualizado pelo browser antes do onclick
+            // NAO inverter aqui — isso causava bug de estado invertido
+            const isChecked = cb.checked;
+            const item = RECIPE_CADEIRA[idx];
+
+            if (isChecked) {
+                container.style.background = '#d1fae5';
+                container.style.borderColor = '#10b981';
+            } else {
+                container.style.background = '';
+                container.style.borderColor = '';
+            }
+
+            // Salva checklist e registra consumo com o estado correto
+            fetch('/api/checklist/state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ produto: productName, componente: item.nome, checked: isChecked })
+            }).catch(e => console.error('Erro checklist:', e));
+
+            registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
+            _updateChecklistProgress();
         }
 
         async function registerConsumption(componentName, qty, unit, productName, checked) {
             try {
-                await fetch('/api/consumption/register', {
+                const res = await fetch('/api/consumption/register', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        component_name: componentName,
-                        qty: qty,
-                        unit: unit,
-                        product_name: productName,
-                        checked: checked
-                    })
+                    body: JSON.stringify({ component_name: componentName, qty: qty, unit: unit, product_name: productName, checked: checked })
                 });
-                // Atualiza a aba de consumo se estiver visível
-                if (document.getElementById('component-usage').classList.contains('active')) {
-                    refreshComponentTab();
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const tab = document.getElementById('component-usage');
+                if (tab && tab.classList.contains('active')) {
+                    setTimeout(() => fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {}), 400);
                 }
             } catch(e) {
                 console.error('Erro ao registrar consumo:', e);
+                showToast('Aviso', 'Falha ao registrar insumo', 'warning');
             }
         }
 
@@ -4438,24 +4442,34 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ action: action, produto: produto })
                 });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
                 const data = await res.json();
 
                 if (action === 'finish') {
                     clearInterval(timerInterval);
-                    const elapsed = data.registro ? data.registro.tempo_segundos : 0;
-                    showToast('✅ Concluído!', `${produto} — ${formatSeconds(elapsed)} registrado.`, 'success');
-                    const modal = bootstrap.Modal.getInstance(document.getElementById('productionModal'));
-                    if (modal) modal.hide();
-                    refreshComponentTab();
-                    loadPendingOrders();
+                    timerInterval = null;
+                    const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
+                    showToast('✅ Concluído!', produto + ' — ' + formatSeconds(elapsed) + ' registrado.', 'success');
+                    // Fecha modal de forma robusta
+                    const modalEl = document.getElementById('productionModal');
+                    if (modalEl) {
+                        try {
+                            const bsModal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+                            bsModal.hide();
+                        } catch(me) { modalEl.remove(); }
+                    }
+                    // Atualiza board e consumo
+                    await loadProductionBoard();
+                    await refreshComponentTab();
                     return;
                 }
 
-                updateTimerDisplay(data.elapsed, data.state);
+                updateTimerDisplay(data.elapsed || 0, data.state || 'stopped');
                 if (action === 'start' || (action === 'get' && data.state === 'running')) {
-                    startLocalCounter(data.elapsed);
+                    startLocalCounter(data.elapsed || 0);
                 } else {
                     clearInterval(timerInterval);
+                    timerInterval = null;
                 }
             } catch (e) {
                 console.error("Erro no timer:", e);
@@ -4579,9 +4593,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const rawNome = item.nome || item.nome_original || 'N/D';
                     const nome = rawNome.replace(/'/g,"&#39;");
                     // Só mostra imagem se for URL real (não placeholder /static/no-image.png)
-                    const imgUrl = (item.imagem && !item.imagem.includes('no-image')) ? item.imagem : '';
+                    const imgUrl = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
                     const imgTag = imgUrl
-                        ? `<img src="${imgUrl}" alt="" style="width:40px;height:40px;object-fit:contain;border-radius:5px;border:1px solid #e5e7eb;margin-right:8px;vertical-align:middle;" onerror="this.remove()">`
+                        ? '<img src="' + imgUrl + '" alt="" loading="lazy" style="width:44px;height:44px;object-fit:contain;border-radius:6px;border:1px solid #e2e8f0;margin-right:8px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">'
                         : '';
                     html += `<tr>
                         <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
