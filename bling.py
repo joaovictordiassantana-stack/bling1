@@ -1342,7 +1342,7 @@ class ProductionTimer:
                 produto_nome = timer_key
             total_seconds = 0
 
-        # Registra componentes nao marcados manualmente
+        # Registra componentes nao marcados manualmente (auto-completa checklist ao concluir)
         if 'CADEIRA' in produto_nome.upper():
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
@@ -1351,9 +1351,10 @@ class ProductionTimer:
                         component_consumption.register_component(
                             nome_comp, comp['qtd'], comp['un'], produto_nome
                         )
+                        checklist_marcado[nome_comp] = True  # marca como registrado
                     except Exception as e:
                         logger.error(f"Auto-registro componente '{nome_comp}': {e}")
-            logger.info(f"Componentes registrados para '{produto_nome}'")
+            logger.info(f"Todos componentes registrados para '{produto_nome}'")
 
         registro = {
             "produto": produto_nome,
@@ -2734,9 +2735,39 @@ class WebServer:
                         'item_key': None,
                     })
 
+            # Enrich waiting/in_prod items with latest cache data (imagem, base, cor)
+            try:
+                with self.orchestrator._cache_lock:
+                    cache_flat = {**self.orchestrator._products_cache, **self.orchestrator._kits_cache}
+            except Exception:
+                cache_flat = {}
+
+            def enrich_item(item):
+                if cache_flat and (not item.get('imagem') or 'no-image' in str(item.get('imagem',''))):
+                    sku = item.get('sku','')
+                    nome = item.get('nome','') or item.get('nome_original','')
+                    cached = cache_flat.get(sku) or cache_flat.get(sku.upper()) or cache_flat.get(nome.upper())
+                    if cached:
+                        img_raw = cached.get('imagem','')
+                        if img_raw and 'no-image' not in str(img_raw):
+                            item = dict(item)
+                            item['imagem'] = img_raw
+                # Re-extract base/cor if missing
+                if not item.get('base') and not item.get('cor'):
+                    nome_full = item.get('nome','') or item.get('nome_original','')
+                    base, cor = _extract_base_cor(nome_full)
+                    if base or cor:
+                        item = dict(item)
+                        item['base'] = base
+                        item['cor'] = cor
+                return item
+
+            waiting_enriched = [enrich_item(i) for i in pending_orders.get_waiting()]
+            in_prod_enriched = [enrich_item(i) for i in in_prod]
+
             return jsonify({
-                'waiting': pending_orders.get_waiting(),
-                'in_production': in_prod,
+                'waiting': waiting_enriched,
+                'in_production': in_prod_enriched,
                 'orphan_timers': orphan,
                 'done': pending_orders.get_done(),
                 'server_time': time.time(),
@@ -2756,7 +2787,17 @@ class WebServer:
             timer_key  = data.get('timer_key') or data.get('produto', '')
             componente = data.get('componente', '')
             checked    = data.get('checked', False)
-            if timer_key and componente and timer_key in production_timer.timers:
+            if timer_key and componente:
+                if timer_key not in production_timer.timers:
+                    # Cria timer parado para persistir checklist mesmo sem timer iniciado
+                    production_timer.timers[timer_key] = {
+                        'produto': timer_key,
+                        'start_ts': 0,
+                        'accumulated': 0,
+                        'state': 'paused',
+                        'created_at': datetime.now().isoformat(),
+                        'checklist': {}
+                    }
                 t = production_timer.timers[timer_key]
                 if 'checklist' not in t:
                     t['checklist'] = {}
@@ -4301,7 +4342,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 '<div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em;opacity:.7;">⏱ Tempo de Produção</div>' +
                 '<div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size:3.5rem;letter-spacing:.05em;text-shadow:0 0 20px rgba(99,102,241,.6);">00:00:00</div>' +
                 '<div id="timer-status" class="badge mb-3" style="font-size:.85rem;padding:.4rem 1rem;">Parado</div>' +
-                '<div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-tkey="' + tkSafe + '" data-pnome="' + pnSafe + '">' +
+                '<div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-tkey="' + tkSafe + '" data-pnome="' + pnSafe + '" data-ikey="' + tkSafe + '">' +
                 '<button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start',document.getElementById('timer-btn-group').dataset.tkey,document.getElementById('timer-btn-group').dataset.pnome)">▶ Iniciar</button>' +
                 '<button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause',document.getElementById('timer-btn-group').dataset.tkey)">⏸ Pausar</button>' +
                 '<button class="btn btn-outline-light px-4" onclick="controlTimer('reset',document.getElementById('timer-btn-group').dataset.tkey)">↺ Zerar</button>' +
@@ -4310,7 +4351,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 '</div><div class="modal-footer bg-white d-flex justify-content-between">' +
                 '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar</button>' +
                 '<button type="button" class="btn btn-success px-4 fw-bold"' +
-                ' onclick="controlTimer('finish',document.getElementById('timer-btn-group').dataset.tkey,document.getElementById('timer-btn-group').dataset.pnome)">✅ CONCLUIR & SALVAR</button>' +
+                ' onclick="finishModalItem(document.getElementById('timer-btn-group').dataset.tkey,document.getElementById('timer-btn-group').dataset.pnome)">✅ CONCLUIR & SALVAR</button>' +
                 '</div></div></div></div>';
 
             const oldModal = document.getElementById('productionModal');
@@ -4436,6 +4477,79 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch (e) {
                 console.error('controlTimer:', e);
                 showToast('Erro', 'Falha ao comunicar com servidor.', 'danger');
+            }
+        }
+
+        /* finishModalItem — chamado pelo botão CONCLUIR & SALVAR do modal.
+           Marca todos checklist não marcados, finaliza o timer e marca o pedido como concluído. */
+        async function finishModalItem(timerKey, produtoNome) {
+            if (!timerKey) return;
+            // Auto-marca todos checkboxes não marcados antes de finalizar
+            const checkboxes = document.querySelectorAll('#productionModal .form-check-input');
+            const autoMarkPromises = [];
+            checkboxes.forEach((cb, i) => {
+                if (!cb.checked && i < RECIPE_CADEIRA.length) {
+                    cb.checked = true;
+                    const ct = cb.closest('.checklist-item');
+                    if (ct) { ct.style.background = '#d1fae5'; ct.style.borderColor = '#10b981'; }
+                    const item = RECIPE_CADEIRA[i];
+                    // Salva no checklist do timer
+                    autoMarkPromises.push(
+                        fetch('/api/checklist/state', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ timer_key: timerKey, componente: item.nome, checked: true })
+                        }).catch(() => {})
+                    );
+                    // Registra consumo
+                    autoMarkPromises.push(
+                        fetch('/api/consumption/register', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ component_name: item.nome, qty: item.qtd, unit: item.un, product_name: produtoNome, checked: true })
+                        }).catch(() => {})
+                    );
+                }
+            });
+            _updateChecklistProgress();
+            // Aguarda todos os registros de checklist
+            if (autoMarkPromises.length > 0) await Promise.allSettled(autoMarkPromises);
+
+            // Finaliza o timer
+            const isCadeira = produtoNome.toUpperCase().includes('CADEIRA');
+            const btnGroup = document.getElementById('timer-btn-group');
+            const itemKey = btnGroup ? btnGroup.dataset.ikey : timerKey;
+
+            try {
+                // Se timerKey == itemKey, chama pending-orders/finish (marca como done)
+                if (itemKey) {
+                    const r = await fetch('/api/pending-orders/finish', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome, timer_key: timerKey })
+                    });
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                } else {
+                    // timer manual sem pedido vinculado
+                    await fetch('/api/timer/action', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ action: 'finish', timer_key: timerKey, produto_nome: produtoNome })
+                    });
+                }
+                clearInterval(timerInterval);
+                timerInterval = null;
+                showToast('✅ Concluído!', produtoNome + ' salvo com sucesso.', 'success');
+                const modalEl = document.getElementById('productionModal');
+                if (modalEl) {
+                    try { (bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl)).hide(); }
+                    catch(me) { modalEl.remove(); }
+                }
+                loadProductionBoard();
+                fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {});
+            } catch(e) {
+                console.error('finishModalItem error:', e);
+                showToast('Erro', 'Falha ao concluir produção.', 'danger');
             }
         }
 
@@ -4596,20 +4710,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 allInProd.forEach(item => {
                     const nome    = item.nome || item.nome_original || item.produto || 'N/D';
                     const nomeSafe = nome.replace(/'/g,"&#39;");
-                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g,'_');
+                    const timerKeyB = item.item_key || item.timer_key || nome;
+                    const safeId  = timerKeyB.replace(/[^a-zA-Z0-9]/g,'_');
                     const elapsed = item.tempo_decorrido || 0;
                     const estado  = item.estado || 'paused';
                     const itemKey = item.item_key || null;
                     const base    = item.base || '—';
                     const cor     = item.cor  || '—';
                     const chkDone = Object.values(item.checklist || {}).filter(Boolean).length;
-                    const chkTotal= RECIPE_CADEIRA.length;
+                    const isCadeiraItem = nome.toUpperCase().includes('CADEIRA');
+                    const chkTotal= isCadeiraItem ? RECIPE_CADEIRA.length : Object.keys(item.checklist || {}).length;
 
-                    // Guarda estado para ticker local
-                    _boardTimerState[nome] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
+                    // Guarda estado para ticker local — usa timerKeyB como chave única
+                    _boardTimerState[timerKeyB] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime, safeId };
 
                     // timerKey = item_key → cada unidade tem cronômetro independente
-                    const timerKeyB = item.item_key || item.timer_key || nome;
                     const openBtn = '<button class="btn btn-xs btn-outline-primary btn-sm me-1"' +
                         ' data-tkey="' + timerKeyB + '" data-pnome="' + nomeSafe + '"' +
                         ' onclick="openProductionChecklist(this.dataset.pnome,this.dataset.tkey)">🛠 Abrir</button>';
@@ -4621,8 +4736,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                           ' data-tkey="' + timerKeyB + '" data-pnome="' + nomeSafe + '"' +
                           ' onclick="controlTimer('finish',this.dataset.tkey,this.dataset.pnome)">✅ Concluir</button>';
 
+                    const imgUrlB = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
+                    const imgTagB = imgUrlB ? '<img src="' + imgUrlB + '" loading="lazy" style="width:40px;height:40px;object-fit:contain;border-radius:6px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;" onerror="this.remove()">' : '';
                     html += `<tr>
-                        <td class="ps-3 fw-bold">${nomeSafe}</td>
+                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTagB}<span style="vertical-align:middle;">${nomeSafe}</span></td>
                         <td class="text-muted small">${base}</td>
                         <td class="text-muted small">${cor}</td>
                         <td class="text-center">
@@ -4669,11 +4786,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             // ── Ticker local (1s) ────────────────────────────────────────
             _boardTick = setInterval(() => {
-                Object.entries(_boardTimerState).forEach(([nome, s]) => {
+                Object.entries(_boardTimerState).forEach(([key, s]) => {
                     if (s.estado !== 'running') return;
                     const elapsed = s.base + (Date.now() / 1000 - s.startedAt);
-                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g, '_');
-                    const el = document.getElementById('btimer_' + safeId);
+                    const el = document.getElementById('btimer_' + s.safeId);
                     if (el) el.textContent = formatSeconds(Math.floor(elapsed));
                 });
             }, 1000);
