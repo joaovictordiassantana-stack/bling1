@@ -1257,31 +1257,30 @@ class ProductionTimer:
             logger.error(f"Erro ao salvar timers em arquivo: {e}")
 
     def _auto_pause_on_restart(self):
+        """
+        Ao reiniciar: pausa timers 'running' E soma o tempo que estava rodando.
+        O background_saver salva a cada 30s, então perdemos no máximo 30s.
+        Garante que o tempo acumulado não seja perdido.
+        """
         changed = False
         now = time.time()
         for k, v in self.timers.items():
-            if 'produto' not in v:
-                v['produto'] = k
-                changed = True
             if v.get('state') == 'running':
                 start_ts = v.get('start_ts', 0)
                 if start_ts and start_ts > 0:
+                    # Soma o tempo que estava rodando desde o último checkpoint
                     v['accumulated'] = v.get('accumulated', 0) + (now - start_ts)
                 v['state'] = 'paused'
                 v['start_ts'] = 0
                 changed = True
         if changed:
             self._save()
-            n = sum(1 for v in self.timers.values() if v.get('state') == 'paused')
-            logger.info(f"Restart: {n} timers pausados.")
+            logger.info(f"⏸ Restart: {sum(1 for v in self.timers.values() if v.get('state')=='paused')} timers pausados com tempo preservado.")
 
-    def start(self, timer_key, produto_nome=None):
+    def start(self, produto_nome):
         now = time.time()
-        if not produto_nome:
-            produto_nome = timer_key
-        if timer_key not in self.timers:
-            self.timers[timer_key] = {
-                'produto': produto_nome,
+        if produto_nome not in self.timers:
+            self.timers[produto_nome] = {
                 'start_ts': now,
                 'accumulated': 0,
                 'state': 'running',
@@ -1289,14 +1288,13 @@ class ProductionTimer:
                 'checklist': {}
             }
         else:
-            t = self.timers[timer_key]
-            t['produto'] = produto_nome
+            t = self.timers[produto_nome]
             if t['state'] != 'running':
                 t['start_ts'] = now
                 t['state'] = 'running'
         self._save()
-        self._launch_background_saver(timer_key)
-        return self.get_status(timer_key)
+        self._launch_background_saver(produto_nome)
+        return self.get_status(produto_nome)
 
     def _launch_background_saver(self, nome):
         """Thread que faz checkpoint do timer a cada 30s enquanto existir (running ou paused)."""
@@ -1316,32 +1314,29 @@ class ProductionTimer:
                     logger.error(f"background_saver erro: {e}")
         Thread(target=background_saver, daemon=True, name=f"saver_{nome}").start()
 
-    def pause(self, timer_key):
-        if timer_key in self.timers and self.timers[timer_key].get('state') == 'running':
-            t = self.timers[timer_key]
-            t['accumulated'] = t.get('accumulated', 0) + (time.time() - t.get('start_ts', 0))
+    def pause(self, produto_nome):
+        if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
+            t = self.timers[produto_nome]
+            # Soma o tempo decorrido desde o start até agora
+            t['accumulated'] += (time.time() - t['start_ts'])
             t['start_ts'] = 0
             t['state'] = 'paused'
             self._save()
-        return self.get_status(timer_key)
+        return self.get_status(produto_nome)
 
-    def stop_and_log(self, timer_key, produto_nome=None):
-        """Finaliza producao: pausa timer, registra componentes, salva historico.
-        timer_key = item_key (pedido) ou produto_nome (manual).
-        """
+    def stop_and_log(self, produto_nome):
+        """Finaliza produção: pausa timer, registra componentes e salva histórico."""
+        # Recupera checklist antes de pausar
         checklist_marcado = {}
-        if timer_key in self.timers:
-            t = self.timers[timer_key]
-            if not produto_nome:
-                produto_nome = t.get('produto', timer_key)
-            checklist_marcado = t.get('checklist', {})
-            status = self.pause(timer_key)
+        if produto_nome in self.timers:
+            checklist_marcado = self.timers[produto_nome].get('checklist', {})
+            status = self.pause(produto_nome)
             total_seconds = status['elapsed']
         else:
-            if not produto_nome:
-                produto_nome = timer_key
+            # Timer não existe (concluído direto do board sem abrir modal)
             total_seconds = 0
 
+        # Registra componentes da receita não marcados manualmente
         if 'CADEIRA' in produto_nome.upper():
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
@@ -1352,11 +1347,10 @@ class ProductionTimer:
                         )
                     except Exception as e:
                         logger.error(f"Auto-registro componente '{nome_comp}': {e}")
-            logger.info(f"Componentes registrados para '{produto_nome}'")
+            logger.info(f"✅ Componentes registrados para '{produto_nome}'")
 
         registro = {
             "produto": produto_nome,
-            "timer_key": timer_key,
             "tempo_segundos": total_seconds,
             "data_conclusao": datetime.now().isoformat(),
             "timestamp": time.time(),
@@ -1364,48 +1358,41 @@ class ProductionTimer:
         }
         self._add_to_history(registro)
 
-        if timer_key in self.timers:
-            del self.timers[timer_key]
+        if produto_nome in self.timers:
+            del self.timers[produto_nome]
             self._save()
 
         return {'elapsed': total_seconds, 'state': 'finished', 'registro': registro}
 
-    def reset(self, timer_key):
-        if timer_key in self.timers:
-            del self.timers[timer_key]
+    def reset(self, produto_nome):
+        if produto_nome in self.timers:
+            del self.timers[produto_nome]
             self._save()
         return {'elapsed': 0, 'state': 'stopped'}
 
-    def get_status(self, timer_key):
-        if timer_key not in self.timers:
+    def get_status(self, produto_nome):
+        if produto_nome not in self.timers:
             return {'elapsed': 0, 'state': 'stopped'}
-        t = self.timers[timer_key]
-        total = t.get('accumulated', 0)
-        if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
+        t = self.timers[produto_nome]
+        total = t['accumulated']
+        if t['state'] == 'running':
             total += (time.time() - t['start_ts'])
-        return {
-            'elapsed': int(total),
-            'state': t.get('state', 'paused'),
-            'produto': t.get('produto', timer_key),
-            'checklist': t.get('checklist', {})
-        }
+        return {'elapsed': int(total), 'state': t['state'], 'checklist': t.get('checklist', {})}
 
     def get_active_timers(self):
-        """Retorna timers ativos. timer_key unico por unidade de producao."""
+        """Retorna timers ativos com tempo ao vivo calculado no servidor."""
         active = []
-        for key, t in self.timers.items():
-            total = t.get('accumulated', 0)
-            if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
-                total += (time.time() - t['start_ts'])
+        for nome, data in self.timers.items():
+            current_total = data.get('accumulated', 0)
+            if data.get('state') == 'running' and data.get('start_ts', 0) > 0:
+                current_total += (time.time() - data['start_ts'])
             active.append({
-                "timer_key": key,
-                "produto": t.get('produto', key),
-                "estado": t.get('state', 'paused'),
-                "tempo_decorrido": int(total),
-                "inicio": t.get('created_at', ''),
-                "checklist": t.get('checklist', {}),
-                "checklist_count": sum(1 for v in t.get('checklist', {}).values() if v),
-                "checklist_total": len(t.get('checklist', {})),
+                "produto": nome,
+                "estado": data.get('state', 'paused'),
+                "tempo_decorrido": int(current_total),
+                "inicio": data.get('created_at', ''),
+                "checklist_count": sum(1 for v in data.get('checklist', {}).values() if v),
+                "checklist_total": len(data.get('checklist', {})),
             })
         return active
 
@@ -1458,7 +1445,6 @@ class ComponentConsumptionManager:
     FILE_PATH = DATA_DIR / 'component_consumption.json'
 
     def __init__(self):
-        self._lock = Lock()
         self.data = self._load()
         self._ensure_current_month()
 
@@ -1506,39 +1492,49 @@ class ComponentConsumptionManager:
             self._save()
 
     def register_component(self, component_name: str, qty: float, unit: str, product_name: str):
-        """Registra consumo de componente (thread-safe)."""
-        with self._lock:
-            self._ensure_current_month()
-            key = self._current_month_key()
-            month_data = self.data[key]
-            if component_name not in month_data['components']:
-                month_data['components'][component_name] = {'qtd': 0, 'un': unit, 'registros': []}
-            comp = month_data['components'][component_name]
-            comp['qtd'] = round(comp['qtd'] + qty, 3)
-            comp['un'] = unit
-            ts = datetime.now().isoformat()
-            comp['registros'].append({'produto': product_name, 'qtd': qty, 'timestamp': ts})
-            month_data['checklist_logs'].append({
-                'componente': component_name, 'produto': product_name,
-                'qtd': qty, 'un': unit, 'timestamp': ts
-            })
-            self._save()
-            return dict(comp)
+        """Registra uso de um componente via checklist."""
+        self._ensure_current_month()
+        key = self._current_month_key()
+        month_data = self.data[key]
+
+        if component_name not in month_data['components']:
+            month_data['components'][component_name] = {'qtd': 0, 'un': unit, 'registros': []}
+
+        comp = month_data['components'][component_name]
+        comp['qtd'] = round(comp['qtd'] + qty, 3)
+        comp['un'] = unit
+
+        registro = {
+            'produto': product_name,
+            'qtd': qty,
+            'timestamp': datetime.now().isoformat()
+        }
+        comp['registros'].append(registro)
+
+        # Log geral
+        month_data['checklist_logs'].append({
+            'componente': component_name,
+            'produto': product_name,
+            'qtd': qty,
+            'un': unit,
+            'timestamp': datetime.now().isoformat()
+        })
+
+        self._save()
+        return comp
 
     def unregister_component(self, component_name: str, qty: float, product_name: str):
-        """Remove uma ocorrencia do componente (thread-safe)."""
-        with self._lock:
-            self._ensure_current_month()
-            key = self._current_month_key()
-            month_data = self.data[key]
-            if component_name in month_data['components']:
-                comp = month_data['components'][component_name]
-                comp['qtd'] = max(0, round(comp['qtd'] - qty, 3))
-                for i in range(len(comp['registros']) - 1, -1, -1):
-                    if comp['registros'][i].get('produto') == product_name:
-                        comp['registros'].pop(i)
-                        break
-                self._save()
+        """Remove o registro de um componente (desmarcou o checkbox)."""
+        self._ensure_current_month()
+        key = self._current_month_key()
+        month_data = self.data[key]
+
+        if component_name in month_data['components']:
+            comp = month_data['components'][component_name]
+            comp['qtd'] = max(0, round(comp['qtd'] - qty, 3))
+            # Remove o último registro deste produto
+            comp['registros'] = [r for r in comp['registros'] if r['produto'] != product_name]
+            self._save()
 
     def get_current_month(self):
         """Retorna os dados do mês atual."""
@@ -1568,69 +1564,74 @@ class ComponentConsumptionManager:
 
 # ── Extração de Base/Cor do nome do produto ──────────────────────────────────
 
+import re as _re_ecb
+
+_BASE_TYPES_ECB = [
+    "BASE QUADRADA", "BASE REDONDA", "BASE ESTRELA", "BASE CROMADA",
+    "BASE PRETA", "BASE ALUMINIO", "BASE ALUMÍNIO", "BASE FIXA",
+    "BASE GIRATORIA", "BASE GIRATÓRIA", "BASE MADEIRA", "BASE INOX",
+]
+_COR_TYPES_ECB = [
+    "COURVIM PRETO","COURVIM BRANCO","COURVIM CARAMELO","COURVIM CINZA",
+    "COURVIM AZUL","COURVIM VERDE","COURVIM ROSA","COURVIM VINHO","COURVIM",
+    "VELUDO PRETO","VELUDO CINZA","VELUDO AZUL","VELUDO VERDE",
+    "VELUDO ROSA","VELUDO BEGE","VELUDO VINHO","VELUDO AMARELO","VELUDO",
+    "LINHO BEGE","LINHO CINZA","LINHO PRETO","LINHO BRANCO","LINHO",
+    "TECIDO PRETO","TECIDO CINZA","TECIDO BEGE","TECIDO BRANCO","TECIDO",
+    "MARSALA","BORDO","BORDÔ","CARAMELO","NUDE","CREME",
+    "PRETO","BRANCO","CINZA","BEGE","MARROM",
+    "AZUL","VERDE","ROSA","AMARELO","LARANJA","VINHO",
+]
+
 def _extract_base_cor(nome: str):
-    """
-    Extrai a base e a cor/material a partir do nome do produto.
-    Estratégia:
-    1. Se o nome tem ' - ' como separador, analisa cada parte.
-    2. Fallback: busca por palavras-chave específicas no nome.
-    Retorna (base, cor) — strings vazias se não encontrado.
-    """
+    """Extrai base e cor do nome do produto. Suporta 'Cor:X', ' - ', keywords."""
     if not nome:
-        return '', ''
-
+        return "", ""
     nome_up = nome.upper()
-    base = ''
-    cor = ''
+    base = ""
+    cor = ""
 
-    # Palavras que identificam base (do mais específico ao mais genérico)
-    BASE_TYPES = [
-        'BASE QUADRADA', 'BASE REDONDA', 'BASE ESTRELA', 'BASE CROMADA',
-        'BASE PRETA', 'BASE ALUMÍNIO', 'BASE ALUMINIO', 'BASE FIXA',
-        'BASE GIRATÓRIA', 'BASE GIRATORIA', 'BASE MADEIRA', 'BASE INOX',
-    ]
-    # Palavras que identificam cor/material
-    COR_TYPES = [
-        'COURVIM PRETO', 'COURVIM BRANCO', 'COURVIM CARAMELO', 'COURVIM CINZA', 'COURVIM',
-        'VELUDO PRETO', 'VELUDO CINZA', 'VELUDO AZUL', 'VELUDO VERDE',
-        'VELUDO ROSA', 'VELUDO BEGE', 'VELUDO VINHO', 'VELUDO',
-        'LINHO BEGE', 'LINHO CINZA', 'LINHO PRETO', 'LINHO',
-        'TECIDO PRETO', 'TECIDO CINZA', 'TECIDO BEGE', 'TECIDO',
-        'PRETO', 'BRANCO', 'CINZA', 'BEGE', 'CARAMELO', 'MARROM',
-        'AZUL', 'VERDE', 'ROSA', 'AMARELO', 'LARANJA', 'VINHO', 'CREME',
-    ]
+    # 1. Padrao "Cor:Marsala" ou "Base:Quadrada" (com ou sem espaco)
+    m_cor = _re_ecb.search(r"(?:COR|TECIDO|MATERIAL)\s*:\s*([^\s\-\/,;]+(?:\s+[^\s\-\/,;]+)?)", nome_up)
+    if m_cor:
+        s = m_cor.start(1)
+        cor = nome[s : s + len(m_cor.group(1))].strip()
 
-    # Tenta separar pelas partes com " - "
-    if ' - ' in nome:
-        partes = [p.strip() for p in nome.split(' - ')]
-        for parte in partes:
-            pu = parte.upper()
-            # Parte é base se começa com BASE ou contém tipo de base
-            if not base:
-                for bt in BASE_TYPES:
-                    if pu.startswith(bt) or pu == bt:
+    m_base = _re_ecb.search(r"BASE\s*:\s*([^\s\-\/,;]+(?:\s+[^\s\-\/,;]+)?)", nome_up)
+    if m_base:
+        s = m_base.start(1)
+        base = nome[s : s + len(m_base.group(1))].strip()
+
+    # 2. Separador " - " ou " / "
+    if not base or not cor:
+        sep = " - " if " - " in nome else (" / " if " / " in nome else None)
+        if sep:
+            for parte in [p.strip() for p in nome.split(sep)]:
+                pu = parte.upper()
+                if not base:
+                    for bt in _BASE_TYPES_ECB:
+                        if pu.startswith(bt) or pu == bt:
+                            base = parte
+                            break
+                    if not base and pu.startswith("BASE ") and len(parte) < 35:
                         base = parte
-                        break
-                # fallback simples: parte curta que começa com "BASE "
-                if not base and pu.startswith('BASE ') and len(parte) < 30:
-                    base = parte
-            # Parte é cor se contém material/cor (e não é a parte do nome do produto)
-            if not cor and not base == parte:
-                for ct in COR_TYPES:
-                    if ct in pu:
-                        # Pega só o trecho relevante (não a parte inteira se for grande)
-                        idx = pu.find(ct)
-                        cor = parte[idx:idx+len(ct)].strip()
-                        break
-    else:
-        # Sem separador: busca por keywords no nome completo
-        for bt in BASE_TYPES:
+                if not cor and parte != base:
+                    for ct in _COR_TYPES_ECB:
+                        if ct in pu:
+                            idx = nome_up.find(ct)
+                            cor = nome[idx : idx + len(ct)].strip()
+                            break
+
+    # 3. Fallback: busca keywords no nome completo
+    if not base:
+        for bt in _BASE_TYPES_ECB:
             if bt in nome_up:
-                base = bt.title()  # ex: "Base Quadrada"
+                base = bt.title()
                 break
-        for ct in COR_TYPES:
+    if not cor:
+        for ct in _COR_TYPES_ECB:
             if ct in nome_up:
-                cor = ct.title()   # ex: "Preto"
+                cor = ct.title()
                 break
 
     return base, cor
@@ -1823,11 +1824,13 @@ class PendingOrdersManager:
                                  or products_cache.get(sku_raw.upper())
                                  or products_cache.get(nome_raw.upper()))
                 nome_produto = produto_cache['nome'] if produto_cache else nome_raw
-                _img = (produto_cache or {}).get('imagem', '')
-                imagem = '' if (not _img or 'no-image' in str(_img)) else _img
+                _img_raw = (produto_cache or {}).get('imagem', '')
+                imagem = '' if (not _img_raw or 'no-image' in str(_img_raw)) else _img_raw
 
-                # Extrai base e cor do nome do produto
+                # Extrai base/cor — tenta nome completo, fallback para nome original do item
                 base, cor = _extract_base_cor(nome_produto)
+                if not base and not cor:
+                    base, cor = _extract_base_cor(nome_raw)
 
                 cliente = ''
                 contato = pedido.get('contato')
@@ -2651,21 +2654,30 @@ class WebServer:
         @self.app.route('/api/timer/action', methods=['POST'])
         def api_timer_action():
             data = request.json
-            action       = data.get('action', 'get')
-            timer_key    = data.get('timer_key') or data.get('produto', '')
-            produto_nome = data.get('produto_nome') or data.get('produto', '')
-            if not timer_key:
-                return jsonify({'error': 'timer_key obrigatorio'}), 400
+            action = data.get('action') # start, pause, reset, finish
+            produto = data.get('produto')
+            
             if action == 'start':
-                status = production_timer.start(timer_key, produto_nome or None)
+                status = production_timer.start(produto)
             elif action == 'pause':
-                status = production_timer.pause(timer_key)
+                status = production_timer.pause(produto)
             elif action == 'reset':
-                status = production_timer.reset(timer_key)
+                status = production_timer.reset(produto)
             elif action == 'finish':
-                status = production_timer.stop_and_log(timer_key, produto_nome or None)
+                status = production_timer.stop_and_log(produto)
             else:
-                status = production_timer.get_status(timer_key)
+                status = production_timer.get_status(produto)
+                
+            # Força recálculo e notifica TODOS os usuários via WebSocket
+            def update_and_broadcast():
+                try:
+                    usage = self.orchestrator.calculate_component_usage()
+                    self.orchestrator._component_usage_cache = usage
+                    self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                except Exception as e:
+                    self.logger.error(f'Erro no broadcast pós-timer: {e}')
+            Thread(target=update_and_broadcast, daemon=True).start()
+                
             return jsonify(status)
 
         @self.app.route('/api/production/board')
@@ -2677,38 +2689,40 @@ class WebServer:
             - done: concluídos do mês (para histórico)
             - timers_orphan: timers sem item_key (iniciados manualmente)
             """
-            # Mapa timer_key -> info (cada item_key tem seu proprio timer)
+            # Mapa de produto_nome -> timer
             timers = production_timer.timers
             timer_map = {}
-            for key, t in timers.items():
+            for nome, t in timers.items():
                 total = t.get('accumulated', 0)
                 if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
                     total += time.time() - t['start_ts']
-                timer_map[key] = {
+                timer_map[nome] = {
                     'estado': t.get('state', 'paused'),
                     'tempo_decorrido': int(total),
                     'checklist': t.get('checklist', {}),
                     'created_at': t.get('created_at', ''),
                 }
 
-            # Enriquece in_production: vincula por item_key (unico por unidade)
+            # Enriquece in_production com dados do timer
             in_prod = []
             for item in pending_orders.get_in_production():
-                key = item.get('item_key', '')
-                t_info = timer_map.get(key, {})
+                nome = item.get('nome') or item.get('nome_original', '')
+                t_info = timer_map.get(nome, {})
                 in_prod.append({**item, **t_info})
 
-            # Orphan: timer_key nao e item_key de nenhum pedido
-            all_item_keys = set(pending_orders.data.keys())
+            # Timers sem pedido vinculado (iniciados manualmente)
+            nomes_com_pedido = {
+                (v.get('nome') or v.get('nome_original', ''))
+                for v in pending_orders.data.values()
+            }
             orphan = []
-            for key, t in timers.items():
-                if key not in all_item_keys:
+            for nome, t in timers.items():
+                if nome not in nomes_com_pedido:
                     total = t.get('accumulated', 0)
                     if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
                         total += time.time() - t['start_ts']
                     orphan.append({
-                        'nome': t.get('produto', key),
-                        'timer_key': key,
+                        'nome': nome,
                         'estado': t.get('state', 'paused'),
                         'tempo_decorrido': int(total),
                         'checklist': t.get('checklist', {}),
@@ -2724,25 +2738,23 @@ class WebServer:
                 'server_time': time.time(),
             })
 
-        @self.app.route('/api/checklist/state/<path:timer_key>', methods=['GET'])
-        def api_checklist_get(timer_key):
-            """Retorna checklist pelo timer_key."""
-            t = production_timer.timers.get(timer_key, {})
-            return jsonify({'checklist': t.get('checklist', {}),
-                            'produto': t.get('produto', timer_key)})
+        @self.app.route('/api/checklist/state/<path:produto>', methods=['GET'])
+        def api_checklist_get(produto):
+            """Retorna estado salvo da checklist de um produto em produção."""
+            t = production_timer.timers.get(produto, {})
+            return jsonify({'checklist': t.get('checklist', {})})
 
         @self.app.route('/api/checklist/state', methods=['POST'])
         def api_checklist_set():
-            """Salva item da checklist identificado pelo timer_key."""
+            """Salva estado de um item da checklist no servidor (persiste)."""
             data = request.json
-            timer_key  = data.get('timer_key') or data.get('produto', '')
+            produto = data.get('produto', '')
             componente = data.get('componente', '')
-            checked    = data.get('checked', False)
-            if timer_key and componente and timer_key in production_timer.timers:
-                t = production_timer.timers[timer_key]
-                if 'checklist' not in t:
-                    t['checklist'] = {}
-                t['checklist'][componente] = checked
+            checked = data.get('checked', False)
+            if produto and componente and produto in production_timer.timers:
+                if 'checklist' not in production_timer.timers[produto]:
+                    production_timer.timers[produto]['checklist'] = {}
+                production_timer.timers[produto]['checklist'][componente] = checked
                 production_timer._save()
             return jsonify({'ok': True})
 
@@ -2764,6 +2776,16 @@ class WebServer:
             else:
                 component_consumption.unregister_component(component_name, qty, product_name)
                 result = {'unregistered': True}
+
+            # Notifica TODOS os usuários via WebSocket sobre o novo insumo registrado
+            def update_and_broadcast():
+                try:
+                    usage = self.orchestrator.calculate_component_usage()
+                    self.orchestrator._component_usage_cache = usage
+                    self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                except Exception as e:
+                    self.logger.error(f'Erro no broadcast pós-consumo: {e}')
+            Thread(target=update_and_broadcast, daemon=True).start()
 
             return jsonify({'success': True, 'result': result})
 
@@ -2813,27 +2835,30 @@ class WebServer:
 
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         def api_pending_orders_start():
-            """Inicia producao: timer chaveado por item_key (unico por unidade)."""
+            """Move pedido de 'Em Espera' para 'Em Produção' e inicia timer."""
             data = request.json
-            item_key     = data.get('item_key', '')
+            item_key = data.get('item_key', '')
             produto_nome = data.get('produto_nome', '')
             if not item_key:
-                return jsonify({'error': 'item_key obrigatorio'}), 400
+                return jsonify({'error': 'item_key obrigatório'}), 400
             item = pending_orders.start_production(item_key)
-            production_timer.start(item_key, produto_nome or item_key)
+            # Inicia o timer de produção com o nome do produto
+            if produto_nome:
+                production_timer.start(produto_nome)
             return jsonify({'success': True, 'item': item})
 
         @self.app.route('/api/pending-orders/finish', methods=['POST'])
         def api_pending_orders_finish():
-            """Finaliza producao: timer_key pode ser item_key ou enviado explicitamente."""
+            """Finaliza produção de um pedido pendente."""
             data = request.json
-            item_key     = data.get('item_key', '')
+            item_key = data.get('item_key', '')
             produto_nome = data.get('produto_nome', '')
-            timer_key    = data.get('timer_key') or item_key
             if not item_key:
-                return jsonify({'error': 'item_key obrigatorio'}), 400
+                return jsonify({'error': 'item_key obrigatório'}), 400
             item = pending_orders.finish_production(item_key)
-            production_timer.stop_and_log(timer_key, produto_nome or None)
+            # Finaliza o timer
+            if produto_nome:
+                production_timer.stop_and_log(produto_nome)
             return jsonify({'success': True, 'item': item})
 
         @self.app.route('/api/pending-orders/dismiss', methods=['POST'])
@@ -4239,112 +4264,156 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
         let timerInterval = null;
 
-        // timerKey = item_key (pedido) ou productName (timer manual)
-        function openProductionChecklist(productName, timerKey) {
-            timerKey = timerKey || productName;
+        function openProductionChecklist(productName) {
             const isCadeira = productName.toUpperCase().includes('CADEIRA');
+            let checklistHtml = '';
 
-            let checklistHtml = isCadeira ? (
-                '<h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>' +
-                '<div class="row g-2 mb-4" style="max-height:320px;overflow-y:auto;">' +
-                RECIPE_CADEIRA.map((item, i) =>
-                    '<div class="col-md-6"><div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item"' +
-                    ' style="cursor:pointer;transition:all .2s;"' +
-                    ' data-pnome="' + productName.replace(/"/g,'') + '" data-tkey="' + timerKey.replace(/"/g,'') + '"' +
-                    ' onclick="toggleChecklist(this,' + i + ',this.dataset.pnome,this.dataset.tkey)">' +
-                    '<input class="form-check-input ms-1" type="checkbox" id="check' + i + '" onclick="event.stopPropagation()">' +
-                    '<label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check' + i + '" style="cursor:pointer;">' +
-                    item.nome + ' <span class="badge bg-light text-dark border float-end">' + item.qtd + ' ' + item.un + '</span>' +
-                    '</label></div></div>'
-                ).join('') +
-                '</div>' +
-                '<div id="checklist-progress" class="alert alert-info py-2 small mb-0">' +
-                '<strong>0 / ' + RECIPE_CADEIRA.length + '</strong> itens marcados como usados</div>'
-            ) : '<div class="alert alert-secondary">Este produto não possui lista técnica automática de insumos.</div>';
+            if (isCadeira) {
+                checklistHtml = `
+                    <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
+                    <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
+                        ${RECIPE_CADEIRA.map((item, i) => `
+                            <div class="col-md-6">
+                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
+                                     style="cursor:pointer; transition: all .2s;"
+                                     data-pname="${productName}" onclick="toggleChecklist(this, ${i}, this.dataset.pname)">
+                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}" onclick="event.stopPropagation()">
+                                    <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
+                                        ${item.nome} 
+                                        <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
+                                    </label>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                    <div id="checklist-progress" class="alert alert-info py-2 small mb-0">
+                        <strong>0 / ${RECIPE_CADEIRA.length}</strong> itens marcados como usados
+                    </div>
+                `;
+            } else {
+                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática de insumos.</div>`;
+            }
 
-            const tk = timerKey.replace(/"/g,'');
-            const pn = productName.replace(/"/g,'');
-            const modalHtml =
-                '<div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">' +
-                '<div class="modal-dialog modal-lg modal-dialog-centered"><div class="modal-content border-0 shadow-2xl">' +
-                '<div class="modal-header text-white" style="background:linear-gradient(135deg,#1e293b 0%,#334155 100%);">' +
-                '<h5 class="modal-title">🛠️ Produção: ' + pn + '</h5>' +
-                '<button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>' +
-                '</div><div class="modal-body" style="background:#f8fafc;">' +
-                '<div class="card mb-4 border-0" style="background:linear-gradient(135deg,#0f172a 0%,#1e293b 100%);color:white;">' +
-                '<div class="card-body text-center py-4">' +
-                '<div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em;opacity:.7;">⏱ Tempo de Produção</div>' +
-                '<div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size:3.5rem;letter-spacing:.05em;">00:00:00</div>' +
-                '<div id="timer-status" class="badge mb-3" style="font-size:.85rem;padding:.4rem 1rem;">Parado</div>' +
-                '<div class="d-flex justify-content-center gap-2" id="tgrp" data-tkey="' + tk + '" data-pnome="' + pn + '">' +
-                '<button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start',document.getElementById('tgrp').dataset.tkey,document.getElementById('tgrp').dataset.pnome)">▶ Iniciar</button>' +
-                '<button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause',document.getElementById('tgrp').dataset.tkey)">⏸ Pausar</button>' +
-                '<button class="btn btn-outline-light px-4" onclick="controlTimer('reset',document.getElementById('tgrp').dataset.tkey)">↺ Zerar</button>' +
-                '</div></div></div>' +
-                checklistHtml +
-                '</div><div class="modal-footer bg-white d-flex justify-content-between">' +
-                '<button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar</button>' +
-                '<button type="button" class="btn btn-success px-4 fw-bold"' +
-                ' onclick="controlTimer('finish',document.getElementById('tgrp').dataset.tkey,document.getElementById('tgrp').dataset.pnome)">✅ CONCLUIR & SALVAR</button>' +
-                '</div></div></div></div>';
+            const modalHtml = `
+                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
+                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                        <div class="modal-content border-0 shadow-2xl">
+                            <div class="modal-header text-white" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
+                                <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
+                            </div>
+                            <div class="modal-body" style="background: #f8fafc;">
+                                <!-- Timer Section -->
+                                <div class="card mb-4 border-0" style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white;">
+                                    <div class="card-body text-center py-4">
+                                        <div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em; opacity:.7;">⏱ Tempo de Produção</div>
+                                        <div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size: 3.5rem; letter-spacing:.05em; text-shadow: 0 0 20px rgba(99,102,241,.6);">
+                                            00:00:00
+                                        </div>
+                                        <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
+                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-produto="${productName}">
+                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', document.getElementById('timer-btn-group').dataset.produto)">
+                                                ▶ Iniciar
+                                            </button>
+                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', document.getElementById('timer-btn-group').dataset.produto)">
+                                                ⏸ Pausar
+                                            </button>
+                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', document.getElementById('timer-btn-group').dataset.produto)">
+                                                ↺ Zerar
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Checklist -->
+                                ${checklistHtml}
+                            </div>
+                            <div class="modal-footer bg-white d-flex justify-content-between">
+                                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
+                                    Fechar
+                                </button>
+                                <button type="button" class="btn btn-success px-4 fw-bold"
+                                    onclick="controlTimer('finish', document.getElementById('timer-btn-group').dataset.produto)">
+                                    ✅ CONCLUIR & SALVAR
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
 
             const oldModal = document.getElementById('productionModal');
             if (oldModal) oldModal.remove();
             document.body.insertAdjacentHTML('beforeend', modalHtml);
-            new bootstrap.Modal(document.getElementById('productionModal')).show();
+            
+            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
+            modal.show();
 
-            controlTimer('get', timerKey, productName);
-            _loadChecklistState(timerKey);
+            // Carrega timer E estado da checklist salvo no servidor
+            controlTimer('get', productName);
+            // Carrega checklist salvo para este produto
+            _loadChecklistState(productName);
         }
 
-        async function _loadChecklistState(timerKey) {
+        // Estado de checklist por produto (para saber o que está marcado)
+        const checklistState = {};
+
+        async function _loadChecklistState(productName) {
             try {
-                const res = await fetch('/api/checklist/state/' + encodeURIComponent(timerKey));
+                const safe = encodeURIComponent(productName);
+                const res = await fetch(`/api/checklist/state/${safe}`);
                 const data = await res.json();
                 const saved = data.checklist || {};
+                // Restaura checkboxes marcados
                 RECIPE_CADEIRA.forEach((item, i) => {
                     if (saved[item.nome]) {
-                        const cb = document.getElementById('check' + i);
-                        const ct = cb && cb.closest('.checklist-item');
-                        if (cb && ct) {
+                        const cb = document.getElementById(`check${i}`);
+                        const container = cb && cb.closest('.checklist-item');
+                        if (cb && container) {
                             cb.checked = true;
-                            ct.style.background = '#d1fae5';
-                            ct.style.borderColor = '#10b981';
+                            container.style.background = '#d1fae5';
+                            container.style.borderColor = '#10b981';
                         }
                     }
                 });
-                _updateProgress();
-            } catch(e) { console.error('_loadChecklistState:', e); }
+                _updateChecklistProgress();
+            } catch(e) { console.error('Erro ao carregar checklist:', e); }
         }
 
-        function _updateProgress() {
+        function _updateChecklistProgress() {
             const total = RECIPE_CADEIRA.length;
-            const n = document.querySelectorAll('#productionModal .form-check-input:checked').length;
-            const div = document.getElementById('checklist-progress');
-            if (!div) return;
-            div.innerHTML = '<strong>' + n + ' / ' + total + '</strong> itens marcados' + (n === total ? ' ✅ Tudo marcado!' : '');
-            div.className = 'alert py-2 small mb-0 ' + (n === total ? 'alert-success' : 'alert-info');
+            const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
+            const progressDiv = document.getElementById('checklist-progress');
+            if (progressDiv) {
+                progressDiv.innerHTML = '<strong>' + checked + ' / ' + total + '</strong> itens marcados' + (checked === total ? ' ✅ Tudo marcado!' : '');
+                progressDiv.className = 'alert py-2 small mb-0 ' + (checked === total ? 'alert-success' : 'alert-info');
+            }
         }
 
-        // timerKey = item_key (pedido unico) ou productName (manual)
-        function toggleChecklist(container, idx, productName, timerKey) {
+        function toggleChecklist(container, idx, productName) {
             const cb = container.querySelector('input[type=checkbox]');
-            // NAO inverter: browser ja atualizou cb.checked antes do onclick
+            // IMPORTANTE: cb.checked já foi atualizado pelo browser antes do onclick
+            // NAO inverter aqui — isso causava bug de estado invertido
             const isChecked = cb.checked;
             const item = RECIPE_CADEIRA[idx];
-            timerKey = timerKey || productName;
 
-            container.style.background  = isChecked ? '#d1fae5' : '';
-            container.style.borderColor = isChecked ? '#10b981' : '';
+            if (isChecked) {
+                container.style.background = '#d1fae5';
+                container.style.borderColor = '#10b981';
+            } else {
+                container.style.background = '';
+                container.style.borderColor = '';
+            }
 
+            // Salva checklist e registra consumo com o estado correto
             fetch('/api/checklist/state', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ timer_key: timerKey, componente: item.nome, checked: isChecked })
-            }).catch(e => console.error('checklist/state:', e));
+                body: JSON.stringify({ produto: productName, componente: item.nome, checked: isChecked })
+            }).catch(e => console.error('Erro checklist:', e));
 
             registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
-            _updateProgress();
+            _updateChecklistProgress();
         }
 
         async function registerConsumption(componentName, qty, unit, productName, checked) {
@@ -4357,20 +4426,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const tab = document.getElementById('component-usage');
                 if (tab && tab.classList.contains('active')) {
-                    fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {});
+                    setTimeout(() => fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {}), 400);
                 }
-            } catch(e) { console.error('registerConsumption:', e); }
+            } catch(e) {
+                console.error('Erro ao registrar consumo:', e);
+                showToast('Aviso', 'Falha ao registrar insumo', 'warning');
+            }
         }
 
-        /* Timer — timerKey unico por unidade (item_key ou productName) */
-        async function controlTimer(action, timerKey, produtoNome) {
-            if (!timerKey) return;
-            produtoNome = produtoNome || timerKey;
+        /* Lógica do Timer Conectada ao Backend */
+        async function controlTimer(action, produto) {
             try {
                 const res = await fetch('/api/timer/action', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ action: action, timer_key: timerKey, produto_nome: produtoNome, produto: timerKey })
+                    body: JSON.stringify({ action: action, produto: produto })
                 });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const data = await res.json();
@@ -4378,15 +4448,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 if (action === 'finish') {
                     clearInterval(timerInterval);
                     timerInterval = null;
-                    const nome = data.produto || produtoNome;
-                    const elapsed = (data.registro && data.registro.tempo_segundos) || data.elapsed || 0;
-                    showToast('✅ Concluído!', nome + ' — ' + formatSeconds(elapsed) + ' registrado.', 'success');
-                    try {
-                        const mel = document.getElementById('productionModal');
-                        if (mel) { (bootstrap.Modal.getInstance(mel) || new bootstrap.Modal(mel)).hide(); }
-                    } catch(_) {}
-                    loadProductionBoard();
-                    fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {});
+                    const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
+                    showToast('✅ Concluído!', produto + ' — ' + formatSeconds(elapsed) + ' registrado.', 'success');
+                    // Fecha modal de forma robusta
+                    const modalEl = document.getElementById('productionModal');
+                    if (modalEl) {
+                        try {
+                            const bsModal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+                            bsModal.hide();
+                        } catch(me) { modalEl.remove(); }
+                    }
+                    // Atualiza board e consumo
+                    await loadProductionBoard();
+                    await refreshComponentTab();
                     return;
                 }
 
@@ -4398,7 +4472,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     timerInterval = null;
                 }
             } catch (e) {
-                console.error('controlTimer:', e);
+                console.error("Erro no timer:", e);
                 showToast('Erro', 'Falha ao comunicar com servidor.', 'danger');
             }
         }
@@ -4519,9 +4593,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const rawNome = item.nome || item.nome_original || 'N/D';
                     const nome = rawNome.replace(/'/g,"&#39;");
                     // Só mostra imagem se for URL real (não placeholder /static/no-image.png)
-                    const imgUrl = (item.imagem && !item.imagem.includes('no-image')) ? item.imagem : '';
+                    const imgUrl = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
                     const imgTag = imgUrl
-                        ? `<img src="${imgUrl}" alt="" style="width:40px;height:40px;object-fit:contain;border-radius:5px;border:1px solid #e5e7eb;margin-right:8px;vertical-align:middle;" onerror="this.remove()">`
+                        ? '<img src="' + imgUrl + '" alt="" loading="lazy" style="width:44px;height:44px;object-fit:contain;border-radius:6px;border:1px solid #e2e8f0;margin-right:8px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">'
                         : '';
                     html += `<tr>
                         <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
@@ -4572,18 +4646,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     // Guarda estado para ticker local
                     _boardTimerState[nome] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
 
-                    // timer_key = item_key (cada unidade e independente)
-                    const timerKeyB = item.item_key || nome;
-                    const openBtn   = '<button class="btn btn-xs btn-outline-primary btn-sm me-1"' +
-                        ' data-tkey="' + timerKeyB + '" data-pnome="' + nomeSafe + '"' +
-                        ' onclick="openProductionChecklist(this.dataset.pnome,this.dataset.tkey)">🛠️ Abrir</button>';
                     const finishBtn = itemKey
-                        ? '<button class="btn btn-xs btn-success btn-sm"' +
-                          ' data-ikey="' + itemKey + '" data-tkey="' + timerKeyB + '" data-pnome="' + nomeSafe + '"' +
-                          ' onclick="finishBoardItem(this.dataset.ikey,this.dataset.pnome,this.dataset.tkey)">✅ Concluir</button>'
-                        : '<button class="btn btn-xs btn-success btn-sm"' +
-                          ' data-tkey="' + timerKeyB + '" data-pnome="' + nomeSafe + '"' +
-                          ' onclick="controlTimer('finish',this.dataset.tkey,this.dataset.pnome)">✅ Concluir</button>';
+                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="finishBoardItem('${itemKey}','${nomeSafe}')">✅ Concluir</button>`
+                        : `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="controlTimer('finish','${nomeSafe}')">✅ Concluir</button>`;
 
                     html += `<tr>
                         <td class="ps-3 fw-bold">${nomeSafe}</td>
@@ -4601,7 +4666,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         <td class="text-center">
                             <span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>
                         </td>
-                        <td class="text-center" style="white-space:nowrap;">${openBtn}${finishBtn}</td>
+                        <td class="text-center">
+                            <button class="btn btn-xs btn-outline-primary btn-sm" onclick="openProductionChecklist('${nomeSafe}')">🛠 Abrir</button>
+                            ${finishBtn}
+                        </td>
                     </tr>`;
                 });
                 html += `</tbody></table></div>`;
@@ -4656,27 +4724,25 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 });
                 if (!res.ok) throw new Error('Servidor retornou erro');
                 await loadProductionBoard();
-                // itemKey como timerKey — cada unidade tem timer proprio
-                openProductionChecklist(produtoNome, itemKey);
-                showToast('✅ Iniciado', 'Produção: ' + produtoNome, 'success');
+                openProductionChecklist(produtoNome);
+                showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
             } catch(e) {
                 console.error('startPendingOrder:', e);
                 showToast('Erro', 'Falha ao iniciar produção', 'danger');
             }
         }
 
-        async function finishBoardItem(itemKey, produtoNome, timerKey) {
-            if (!confirm('Concluir producao de "' + produtoNome + '"?')) return;
-            timerKey = timerKey || itemKey;
+        async function finishBoardItem(itemKey, produtoNome) {
+            if (!confirm(`Concluir produção de "${produtoNome}"?`)) return;
             try {
                 await fetch('/api/pending-orders/finish', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome, timer_key: timerKey })
+                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
                 });
                 showToast('✅ Concluído!', produtoNome, 'success');
-                loadProductionBoard();
-                fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {});
+                await loadProductionBoard();
+                await refreshComponentTab();
             } catch(e) { showToast('Erro', 'Falha ao concluir', 'danger'); }
         }
 
