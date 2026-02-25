@@ -3300,44 +3300,39 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <style>
         /* ══════════════════════════════════════════
-           SW MÓVEIS MDF — DESIGN SYSTEM
-           Cores: Manual ID Visual 2025
+           SW MÓVEIS MDF — DESIGN SYSTEM 2025
+           Manual de Identidade Visual
         ══════════════════════════════════════════ */
         :root {
-            --sw-yellow: #ffb600;
+            --sw-yellow:       #ffb600;
             --sw-yellow-light: #fede8f;
-            --sw-yellow-pale: #f5f883;
-            --sw-black: #01010d;
-            --sw-gray: #807f7f;
-            --sw-nurse: #ecedec;
+            --sw-yellow-pale:  #f5f5a0;
+            --sw-black:        #01010d;
+            --sw-gray:         #807f7f;
+            --sw-nurse:        #ecedec;
 
-            /* Alias funcionais */
-            --primary: var(--sw-black);
-            --accent: var(--sw-yellow);
-            --accent-light: var(--sw-yellow-light);
-            --success: #10b981;
-            --warning: var(--sw-yellow);
-            --error: #ef4444;
-            --bg: #f9f9f7;
-            --bg-card: #ffffff;
-            --border: rgba(1,1,13,0.08);
-            --text-muted: var(--sw-gray);
-
-            /* Spacing / Radius */
-            --radius-sm: 6px;
-            --radius: 12px;
-            --radius-lg: 20px;
-            --shadow: 0 2px 12px rgba(1,1,13,0.07);
-            --shadow-hover: 0 12px 40px rgba(1,1,13,0.13);
+            --primary:     var(--sw-black);
+            --accent:      var(--sw-yellow);
+            --accent-light:var(--sw-yellow-light);
+            --success:     #10b981;
+            --warning:     var(--sw-yellow);
+            --error:       #ef4444;
+            --bg:          #f9f9f7;
+            --bg-card:     #ffffff;
+            --border:      rgba(1,1,13,0.09);
+            --text-muted:  var(--sw-gray);
+            --radius:      12px;
+            --radius-sm:   7px;
+            --shadow:      0 2px 12px rgba(1,1,13,0.07);
+            --shadow-lg:   0 12px 40px rgba(1,1,13,0.13);
         }
 
-        /* ══ RESET & BASE ══ */
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        *, *::before, *::after { box-sizing: border-box; }
 
         html { scroll-behavior: smooth; }
 
         body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             background: var(--bg);
             color: var(--primary);
             font-size: 14px;
@@ -3347,57 +3342,60 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             overflow-x: hidden;
         }
 
-        /* ══ TIPOGRAFIA ══ */
-        .font-bebas { font-family: 'Bebas Neue', sans-serif; letter-spacing: 0.04em; }
-        h1, h2, h3, h4, h5, h6 { font-weight: 700; line-height: 1.2; }
+        h1,h2,h3,h4,h5,h6 { font-weight: 700; line-height: 1.2; }
+
+        /* ══ PATTERN BAR ══ */
+        .sw-pattern-bar {
+            height: 5px;
+            background: repeating-linear-gradient(
+                90deg,
+                var(--sw-yellow) 0, var(--sw-yellow) 12px,
+                var(--sw-black) 12px, var(--sw-black) 18px
+            );
+        }
 
         /* ══ NAVBAR ══ */
-        .sw-nav {
-            background: var(--sw-black);
+        .navbar {
+            background: var(--sw-black) !important;
             border-bottom: 3px solid var(--sw-yellow);
             padding: 0 1.5rem;
-            height: 64px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            position: sticky;
-            top: 0;
-            z-index: 1000;
+            min-height: 64px;
+            box-shadow: 0 2px 20px rgba(1,1,13,0.3);
             will-change: transform;
         }
 
-        .sw-nav-brand {
+        .navbar-brand {
             display: flex;
             align-items: center;
             gap: 0.75rem;
             text-decoration: none;
         }
 
-        .sw-nav-brand img {
-            height: 38px;
+        .navbar-brand img {
+            height: 40px;
             width: auto;
+            filter: brightness(1.05);
         }
 
-        .sw-nav-brand-text {
-            font-family: 'Bebas Neue', sans-serif;
-            font-size: 1.4rem;
-            color: var(--sw-yellow);
-            letter-spacing: 0.06em;
-            line-height: 1;
-        }
-
-        .sw-nav-brand-sub {
-            font-size: 0.6rem;
-            color: rgba(255,255,255,0.5);
-            letter-spacing: 0.15em;
-            text-transform: uppercase;
-            display: block;
-        }
-
-        .sw-nav-right {
+        .navbar-brand-text {
             display: flex;
-            align-items: center;
-            gap: 0.75rem;
+            flex-direction: column;
+            line-height: 1.1;
+        }
+
+        .navbar-brand-name {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.35rem;
+            color: var(--sw-yellow);
+            letter-spacing: 0.07em;
+        }
+
+        .navbar-brand-sub {
+            font-size: 0.58rem;
+            color: rgba(255,255,255,0.45);
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            font-weight: 500;
         }
 
         /* ══ STATUS BADGE ══ */
@@ -3405,53 +3403,43 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             display: inline-flex;
             align-items: center;
             gap: 0.4rem;
-            padding: 0.3rem 0.85rem;
-            border-radius: 50px;
+            padding: 0.35rem 0.9rem !important;
+            border-radius: 50px !important;
             font-size: 0.72rem;
             font-weight: 700;
+            letter-spacing: 0.06em;
             text-transform: uppercase;
-            letter-spacing: 0.08em;
-            transition: all 0.3s ease;
         }
 
         #status-badge.bg-success {
             background: #10b981 !important;
-            color: white;
-            box-shadow: 0 0 16px rgba(16,185,129,0.4);
+            box-shadow: 0 0 14px rgba(16,185,129,0.4);
         }
 
         #status-badge.bg-danger {
             background: #ef4444 !important;
-            color: white;
         }
 
         #status-badge.bg-secondary {
-            background: rgba(255,255,255,0.1) !important;
-            color: rgba(255,255,255,0.6);
+            background: rgba(255,255,255,0.12) !important;
+            color: rgba(255,255,255,0.7);
         }
 
-        #status-badge::before {
-            content: '';
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            background: currentColor;
-            animation: pulse-dot 2s infinite;
+        @keyframes pulse-badge {
+            0%,100% { opacity:1; }
+            50% { opacity:0.75; }
         }
 
-        @keyframes pulse-dot {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.5; transform: scale(0.8); }
-        }
+        #status-badge { animation: pulse-badge 2.5s ease-in-out infinite; }
 
-        /* ══ BTN AUTH ══ */
+        /* ══ AUTH LINK BUTTON ══ */
         #auth-link {
             padding: 0.4rem 1rem;
             border: 1.5px solid var(--sw-yellow);
-            color: var(--sw-yellow);
+            color: var(--sw-yellow) !important;
             border-radius: var(--radius-sm);
             font-size: 0.78rem;
-            font-weight: 600;
+            font-weight: 700;
             text-decoration: none;
             letter-spacing: 0.04em;
             transition: all 0.2s ease;
@@ -3460,183 +3448,116 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         #auth-link:hover {
             background: var(--sw-yellow);
-            color: var(--sw-black);
+            color: var(--sw-black) !important;
         }
 
-        /* ══ MAIN CONTAINER ══ */
-        .sw-main {
+        /* ══ CONTAINER ══ */
+        .container-fluid.px-4.py-5 {
             max-width: 1440px;
             margin: 0 auto;
-            padding: 2rem 1.5rem 4rem;
         }
 
-        /* ══ PAGE HEADER ══ */
-        .sw-page-header {
-            margin-bottom: 2rem;
-            padding-bottom: 1.5rem;
-            border-bottom: 1px solid var(--border);
-        }
-
-        .sw-page-title {
+        /* ══ PAGE TITLE ══ */
+        .page-title {
             font-family: 'Bebas Neue', sans-serif;
             font-size: 2.2rem;
-            color: var(--sw-black);
             letter-spacing: 0.04em;
             line-height: 1;
+            color: var(--sw-black);
         }
 
-        .sw-page-title span {
-            color: var(--sw-yellow);
-        }
-
-        .sw-page-sub {
-            color: var(--text-muted);
-            font-size: 0.85rem;
-            margin-top: 0.3rem;
-        }
+        .page-title .highlight { color: var(--sw-yellow); }
 
         /* ══ KPI CARDS ══ */
-        .kpi-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1rem;
-            margin-bottom: 2rem;
-        }
-
-        @media (max-width: 768px) {
-            .kpi-grid { grid-template-columns: 1fr; }
-        }
-
-        .kpi-card {
-            background: var(--bg-card);
+        .card {
             border: 1px solid var(--border);
             border-radius: var(--radius);
-            padding: 1.5rem;
-            position: relative;
-            overflow: hidden;
+            background: var(--bg-card);
+            box-shadow: var(--shadow);
             transition: transform 0.25s ease, box-shadow 0.25s ease;
             will-change: transform;
         }
 
-        .kpi-card::after {
+        .card:hover {
+            transform: translateY(-3px);
+            box-shadow: var(--shadow-lg);
+            border-color: rgba(255,182,0,0.35);
+        }
+
+        .kpi-card {
+            border-left: 4px solid;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .kpi-card::before {
             content: '';
             position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 3px;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.5) 0%, transparent 100%);
+            pointer-events: none;
         }
 
-        .kpi-daily::after { background: var(--sw-yellow); }
-        .kpi-weekly::after { background: var(--sw-yellow-light); }
-        .kpi-historic::after { background: var(--success); }
+        .kpi-daily   { border-left-color: var(--sw-yellow); }
+        .kpi-weekly  { border-left-color: var(--sw-yellow-light); }
+        .kpi-historic{ border-left-color: var(--success); }
 
-        .kpi-card:hover {
-            transform: translateY(-3px);
-            box-shadow: var(--shadow-hover);
-        }
-
-        .kpi-card .kpi-label {
-            font-size: 0.7rem;
-            font-weight: 700;
+        .kpi-card h5 {
+            font-size: 0.68rem;
+            font-weight: 800;
+            color: var(--text-muted);
             text-transform: uppercase;
             letter-spacing: 0.1em;
-            color: var(--text-muted);
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.6rem;
         }
 
-        .kpi-card .kpi-value {
+        .kpi-card h3 {
             font-family: 'Bebas Neue', sans-serif;
             font-size: 3rem;
             line-height: 1;
-            color: var(--sw-black);
+            margin: 0;
         }
 
-        .kpi-daily .kpi-value { color: var(--sw-yellow); }
-        .kpi-weekly .kpi-value { color: #c49200; }
-        .kpi-historic .kpi-value { color: var(--success); }
-
-        .kpi-card .kpi-sub {
-            font-size: 0.72rem;
-            color: var(--text-muted);
-            margin-top: 0.4rem;
-        }
-
-        .kpi-card.updating {
-            animation: kpi-flash 0.5s ease;
-        }
+        #kpi-daily   { color: var(--sw-yellow); }
+        #kpi-weekly  { color: #c49200; }
+        #kpi-historic{ color: var(--success); }
 
         @keyframes kpi-flash {
-            0% { background: var(--sw-yellow-pale); }
-            100% { background: var(--bg-card); }
+            0%   { background: rgba(255,182,0,0.15); }
+            100% { background: transparent; }
         }
 
-        /* ══ CARD ══ */
-        .sw-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            overflow: hidden;
-            box-shadow: var(--shadow);
-            transition: box-shadow 0.25s ease;
-        }
+        .kpi-card.updating { animation: kpi-flash 0.6s ease-out; }
 
-        .sw-card:hover { box-shadow: var(--shadow-hover); }
-
-        .sw-card-header {
-            background: var(--sw-black);
+        /* ══ CARD HEADER ══ */
+        .card-header {
+            background: var(--sw-black) !important;
             color: white;
+            border: none;
+            border-radius: var(--radius) var(--radius) 0 0 !important;
+            font-weight: 600;
             padding: 1rem 1.25rem;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 0.75rem;
         }
 
-        .sw-card-header h5, .sw-card-header h6 {
+        .card-header h5 {
             font-family: 'Bebas Neue', sans-serif;
             font-size: 1rem;
-            letter-spacing: 0.06em;
+            letter-spacing: 0.07em;
             margin: 0;
             color: white;
         }
 
-        .sw-card-header .sw-accent { color: var(--sw-yellow); }
-
-        .sw-card-header small {
-            font-size: 0.7rem;
-            color: rgba(255,255,255,0.5);
-            font-weight: 400;
-        }
-
-        .sw-card-body { padding: 1.25rem; }
-
-        /* ══ ACCENT CARD HEADERS (abas coloridas) ══ */
-        .sw-card-header.success { background: linear-gradient(135deg, #065f46, #059669); }
-        .sw-card-header.purple { background: linear-gradient(135deg, #3b0764, #7c3aed); }
-        .sw-card-header.production { background: linear-gradient(135deg, var(--sw-black), #1e3a5f); }
-
-        /* ══ TIMESTAMP ══ */
-        .sw-timestamp {
-            font-size: 0.72rem;
-            color: var(--text-muted);
-            display: flex;
-            align-items: center;
-            gap: 0.3rem;
-            margin-bottom: 1.5rem;
-        }
-
-        .sw-timestamp span { font-weight: 600; color: var(--sw-black); }
+        .card-header small { color: rgba(255,255,255,0.5); font-weight: 400; }
 
         /* ══ LOG BOX ══ */
         .log-box {
             font-family: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
             font-size: 0.76rem;
-            background: var(--sw-black);
+            background: #01010d;
             color: #d4d4d4;
             border-radius: 0 0 var(--radius) var(--radius);
             padding: 1rem;
-            max-height: 320px;
+            max-height: 340px;
             overflow-y: auto;
             line-height: 1.6;
         }
@@ -3644,101 +3565,62 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .log-box::-webkit-scrollbar { width: 4px; }
         .log-box::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); }
         .log-box::-webkit-scrollbar-thumb { background: rgba(255,182,0,0.3); border-radius: 2px; }
-        .log-box::-webkit-scrollbar-thumb:hover { background: rgba(255,182,0,0.5); }
+        .log-box::-webkit-scrollbar-thumb:hover { background: rgba(255,182,0,0.55); }
 
-        .log-entry { padding: 0.15rem 0; animation: log-in 0.25s ease-out; }
+        .log-entry { padding: 0.12rem 0; animation: log-slide-in 0.25s ease-out; }
 
-        @keyframes log-in {
-            from { opacity: 0; transform: translateX(-8px); }
-            to { opacity: 1; transform: translateX(0); }
+        @keyframes log-slide-in {
+            from { opacity:0; transform: translateX(-8px); }
+            to   { opacity:1; transform: translateX(0); }
         }
 
-        .log-level-INFO { color: #4ec9b0; }
+        .log-level-INFO    { color: #4ec9b0; }
         .log-level-WARNING { color: var(--sw-yellow); }
-        .log-level-ERROR { color: #f48771; }
-        .log-level-DEBUG { color: #569cd6; }
+        .log-level-ERROR   { color: #f48771; }
+        .log-level-DEBUG   { color: #569cd6; }
 
         /* ══ TABS ══ */
-        .sw-tabs {
-            display: flex;
-            gap: 0.25rem;
+        .nav-tabs {
             border-bottom: 2px solid var(--border);
-            margin-bottom: 1.5rem;
+            gap: 0.15rem;
+            flex-wrap: nowrap;
             overflow-x: auto;
         }
 
-        .sw-tabs::-webkit-scrollbar { display: none; }
+        .nav-tabs::-webkit-scrollbar { display: none; }
 
-        .sw-tab-btn {
-            padding: 0.65rem 1.1rem;
-            font-size: 0.78rem;
-            font-weight: 600;
+        .nav-tabs .nav-link {
             color: var(--text-muted);
-            background: none;
             border: none;
             border-bottom: 3px solid transparent;
-            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.8rem;
+            letter-spacing: 0.02em;
+            padding: 0.65rem 1rem;
+            margin-bottom: -2px;
             transition: all 0.2s ease;
             white-space: nowrap;
-            margin-bottom: -2px;
-            letter-spacing: 0.03em;
-        }
-
-        .sw-tab-btn:hover { color: var(--sw-black); }
-
-        .sw-tab-btn.active {
-            color: var(--sw-black);
-            border-bottom-color: var(--sw-yellow);
-            font-weight: 700;
-        }
-
-        /* Bootstrap tab wrapper */
-        .nav-tabs { border: none; }
-        .nav-tabs .nav-link {
-            padding: 0.65rem 1.1rem;
-            font-size: 0.78rem;
-            font-weight: 600;
-            color: var(--text-muted);
-            border: none;
-            border-bottom: 3px solid transparent;
-            margin-bottom: -2px;
-            letter-spacing: 0.03em;
-            transition: all 0.2s ease;
             background: none;
         }
-        .nav-tabs .nav-link:hover { color: var(--sw-black); border-bottom-color: rgba(255,182,0,0.4); }
+
+        .nav-tabs .nav-link:hover {
+            color: var(--sw-black);
+            border-bottom-color: rgba(255,182,0,0.4);
+        }
+
         .nav-tabs .nav-link.active {
             color: var(--sw-black);
+            background: none;
             border-bottom-color: var(--sw-yellow);
             font-weight: 700;
-            background: none;
-        }
-        .nav-tabs-wrapper {
-            border-bottom: 2px solid var(--border);
-            margin-bottom: 1.5rem;
-            overflow-x: auto;
-        }
-        .nav-tabs-wrapper::-webkit-scrollbar { display: none; }
-
-        /* ══ FORM CONTROLS ══ */
-        .form-control, .form-select {
-            border: 1.5px solid var(--border);
-            border-radius: var(--radius-sm);
-            padding: 0.65rem 0.9rem;
-            font-size: 0.85rem;
-            font-weight: 500;
-            color: var(--sw-black);
-            background: white;
-            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
 
-        .form-control:focus, .form-select:focus {
-            border-color: var(--sw-yellow);
-            box-shadow: 0 0 0 3px rgba(255,182,0,0.15);
-            outline: none;
-        }
+        .tab-content { animation: fadeIn 0.3s ease-out; }
 
-        .form-control::placeholder { color: var(--text-muted); font-weight: 400; }
+        @keyframes fadeIn {
+            from { opacity:0; transform: translateY(6px); }
+            to   { opacity:1; transform: translateY(0); }
+        }
 
         /* ══ BUTTONS ══ */
         .btn {
@@ -3747,56 +3629,50 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             letter-spacing: 0.03em;
             border-radius: var(--radius-sm);
             transition: all 0.2s ease;
-            cursor: pointer;
         }
 
         .btn-primary {
-            background: var(--sw-yellow);
-            border-color: var(--sw-yellow);
-            color: var(--sw-black);
+            background: var(--sw-yellow) !important;
+            border-color: var(--sw-yellow) !important;
+            color: var(--sw-black) !important;
         }
 
         .btn-primary:hover {
-            background: #e6a400;
-            border-color: #e6a400;
-            color: var(--sw-black);
+            background: #e6a400 !important;
+            border-color: #e6a400 !important;
             transform: translateY(-1px);
-            box-shadow: 0 6px 20px rgba(255,182,0,0.35);
+            box-shadow: 0 6px 20px rgba(255,182,0,0.4);
         }
 
         .btn-primary:active { transform: translateY(0); }
 
         .btn-outline-light {
-            border: 1.5px solid rgba(255,255,255,0.3);
-            color: white;
-            background: transparent;
+            border: 1.5px solid rgba(255,255,255,0.3) !important;
+            color: white !important;
         }
 
         .btn-outline-light:hover {
-            background: rgba(255,255,255,0.1);
-            border-color: rgba(255,255,255,0.6);
-            color: white;
+            background: rgba(255,255,255,0.12) !important;
+            border-color: rgba(255,255,255,0.6) !important;
         }
 
-        .btn-outline-secondary {
+        /* ══ FORM CONTROLS ══ */
+        .form-control, .form-select {
             border: 1.5px solid var(--border);
-            color: var(--text-muted);
-            background: white;
+            border-radius: var(--radius-sm);
+            padding: 0.7rem 0.95rem;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
         }
 
-        .btn-outline-secondary:hover {
-            background: var(--bg);
+        .form-control:focus, .form-select:focus {
             border-color: var(--sw-yellow);
-            color: var(--sw-black);
+            box-shadow: 0 0 0 3px rgba(255,182,0,0.18);
         }
-
-        .btn-sm { padding: 0.35rem 0.8rem; font-size: 0.76rem; }
 
         /* ══ TABLE ══ */
-        .table {
-            font-size: 0.82rem;
-            margin: 0;
-        }
+        .table { font-size: 0.82rem; }
 
         .table thead th {
             background: var(--bg);
@@ -3806,8 +3682,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             color: var(--text-muted);
             font-size: 0.68rem;
             text-transform: uppercase;
-            letter-spacing: 0.08em;
-            padding: 0.85rem 1rem;
+            letter-spacing: 0.09em;
+            padding: 0.8rem 1rem;
         }
 
         .table tbody tr {
@@ -3815,26 +3691,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             transition: background 0.15s ease;
         }
 
-        .table tbody tr:hover { background: rgba(255,182,0,0.05); }
-        .table tbody tr:last-child { border-bottom: none; }
-        .table td { padding: 0.8rem 1rem; vertical-align: middle; }
+        .table tbody tr:hover { background: rgba(255,182,0,0.04); }
+        .table td { padding: 0.75rem 1rem; vertical-align: middle; }
 
         /* ══ BADGES ══ */
         .badge {
             font-weight: 700;
             font-size: 0.65rem;
-            letter-spacing: 0.06em;
+            letter-spacing: 0.05em;
             padding: 0.3rem 0.65rem;
             border-radius: 50px;
-            text-transform: uppercase;
         }
 
         .badge.bg-success { background: #10b981 !important; }
         .badge.bg-warning { background: var(--sw-yellow) !important; color: var(--sw-black) !important; }
-        .badge.bg-danger { background: #ef4444 !important; }
-        .badge.bg-secondary { background: var(--sw-gray) !important; }
-        .badge.bg-info { background: #3b82f6 !important; }
-        .badge.bg-light { background: var(--sw-nurse) !important; color: var(--sw-black) !important; }
+        .badge.bg-danger  { background: #ef4444 !important; }
 
         /* ══ ALERTS ══ */
         .alert {
@@ -3843,7 +3714,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             border-radius: var(--radius-sm);
             font-size: 0.83rem;
             font-weight: 500;
-            padding: 0.85rem 1.1rem;
         }
 
         .alert-warning {
@@ -3864,14 +3734,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             color: #7f1d1d;
         }
 
-        /* ══ METRIC BOXES (Dashboard tab) ══ */
+        /* ══ METRIC BOX ══ */
         .metric-box {
             background: var(--sw-black);
             border-radius: var(--radius);
-            padding: 1.25rem;
+            padding: 1.3rem;
             color: white;
             text-align: center;
             transition: transform 0.2s ease, box-shadow 0.2s ease;
+            margin-bottom: 1rem;
         }
 
         .metric-box:hover {
@@ -3890,22 +3761,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         .metric-value {
             font-family: 'Bebas Neue', sans-serif;
-            font-size: 2.5rem;
+            font-size: 2.4rem;
             color: var(--sw-yellow);
             line-height: 1;
         }
-
-        /* ══ INPUT GROUP ══ */
-        .input-group { gap: 0.5rem; }
-        .input-group .form-control { flex: 1; }
-        .input-group .btn { flex-shrink: 0; }
 
         /* ══ LIST GROUP ══ */
         .list-group-item {
             border: 1px solid var(--border);
             border-radius: var(--radius-sm) !important;
             margin-bottom: 0.4rem;
-            padding: 0.85rem 1rem;
             font-size: 0.83rem;
             transition: all 0.2s ease;
         }
@@ -3917,11 +3782,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /* ══ ACCORDION ══ */
-        .accordion-button {
-            font-weight: 600;
-            font-size: 0.85rem;
-            background: var(--bg);
-        }
+        .accordion-button { font-weight: 600; font-size: 0.85rem; }
 
         .accordion-button:not(.collapsed) {
             background: rgba(255,182,0,0.08);
@@ -3931,10 +3792,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         .accordion-button:focus {
             box-shadow: 0 0 0 3px rgba(255,182,0,0.2);
-        }
-
-        .accordion-button::after {
-            filter: none;
         }
 
         /* ══ TOAST ══ */
@@ -3950,91 +3807,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         @keyframes toast-in {
-            from { opacity: 0; transform: translateX(50px); }
-            to { opacity: 1; transform: translateX(0); }
+            from { opacity:0; transform: translateX(50px); }
+            to   { opacity:1; transform: translateX(0); }
         }
 
         .toast.hide { animation: toast-out 0.25s ease forwards; }
 
         @keyframes toast-out {
-            to { opacity: 0; transform: translateX(50px); }
+            to { opacity:0; transform: translateX(50px); }
         }
-
-        .toast-header {
-            background: transparent;
-            border-bottom: 1px solid rgba(255,255,255,0.1);
-            color: white;
-        }
-
-        .toast-header strong { color: var(--sw-yellow); }
-        .toast-header .btn-close { filter: invert(1); }
-        .toast-body { color: rgba(255,255,255,0.85); font-size: 0.82rem; }
 
         /* ══ MODAL ══ */
         .modal-content {
             border: none;
-            border-radius: var(--radius-lg);
+            border-radius: var(--radius) !important;
             overflow: hidden;
             box-shadow: 0 25px 80px rgba(1,1,13,0.3);
         }
 
         .modal-header {
-            background: var(--sw-black);
-            border-bottom: 3px solid var(--sw-yellow);
+            background: var(--sw-black) !important;
+            border-bottom: 3px solid var(--sw-yellow) !important;
             color: white;
         }
 
-        .modal-title { font-family: 'Bebas Neue', sans-serif; font-size: 1.1rem; letter-spacing: 0.06em; }
-        .modal-body { background: var(--bg); }
-        .modal-footer { background: white; border-top: 1px solid var(--border); }
-
-        /* ══ PRODUCTION BOARD ══ */
-        .prod-col-header {
-            padding: 0.75rem 1rem;
-            font-size: 0.68rem;
-            font-weight: 800;
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-        }
-
-        .prod-col-header .count-pill {
-            background: var(--sw-yellow);
-            color: var(--sw-black);
-            padding: 0.1rem 0.5rem;
-            border-radius: 50px;
-            font-size: 0.65rem;
-        }
-
-        .prod-card-item {
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border);
-            cursor: pointer;
-            transition: background 0.15s ease;
-            font-size: 0.8rem;
-        }
-
-        .prod-card-item:hover { background: rgba(255,182,0,0.06); }
-        .prod-card-item:last-child { border-bottom: none; }
-
-        .prod-card-item .prod-name {
-            font-weight: 600;
-            color: var(--sw-black);
-        }
-
-        .prod-card-item .prod-meta {
-            font-size: 0.72rem;
-            color: var(--text-muted);
-        }
-
-        .prod-timer {
-            font-family: 'Bebas Neue', sans-serif;
-            font-size: 1.1rem;
-            color: var(--sw-yellow);
-        }
+        .modal-title { font-family: 'Bebas Neue', sans-serif !important; letter-spacing: 0.06em; }
 
         /* ══ SCROLLBAR GLOBAL ══ */
         ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -4047,268 +3844,256 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .stock-badge, .estoque-info, .stock-info-row { display: none !important; }
         .shadow-2xl { box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25); }
         .letter-spacing-2 { letter-spacing: 0.1em; }
-        .text-yellow { color: var(--sw-yellow) !important; }
-        .text-muted { color: var(--text-muted) !important; }
 
-        /* ══ FOOTER ══ */
-        .sw-footer {
-            background: var(--sw-black);
-            border-top: 3px solid var(--sw-yellow);
-            padding: 1.5rem 2rem;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex-wrap: wrap;
-            gap: 0.75rem;
-        }
-
-        .sw-footer p { color: rgba(255,255,255,0.7); font-size: 0.78rem; margin: 0; }
-        .sw-footer strong { color: var(--sw-yellow); }
-        .sw-footer small { color: rgba(255,255,255,0.4); font-size: 0.7rem; }
-
-        /* ══ PATTERN ACCENT (decorativo, leve) ══ */
-        .sw-pattern-bar {
-            height: 6px;
-            background: repeating-linear-gradient(
-                90deg,
-                var(--sw-yellow) 0px,
-                var(--sw-yellow) 12px,
-                var(--sw-black) 12px,
-                var(--sw-black) 18px
-            );
-        }
-
-        /* ══ ANIMATIONS GLOBAIS ══ */
-        @keyframes fadeInUp {
-            from { opacity: 0; transform: translateY(12px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
+        /* ══ ANIMATIONS ══ */
         @keyframes slideDown {
-            from { opacity: 0; transform: translateY(-10px); }
-            to { opacity: 1; transform: translateY(0); }
+            from { opacity:0; transform: translateY(-12px); }
+            to   { opacity:1; transform: translateY(0); }
+        }
+
+        @keyframes fadeInUp {
+            from { opacity:0; transform: translateY(14px); }
+            to   { opacity:1; transform: translateY(0); }
         }
 
         @keyframes pulse-animation {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            0%,100% { opacity:1; }
+            50%      { opacity:0.5; }
         }
 
         .pulse-animation { animation: pulse-animation 2s infinite; }
-        .fade-in-up { animation: fadeInUp 0.4s ease-out both; }
+
+        .navbar { animation: slideDown 0.3s ease-out; }
+        .card   { animation: fadeInUp 0.35s ease-out; }
+
+        /* ══ FOOTER ══ */
+        footer {
+            background: var(--sw-black) !important;
+            border-top: 3px solid var(--sw-yellow);
+        }
 
         /* ══ RESPONSIVO ══ */
         @media (max-width: 768px) {
-            .sw-main { padding: 1.25rem 1rem 3rem; }
-            .kpi-grid { gap: 0.75rem; }
-            .kpi-card .kpi-value { font-size: 2.2rem; }
-            .sw-footer { flex-direction: column; text-align: center; }
+            .kpi-card h3 { font-size: 2.2rem; }
             .metric-value { font-size: 1.8rem; }
+            .log-box { max-height: 260px; }
         }
-
-        /* ══ CHART customization ══ */
-        canvas { display: block; }
-
-        /* ══ TAB CONTENT ANIMATION ══ */
-        .tab-pane.active { animation: fadeInUp 0.3s ease-out; }
     </style>
 </head>
 <body>
 
-    <!-- ══ PATTERN BAR TOP ══ -->
+    <!-- PATTERN BAR TOP -->
     <div class="sw-pattern-bar"></div>
 
-    <!-- ══ NAVBAR ══ -->
-    <nav class="sw-nav">
-        <a class="sw-nav-brand" href="#">
-            <img src="https://i.imgur.com/j79HO6n.png" alt="SW Móveis MDF">
-            <div>
-                <div class="sw-nav-brand-text">SW Móveis MDF</div>
-                <span class="sw-nav-brand-sub">Painel de Gestão</span>
+    <!-- NAVBAR -->
+    <nav class="navbar navbar-expand-lg">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand text-white d-flex align-items-center" href="#" style="gap: 0.75rem;">
+                <img src="https://i.imgur.com/j79HO6n.png" alt="SW Móveis MDF" style="height: 40px; width: auto; filter: brightness(1.1);">
+                <div class="navbar-brand-text">
+                    <span class="navbar-brand-name">SW Móveis MDF</span>
+                    <span class="navbar-brand-sub">Painel de Gestão</span>
+                </div>
+            </a>
+            <div class="d-flex align-items-center gap-3">
+                <span id="status-badge" class="badge bg-secondary">Carregando...</span>
+                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
             </div>
-        </a>
-        <div class="sw-nav-right">
-            <span id="status-badge" class="badge bg-secondary">Carregando...</span>
-            <a id="auth-link" href="{{ auth_url }}">Autenticar</a>
         </div>
     </nav>
 
-    <!-- ══ MAIN ══ -->
-    <div class="sw-main">
+    <!-- CONTAINER PRINCIPAL -->
+    <div class="container-fluid px-4 py-5">
 
         <!-- PAGE HEADER -->
-        <div class="sw-page-header fade-in-up">
-            <h1 class="sw-page-title">Pedidos de <span>Venda</span></h1>
-            <p class="sw-page-sub">Acompanhe pedidos abertos e fechados em tempo real</p>
+        <div class="row mb-5">
+            <div class="col-12">
+                <h2 class="mb-1 page-title">Pedidos de <span class="highlight">Venda</span></h2>
+                <p class="text-muted mb-4" style="font-size:0.85rem;">Acompanhe os pedidos abertos e fechados em tempo real</p>
+            </div>
         </div>
 
         <!-- KPI CARDS -->
-        <div class="kpi-grid">
-            <div class="kpi-card kpi-daily fade-in-up">
-                <div class="kpi-label">⚡ Pedidos Diários</div>
-                <div class="kpi-value" id="kpi-daily">0</div>
-                <div class="kpi-sub">Últimas 24h</div>
+        <div class="row mb-5">
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-daily text-center">
+                    <h5>⚡ Pedidos Diários</h5>
+                    <h3 id="kpi-daily" class="text-primary">0</h3>
+                    <small class="text-muted">Últimas 24h</small>
+                </div>
             </div>
-            <div class="kpi-card kpi-weekly fade-in-up" style="animation-delay: 0.07s">
-                <div class="kpi-label">📅 Pedidos Semanais</div>
-                <div class="kpi-value" id="kpi-weekly">0</div>
-                <div class="kpi-sub">Últimos 7 dias</div>
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-weekly text-center">
+                    <h5>📅 Pedidos Semanais</h5>
+                    <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
+                    <small class="text-muted">Últimos 7 dias</small>
+                </div>
             </div>
-            <div class="kpi-card kpi-historic fade-in-up" style="animation-delay: 0.14s">
-                <div class="kpi-label">📊 Pedidos Mensais</div>
-                <div class="kpi-value" id="kpi-historic">0</div>
-                <div class="kpi-sub">Este mês</div>
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-historic text-center">
+                    <h5>📊 Pedidos Mensais</h5>
+                    <h3 id="kpi-historic" style="color: var(--success);">0</h3>
+                    <small class="text-muted">Este Mês</small>
+                </div>
             </div>
         </div>
 
         <!-- TIMESTAMP -->
-        <div class="sw-timestamp mb-4">
-            ⏱ Último Recálculo: <span id="last-recalculated">N/D</span>
+        <div class="row mb-5">
+            <div class="col-12">
+                <small class="text-muted">
+                    ⏱️ Último Recálculo: <span id="last-recalculated" style="font-weight: 600;">N/D</span>
+                </small>
+            </div>
         </div>
 
-        <!-- LOGS CARD -->
-        <div class="sw-card mb-4 fade-in-up">
-            <div class="sw-card-header">
-                <div>
-                    <h5>📋 Logs <span class="sw-accent">em Tempo Real</span></h5>
+        <!-- LOGS EM TEMPO REAL -->
+        <div class="row mb-5">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">📋 Logs <span style="color:var(--sw-yellow)">em Tempo Real</span></h5>
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="logs-content" class="log-box"></div>
+                    </div>
                 </div>
             </div>
-            <div id="logs-content" class="log-box"></div>
         </div>
 
         <!-- TABS -->
-        <div class="nav-tabs-wrapper">
-            <ul class="nav nav-tabs" id="myTab" role="tablist">
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search" type="button">🔍 Busca</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits" type="button">📦 Produtos</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
-                </li>
-                <li class="nav-item" role="presentation">
-                    <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🔧 Insumos & Produção</button>
-                </li>
-            </ul>
-        </div>
+        <div class="row">
+            <div class="col-12">
+                <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search" type="button">🔍 Busca</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits" type="button">📦 Produtos</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🔧 Insumos & Produção</button>
+                    </li>
+                </ul>
 
-        <!-- AUTH REQUIRED MESSAGE -->
-        <div id="auth-required-tabs" class="alert alert-warning hidden mb-4">
-            🔐 É necessário autenticar com o SW Móveis para visualizar o conteúdo.
-        </div>
-
-        <!-- TAB CONTENT -->
-        <div id="content-tabs" class="tab-content hidden">
-
-            <!-- TAB: BUSCA -->
-            <div class="tab-pane fade show active" id="search" role="tabpanel">
-                <div class="row mb-4">
-                    <div class="col-12">
-                        <div class="input-group">
-                            <input type="text" class="form-control" id="search-input" placeholder="Digite SKU ou nome do produto...">
-                            <button class="btn btn-primary" id="btn-search" type="button">Buscar</button>
-                        </div>
-                    </div>
+                <!-- AUTH REQUIRED -->
+                <div id="auth-required-tabs" class="alert alert-warning hidden mb-4">
+                    🔐 É necessário autenticar com o SW Móveis para visualizar o conteúdo.
                 </div>
-                <div id="search-results"></div>
-            </div>
 
-            <!-- TAB: PRODUTOS -->
-            <div class="tab-pane fade" id="kits" role="tabpanel">
-                <div class="mb-4 d-flex align-items-center gap-3">
-                    <button class="btn btn-primary btn-sm" onclick="forceAndReloadKits(event)">🔄 Recarregar Lista</button>
-                    <small class="text-muted">⚠️ Carregamento pode levar 2-5 minutos. Aguarde a notificação.</small>
-                </div>
-                <div id="kits-list"></div>
-            </div>
+                <!-- TAB CONTENT -->
+                <div id="content-tabs" class="tab-content hidden">
 
-            <!-- TAB: DASHBOARD KPI -->
-            <div class="tab-pane fade" id="kpi-chart" role="tabpanel">
-                <div class="row g-4">
-                    <div class="col-lg-8">
-                        <div class="sw-card">
-                            <div class="sw-card-header">
-                                <h5>📈 Evolução de Pedidos <span class="sw-accent">(30 dias)</span></h5>
-                            </div>
-                            <div class="sw-card-body" style="height: 380px;">
-                                <canvas id="salesChart"></canvas>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-lg-4">
-                        <div class="sw-card h-100">
-                            <div class="sw-card-header">
-                                <h5>🎯 Métricas <span class="sw-accent">Rápidas</span></h5>
-                            </div>
-                            <div class="sw-card-body d-flex flex-column gap-3">
-                                <div class="metric-box">
-                                    <div class="metric-label">Média Diária</div>
-                                    <div class="metric-value" id="avg-daily">0</div>
-                                </div>
-                                <div class="metric-box">
-                                    <div class="metric-label">Crescimento Semanal</div>
-                                    <div class="metric-value" id="growth-weekly">+0%</div>
-                                </div>
-                                <div class="metric-box">
-                                    <div class="metric-label">Tendência</div>
-                                    <div class="metric-value" id="trend-indicator" style="font-size: 1.5rem;">📊 Estável</div>
+                    <!-- TAB: BUSCA -->
+                    <div class="tab-pane fade show active" id="search" role="tabpanel">
+                        <div class="row mb-4">
+                            <div class="col-12">
+                                <div class="input-group">
+                                    <input type="text" class="form-control" id="search-input" placeholder="Digite SKU ou nome do produto..." style="padding: 0.75rem 1rem; font-weight: 500;">
+                                    <button class="btn btn-primary" id="btn-search" type="button">Buscar</button>
                                 </div>
                             </div>
                         </div>
+                        <div id="search-results"></div>
                     </div>
-                </div>
-            </div>
 
-            <!-- TAB: INSUMOS & PRODUÇÃO -->
-            <div class="tab-pane fade" id="component-usage" role="tabpanel">
-
-                <!-- PAINEL DE PRODUÇÃO -->
-                <div class="sw-card mb-4">
-                    <div class="sw-card-header production">
-                        <div>
-                            <h5>🏭 Painel de <span class="sw-accent">Produção</span></h5>
-                            <small>
-                                ⏳ Em Espera <span id="waiting-count-badge" class="badge bg-warning ms-1">0</span>
-                                &nbsp;⚙️ Produzindo <span id="inprod-count-badge" class="badge bg-success ms-1">0</span>
-                                &nbsp;✅ Concluídos <span id="done-count-badge" class="badge bg-secondary ms-1">0</span>
-                            </small>
+                    <!-- TAB: PRODUTOS -->
+                    <div class="tab-pane fade" id="kits" role="tabpanel">
+                        <div class="mb-4">
+                            <button class="btn btn-primary btn-sm" onclick="forceAndReloadKits(event)">🔄 Recarregar Lista</button>
+                            <small class="text-muted d-block mt-2">⚠️ Carregamento pode levar 2-5 minutos. Aguarde a notificação do WebSocket.</small>
                         </div>
-                        <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                        <div id="kits-list"></div>
                     </div>
-                    <div class="card-body p-0" id="production-board-section">
-                        <p class="text-center text-muted py-4">⏳ Carregando...</p>
-                    </div>
-                </div>
 
-                <!-- CONSUMO MENSAL -->
-                <div class="sw-card mb-4">
-                    <div class="sw-card-header success">
-                        <div>
-                            <h5>📊 Consumo de Insumos</h5>
-                            <small id="consumption-month-label">Mês atual • Reinicia todo mês</small>
+                    <!-- TAB: DASHBOARD KPI -->
+                    <div class="tab-pane fade" id="kpi-chart" role="tabpanel">
+                        <div class="row">
+                            <div class="col-lg-8 mb-4">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">📈 Evolução de Pedidos <span style="color:var(--sw-yellow)">(Últimos 30 dias)</span></h5>
+                                    </div>
+                                    <div class="card-body" style="height: 400px;">
+                                        <canvas id="salesChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-4">
+                                <div class="card">
+                                    <div class="card-header">
+                                        <h5 class="mb-0">🎯 Métricas <span style="color:var(--sw-yellow)">Rápidas</span></h5>
+                                    </div>
+                                    <div class="card-body">
+                                        <div class="metric-box mb-3">
+                                            <div class="metric-label">Média Diária</div>
+                                            <div class="metric-value" id="avg-daily">0</div>
+                                        </div>
+                                        <div class="metric-box mb-3">
+                                            <div class="metric-label">Crescimento Semanal</div>
+                                            <div class="metric-value" id="growth-weekly">+0%</div>
+                                        </div>
+                                        <div class="metric-box">
+                                            <div class="metric-label">Tendência</div>
+                                            <div class="metric-value" id="trend-indicator" style="font-size:1.4rem;">📊 Estável</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
-                        <span class="badge bg-light" id="consumption-total-badge">0 insumos</span>
                     </div>
-                    <div class="card-body p-0" id="consumption-table-section">
-                        <div class="text-center py-4 text-muted">⏳ Carregando consumo...</div>
-                    </div>
-                </div>
 
-                <!-- HISTÓRICO -->
-                <div class="sw-card">
-                    <div class="sw-card-header purple">
-                        <div>
-                            <h5>📜 Histórico de Finalizações</h5>
-                            <small>Registro de cada produto finalizado com tempo de produção</small>
+                    <!-- TAB: INSUMOS & PRODUÇÃO -->
+                    <div class="tab-pane fade" id="component-usage" role="tabpanel">
+
+                        <!-- PAINEL DE PRODUÇÃO -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center py-3" style="background: linear-gradient(135deg, #01010d 0%, #1e3a5f 100%) !important;">
+                                <div>
+                                    <h5 class="mb-0 text-white">🏭 Painel de <span style="color:var(--sw-yellow)">Produção</span></h5>
+                                    <small class="text-white-50">
+                                        ⏳ Em Espera <span id="waiting-count-badge" class="badge bg-warning text-dark ms-1">0</span>
+                                        &nbsp; ⚙️ Produzindo <span id="inprod-count-badge" class="badge bg-success ms-1">0</span>
+                                        &nbsp; ✅ Concluídos <span id="done-count-badge" class="badge bg-secondary ms-1">0</span>
+                                    </small>
+                                </div>
+                                <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                            </div>
+                            <div class="card-body p-0" id="production-board-section">
+                                <p class="text-center text-muted py-4">⏳ Carregando...</p>
+                            </div>
                         </div>
-                    </div>
-                    <div class="card-body p-0" id="production-history-section">
-                        <div class="text-center py-4 text-muted">⏳ Carregando histórico...</div>
+
+                        <!-- CONSUMO MENSAL -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #065f46 0%, #059669 100%) !important;">
+                                <div>
+                                    <h5 class="mb-0">📊 Consumo de Insumos & Componentes</h5>
+                                    <small class="text-white-50" id="consumption-month-label">Mês atual • Reinicia todo mês</small>
+                                </div>
+                                <span class="badge bg-light text-dark" id="consumption-total-badge">0 insumos</span>
+                            </div>
+                            <div class="card-body p-0" id="consumption-table-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando consumo...</div>
+                            </div>
+                        </div>
+
+                        <!-- HISTÓRICO DE FINALIZAÇÕES -->
+                        <div class="card border-0 shadow-sm">
+                            <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%) !important;">
+                                <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
+                                <small class="text-white-50">Registro de cada produto finalizado com tempo de produção</small>
+                            </div>
+                            <div class="card-body p-0" id="production-history-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando histórico...</div>
+                            </div>
+                        </div>
+
                     </div>
                 </div>
-
             </div>
         </div>
     </div>
@@ -4316,194 +4101,1037 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <!-- TOAST CONTAINER -->
     <div class="toast-container position-fixed bottom-0 end-0 p-4"></div>
 
-    <!-- SCRIPTS -->
+    <!-- BOOTSTRAP JS -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
-    <script>
+<script>
         const API = '/api';
         let isAuthenticated = false;
         let salesChart = null;
 
-        /* ══ FETCH API ══ */
+        /* ✅ DESIGN: Fetch API com Tratamento */
         async function fetchAPI(url, options = {}) {
             try {
                 const response = await fetch(url, options);
+
                 if (response.status === 401) {
                     console.error("Sessão expirada (401). Redirecionando para autenticação.");
                     window.location.href = document.getElementById('auth-link').href;
                     throw new Error("Sessão expirada. Redirecionamento em curso.");
                 }
+
                 if (!response.ok) {
-                    let errMsg = `HTTP ${response.status}`;
-                    try { const d = await response.json(); errMsg = d.error || d.message || errMsg; } catch(e) {}
-                    throw new Error(errMsg);
+                    const errorText = await response.text();
+                    throw new Error(`Erro na API (${response.status}): ${errorText}`);
                 }
-                return await response.json();
-            } catch(e) {
-                if (e.message !== "Sessão expirada. Redirecionamento em curso.") console.error(`fetchAPI(${url}):`, e);
-                throw e;
+
+                try {
+                    return await response.json();
+                } catch (e) {
+                    return {};
+                }
+
+            } catch (error) {
+                console.error("Erro em fetchAPI:", error);
+                throw error;
             }
         }
 
-        /* ══ TOAST ══ */
+        /* ✅ DESIGN: Toast com Animação */
         function showToast(title, message, type = 'info') {
-            const container = document.querySelector('.toast-container');
-            const borderColors = { success: '#10b981', danger: '#ef4444', warning: '#ffb600', info: '#3b82f6' };
-            const color = borderColors[type] || '#ffb600';
-            const id = `toast-${Date.now()}`;
-            const div = document.createElement('div');
-            div.id = id;
-            div.className = `toast show align-items-center`;
-            div.setAttribute('role','alert');
-            div.style.borderLeftColor = color;
-            div.innerHTML = `
-                <div class="toast-header">
-                    <strong class="me-auto" style="color:${color}">${title}</strong>
-                    <button type="button" class="btn-close" onclick="this.closest('.toast').remove()"></button>
+            const toastContainer = document.querySelector('.toast-container');
+            const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
+            const textClass = type === 'warning' ? 'text-dark' : 'text-white';
+
+            const toastHtml = `
+                <div class="toast align-items-center ${bgClass} ${textClass} border-0" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
+                    <div class="d-flex">
+                        <div class="toast-body fw-600">
+                            <strong>${title}:</strong> ${message}
+                        </div>
+                        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                    </div>
                 </div>
-                <div class="toast-body">${message}</div>`;
-            container.appendChild(div);
-            setTimeout(() => { div.classList.add('hide'); setTimeout(() => div.remove(), 300); }, 4000);
+            `;
+
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = toastHtml;
+            const toastElement = tempDiv.firstChild;
+
+            toastContainer.appendChild(toastElement);
+
+            const toast = new bootstrap.Toast(toastElement);
+            toast.show();
+
+            toastElement.addEventListener('hidden.bs.toast', () => {
+                toastElement.remove();
+            });
         }
 
-        /* ══ WEBSOCKET ══ */
-        let ws = null;
-        let wsReconnectDelay = 1000;
-        let wsReconnectTimer = null;
-
-        function connectWS() {
-            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-            const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
-            ws = new WebSocket(`${protocol}://${location.host}/ws`);
-            ws.onopen = () => { wsReconnectDelay = 1000; console.log('WS conectado'); };
-            ws.onmessage = (e) => { try { handleWSMessage(JSON.parse(e.data)); } catch(err) { console.warn('WS msg erro:', err); } };
-            ws.onclose = () => {
-                console.warn('WS fechado. Reconectando em', wsReconnectDelay, 'ms');
-                wsReconnectTimer = setTimeout(() => { wsReconnectDelay = Math.min(wsReconnectDelay * 1.5, 30000); connectWS(); }, wsReconnectDelay);
-            };
-            ws.onerror = (e) => { console.error('WS error:', e); ws.close(); };
+        function formatLog(log) {
+            const levelClass = `log-level-${log.level}`;
+            return `<div class="log-entry ${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
         }
 
-        function handleWSMessage(data) {
-            if (data.type === 'log') {
-                appendLog(data.level, data.message, data.timestamp);
-            } else if (data.type === 'kpi_update') {
-                updateKPIs(data);
-            } else if (data.type === 'auth_status') {
-                updateAuthStatus(data.authenticated, data.user);
-            } else if (data.type === 'cache_loaded') {
-                showToast('Cache Atualizado', '✅ Cache de produtos recarregado!', 'success');
-                loadKits();
-            } else if (data.type === 'cache_loading') {
-                showToast('Carregando Cache', '⏳ Atualizando produtos do Bling...', 'info');
-            } else if (data.type === 'production_update') {
-                if (document.querySelector('#component-usage.active, #component-usage.show')) {
-                    loadProductionBoard();
-                    refreshComponentTab();
+        /* ✅ DESIGN: Formatação de Data/Hora */
+        function formatDateTime(isoString) {
+            if (!isoString || isoString === 'N/D') return 'N/D';
+            try {
+                const date = new Date(isoString);
+                const now = new Date();
+                const isToday = date.toDateString() === now.toDateString();
+
+                if (isToday) {
+                    return date.toLocaleTimeString('pt-BR');
+                } else {
+                    return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
                 }
+            } catch (e) {
+                return 'N/D';
             }
         }
 
-        /* ══ LOGS ══ */
-        function appendLog(level, message, timestamp) {
+        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
             const box = document.getElementById('logs-content');
-            if (!box) return;
-            const div = document.createElement('div');
-            div.className = `log-entry log-level-${level}`;
-            const ts = timestamp ? `<span style="opacity:0.5">[${timestamp}]</span> ` : '';
-            div.innerHTML = `${ts}<span class="log-level-${level}">[${level}]</span> ${escapeHtml(message)}`;
-            box.appendChild(div);
-            if (box.children.length > 500) box.removeChild(box.firstChild);
-            box.scrollTop = box.scrollHeight;
-        }
-
-        function escapeHtml(s) {
-            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        }
-
-        /* ══ KPI UPDATE ══ */
-        function updateKPIs(data) {
-            const fields = { 'kpi-daily': data.daily, 'kpi-weekly': data.weekly, 'kpi-historic': data.monthly ?? data.historic };
-            for (const [id, val] of Object.entries(fields)) {
-                const el = document.getElementById(id);
-                if (el && val !== undefined) {
-                    el.textContent = val;
-                    const card = el.closest('.kpi-card');
-                    if (card) { card.classList.add('updating'); setTimeout(() => card.classList.remove('updating'), 600); }
-                }
-            }
-            if (data.last_recalculated) {
-                const el = document.getElementById('last-recalculated');
-                if (el) el.textContent = data.last_recalculated;
+            if(data.logs) {
+                data.logs.forEach(l => box.innerHTML += formatLog(l));
+                box.scrollTop = box.scrollHeight;
             }
         }
 
-        /* ══ AUTH STATUS ══ */
-        function updateAuthStatus(authenticated, user) {
-            isAuthenticated = authenticated;
+        /* ✅ DESIGN: Atualizar Status de Autenticação */
+        function updateAuthStatus(authenticated, authUrl) {
             const badge = document.getElementById('status-badge');
-            const authLink = document.getElementById('auth-link');
-            const contentTabs = document.getElementById('content-tabs');
-            const authRequired = document.getElementById('auth-required-tabs');
-            if (authenticated) {
+            isAuthenticated = authenticated;
+
+            if(isAuthenticated) {
                 badge.className = 'badge bg-success';
-                badge.textContent = user ? `Conectado: ${user}` : 'Conectado';
-                authLink.style.display = 'none';
-                contentTabs.classList.remove('hidden');
-                authRequired.classList.add('hidden');
+                badge.textContent = '🟢 Online';
+                document.getElementById('auth-link').classList.add('d-none');
+                document.getElementById('content-tabs').classList.remove('hidden');
+                document.getElementById('auth-required-tabs').classList.add('hidden');
             } else {
                 badge.className = 'badge bg-danger';
-                badge.textContent = 'Desconectado';
-                authLink.style.display = '';
-                contentTabs.classList.add('hidden');
-                authRequired.classList.remove('hidden');
+                badge.textContent = '🔴 Offline';
+                document.getElementById('auth-link').classList.remove('d-none');
+                document.getElementById('content-tabs').classList.add('hidden');
+                document.getElementById('auth-required-tabs').classList.remove('hidden');
+            }
+            document.getElementById('auth-link').href = authUrl;
+        }
+
+        /* ✅ DESIGN: Atualizar KPIs com Animação */
+        function updateKpis(dSalesStats) {
+            const kpiDaily = document.getElementById('kpi-daily');
+            const kpiWeekly = document.getElementById('kpi-weekly');
+            const kpiHistoric = document.getElementById('kpi-historic');
+
+            kpiDaily.textContent = dSalesStats.daily;
+            kpiWeekly.textContent = dSalesStats.weekly;
+            kpiHistoric.textContent = dSalesStats.monthly;
+            document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
+
+            // Animação de atualização
+            const cards = document.querySelectorAll('.kpi-card');
+            cards.forEach(card => {
+                card.classList.add('updating');
+                setTimeout(() => {
+                    card.classList.remove('updating');
+                }, 600);
+            });
+        }
+
+        /* ✅ DESIGN: Lista Técnica Hardcoded (Engenharia) */
+        const RECIPE_CADEIRA = [
+            {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+            {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+            {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+            {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+            {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+            {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+            {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+            {"nome": "COLA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+            {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+            {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+            {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+            {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+            {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+            {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+            {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+            {"nome": "BASE", "qtd": 1, "un": "Unid"}
+        ];
+
+        /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
+        let timerInterval = null;
+
+        function openProductionChecklist(productName) {
+            const isCadeira = productName.toUpperCase().includes('CADEIRA');
+            let checklistHtml = '';
+
+            if (isCadeira) {
+                checklistHtml = `
+                    <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
+                    <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
+                        ${RECIPE_CADEIRA.map((item, i) => `
+                            <div class="col-md-6">
+                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
+                                     style="cursor:pointer; transition: all .2s;"
+                                     data-pname="${productName}" onclick="toggleChecklist(this, ${i}, this.dataset.pname)">
+                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}" onclick="event.stopPropagation()">
+                                    <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
+                                        ${item.nome} 
+                                        <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
+                                    </label>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                    <div id="checklist-progress" class="alert alert-info py-2 small mb-0">
+                        <strong>0 / ${RECIPE_CADEIRA.length}</strong> itens marcados como usados
+                    </div>
+                `;
+            } else {
+                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática de insumos.</div>`;
+            }
+
+            const modalHtml = `
+                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
+                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                        <div class="modal-content border-0 shadow-2xl">
+                            <div class="modal-header text-white" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
+                                <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
+                            </div>
+                            <div class="modal-body" style="background: #f8fafc;">
+                                <!-- Timer Section -->
+                                <div class="card mb-4 border-0" style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white;">
+                                    <div class="card-body text-center py-4">
+                                        <div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em; opacity:.7;">⏱ Tempo de Produção</div>
+                                        <div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size: 3.5rem; letter-spacing:.05em; text-shadow: 0 0 20px rgba(99,102,241,.6);">
+                                            00:00:00
+                                        </div>
+                                        <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
+                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-produto="${productName}">
+                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', document.getElementById('timer-btn-group').dataset.produto)">
+                                                ▶ Iniciar
+                                            </button>
+                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', document.getElementById('timer-btn-group').dataset.produto)">
+                                                ⏸ Pausar
+                                            </button>
+                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', document.getElementById('timer-btn-group').dataset.produto)">
+                                                ↺ Zerar
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Checklist -->
+                                ${checklistHtml}
+                            </div>
+                            <div class="modal-footer bg-white d-flex justify-content-between">
+                                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
+                                    Fechar
+                                </button>
+                                <button type="button" class="btn btn-success px-4 fw-bold"
+                                    onclick="controlTimer('finish', document.getElementById('timer-btn-group').dataset.produto)">
+                                    ✅ CONCLUIR & SALVAR
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            const oldModal = document.getElementById('productionModal');
+            if (oldModal) oldModal.remove();
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            
+            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
+            modal.show();
+
+            // Carrega timer E estado da checklist salvo no servidor
+            controlTimer('get', productName);
+            // Carrega checklist salvo para este produto
+            _loadChecklistState(productName);
+        }
+
+        // Estado de checklist por produto (para saber o que está marcado)
+        const checklistState = {};
+
+        async function _loadChecklistState(productName) {
+            try {
+                const safe = encodeURIComponent(productName);
+                const res = await fetch(`/api/checklist/state/${safe}`);
+                const data = await res.json();
+                const saved = data.checklist || {};
+                // Restaura checkboxes marcados
+                RECIPE_CADEIRA.forEach((item, i) => {
+                    if (saved[item.nome]) {
+                        const cb = document.getElementById(`check${i}`);
+                        const container = cb && cb.closest('.checklist-item');
+                        if (cb && container) {
+                            cb.checked = true;
+                            container.style.background = '#d1fae5';
+                            container.style.borderColor = '#10b981';
+                        }
+                    }
+                });
+                _updateChecklistProgress();
+            } catch(e) { console.error('Erro ao carregar checklist:', e); }
+        }
+
+        function _updateChecklistProgress() {
+            const total = RECIPE_CADEIRA.length;
+            const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
+            const progressDiv = document.getElementById('checklist-progress');
+            if (progressDiv) {
+                progressDiv.innerHTML = '<strong>' + checked + ' / ' + total + '</strong> itens marcados' + (checked === total ? ' ✅ Tudo marcado!' : '');
+                progressDiv.className = 'alert py-2 small mb-0 ' + (checked === total ? 'alert-success' : 'alert-info');
             }
         }
 
-        /* ══ INIT ══ */
-        async function init() {
+        function toggleChecklist(container, idx, productName) {
+            const cb = container.querySelector('input[type=checkbox]');
+            // IMPORTANTE: cb.checked já foi atualizado pelo browser antes do onclick
+            // NAO inverter aqui — isso causava bug de estado invertido
+            const isChecked = cb.checked;
+            const item = RECIPE_CADEIRA[idx];
+
+            if (isChecked) {
+                container.style.background = '#d1fae5';
+                container.style.borderColor = '#10b981';
+            } else {
+                container.style.background = '';
+                container.style.borderColor = '';
+            }
+
+            // Salva checklist e registra consumo com o estado correto
+            fetch('/api/checklist/state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ produto: productName, componente: item.nome, checked: isChecked })
+            }).catch(e => console.error('Erro checklist:', e));
+
+            registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
+            _updateChecklistProgress();
+        }
+
+        async function registerConsumption(componentName, qty, unit, productName, checked) {
             try {
-                const data = await fetchAPI('/api/status');
-                updateAuthStatus(data.authenticated, data.user);
-                if (data.authenticated) {
-                    await loadInitialKPI();
-                    await loadLogs();
+                const res = await fetch('/api/consumption/register', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ component_name: componentName, qty: qty, unit: unit, product_name: productName, checked: checked })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const tab = document.getElementById('component-usage');
+                if (tab && tab.classList.contains('active')) {
+                    setTimeout(() => fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {}), 400);
                 }
-                connectWS();
             } catch(e) {
-                console.error('Init error:', e);
-                connectWS();
+                console.error('Erro ao registrar consumo:', e);
+                showToast('Aviso', 'Falha ao registrar insumo', 'warning');
             }
         }
 
-        async function loadInitialKPI() {
+        /* Lógica do Timer Conectada ao Backend */
+        async function controlTimer(action, produto) {
             try {
-                const data = await fetchAPI('/api/kpi');
-                updateKPIs(data);
-            } catch(e) { console.error('loadInitialKPI:', e); }
+                const res = await fetch('/api/timer/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action: action, produto: produto })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+
+                if (action === 'finish') {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                    const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
+                    showToast('✅ Concluído!', produto + ' — ' + formatSeconds(elapsed) + ' registrado.', 'success');
+                    // Fecha modal de forma robusta
+                    const modalEl = document.getElementById('productionModal');
+                    if (modalEl) {
+                        try {
+                            const bsModal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
+                            bsModal.hide();
+                        } catch(me) { modalEl.remove(); }
+                    }
+                    // Atualiza board e consumo
+                    await loadProductionBoard();
+                    await refreshComponentTab();
+                    return;
+                }
+
+                updateTimerDisplay(data.elapsed || 0, data.state || 'stopped');
+                if (action === 'start' || (action === 'get' && data.state === 'running')) {
+                    startLocalCounter(data.elapsed || 0);
+                } else {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                }
+            } catch (e) {
+                console.error("Erro no timer:", e);
+                showToast('Erro', 'Falha ao comunicar com servidor.', 'danger');
+            }
         }
 
-        async function loadLogs() {
-            try {
-                const data = await fetchAPI('/api/logs');
-                const box = document.getElementById('logs-content');
-                if (!box) return;
-                box.innerHTML = '';
-                (data.logs || []).forEach(l => appendLog(l.level, l.message, l.timestamp));
-            } catch(e) { console.error('loadLogs:', e); }
+        function formatSeconds(s) {
+            s = Math.floor(s || 0);
+            const h = Math.floor(s / 3600).toString().padStart(2,'0');
+            const m = Math.floor((s % 3600) / 60).toString().padStart(2,'0');
+            const sec = (s % 60).toString().padStart(2,'0');
+            return `${h}:${m}:${sec}`;
         }
 
-        /* ══ SEARCH ══ */
+        function startLocalCounter(startSeconds) {
+            clearInterval(timerInterval);
+            let seconds = startSeconds;
+            const display = document.getElementById('timer-display');
+            
+            timerInterval = setInterval(() => {
+                seconds++;
+                display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            }, 1000);
+        }
+
+        function updateTimerDisplay(seconds, state) {
+            const display = document.getElementById('timer-display');
+            const badge = document.getElementById('timer-status');
+            
+            display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            
+            if(state === 'running') {
+                badge.className = 'mt-2 badge bg-success';
+                badge.textContent = 'Em Produção...';
+                badge.classList.add('pulse-animation');
+            } else if (state === 'paused') {
+                badge.className = 'mt-2 badge bg-warning text-dark';
+                badge.textContent = 'Pausado';
+                badge.classList.remove('pulse-animation');
+            } else {
+                badge.className = 'mt-2 badge bg-secondary';
+                badge.textContent = 'Parado';
+                badge.classList.remove('pulse-animation');
+            }
+        }
+
+        /* ════════════════════════════════════════════════════════════
+           PAINEL DE PRODUÇÃO UNIFICADO
+           - Busca /api/production/board a cada 10s automaticamente
+           - Em Espera + Em Produção + Concluídos numa única view
+           ════════════════════════════════════════════════════════════ */
+
+        let _boardTick = null;      // setInterval do ticker de tempo
+        let _boardPoll = null;      // setInterval do polling de dados
+        let _boardTimerState = {};  // snapshot do servidor para ticker local
+
+        async function syncAndRefreshPending() {
+            const btn = document.querySelector('[onclick="syncAndRefreshPending()"]');
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
+            try {
+                const res = await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
+                if (res.message) showToast('Info', res.message, 'info');
+                else showToast('Sucesso', `${res.added || 0} novos itens adicionados.`, 'success');
+            } catch(e) {
+                showToast('Aviso', 'Faça login para sincronizar.', 'warning');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '🔄 Sincronizar Bling'; }
+            }
+            await loadProductionBoard();
+        }
+
+        // Mantido como alias para compatibilidade com outros pontos do código
+        async function loadPendingOrders() { await loadProductionBoard(); }
+
+        async function loadProductionBoard() {
+            const div = document.getElementById('production-board-section');
+            if (!div) return;
+            try {
+                const data = await fetch('/api/production/board').then(r => r.json());
+                renderProductionBoard(data);
+            } catch(e) {
+                div.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar painel.</div>';
+            }
+        }
+
+        function renderProductionBoard(data) {
+            const div = document.getElementById('production-board-section');
+            if (!div) return;
+
+            const waiting    = data.waiting      || [];
+            const inProd     = data.in_production || [];
+            const orphans    = data.orphan_timers || [];
+            const done       = data.done          || [];
+            const serverTime = data.server_time   || (Date.now() / 1000);
+
+            // Atualiza badges
+            const wb = document.getElementById('waiting-count-badge');
+            const ib = document.getElementById('inprod-count-badge');
+            const db = document.getElementById('done-count-badge');
+            if (wb) wb.textContent = waiting.length;
+            if (ib) ib.textContent = inProd.length + orphans.length;
+            if (db) db.textContent = done.length;
+
+            // Para ticker anterior
+            if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
+            _boardTimerState = {};
+
+            let html = '';
+
+            // ── Em Espera ───────────────────────────────────────────────
+            if (waiting.length === 0) {
+                html += `<div class="text-center py-3 text-muted"><small>Nenhum pedido em espera. Clique em 🔄 Sincronizar Bling.</small></div>`;
+            } else {
+                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
+                    <thead style="background:#fef9c3;"><tr>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
+                        <th>Pedido Nº</th><th>Cliente</th><th class="text-center">Ação</th>
+                    </tr></thead><tbody>`;
+                waiting.forEach(item => {
+                    const rawNome = item.nome || item.nome_original || 'N/D';
+                    const nome = rawNome.replace(/'/g,"&#39;");
+                    // Só mostra imagem se for URL real (não placeholder /static/no-image.png)
+                    const imgUrl = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
+                    const imgTag = imgUrl
+                        ? '<img src="' + imgUrl + '" alt="" loading="lazy" style="width:44px;height:44px;object-fit:contain;border-radius:6px;border:1px solid #e2e8f0;margin-right:8px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">'
+                        : '';
+                    html += `<tr>
+                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
+                        <td class="text-muted small">${item.base || '—'}</td>
+                        <td class="text-muted small">${item.cor || '—'}</td>
+                        <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
+                        <td class="text-muted small">${item.cliente || '—'}</td>
+                        <td class="text-center">
+                            <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
+                                data-ikey="${item.item_key}"
+                                data-pnome="${(item.nome || item.nome_original || '').replace(/"/g,'')}"
+                                onclick="startPendingOrder(this.dataset.ikey, this.dataset.pnome)">▶ Produzir</button>
+                            <button class="btn btn-xs btn-outline-secondary btn-sm"
+                                data-dkey="${item.item_key}"
+                                onclick="dismissPendingOrder(this.dataset.dkey)">✕</button>
+                        </td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div>`;
+            }
+
+            // ── Em Produção ─────────────────────────────────────────────
+            const allInProd = [...inProd, ...orphans];
+            html += `<div class="border-bottom border-top px-3 py-2 mt-1" style="background:#dcfce7;">
+                <small class="fw-bold text-success">⚙️ EM PRODUÇÃO (${allInProd.length})</small>
+            </div>`;
+            if (allInProd.length === 0) {
+                html += `<div class="text-center py-3 text-muted"><small>Nenhuma produção em andamento.</small></div>`;
+            } else {
+                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
+                    <thead style="background:#f0fdf4;"><tr>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
+                        <th class="text-center">⏱ Tempo</th><th class="text-center">Status</th>
+                        <th class="text-center">Checklist</th><th class="text-center">Ação</th>
+                    </tr></thead><tbody>`;
+                allInProd.forEach(item => {
+                    const nome    = item.nome || item.nome_original || item.produto || 'N/D';
+                    const nomeSafe = nome.replace(/'/g,"&#39;");
+                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g,'_');
+                    const elapsed = item.tempo_decorrido || 0;
+                    const estado  = item.estado || 'paused';
+                    const itemKey = item.item_key || null;
+                    const base    = item.base || '—';
+                    const cor     = item.cor  || '—';
+                    const chkDone = Object.values(item.checklist || {}).filter(Boolean).length;
+                    const chkTotal= RECIPE_CADEIRA.length;
+
+                    // Guarda estado para ticker local
+                    _boardTimerState[nome] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
+
+                    const finishBtn = itemKey
+                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="finishBoardItem('${itemKey}','${nomeSafe}')">✅ Concluir</button>`
+                        : `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="controlTimer('finish','${nomeSafe}')">✅ Concluir</button>`;
+
+                    html += `<tr>
+                        <td class="ps-3 fw-bold">${nomeSafe}</td>
+                        <td class="text-muted small">${base}</td>
+                        <td class="text-muted small">${cor}</td>
+                        <td class="text-center">
+                            <span id="btimer_${safeId}" class="font-monospace fw-bold text-primary" style="font-size:1.1rem;">${formatSeconds(elapsed)}</span>
+                        </td>
+                        <td class="text-center">
+                            <span class="badge ${estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}"
+                                style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
+                                ${estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}
+                            </span>
+                        </td>
+                        <td class="text-center">
+                            <span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>
+                        </td>
+                        <td class="text-center">
+                            <button class="btn btn-xs btn-outline-primary btn-sm" onclick="openProductionChecklist('${nomeSafe}')">🛠 Abrir</button>
+                            ${finishBtn}
+                        </td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div>`;
+            }
+
+            // ── Concluídos ──────────────────────────────────────────────
+            if (done.length > 0) {
+                html += `<div class="border-top px-3 py-2 mt-1" style="background:#f0fdf4;">
+                    <small class="fw-bold text-success">✅ CONCLUÍDOS ESTE MÊS (${done.length})</small>
+                </div>
+                <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+                    <tbody>`;
+                done.slice().reverse().forEach(item => {
+                    const nome = (item.nome || item.nome_original || 'N/D').replace(/'/g,'&#39;');
+                    const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                    html += `<tr class="table-success">
+                        <td class="ps-3 fw-bold text-success">${nome}</td>
+                        <td class="text-muted small">${item.base || '—'}</td>
+                        <td class="text-muted small">${item.cor  || '—'}</td>
+                        <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
+                        <td class="text-muted small">${item.cliente || '—'}</td>
+                        <td class="text-center"><span class="badge bg-success">✅ Concluído</span><br><small class="text-muted">${fin}</small></td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div>`;
+            }
+
+            div.innerHTML = html;
+
+            // ── Ticker local (1s) ────────────────────────────────────────
+            _boardTick = setInterval(() => {
+                Object.entries(_boardTimerState).forEach(([nome, s]) => {
+                    if (s.estado !== 'running') return;
+                    const elapsed = s.base + (Date.now() / 1000 - s.startedAt);
+                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g, '_');
+                    const el = document.getElementById('btimer_' + safeId);
+                    if (el) el.textContent = formatSeconds(Math.floor(elapsed));
+                });
+            }, 1000);
+        }
+
+        async function startPendingOrder(itemKey, produtoNome) {
+            if (!itemKey || !produtoNome) {
+                showToast('Erro', 'Dados do pedido inválidos', 'danger');
+                return;
+            }
+            try {
+                const res = await fetch('/api/pending-orders/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
+                });
+                if (!res.ok) throw new Error('Servidor retornou erro');
+                await loadProductionBoard();
+                openProductionChecklist(produtoNome);
+                showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
+            } catch(e) {
+                console.error('startPendingOrder:', e);
+                showToast('Erro', 'Falha ao iniciar produção', 'danger');
+            }
+        }
+
+        async function finishBoardItem(itemKey, produtoNome) {
+            if (!confirm(`Concluir produção de "${produtoNome}"?`)) return;
+            try {
+                await fetch('/api/pending-orders/finish', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
+                });
+                showToast('✅ Concluído!', produtoNome, 'success');
+                await loadProductionBoard();
+                await refreshComponentTab();
+            } catch(e) { showToast('Erro', 'Falha ao concluir', 'danger'); }
+        }
+
+        async function dismissPendingOrder(itemKey) {
+            if (!confirm('Remover este pedido da fila?')) return;
+            try {
+                await fetch('/api/pending-orders/dismiss', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey })
+                });
+                await loadProductionBoard();
+            } catch(e) { showToast('Erro', 'Falha ao remover pedido', 'danger'); }
+        }
+
+        function updateComponentUsage(usageData) {
+            if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
+        }
+
+        async function refreshComponentTab() {
+            await loadProductionBoard();
+            try {
+                const consumptionData = await fetchAPI('/api/consumption/summary');
+                renderConsumptionTable(consumptionData);
+            } catch(e) {
+                document.getElementById('consumption-table-section').innerHTML =
+                    '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
+            }
+            try {
+                const usageData = await fetchAPI('/api/components/usage');
+                if (usageData.history_production) renderProductionHistory(usageData.history_production);
+            } catch(e) { console.error('Erro ao carregar histórico:', e); }
+        }
+
+        // renderActiveTimers mantido como stub (o board substituiu)
+        function renderActiveTimers(activeProduction) {}
+
+        function renderConsumptionTable(data) {
+            const tableSection = document.getElementById('consumption-table-section');
+            const monthLabel = document.getElementById('consumption-month-label');
+            const totalBadge = document.getElementById('consumption-total-badge');
+            if (!tableSection) return;
+            const monthStr = data.month || '';
+            const [year, month] = monthStr.split('-');
+            const monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+            const monthName = month ? `${monthNames[parseInt(month)-1]}/${year}` : monthStr;
+            if (monthLabel) monthLabel.textContent = `${monthName} • Reinicia todo mês`;
+            const summary = data.summary || [];
+            if (totalBadge) totalBadge.textContent = `${summary.length} insumos registrados`;
+            if (summary.length === 0) {
+                tableSection.innerHTML = `<div class="text-center py-5"><div style="font-size:3rem;opacity:.3;">📦</div><p class="text-muted mt-2">Nenhum insumo registrado ainda este mês.</p><small class="text-muted">Abra um produto e marque os itens na checklist para registrar o consumo.</small></div>`;
+                return;
+            }
+            tableSection.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead style="background:#f8fafc;"><tr><th class="ps-3">Insumo / Componente</th><th class="text-center">Qtd Usada (Mês)</th><th class="text-center">Un.</th><th class="text-center">Registros</th></tr></thead>
+                <tbody>${summary.map(item => `<tr>
+                    <td class="ps-3 fw-bold">${item.nome}</td>
+                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#059669,#10b981);color:white;padding:.4rem .9rem;">${item.qtd_total}</span></td>
+                    <td class="text-center text-muted small">${item.un}</td>
+                    <td class="text-center"><span class="badge bg-light text-dark border">${item.num_registros}x</span></td>
+                </tr>`).join('')}</tbody></table></div>`;
+        }
+
+
+
+        function renderProductionHistory(history) {
+            const div = document.getElementById('production-history-section');
+            if (!div) return;
+            const reversed = [...(history || [])].reverse();
+            if (reversed.length === 0) {
+                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado este mês.</div>';
+                return;
+            }
+            div.innerHTML = `<div class="table-responsive" style="max-height:320px;overflow-y:auto;"><table class="table table-sm table-striped align-middle mb-0">
+                <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
+                <tbody>${reversed.map(h => `<tr>
+                    <td class="ps-3 small text-muted">${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
+                    <td class="fw-bold">${h.produto}</td>
+                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos)}</td>
+                </tr>`).join('')}</tbody></table></div>`;
+        }
+
+
+
+        function formatSeconds(s) {
+            s = Math.floor(s || 0);
+            const h = Math.floor(s / 3600).toString().padStart(2, '0');
+            const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
+            const sec = (s % 60).toString().padStart(2, '0');
+            return `${h}:${m}:${sec}`;
+        }
+
+
+        /* ✅ DESIGN: WebSocket KPI */
+        const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+
+        function setupKpiWebSocket() {
+            wsKpi.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+
+                if (data.type === 'full_update') {
+                    updateAuthStatus(data.authenticated, data.auth_url);
+
+                    if (data.sales_stats) {
+                        updateKpis(data.sales_stats);
+                    }
+
+                    if (data.component_usage) {
+                        updateComponentUsage(data.component_usage);
+                    }
+
+                    const forceLoadButton = document.querySelector('#kits button.btn-primary');
+                    if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
+                        forceLoadButton.disabled = false;
+                        forceLoadButton.textContent = '🔄 Recarregar Lista';
+                        loadKits();
+                        showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
+                    }
+                }
+            };
+
+            wsKpi.onerror = (e) => {
+                console.error("Erro WebSocket KPI:", e);
+                showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
+            };
+
+            wsKpi.onclose = () => {
+                console.log("WebSocket KPI desconectado. Reconectando...");
+                setTimeout(() => {
+                    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                    wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
+                    setupKpiWebSocket();
+                }, 3000);
+            };
+        }
+
+        setupKpiWebSocket();
+
+        /* ✅ DESIGN: Busca de Produtos */
+        const btnSearch = document.getElementById('btn-search');
+        btnSearch.onclick = async () => {
+            if (!isAuthenticated) {
+                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o SW Móveis para realizar buscas.</div>';
+                return;
+            }
+
+            const q = document.getElementById('search-input').value;
+            const div = document.getElementById('search-results');
+            div.innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm text-primary" role="status"><span class="visually-hidden">Buscando...</span></div></div>';
+
+            try {
+                const data = await fetchAPI(`${API}/products/search?q=${q}`);
+
+                if(!data.length) {
+                    div.innerHTML = '<div class="alert alert-warning">Nenhum resultado encontrado.</div>';
+                    return;
+                }
+
+                let html = '<div class="list-group">';
+
+                data.forEach(p => {
+                    const imgHtml = p.imagemURL
+                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
+                        : '<span class="text-muted">-</span>';
+
+                    html += `
+                        <div class="list-group-item list-group-item-action" onclick="openProductionChecklist('${p.nome || p.produto}')" style="cursor: pointer;">
+                            <div class="d-flex">
+                                ${imgHtml}
+
+                                <div class="flex-grow-1">
+                                    <div class="d-flex w-100 justify-content-between">
+                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
+                                        <small>${p.sku || 'N/D'}</small>
+                                    </div>
+
+                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
+
+                                    <small class="text-muted d-block">
+                                        <b>Tipo:</b> ${p.tipo}
+                                    </small>
+
+                                    ${p.componentes && p.componentes.length > 0 ? `
+                                        <div class="componentes mt-2 p-2 bg-light rounded">
+                                            <small>Componentes:</small>
+                                            <ul>
+                                                ${p.componentes.map(c =>
+                                                    `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
+                                                ).join("")}
+                                            </ul>
+                                        </div>
+                                    ` : ""}
+
+                                    ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
+                                        <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
+                                            <b>📦 Este componente é usado em:</b><br>
+                                            ${p.usado_em.map(u =>
+                                                `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
+                                            ).join("<br>")}
+                                        </div>
+                                    ` : ""}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                });
+
+                html += '</div>';
+                div.innerHTML = html;
+
+            } catch(e) {
+                div.innerHTML = `<div class="alert alert-danger">Erro: ${e.message}</div>`;
+            }
+        };
+
+        /* ✅ DESIGN: Carregar Kits */
+        async function loadKits() {
+            const div = document.getElementById('kits-list');
+            const authRequiredDiv = document.getElementById('auth-required-tabs');
+
+            if (!isAuthenticated) {
+                div.innerHTML = '';
+                authRequiredDiv.classList.remove('hidden');
+                return;
+            }
+
+            authRequiredDiv.classList.add('hidden');
+            div.innerHTML = '<div class="alert alert-info">⏳ Carregando dados. O worker em segundo plano atualiza o cache a cada 10 minutos. Se a lista estiver vazia, aguarde até 10 minutos e recarregue a página.</div>';
+
+            try {
+                const data = await fetchAPI(`${API}/kits`);
+
+                if (!data || data.length === 0) {
+                    div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Produto/Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
+                    return;
+                }
+
+                let html = `
+                <div class="table-responsive">
+                <table class="table table-sm">
+                <thead>
+                <tr>
+                    <th>IMG</th>
+                    <th>SKU</th>
+                    <th>Nome</th>
+                    <th>Componentes / Tipo</th>
+                </tr>
+                </thead>
+                <tbody>
+                `;
+
+                data.forEach(k => {
+                    const imgHtml = k.imagemURL
+                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
+                        : '<span class="text-muted">-</span>';
+
+                    let comps = '';
+                    if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
+                        comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
+                            .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
+                            .join('<br>');
+                    } else if (k.tipo === 'P') {
+                        comps = `<span class="badge bg-light text-dark border">Produto Cadastrado</span>`;
+                        if (k.pai_id) {
+                            comps += `<br><span class="badge bg-secondary">Variação</span>`;
+                        }
+                    } else {
+                        comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
+                    }
+
+                    html += `
+                        <tr onclick="openProductionChecklist('${k.nome}')" style="cursor: pointer;">
+                            <td style="width:60px">${imgHtml}</td>
+                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
+                            <td>${k.nome || 'N/D'}</td>
+                            <td>${comps}</td>
+                        </tr>
+                    `;
+                });
+
+                html += '</tbody></table></div>';
+                div.innerHTML = html;
+
+            } catch(e) {
+                div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+            }
+        }
+
+        /* ✅ DESIGN: Forçar Recarregamento */
+        async function forceAndReloadKits(event) {
+            if (!isAuthenticated) {
+                showToast('Aviso', 'Faça login primeiro!', 'warning');
+                return;
+            }
+
+            const btn = event.target;
+            btn.disabled = true;
+            btn.innerHTML = '⏳ Carregando cache... (pode levar 2-5 minutos)';
+
+            try {
+                const data = await fetchAPI('/api/force-load', { method: 'POST' });
+                showToast('Info', 'Cache sendo atualizado. Aguarde a notificação do WebSocket.', 'info');
+            } catch(e) {
+                showToast('Erro', 'Erro: ' + e.message, 'danger');
+                btn.disabled = false;
+                btn.innerHTML = '🔄 Recarregar Lista';
+            }
+        }
+
+        /* ✅ DESIGN: Gráfico KPI */
+        async function loadKPIChart() {
+            try {
+                const data = await fetchAPI('/api/sales/history');
+
+                const ctx = document.getElementById('salesChart').getContext('2d');
+
+                if (salesChart) salesChart.destroy();
+
+                salesChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: data.labels,
+                        datasets: [{
+                            label: 'Pedidos Diários',
+                            data: data.daily,
+                            borderColor: '#6366f1',
+                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
+                            tension: 0.4,
+                            fill: true,
+                            borderWidth: 2
+                        }, {
+                            label: 'Média Móvel (7 dias)',
+                            data: data.moving_avg,
+                            borderColor: '#f59e0b',
+                            borderDash: [5, 5],
+                            tension: 0.4,
+                            borderWidth: 2
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { position: 'top' },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            y: { beginAtZero: true }
+                        }
+                    }
+                });
+
+                document.getElementById('avg-daily').textContent = data.avg_daily.toFixed(1);
+                document.getElementById('growth-weekly').textContent =
+                    (data.growth > 0 ? '+' : '') + data.growth.toFixed(1) + '%';
+                document.getElementById('trend-indicator').textContent =
+                    data.growth > 10 ? '📈 Crescendo' : data.growth < -10 ? '📉 Caindo' : '📊 Estável';
+            } catch(e) {
+                console.error('Erro ao carregar gráfico KPI:', e);
+            }
+        }
+
+        /* ✅ DESIGN: Inicialização */
         document.addEventListener('DOMContentLoaded', () => {
-            init();
-
-            const searchBtn = document.getElementById('btn-search');
-            const searchInput = document.getElementById('search-input');
-
-            if (searchBtn) searchBtn.addEventListener('click', doSearch);
-            if (searchInput) {
-                searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
-            }
+            loadKits();
 
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
             if (kpiTab) kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
@@ -4513,412 +5141,37 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
                     loadProductionBoard();
-                    if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
+                    // Inicia polling automático a cada 10s (atualiza timers ao vivo para todos)
+                    if (!_boardPoll) {
+                        _boardPoll = setInterval(loadProductionBoard, 10000);
+                    }
                 });
                 componentUsageTab.addEventListener('hidden.bs.tab', () => {
+                    // Para polling e ticker ao sair da aba (economiza recursos)
                     if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
                     if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
                 });
             }
-
-            loadKits();
         });
-
-        async function doSearch() {
-            if (!isAuthenticated) { showToast('Aviso', 'Faça login primeiro!', 'warning'); return; }
-            const q = document.getElementById('search-input')?.value?.trim();
-            if (!q) { showToast('Aviso', 'Digite um SKU ou nome.', 'warning'); return; }
-            const div = document.getElementById('search-results');
-            div.innerHTML = '<div class="text-center py-4 text-muted pulse-animation">🔍 Buscando...</div>';
-            try {
-                const data = await fetchAPI(`/api/search?q=${encodeURIComponent(q)}`);
-                renderSearchResults(data, div);
-            } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro: ${escapeHtml(e.message)}</div>`;
-            }
-        }
-
-        function renderSearchResults(data, container) {
-            if (!data || (!data.orders?.length && !data.products?.length)) {
-                container.innerHTML = '<div class="alert alert-info">Nenhum resultado encontrado.</div>';
-                return;
-            }
-            let html = '';
-            if (data.orders?.length) {
-                html += `<div class="sw-card mb-4"><div class="sw-card-header"><h5>📋 Pedidos <span class="sw-accent">(${data.orders.length})</span></h5></div><div class="sw-card-body p-0"><div class="table-responsive"><table class="table"><thead><tr><th>Número</th><th>Data</th><th>Cliente</th><th>Valor</th><th>Status</th></tr></thead><tbody>`;
-                data.orders.forEach(o => {
-                    html += `<tr><td><strong>${escapeHtml(o.numero||'')}</strong></td><td>${escapeHtml(o.data||'')}</td><td>${escapeHtml(o.cliente||'')}</td><td>R$ ${escapeHtml(String(o.valor||0))}</td><td><span class="badge bg-${o.situacao==='Em aberto'?'warning':'secondary'}">${escapeHtml(o.situacao||'')}</span></td></tr>`;
-                });
-                html += '</tbody></table></div></div></div>';
-            }
-            if (data.products?.length) {
-                html += `<div class="sw-card"><div class="sw-card-header"><h5>📦 Produtos <span class="sw-accent">(${data.products.length})</span></h5></div><div class="sw-card-body p-0"><div class="table-responsive"><table class="table"><thead><tr><th>SKU</th><th>Nome</th><th>Preço</th></tr></thead><tbody>`;
-                data.products.forEach(p => {
-                    html += `<tr><td><code style="color:var(--sw-yellow);font-size:0.78rem">${escapeHtml(p.sku||'')}</code></td><td>${escapeHtml(p.nome||'')}</td><td>R$ ${escapeHtml(String(p.preco||0))}</td></tr>`;
-                });
-                html += '</tbody></table></div></div></div>';
-            }
-            container.innerHTML = html;
-        }
-
-        /* ══ KITS/PRODUCTS ══ */
-        async function loadKits() {
-            if (!isAuthenticated) return;
-            const div = document.getElementById('kits-list');
-            if (!div) return;
-            div.innerHTML = '<div class="text-center py-4 text-muted pulse-animation">⏳ Carregando produtos...</div>';
-            try {
-                const data = await fetchAPI('/api/kits');
-                if (!data || !data.kits || !data.kits.length) {
-                    div.innerHTML = '<div class="alert alert-info">Nenhum produto no cache. Clique em Recarregar.</div>';
-                    return;
-                }
-                let html = '<div class="table-responsive"><table class="table"><thead><tr><th style="width:60px"></th><th style="width:120px">SKU</th><th>Nome</th><th>Componentes</th></tr></thead><tbody>';
-                data.kits.forEach(k => {
-                    const imgHtml = k.imagem ? `<img src="${escapeHtml(k.imagem)}" style="width:48px;height:48px;object-fit:cover;border-radius:6px;border:1px solid var(--border)">` : '<div style="width:48px;height:48px;border-radius:6px;background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:1.2rem">📦</div>';
-                    let comps = '<span class="badge bg-secondary">Sem dados</span>';
-                    if (k.tipo === 'kit') comps = `<span class="badge bg-success">Kit</span>`;
-                    else if (k.tipo === 'produto') comps = `<span class="badge" style="background:var(--sw-yellow);color:var(--sw-black)">Produto</span>`;
-                    else if (k.tipo === 'servico') comps = `<span class="badge bg-info">Serviço</span>`;
-                    html += `<tr onclick="openProductionChecklist('${escapeHtml(k.nome)}')" style="cursor:pointer"><td>${imgHtml}</td><td><code style="font-size:0.75rem;color:var(--sw-yellow)">${escapeHtml(k.sku||'')}</code></td><td style="font-weight:600">${escapeHtml(k.nome||'N/D')}</td><td>${comps}</td></tr>`;
-                });
-                html += '</tbody></table></div>';
-                div.innerHTML = html;
-            } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro ao carregar lista. Verifique os logs.</div>`;
-            }
-        }
-
-        async function forceAndReloadKits(event) {
-            if (!isAuthenticated) { showToast('Aviso', 'Faça login primeiro!', 'warning'); return; }
-            const btn = event.target;
-            btn.disabled = true;
-            btn.innerHTML = '⏳ Carregando cache...';
-            try {
-                await fetchAPI('/api/force-load', { method: 'POST' });
-                showToast('Info', 'Cache sendo atualizado. Aguarde notificação.', 'info');
-            } catch(e) {
-                showToast('Erro', 'Erro: ' + e.message, 'danger');
-                btn.disabled = false;
-                btn.innerHTML = '🔄 Recarregar Lista';
-            }
-        }
-
-        /* ══ KPI CHART ══ */
-        async function loadKPIChart() {
-            try {
-                const data = await fetchAPI('/api/sales/history');
-                const ctx = document.getElementById('salesChart').getContext('2d');
-                if (salesChart) salesChart.destroy();
-                salesChart = new Chart(ctx, {
-                    type: 'line',
-                    data: {
-                        labels: data.labels,
-                        datasets: [{
-                            label: 'Pedidos Diários',
-                            data: data.daily,
-                            borderColor: '#ffb600',
-                            backgroundColor: 'rgba(255,182,0,0.1)',
-                            tension: 0.4,
-                            fill: true,
-                            borderWidth: 2,
-                            pointBackgroundColor: '#ffb600',
-                            pointRadius: 3
-                        }, {
-                            label: 'Média Móvel (7 dias)',
-                            data: data.moving_avg,
-                            borderColor: 'rgba(255,255,255,0.3)',
-                            borderDash: [5, 5],
-                            tension: 0.4,
-                            borderWidth: 2,
-                            pointRadius: 0
-                        }]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {
-                            legend: {
-                                position: 'top',
-                                labels: { color: '#01010d', font: { family: 'Inter', weight: '600', size: 11 } }
-                            },
-                            tooltip: { mode: 'index', intersect: false }
-                        },
-                        scales: {
-                            x: { grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { color: '#807f7f', font: { size: 10 } } },
-                            y: { beginAtZero: true, grid: { color: 'rgba(0,0,0,0.05)' }, ticks: { color: '#807f7f', font: { size: 10 } } }
-                        }
-                    }
-                });
-                const avgEl = document.getElementById('avg-daily');
-                const growthEl = document.getElementById('growth-weekly');
-                const trendEl = document.getElementById('trend-indicator');
-                if (avgEl) avgEl.textContent = data.avg_daily?.toFixed(1) ?? '0';
-                if (growthEl) growthEl.textContent = (data.growth > 0 ? '+' : '') + (data.growth?.toFixed(1) ?? '0') + '%';
-                if (trendEl) trendEl.textContent = data.growth > 10 ? '📈 Crescendo' : data.growth < -10 ? '📉 Caindo' : '📊 Estável';
-            } catch(e) { console.error('loadKPIChart:', e); }
-        }
-
-        /* ══ PRODUCTION BOARD ══ */
-        let _boardPoll = null;
-        let _boardTick = null;
-        let _timerData = {};
-
-        async function loadProductionBoard() {
-            try {
-                const data = await fetchAPI('/api/production/board');
-                renderProductionBoard(data);
-            } catch(e) { console.error('loadProductionBoard:', e); }
-        }
-
-        function renderProductionBoard(data) {
-            const section = document.getElementById('production-board-section');
-            if (!section) return;
-            const waiting = data.waiting || [];
-            const inProd = data.in_production || [];
-            const done = data.done || [];
-
-            const wBadge = document.getElementById('waiting-count-badge');
-            const iBadge = document.getElementById('inprod-count-badge');
-            const dBadge = document.getElementById('done-count-badge');
-            if (wBadge) wBadge.textContent = waiting.length;
-            if (iBadge) iBadge.textContent = inProd.length;
-            if (dBadge) dBadge.textContent = done.length;
-
-            _timerData = {};
-            inProd.forEach(item => { if (item.timer_start) _timerData[item.id] = item.timer_start; });
-
-            let html = '<div class="row g-0">';
-            // Coluna Espera
-            html += `<div class="col-md-4" style="border-right:1px solid var(--border)">
-                <div class="prod-col-header" style="color:var(--sw-yellow)">⏳ Em Espera <span class="count-pill">${waiting.length}</span></div>`;
-            if (!waiting.length) html += '<div class="text-center text-muted py-4" style="font-size:0.8rem">Nenhum pedido</div>';
-            waiting.forEach(item => {
-                html += `<div class="prod-card-item" onclick="openProductionChecklist('${escapeHtml(item.nome||'')}')">
-                    <div class="prod-name">${escapeHtml(item.nome||'N/D')}</div>
-                    <div class="prod-meta">SKU: ${escapeHtml(item.sku||'')} • Qtd: ${item.qtd||1}</div>
-                </div>`;
-            });
-            html += '</div>';
-
-            // Coluna Produzindo
-            html += `<div class="col-md-4" style="border-right:1px solid var(--border)">
-                <div class="prod-col-header" style="color:#10b981">⚙️ Produzindo <span class="count-pill" style="background:#10b981">${inProd.length}</span></div>`;
-            if (!inProd.length) html += '<div class="text-center text-muted py-4" style="font-size:0.8rem">Nenhum em produção</div>';
-            inProd.forEach(item => {
-                html += `<div class="prod-card-item" onclick="openProductionChecklist('${escapeHtml(item.nome||'')}')">
-                    <div class="d-flex justify-content-between align-items-start">
-                        <div>
-                            <div class="prod-name">${escapeHtml(item.nome||'N/D')}</div>
-                            <div class="prod-meta">SKU: ${escapeHtml(item.sku||'')}</div>
-                        </div>
-                        <div class="prod-timer" id="timer-${escapeHtml(item.id||'')}">--:--</div>
-                    </div>
-                </div>`;
-            });
-            html += '</div>';
-
-            // Coluna Concluídos
-            html += `<div class="col-md-4">
-                <div class="prod-col-header" style="color:var(--sw-gray)">✅ Concluídos <span class="count-pill" style="background:var(--sw-gray)">${done.length}</span></div>`;
-            if (!done.length) html += '<div class="text-center text-muted py-4" style="font-size:0.8rem">Nenhum concluído</div>';
-            done.slice(0,10).forEach(item => {
-                html += `<div class="prod-card-item">
-                    <div class="prod-name" style="color:var(--text-muted)">${escapeHtml(item.nome||'N/D')}</div>
-                    <div class="prod-meta">${escapeHtml(item.tempo_producao||'')}</div>
-                </div>`;
-            });
-            html += '</div>';
-            html += '</div>';
-            section.innerHTML = html;
-
-            // Iniciar ticker de timers
-            if (_boardTick) clearInterval(_boardTick);
-            _boardTick = setInterval(tickTimers, 1000);
-        }
-
-        function tickTimers() {
-            const now = Date.now() / 1000;
-            for (const [id, start] of Object.entries(_timerData)) {
-                const el = document.getElementById(`timer-${id}`);
-                if (!el) continue;
-                const elapsed = Math.floor(now - start);
-                const h = String(Math.floor(elapsed / 3600)).padStart(2,'0');
-                const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2,'0');
-                const s = String(elapsed % 60).padStart(2,'0');
-                el.textContent = elapsed >= 3600 ? `${h}:${m}:${s}` : `${m}:${s}`;
-            }
-        }
-
-        async function syncAndRefreshPending() {
-            if (!isAuthenticated) { showToast('Aviso', 'Faça login primeiro!', 'warning'); return; }
-            try {
-                await fetchAPI('/api/production/sync', { method: 'POST' });
-                showToast('Sincronizado', 'Painel atualizado com dados do Bling.', 'success');
-                await loadProductionBoard();
-            } catch(e) { showToast('Erro', e.message, 'danger'); }
-        }
-
-        /* ══ COMPONENT TAB ══ */
-        async function refreshComponentTab() {
-            await Promise.all([loadConsumptionTable(), loadProductionHistory()]);
-        }
-
-        async function loadConsumptionTable() {
-            const section = document.getElementById('consumption-table-section');
-            if (!section) return;
-            try {
-                const data = await fetchAPI('/api/consumption');
-                const badge = document.getElementById('consumption-total-badge');
-                const label = document.getElementById('consumption-month-label');
-                if (!data || !data.items?.length) {
-                    section.innerHTML = '<div class="text-center py-4 text-muted">Nenhum dado de consumo.</div>';
-                    if (badge) badge.textContent = '0 insumos';
-                    return;
-                }
-                if (badge) badge.textContent = `${data.items.length} insumos`;
-                if (label && data.month) label.textContent = `${data.month} • Reinicia todo mês`;
-                let html = '<div class="table-responsive"><table class="table"><thead><tr><th>Insumo</th><th>Qtd. Consumida</th><th>Unidade</th></tr></thead><tbody>';
-                data.items.forEach(item => {
-                    html += `<tr><td style="font-weight:600">${escapeHtml(item.nome||'')}</td><td><strong style="color:var(--sw-yellow)">${item.qtd||0}</strong></td><td><span class="badge bg-light" style="color:var(--sw-black)">${escapeHtml(item.un||'')}</span></td></tr>`;
-                });
-                html += '</tbody></table></div>';
-                section.innerHTML = html;
-            } catch(e) { section.innerHTML = '<div class="text-center py-4 text-muted">Erro ao carregar consumo.</div>'; }
-        }
-
-        async function loadProductionHistory() {
-            const section = document.getElementById('production-history-section');
-            if (!section) return;
-            try {
-                const data = await fetchAPI('/api/production/history');
-                if (!data || !data.items?.length) {
-                    section.innerHTML = '<div class="text-center py-4 text-muted">Nenhum histórico este mês.</div>';
-                    return;
-                }
-                let html = '<div class="table-responsive"><table class="table"><thead><tr><th>Produto</th><th>Finalizado em</th><th>Tempo de Produção</th><th>Responsável</th></tr></thead><tbody>';
-                data.items.forEach(item => {
-                    html += `<tr><td style="font-weight:600">${escapeHtml(item.nome||'')}</td><td style="color:var(--text-muted)">${escapeHtml(item.data_fim||'')}</td><td><span class="prod-timer" style="font-size:0.9rem">${escapeHtml(item.tempo||'')}</span></td><td>${escapeHtml(item.responsavel||'-')}</td></tr>`;
-                });
-                html += '</tbody></table></div>';
-                section.innerHTML = html;
-            } catch(e) { section.innerHTML = '<div class="text-center py-4 text-muted">Erro ao carregar histórico.</div>'; }
-        }
-
-        /* ══ PRODUCTION CHECKLIST MODAL ══ */
-        async function openProductionChecklist(productName) {
-            if (!isAuthenticated) { showToast('Aviso', 'Faça login primeiro!', 'warning'); return; }
-            const existingModal = document.getElementById('productionModal');
-            if (existingModal) { try { bootstrap.Modal.getInstance(existingModal)?.hide(); } catch(e) {} existingModal.remove(); }
-
-            let checklistData = null;
-            try {
-                checklistData = await fetchAPI(`/api/production/checklist?nome=${encodeURIComponent(productName)}`);
-            } catch(e) { showToast('Erro', 'Não foi possível carregar checklist.', 'danger'); return; }
-
-            let timerInterval = null;
-            let timerStart = null;
-            const itemId = checklistData?.id;
-
-            const modalHtml = `
-                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
-                    <div class="modal-dialog modal-lg modal-dialog-centered">
-                        <div class="modal-content">
-                            <div class="modal-header">
-                                <h5 class="modal-title">🛠️ Produção: ${escapeHtml(productName)}</h5>
-                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
-                            </div>
-                            <div class="modal-body p-4">
-                                <div class="d-flex justify-content-between align-items-center mb-4">
-                                    <div>
-                                        <div style="font-size:0.7rem;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-muted)">Tempo de Produção</div>
-                                        <div class="prod-timer" id="modal-timer" style="font-size:2.5rem">00:00</div>
-                                    </div>
-                                    <div class="d-flex gap-2">
-                                        <button class="btn btn-primary" id="btn-start-prod" onclick="startProductionTimer('${escapeHtml(itemId||'')}')">▶ Iniciar</button>
-                                        <button class="btn btn-outline-secondary" id="btn-finish-prod" onclick="finishProduction('${escapeHtml(itemId||'')}', '${escapeHtml(productName)}')">✅ Concluir</button>
-                                    </div>
-                                </div>
-                                <div id="checklist-items">
-                                    ${renderChecklistItems(checklistData?.components || [])}
-                                </div>
-                            </div>
-                            <div class="modal-footer">
-                                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">Fechar</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>`;
-
-            document.body.insertAdjacentHTML('beforeend', modalHtml);
-            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
-            modal.show();
-
-            // Verificar se já tem timer ativo
-            if (checklistData?.timer_start) {
-                timerStart = checklistData.timer_start;
-                startModalTimer();
-                document.getElementById('btn-start-prod').disabled = true;
-                document.getElementById('btn-start-prod').textContent = '⚙️ Em Produção';
-            }
-
-            function startModalTimer() {
-                const el = document.getElementById('modal-timer');
-                timerInterval = setInterval(() => {
-                    if (!el) { clearInterval(timerInterval); return; }
-                    const elapsed = Math.floor(Date.now()/1000 - timerStart);
-                    const h = String(Math.floor(elapsed/3600)).padStart(2,'0');
-                    const m = String(Math.floor((elapsed%3600)/60)).padStart(2,'0');
-                    const s = String(elapsed%60).padStart(2,'0');
-                    el.textContent = elapsed >= 3600 ? `${h}:${m}:${s}` : `${m}:${s}`;
-                }, 1000);
-            }
-
-            window.startProductionTimer = async function(id) {
-                try {
-                    const res = await fetchAPI('/api/production/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, nome: productName}) });
-                    timerStart = res.timer_start || Date.now()/1000;
-                    startModalTimer();
-                    const btn = document.getElementById('btn-start-prod');
-                    if (btn) { btn.disabled = true; btn.textContent = '⚙️ Em Produção'; }
-                    showToast('Produção Iniciada', `Timer iniciado para ${productName}`, 'success');
-                    loadProductionBoard();
-                } catch(e) { showToast('Erro', e.message, 'danger'); }
-            };
-
-            window.finishProduction = async function(id, nome) {
-                try {
-                    clearInterval(timerInterval);
-                    await fetchAPI('/api/production/finish', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({id, nome}) });
-                    const modalEl = document.getElementById('productionModal');
-                    if (modalEl) { try { (bootstrap.Modal.getInstance(modalEl)||new bootstrap.Modal(modalEl)).hide(); } catch(e) {} setTimeout(() => modalEl.remove(), 300); }
-                    showToast('Concluído!', `${nome} finalizado com sucesso!`, 'success');
-                    loadProductionBoard();
-                    refreshComponentTab();
-                } catch(e) { showToast('Erro', e.message, 'danger'); }
-            };
-        }
-
-        function renderChecklistItems(components) {
-            if (!components?.length) return '<p class="text-muted text-center py-3">Sem componentes cadastrados.</p>';
-            return components.map((c, i) => `
-                <div class="d-flex align-items-center gap-3 p-3 mb-2" style="background:white;border:1px solid var(--border);border-radius:var(--radius-sm);transition:all 0.2s ease">
-                    <input type="checkbox" id="chk-${i}" style="width:18px;height:18px;accent-color:var(--sw-yellow);cursor:pointer">
-                    <label for="chk-${i}" style="cursor:pointer;font-size:0.85rem;font-weight:500;flex:1">${escapeHtml(c.nome||'')} <span style="color:var(--text-muted);font-weight:400">× ${c.qtd||1} ${escapeHtml(c.un||'')}</span></label>
-                </div>`).join('');
-        }
-
     </script>
 
     <!-- FOOTER -->
-    <footer class="sw-footer">
-        <div>
-            <p><strong>SW Móveis MDF</strong> — Gestão Inteligente de Pedidos</p>
-            <small>© 2025 — Desenvolvido por João Victor Dias Santana</small>
-        </div>
-        <div style="text-align:right">
-            <p><strong>Versão</strong> 4.6</p>
-            <small>Sistema Integrado Bling API v3</small>
+    <footer class="bg-primary text-white mt-5 py-4">
+        <div class="container-fluid px-4">
+            <div class="row align-items-center">
+                <div class="col-md-6">
+                    <p class="mb-0">
+                        <strong style="color:var(--sw-yellow)">SW Móveis MDF</strong> — Gestão Inteligente de Pedidos
+                    </p>
+                    <small class="text-white-50">© 2025 — Desenvolvido por João Victor Dias Santana</small>
+                </div>
+                <div class="col-md-6 text-md-end">
+                    <p class="mb-0">
+                        <strong style="color:var(--sw-yellow)">Versão</strong> 4.6
+                    </p>
+                    <small class="text-white-50">Sistema Integrado Bling API v3</small>
+                </div>
+            </div>
         </div>
     </footer>
     <div class="sw-pattern-bar"></div>
