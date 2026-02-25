@@ -1326,6 +1326,9 @@ class ProductionTimer:
 
     def stop_and_log(self, produto_nome):
         """Finaliza produção: pausa timer, registra componentes e salva histórico."""
+        # BUG FIX: timer_key pode ser "produto||item_key" — extrair nome real do produto
+        nome_real = produto_nome.split('||')[0] if '||' in produto_nome else produto_nome
+
         # Recupera checklist antes de pausar
         checklist_marcado = {}
         if produto_nome in self.timers:
@@ -1335,22 +1338,28 @@ class ProductionTimer:
         else:
             # Timer não existe (concluído direto do board sem abrir modal)
             total_seconds = 0
+            logger.info(f"⚠️ Timer não encontrado para '{produto_nome}' — registrando com tempo 0")
 
-        # Registra componentes da receita não marcados manualmente
-        if 'CADEIRA' in produto_nome.upper():
+        # BUG FIX: Registra TODOS os componentes não marcados da receita ao concluir
+        # Isso garante que a produção que esqueceu de marcar seja contabilizada
+        if 'CADEIRA' in nome_real.upper():
+            auto_registrados = 0
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
                 if not checklist_marcado.get(nome_comp, False):
                     try:
                         component_consumption.register_component(
-                            nome_comp, comp['qtd'], comp['un'], produto_nome
+                            nome_comp, comp['qtd'], comp['un'], nome_real
                         )
+                        auto_registrados += 1
                     except Exception as e:
                         logger.error(f"Auto-registro componente '{nome_comp}': {e}")
-            logger.info(f"✅ Componentes registrados para '{produto_nome}'")
+            if auto_registrados > 0:
+                logger.info(f"✅ Auto-registrados {auto_registrados} componentes faltantes para '{nome_real}'")
+            logger.info(f"✅ Todos componentes processados para '{nome_real}'")
 
         registro = {
-            "produto": produto_nome,
+            "produto": nome_real,
             "tempo_segundos": total_seconds,
             "data_conclusao": datetime.now().isoformat(),
             "timestamp": time.time(),
@@ -1501,24 +1510,35 @@ class ComponentConsumptionManager:
             month_data['components'][component_name] = {'qtd': 0, 'un': unit, 'registros': []}
 
         comp = month_data['components'][component_name]
-        comp['qtd'] = round(comp['qtd'] + qty, 3)
         comp['un'] = unit
 
-        registro = {
-            'produto': product_name,
-            'qtd': qty,
-            'timestamp': datetime.now().isoformat()
-        }
-        comp['registros'].append(registro)
-
-        # Log geral
-        month_data['checklist_logs'].append({
-            'componente': component_name,
-            'produto': product_name,
-            'qtd': qty,
-            'un': unit,
-            'timestamp': datetime.now().isoformat()
-        })
+        # BUG FIX: Verificar se já existe registro deste produto para este componente
+        # (evita duplicação quando marca-desmarca-remarca)
+        existing_idx = next((i for i, r in enumerate(comp['registros']) 
+                             if r.get('produto') == product_name), None)
+        
+        if existing_idx is not None:
+            # Já existe: apenas atualiza o timestamp (não soma novamente)
+            comp['registros'][existing_idx]['timestamp'] = datetime.now().isoformat()
+            # A quantidade já foi somada anteriormente, não somar novamente
+        else:
+            # Novo registro: soma a quantidade e adiciona
+            comp['qtd'] = round(comp['qtd'] + qty, 3)
+            registro = {
+                'produto': product_name,
+                'qtd': qty,
+                'timestamp': datetime.now().isoformat()
+            }
+            comp['registros'].append(registro)
+            
+            # Log geral (só quando realmente soma)
+            month_data['checklist_logs'].append({
+                'componente': component_name,
+                'produto': product_name,
+                'qtd': qty,
+                'un': unit,
+                'timestamp': datetime.now().isoformat()
+            })
 
         self._save()
         return comp
@@ -1552,11 +1572,14 @@ class ComponentConsumptionManager:
         summary = []
         for nome, info in month['components'].items():
             todos = info.get('registros', [])
+            # BUG FIX: num_registros conta o número de registros únicos por produto
+            # Um mesmo produto pode ter múltiplos registros (marca-desmarca-remarca)
+            produtos_unicos = len(set(r.get('produto', '') for r in todos))
             summary.append({
                 'nome': nome,
                 'qtd_total': info['qtd'],
                 'un': info['un'],
-                'num_registros': len(todos),
+                'num_registros': max(len(todos), produtos_unicos),
                 'registros': todos[-5:]
             })
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
@@ -2689,49 +2712,94 @@ class WebServer:
             - done: concluídos do mês (para histórico)
             - timers_orphan: timers sem item_key (iniciados manualmente)
             """
-            # Mapa de produto_nome -> timer
             timers = production_timer.timers
-            timer_map = {}
-            for nome, t in timers.items():
+
+            def _timer_info(t):
                 total = t.get('accumulated', 0)
                 if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
                     total += time.time() - t['start_ts']
-                timer_map[nome] = {
+                return {
                     'estado': t.get('state', 'paused'),
                     'tempo_decorrido': int(total),
                     'checklist': t.get('checklist', {}),
                     'created_at': t.get('created_at', ''),
                 }
 
-            # Enriquece in_production com dados do timer
+            # Mapa timer_key -> timer info
+            # Suporta tanto "produto||item_key" (novo) quanto "produto" (legado)
+            timer_map_by_key = {}   # item_key -> timer_info (lookup por item_key)
+            timer_map_by_nome = {}  # nome -> timer_info (fallback legado)
+            for tkey, t in timers.items():
+                info = _timer_info(t)
+                if '||' in tkey:
+                    # Novo formato: "produto_nome||item_key"
+                    parts = tkey.split('||', 1)
+                    timer_map_by_key[parts[1]] = {**info, 'timer_key': tkey}
+                    timer_map_by_nome[parts[0]] = {**info, 'timer_key': tkey}
+                else:
+                    # Legado: chave é nome do produto
+                    timer_map_by_nome[tkey] = {**info, 'timer_key': tkey}
+
+            # Enriquece in_production com dados do timer correto
             in_prod = []
             for item in pending_orders.get_in_production():
+                ikey = item.get('item_key', '')
                 nome = item.get('nome') or item.get('nome_original', '')
-                t_info = timer_map.get(nome, {})
-                in_prod.append({**item, **t_info})
+                # Tenta primeiro pelo item_key único, depois por nome (legado)
+                t_info = timer_map_by_key.get(ikey) or timer_map_by_nome.get(nome) or {}
+                # BUG FIX: Re-extrair base/cor se não foram populados na sincronização
+                enriched = {**item, **t_info}
+                if not enriched.get('cor') and not enriched.get('base'):
+                    nome_raw = enriched.get('nome_original') or nome or ''
+                    base_r, cor_r = _extract_base_cor(nome)
+                    if not base_r and not cor_r:
+                        base_r, cor_r = _extract_base_cor(nome_raw)
+                    if base_r: enriched['base'] = base_r
+                    if cor_r: enriched['cor'] = cor_r
+                in_prod.append(enriched)
 
-            # Timers sem pedido vinculado (iniciados manualmente)
-            nomes_com_pedido = {
-                (v.get('nome') or v.get('nome_original', ''))
-                for v in pending_orders.data.values()
-            }
+            # Timers sem pedido vinculado (iniciados via modal diretamente)
+            ikeys_com_pedido = {v.get('item_key', '') for v in pending_orders.data.values()}
+            nomes_com_pedido = {(v.get('nome') or v.get('nome_original', '')) for v in pending_orders.data.values()}
             orphan = []
-            for nome, t in timers.items():
-                if nome not in nomes_com_pedido:
-                    total = t.get('accumulated', 0)
-                    if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
-                        total += time.time() - t['start_ts']
-                    orphan.append({
-                        'nome': nome,
-                        'estado': t.get('state', 'paused'),
-                        'tempo_decorrido': int(total),
-                        'checklist': t.get('checklist', {}),
-                        'created_at': t.get('created_at', ''),
-                        'item_key': None,
-                    })
+            for tkey, t in timers.items():
+                # Verifica se está vinculado a algum pedido
+                if '||' in tkey:
+                    ikey_part = tkey.split('||', 1)[1]
+                    if ikey_part in ikeys_com_pedido:
+                        continue  # Já está em in_prod
+                    nome_display = tkey.split('||', 1)[0]
+                else:
+                    if tkey in nomes_com_pedido:
+                        continue
+                    nome_display = tkey
+                info = _timer_info(t)
+                orphan.append({
+                    'nome': nome_display,
+                    'estado': info['estado'],
+                    'tempo_decorrido': info['tempo_decorrido'],
+                    'checklist': info['checklist'],
+                    'created_at': info['created_at'],
+                    'item_key': None,
+                    'timer_key': tkey,
+                })
+
+            # BUG FIX: Re-extrair base/cor para itens em espera também
+            waiting_enriched = []
+            for item in pending_orders.get_waiting():
+                enriched = dict(item)
+                if not enriched.get('cor') and not enriched.get('base'):
+                    nome = enriched.get('nome') or enriched.get('nome_original', '')
+                    nome_raw = enriched.get('nome_original', '')
+                    base_r, cor_r = _extract_base_cor(nome)
+                    if not base_r and not cor_r:
+                        base_r, cor_r = _extract_base_cor(nome_raw)
+                    if base_r: enriched['base'] = base_r
+                    if cor_r: enriched['cor'] = cor_r
+                waiting_enriched.append(enriched)
 
             return jsonify({
-                'waiting': pending_orders.get_waiting(),
+                'waiting': waiting_enriched,
                 'in_production': in_prod,
                 'orphan_timers': orphan,
                 'done': pending_orders.get_done(),
@@ -2751,11 +2819,22 @@ class WebServer:
             produto = data.get('produto', '')
             componente = data.get('componente', '')
             checked = data.get('checked', False)
-            if produto and componente and produto in production_timer.timers:
+            if produto and componente:
+                # BUG FIX: Cria o timer automaticamente se não existir
+                # Antes bloqueava silenciosamente, causando 0 registros de consumo
+                if produto not in production_timer.timers:
+                    production_timer.timers[produto] = {
+                        'start_ts': 0,
+                        'accumulated': 0,
+                        'state': 'paused',
+                        'created_at': datetime.now().isoformat(),
+                        'checklist': {}
+                    }
                 if 'checklist' not in production_timer.timers[produto]:
                     production_timer.timers[produto]['checklist'] = {}
                 production_timer.timers[produto]['checklist'][componente] = checked
                 production_timer._save()
+                logger.debug(f"Checklist salvo: produto={produto} comp={componente} checked={checked}")
             return jsonify({'ok': True})
 
         @self.app.route('/api/consumption/register', methods=['POST'])
@@ -2842,9 +2921,15 @@ class WebServer:
             if not item_key:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             item = pending_orders.start_production(item_key)
-            # Inicia o timer de produção com o nome do produto
+            # BUG FIX: Usar timer_key único = "produto||item_key" para não misturar
+            # timers de pedidos diferentes do mesmo produto
             if produto_nome:
-                production_timer.start(produto_nome)
+                timer_key = f"{produto_nome}||{item_key}"
+                production_timer.start(timer_key)
+                # Salva o timer_key no item para usar no finish
+                if item_key in pending_orders.data:
+                    pending_orders.data[item_key]['timer_key'] = timer_key
+                    pending_orders._save_one(item_key)
             return jsonify({'success': True, 'item': item})
 
         @self.app.route('/api/pending-orders/finish', methods=['POST'])
@@ -2855,9 +2940,14 @@ class WebServer:
             produto_nome = data.get('produto_nome', '')
             if not item_key:
                 return jsonify({'error': 'item_key obrigatório'}), 400
+            # BUG FIX: Recupera timer_key único salvo no item
+            item_data = pending_orders.data.get(item_key, {})
+            timer_key = item_data.get('timer_key') or (f"{produto_nome}||{item_key}" if produto_nome else None)
             item = pending_orders.finish_production(item_key)
-            # Finaliza o timer
-            if produto_nome:
+            # Finaliza o timer usando o timer_key único
+            if timer_key:
+                production_timer.stop_and_log(timer_key)
+            elif produto_nome:
                 production_timer.stop_and_log(produto_nome)
             return jsonify({'success': True, 'item': item})
 
@@ -4289,15 +4379,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             let checklistHtml = '';
 
             if (isCadeira) {
+                // BUG FIX: Usar dataset encodado corretamente para productName
+                // Usar onchange no checkbox diretamente (não onclick no div container)
+                // Evita o problema de double-fire e estado invertido
+                const encodedName = encodeURIComponent(productName);
                 checklistHtml = `
                     <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
                     <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
                         ${RECIPE_CADEIRA.map((item, i) => `
                             <div class="col-md-6">
                                 <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
-                                     style="cursor:pointer; transition: all .2s;"
-                                     data-pname="${productName}" onclick="toggleChecklist(this, ${i}, this.dataset.pname)">
-                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}" onclick="event.stopPropagation()">
+                                     id="checklist-row-${i}"
+                                     style="cursor:pointer; transition: background 0.2s, border-color 0.2s;">
+                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}"
+                                        onchange="handleChecklistChange(this, ${i}, '${encodedName}')">
                                     <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
                                         ${item.nome} 
                                         <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
@@ -4331,14 +4426,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                             00:00:00
                                         </div>
                                         <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
-                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-produto="${productName}">
-                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', document.getElementById('timer-btn-group').dataset.produto)">
+                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-produto="${encodeURIComponent(productName)}">
+                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
                                                 ▶ Iniciar
                                             </button>
-                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', document.getElementById('timer-btn-group').dataset.produto)">
+                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
                                                 ⏸ Pausar
                                             </button>
-                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', document.getElementById('timer-btn-group').dataset.produto)">
+                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
                                                 ↺ Zerar
                                             </button>
                                         </div>
@@ -4353,7 +4448,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     Fechar
                                 </button>
                                 <button type="button" class="btn btn-success px-4 fw-bold"
-                                    onclick="controlTimer('finish', document.getElementById('timer-btn-group').dataset.produto)">
+                                    onclick="controlTimer('finish', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
                                     ✅ CONCLUIR & SALVAR
                                 </button>
                             </div>
@@ -4388,11 +4483,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 RECIPE_CADEIRA.forEach((item, i) => {
                     if (saved[item.nome]) {
                         const cb = document.getElementById(`check${i}`);
-                        const container = cb && cb.closest('.checklist-item');
-                        if (cb && container) {
+                        const row = document.getElementById(`checklist-row-${i}`);
+                        if (cb) {
                             cb.checked = true;
-                            container.style.background = '#d1fae5';
-                            container.style.borderColor = '#10b981';
+                            if (row) {
+                                row.style.background = '#d1fae5';
+                                row.style.borderColor = '#10b981';
+                            }
                         }
                     }
                 });
@@ -4410,30 +4507,40 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        function toggleChecklist(container, idx, productName) {
-            const cb = container.querySelector('input[type=checkbox]');
-            // IMPORTANTE: cb.checked já foi atualizado pelo browser antes do onclick
-            // NAO inverter aqui — isso causava bug de estado invertido
+        // NOVA FUNÇÃO: handleChecklistChange — acionada pelo onchange do checkbox
+        // Corrige bug de double-fire e estado invertido do toggleChecklist anterior
+        function handleChecklistChange(cb, idx, encodedName) {
+            const productName = decodeURIComponent(encodedName);
             const isChecked = cb.checked;
             const item = RECIPE_CADEIRA[idx];
+            const row = document.getElementById('checklist-row-' + idx);
 
-            if (isChecked) {
-                container.style.background = '#d1fae5';
-                container.style.borderColor = '#10b981';
-            } else {
-                container.style.background = '';
-                container.style.borderColor = '';
+            if (row) {
+                if (isChecked) {
+                    row.style.background = '#d1fae5';
+                    row.style.borderColor = '#10b981';
+                } else {
+                    row.style.background = '';
+                    row.style.borderColor = '';
+                }
             }
 
-            // Salva checklist e registra consumo com o estado correto
+            // Salva estado da checklist no servidor
             fetch('/api/checklist/state', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ produto: productName, componente: item.nome, checked: isChecked })
-            }).catch(e => console.error('Erro checklist:', e));
+            }).catch(e => console.error('Erro ao salvar checklist:', e));
 
+            // Registra consumo
             registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
             _updateChecklistProgress();
+        }
+
+        // Mantido como stub de compatibilidade (pode ser chamado por código antigo)
+        function toggleChecklist(container, idx, productName) {
+            const cb = container.querySelector('input[type=checkbox]');
+            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(productName));
         }
 
         async function registerConsumption(componentName, qty, unit, productName, checked) {
@@ -4667,11 +4774,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     _boardTimerState[nome] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
 
                     const finishBtn = itemKey
-                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="finishBoardItem('${itemKey}','${nomeSafe}')">✅ Concluir</button>`
-                        : `<button class="btn btn-xs btn-success btn-sm ms-1" onclick="controlTimer('finish','${nomeSafe}')">✅ Concluir</button>`;
+                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome)">✅ Concluir</button>`
+                        : `<button class="btn btn-xs btn-success btn-sm ms-1" data-pnome="${nomeSafe}" onclick="controlTimer('finish', this.dataset.pnome)">✅ Concluir</button>`;
 
+                    const imgUrlProd = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
+                    const imgTagProd = imgUrlProd ? `<img src="${imgUrlProd}" alt="" loading="lazy" style="width:38px;height:38px;object-fit:contain;border-radius:5px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">` : '';
                     html += `<tr>
-                        <td class="ps-3 fw-bold">${nomeSafe}</td>
+                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTagProd}<span style="vertical-align:middle;">${nomeSafe}</span></td>
                         <td class="text-muted small">${base}</td>
                         <td class="text-muted small">${cor}</td>
                         <td class="text-center">
@@ -4687,7 +4796,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             <span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>
                         </td>
                         <td class="text-center">
-                            <button class="btn btn-xs btn-outline-primary btn-sm" onclick="openProductionChecklist('${nomeSafe}')">🛠 Abrir</button>
+                            <button class="btn btn-xs btn-outline-primary btn-sm" data-nome="${nomeSafe}" onclick="openProductionChecklist(this.dataset.nome)">🛠 Abrir</button>
                             ${finishBtn}
                         </td>
                     </tr>`;
