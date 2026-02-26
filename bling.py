@@ -99,7 +99,6 @@ except Exception as _mongo_err:
     MONGO_AVAILABLE = False
     _mongo_db = None
 
-
 class MongoStore:
     """
     Camada de acesso unificada ao MongoDB.
@@ -171,7 +170,6 @@ class MongoStore:
             return True
         except Exception:
             return False
-
 
 # ============================================================================
 # CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
@@ -533,7 +531,6 @@ def load_products_cache(cache_file):
         logger.warning(f"[WARN] Falha ao carregar cache do disco: {e}")
         return {}
 
-
 def save_products_cache(cache_file, products, kits):
     """
     Salva cache de produtos e kits no disco.
@@ -672,33 +669,15 @@ class BlingAPIClient:
         kwargs.setdefault('headers', {})
         kwargs['headers']['Authorization'] = f'Bearer {token}'
         
-        # --- DEBUG: log de entrada da requisição ---
-        self.logger.debug(f"API REQ -> {method} {url} params={kwargs.get('params')} json_keys={list(kwargs.get('json', {}).keys()) if kwargs.get('json') else None}")
-
         # Rate Limiter
         self.rate_limiter.wait()
-        
+
         try:
             start_time = time.time()
-            # Timeout aumentado para evitar quedas em queries lentas do Bling
             response = self.session.request(method, url, timeout=45, **kwargs)
             latency = time.time() - start_time
-            
-            # DEBUG: log de status e tamanho do body
-            text_len = len(response.text) if response.text else 0
-            self.logger.debug(f"API RESP <- {method} {url} status={response.status_code} text_len={text_len}")
-
             self.metrics.record_request(response.status_code, latency)
-            
-            # tenta parse do JSON e logar keys top-level (para entender formato)
-            try:
-                resp_json = response.json()
-                if isinstance(resp_json, dict):
-                    self.logger.debug(f"API JSON KEYS: {list(resp_json.keys())}")
-                else:
-                    self.logger.debug(f"API JSON TYPE: {type(resp_json)}")
-            except Exception as e:
-                self.logger.debug(f"API JSON parse failed: {e}")
+            self.logger.debug(f"API {method} {endpoint} -> {response.status_code} ({latency*1000:.0f}ms)")
 
             # Tratamento de Token Expirado (401)
             if response.status_code == 401:
@@ -815,7 +794,6 @@ class AuthManager:
     def __init__(self, config: Config):
         self.config = config
         
-        # --- ADICIONE ESTA VERIFICAÇÃO ---
         if not self.config.REDIRECT_URI:
             raise ValueError("CRÍTICO: BLING_REDIRECT_URI não configurada nas variáveis de ambiente!")
         # ---------------------------------
@@ -1128,7 +1106,6 @@ class SalesManager:
         inicio_semana = hoje - timedelta(days=hoje.weekday())
         inicio_mes = hoje.replace(day=1)
         
-        # --- MUDANÇA AQUI: Janela móvel de 30 dias para o Gráfico ---
         inicio_grafico = hoje - timedelta(days=29) # Últimos 30 dias
         
         daily_orders = []
@@ -1166,7 +1143,7 @@ class SalesManager:
                 # Dados para o Gráfico (Últimos 30 dias)
                 if dt_pedido >= inicio_grafico:
                     daily_counts_chart[dt_pedido] += 1
-            except:
+            except Exception:
                 continue
 
         # Gera eixo X do gráfico (30 dias corridos)
@@ -1210,8 +1187,8 @@ class ProductionTimer:
 
     def __init__(self):
         self.timers = self._load()
+        self._active_savers: set = set()  # rastreia nomes com saver ativo
         self._auto_pause_on_restart()
-        # Lança savers para TODOS os timers existentes (running ou paused)
         for nome in list(self.timers.keys()):
             self._launch_background_saver(nome)
 
@@ -1286,22 +1263,30 @@ class ProductionTimer:
         return self.get_status(produto_nome)
 
     def _launch_background_saver(self, nome):
-        """Thread que faz checkpoint do timer a cada 30s enquanto existir (running ou paused)."""
+        """Thread que faz checkpoint do timer a cada 30s. Garante no máximo 1 thread por timer."""
+        if nome in self._active_savers:
+            return  # Já existe saver para este timer
+        self._active_savers.add(nome)
+
         def background_saver():
-            while True:
-                time.sleep(30)
-                if nome not in self.timers:
-                    break  # Timer foi removido (concluído/zerado)
-                t = self.timers[nome]
-                if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
-                    now_ts = time.time()
-                    t['accumulated'] = t.get('accumulated', 0) + (now_ts - t['start_ts'])
-                    t['start_ts'] = now_ts
-                try:
-                    self._save()
-                except Exception as e:
-                    logger.error(f"background_saver erro: {e}")
-        Thread(target=background_saver, daemon=True, name=f"saver_{nome}").start()
+            try:
+                while True:
+                    time.sleep(30)
+                    if nome not in self.timers:
+                        break  # Timer removido (concluído/zerado)
+                    t = self.timers[nome]
+                    if t.get('state') == 'running' and t.get('start_ts', 0) > 0:
+                        now_ts = time.time()
+                        t['accumulated'] = t.get('accumulated', 0) + (now_ts - t['start_ts'])
+                        t['start_ts'] = now_ts
+                    try:
+                        self._save()
+                    except Exception as e:
+                        logger.error(f"background_saver erro: {e}")
+            finally:
+                self._active_savers.discard(nome)  # Libera ao sair
+
+        Thread(target=background_saver, daemon=True, name=f"saver_{nome[:40]}").start()
 
     def pause(self, produto_nome):
         if produto_nome in self.timers and self.timers[produto_nome]['state'] == 'running':
@@ -1315,7 +1300,6 @@ class ProductionTimer:
 
     def stop_and_log(self, produto_nome):
         """Finaliza produção: pausa timer, registra componentes e salva histórico."""
-        # BUG FIX: timer_key pode ser "produto||item_key" — extrair nome real do produto
         nome_real = produto_nome.split('||')[0] if '||' in produto_nome else produto_nome
 
         # Recupera checklist antes de pausar
@@ -1329,7 +1313,6 @@ class ProductionTimer:
             total_seconds = 0
             logger.info(f"⚠️ Timer não encontrado para '{produto_nome}' — registrando com tempo 0")
 
-        # BUG FIX: Registra TODOS os componentes não marcados da receita ao concluir
         # Isso garante que a produção que esqueceu de marcar seja contabilizada
         if 'CADEIRA' in nome_real.upper():
             auto_registrados = 0
@@ -1501,7 +1484,6 @@ class ComponentConsumptionManager:
         comp = month_data['components'][component_name]
         comp['un'] = unit
 
-        # BUG FIX: Verificar se já existe registro deste produto para este componente
         # (evita duplicação quando marca-desmarca-remarca)
         existing_idx = next((i for i, r in enumerate(comp['registros']) 
                              if r.get('produto') == product_name), None)
@@ -1540,7 +1522,6 @@ class ComponentConsumptionManager:
 
         if component_name in month_data['components']:
             comp = month_data['components'][component_name]
-            # BUG FIX: Remover apenas o ÚLTIMO registro deste produto
             # (antes removia todos, perdendo histórico de marcações anteriores no mês)
             last_idx = None
             for i in range(len(comp['registros']) - 1, -1, -1):
@@ -1569,7 +1550,6 @@ class ComponentConsumptionManager:
         summary = []
         for nome, info in month['components'].items():
             todos = info.get('registros', [])
-            # BUG FIX: num_registros conta o número de registros únicos por produto
             # Um mesmo produto pode ter múltiplos registros (marca-desmarca-remarca)
             produtos_unicos = len(set(r.get('produto', '') for r in todos))
             summary.append({
@@ -1580,7 +1560,6 @@ class ComponentConsumptionManager:
                 'registros': todos[-5:]
             })
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
-
 
 # ── Extração de Base/Cor do nome do produto ──────────────────────────────────
 
@@ -1655,7 +1634,6 @@ def _extract_base_cor(nome: str):
                 break
 
     return base, cor
-
 
 class PendingOrdersManager:
     """
@@ -1889,7 +1867,6 @@ class PendingOrdersManager:
             logger.info(f"✅ PendingOrders: {added} novos itens adicionados.")
         return added
 
-
 # Instâncias globais
 production_timer = ProductionTimer()
 component_consumption = ComponentConsumptionManager()
@@ -2007,7 +1984,6 @@ class Orchestrator:
         """Verifica se o worker está ativo."""
         return self._running
 
-
     def _worker_loop(self):
         cycle_count = 0
         logger.info("🔄 Worker loop iniciado.")
@@ -2052,12 +2028,12 @@ class Orchestrator:
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
-        self.logger.debug(f"DEBUG: process_sales_orders chamado (force={force})")
+        self.logger.debug(f"process_sales_orders chamado (force={force})")
         
         # Evita recálculos encavalados
         with self.sales.recalculation_lock:
             if self.sales._recalculation_running and not force:
-                self.logger.debug("DEBUG: Recálculo já em execução, ignorando.")
+                self.logger.debug("Recálculo já em execução, ignorando.")
                 return
             self.sales._recalculation_running = True
             
@@ -2084,18 +2060,17 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
-                self.logger.debug(f"DEBUG: Buscando página {page} de pedidos...")
+                self.logger.debug(f"Buscando página {page} de pedidos...")
                 try:
                     response = self.api.get('pedidos/vendas', params=params)
                 except Exception as e:
-                    self.logger.error(f"DEBUG: Erro na API ao buscar pedidos: {e}")
+                    self.logger.error(f"Erro na API ao buscar pedidos: {e}")
                     break # Se der erro na API, para o loop mas processa o que já pegou
                 
                 if response is None:
-                    self.logger.debug(f"DEBUG: Resposta da API nula na página {page}")
+                    self.logger.debug(f"Resposta da API nula na página {page}")
                     break
     
-                # --- CORREÇÃO DE LEITURA (PARSING) ---
                 data = []
                 if isinstance(response, dict):
                     # Formato V3 Padrão
@@ -2112,7 +2087,7 @@ class Orchestrator:
                     data = response
                 # -------------------------------------
                 
-                self.logger.debug(f"DEBUG: Página {page} retornou {len(data) if data else 0} pedidos.")
+                self.logger.debug(f"Página {page} retornou {len(data) if data else 0} pedidos.")
                 
                 if not data:
                     break
@@ -2132,7 +2107,6 @@ class Orchestrator:
                 # Filtra pedidos válidos (tem que ter ID e Data)
                 valid_orders = []
                 for o in all_orders:
-                    # --- MELHORIA DE NORMALIZAÇÃO ---
                     # Garante que temos uma data válida, verificando vários campos
                     data_pedido = o.get('data') or o.get('dataEmissao') or o.get('dataSaida')
                     
@@ -2144,7 +2118,7 @@ class Orchestrator:
                     if o.get('id'):
                         valid_orders.append(o)
 
-                self.logger.debug(f"DEBUG: {len(valid_orders)} pedidos válidos após normalização inicial.")
+                self.logger.debug(f"{len(valid_orders)} pedidos válidos após normalização inicial.")
                 # 1. Substitui o histórico de vendas pelo resultado da busca (Reset Mensal)
                 self.sales._sales_history = valid_orders
                 
@@ -2172,7 +2146,8 @@ class Orchestrator:
         except Exception as e:
             self.logger.exception(f"Erro fatal no processamento de pedidos: {e}")
         finally:
-            self.sales._recalculation_running = False
+            with self.sales.recalculation_lock:
+                self.sales._recalculation_running = False
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
@@ -2200,7 +2175,6 @@ class Orchestrator:
                 p_id = p.get("id")
                 if not p_id: continue
 
-                # --- LÓGICA DE EXTRAÇÃO DE IMAGEM ROBUSTA (V3) ---
                 img_url = "/static/no-image.png" # Placeholder padrão
                 imagens = p.get("imagens", [])
                 if isinstance(imagens, list) and len(imagens) > 0:
@@ -2593,23 +2567,20 @@ class WebServer:
                 "avg_daily": stats.get('avg_daily', 0)
             })
 
-
         @self.app.route('/api/recalculate', methods=['POST'])
         @token_required
         def api_recalculate(token):
             """Força o recálculo dos KPIs em uma thread separada."""
             
             # Verifica e marca o estado de recalculação dentro do lock
+            # Não setar _recalculation_running aqui: process_sales_orders já faz isso
+            # Setar aqui causaria deadlock: process_sales_orders veria True e retornaria sem executar
             with self.orchestrator.sales.recalculation_lock:
                 if self.orchestrator.sales._recalculation_running:
-                    self.logger.warning("Recálculo de KPIs já em andamento. Requisição ignorada.")
-                    return jsonify({"status": "already_running", "message": "Recálculo de KPIs já em andamento."}), 202
-                
-                self.orchestrator.sales._recalculation_running = True
+                    return jsonify({"status": "already_running", "message": "Recálculo já em andamento."}), 202
 
-            Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
-            
-            return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
+            Thread(target=self.orchestrator.process_sales_orders, kwargs={'force': True}, daemon=True).start()
+            return jsonify({"status": "started", "message": "Recálculo iniciado em segundo plano."}), 202
 
         @self.app.route('/api/timer/action', methods=['POST'])
         def api_timer_action():
@@ -2684,7 +2655,6 @@ class WebServer:
                 nome = item.get('nome') or item.get('nome_original', '')
                 # Tenta primeiro pelo item_key único, depois por nome (legado)
                 t_info = timer_map_by_key.get(ikey) or timer_map_by_nome.get(nome) or {}
-                # BUG FIX: Re-extrair base/cor se não foram populados na sincronização
                 enriched = {**item, **t_info}
                 if not enriched.get('cor') and not enriched.get('base'):
                     nome_raw = enriched.get('nome_original') or nome or ''
@@ -2721,7 +2691,6 @@ class WebServer:
                     'timer_key': tkey,
                 })
 
-            # BUG FIX: Re-extrair base/cor para itens em espera também
             waiting_enriched = []
             for item in pending_orders.get_waiting():
                 enriched = dict(item)
@@ -2757,7 +2726,6 @@ class WebServer:
             componente = data.get('componente', '')
             checked = data.get('checked', False)
             if produto and componente:
-                # BUG FIX: Cria o timer automaticamente se não existir
                 # Antes bloqueava silenciosamente, causando 0 registros de consumo
                 if produto not in production_timer.timers:
                     production_timer.timers[produto] = {
@@ -2793,7 +2761,6 @@ class WebServer:
                 component_consumption.unregister_component(component_name, qty, product_name)
                 result = {'unregistered': True}
 
-            # Notifica TODOS os usuários via WebSocket sobre o novo insumo registrado
             def update_and_broadcast():
                 try:
                     usage = self.orchestrator.calculate_component_usage()
@@ -2858,16 +2825,14 @@ class WebServer:
             if not item_key:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             item = pending_orders.start_production(item_key)
-            # BUG FIX: Usar timer_key único = "produto||item_key" para não misturar
-            # timers de pedidos diferentes do mesmo produto
+            timer_key = None
             if produto_nome:
                 timer_key = f"{produto_nome}||{item_key}"
                 production_timer.start(timer_key)
-                # Salva o timer_key no item para usar no finish
                 if item_key in pending_orders.data:
                     pending_orders.data[item_key]['timer_key'] = timer_key
                     pending_orders._save_one(item_key)
-            return jsonify({'success': True, 'item': item})
+            return jsonify({'success': True, 'item': item, 'timer_key': timer_key})
 
         @self.app.route('/api/pending-orders/finish', methods=['POST'])
         def api_pending_orders_finish():
@@ -2877,7 +2842,6 @@ class WebServer:
             produto_nome = data.get('produto_nome', '')
             if not item_key:
                 return jsonify({'error': 'item_key obrigatório'}), 400
-            # BUG FIX: Recupera timer_key único salvo no item
             item_data = pending_orders.data.get(item_key, {})
             timer_key = item_data.get('timer_key') or (f"{produto_nome}||{item_key}" if produto_nome else None)
             item = pending_orders.finish_production(item_key)
@@ -3068,7 +3032,6 @@ class WebServer:
             all_list = [normalize_for_api(p) for p in kits + products]
             return jsonify(all_list)
 
-
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
             """Retorna status da conexão MongoDB."""
@@ -3139,18 +3102,18 @@ class WebServer:
             with WebServer.webhook_lock:
                 try:
                     # Log de entrada bruta para diagnóstico
-                    self.logger.debug(f"DEBUG: Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
-                    self.logger.debug(f"DEBUG: Headers do Webhook: {dict(request.headers)}")
+                    self.logger.debug(f"Webhook bruto recebido: {request.data.decode('utf-8')[:500]}")
+                    self.logger.debug(f"Headers do Webhook: {dict(request.headers)}")
 
                     # 1. Validação de Assinatura (Mantenha se configurado no Render)
                     signature = request.headers.get("X-Bling-Signature-256")
                     if self.config.WEBHOOK_SECRET and not signature:
-                        self.logger.warning("DEBUG: Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
+                        self.logger.warning("Webhook rejeitado: WEBHOOK_SECRET configurado mas assinatura ausente.")
                         return jsonify({"status": "forbidden", "reason": "missing signature"}), 403
 
                     data = request.json
                     if not data:
-                        self.logger.debug("DEBUG: Webhook ignorado: JSON vazio ou inválido.")
+                        self.logger.debug("Webhook ignorado: JSON vazio ou inválido.")
                         return jsonify({"status": "ignored"}), 200
 
                     self.logger.info(f"⚡ Webhook recebido: {str(data)[:200]}")
@@ -3160,22 +3123,22 @@ class WebServer:
 
                     # Caso 1: Webhook V3 Padrão (vem "id", "situacao", "tipo" na raiz)
                     if 'situacao' in data and 'id' in data:
-                        self.logger.debug(f"DEBUG: Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
+                        self.logger.debug(f"Webhook V3 detectado (ID: {data.get('id')}, Situação: {data.get('situacao')})")
                         should_update = True
                     
                     # Caso 2: Tipo explícito
                     elif data.get('tipo') == 'pedidoVenda':
-                        self.logger.debug("DEBUG: Webhook tipo pedidoVenda detectado.")
+                        self.logger.debug("Webhook tipo pedidoVenda detectado.")
                         should_update = True
 
                     # Caso 3: Formato antigo (V2)
                     elif 'retorno' in data and 'pedidos' in data['retorno']:
-                        self.logger.debug("DEBUG: Webhook V2 detectado.")
+                        self.logger.debug("Webhook V2 detectado.")
                         should_update = True
                     
                     # Caso 4: Callbacks de teste
                     elif data.get('test') == True:
-                        self.logger.debug("DEBUG: Webhook de teste recebido.")
+                        self.logger.debug("Webhook de teste recebido.")
                         return jsonify({"status": "ok", "message": "Test received"}), 200
 
                     if should_update:
@@ -3237,7 +3200,6 @@ class WebServer:
                 try:
                     ws.send(json.dumps(payload))
                 except ConnectionClosed:
-                    # ✅ ADICIONE: Sinaliza para remover este callback
                     raise
                 except Exception as e:
                     self.logger.exception("Erro enviando via WS.")
@@ -4194,16 +4156,34 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
-        ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
-            const box = document.getElementById('logs-content');
-            if(data.logs) {
-                data.logs.forEach(l => box.innerHTML += formatLog(l));
+        // WebSocket de logs com reconexão automática e limite de linhas
+        const _MAX_LOG_LINES = 300;
+        let _wsLogs = null;
+
+        function _connectWsLogs() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            _wsLogs = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+            _wsLogs.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                const box = document.getElementById('logs-content');
+                if (!box || !data.logs) return;
+                // Adicionar novas linhas sem acumular memória infinita
+                data.logs.forEach(l => box.insertAdjacentHTML('beforeend', formatLog(l)));
+                // Limitar linhas visíveis
+                const entries = box.querySelectorAll('.log-entry');
+                if (entries.length > _MAX_LOG_LINES) {
+                    for (let i = 0; i < entries.length - _MAX_LOG_LINES; i++) {
+                        entries[i].remove();
+                    }
+                }
                 box.scrollTop = box.scrollHeight;
-            }
+            };
+            _wsLogs.onclose = () => {
+                setTimeout(_connectWsLogs, 4000);
+            };
+            _wsLogs.onerror = () => _wsLogs.close();
         }
+        _connectWsLogs();
 
         /* Atualizar Status de Autenticação */
         function updateAuthStatus(authenticated, authUrl) {
@@ -4236,7 +4216,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             kpiDaily.textContent = dSalesStats.daily;
             kpiWeekly.textContent = dSalesStats.weekly;
-            kpiHistoric.textContent = dSalesStats.monthly;
+            kpiHistoric.textContent = dSalesStats.historic || dSalesStats.monthly;
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
             // Animação de atualização
@@ -4289,14 +4269,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
         let timerInterval = null;
 
-        function openProductionChecklist(productName) {
+        function openProductionChecklist(productName, timerKey) {
+            // timerKey é o identificador único do timer (pode ser "nome||item_key" ou apenas "nome")
+            const _timerKey = timerKey || productName;
             const isCadeira = productName.toUpperCase().includes('CADEIRA');
             let checklistHtml = '';
 
             if (isCadeira) {
-                // BUG FIX: Usar dataset encodado corretamente para productName
-                // Usar onchange no checkbox diretamente (não onclick no div container)
-                // Evita o problema de double-fire e estado invertido
                 const encodedName = encodeURIComponent(productName);
                 checklistHtml = `
                     <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
@@ -4341,7 +4320,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                             00:00:00
                                         </div>
                                         <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
-                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group" data-produto="${encodeURIComponent(productName)}">
+                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group"
+                                             data-produto="${encodeURIComponent(_timerKey)}"
+                                             data-display="${encodeURIComponent(productName)}">
                                             <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
                                                 ▶ Iniciar
                                             </button>
@@ -4379,13 +4360,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
 
-            // Carrega timer E estado da checklist salvo no servidor
-            controlTimer('get', productName);
-            // Carrega checklist salvo para este produto
+            // Carrega estado do timer (usa timer_key) e checklist (usa nome do produto)
+            controlTimer('get', _timerKey);
             _loadChecklistState(productName);
         }
 
-        // Estado de checklist por produto (para saber o que está marcado)
         const checklistState = {};
 
         async function _loadChecklistState(productName) {
@@ -4422,8 +4401,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        // NOVA FUNÇÃO: handleChecklistChange — acionada pelo onchange do checkbox
-        // Corrige bug de double-fire e estado invertido do toggleChecklist anterior
         function handleChecklistChange(cb, idx, encodedName) {
             const productName = decodeURIComponent(encodedName);
             const isChecked = cb.checked;
@@ -4452,7 +4429,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             _updateChecklistProgress();
         }
 
-        // Mantido como stub de compatibilidade (pode ser chamado por código antigo)
         function toggleChecklist(container, idx, productName) {
             const cb = container.querySelector('input[type=checkbox]');
             if (cb) handleChecklistChange(cb, idx, encodeURIComponent(productName));
@@ -4529,12 +4505,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         function startLocalCounter(startSeconds) {
             clearInterval(timerInterval);
-            let seconds = startSeconds;
+            let seconds = Math.floor(startSeconds || 0);
             const display = document.getElementById('timer-display');
-            
             timerInterval = setInterval(() => {
                 seconds++;
-                display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+                if (display) display.textContent = formatSeconds(seconds);
             }, 1000);
         }
 
@@ -4542,7 +4517,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const display = document.getElementById('timer-display');
             const badge = document.getElementById('timer-status');
             
-            display.textContent = new Date(seconds * 1000).toISOString().substr(11, 8);
+            if (display) display.textContent = formatSeconds(seconds);
             
             if(state === 'running') {
                 badge.className = 'mt-2 badge bg-success';
@@ -4767,8 +4742,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
                 });
                 if (!res.ok) throw new Error('Servidor retornou erro');
+                const resData = await res.json();
+                // Passa o timer_key real (nome||item_key) para o modal
+                const timerKey = resData.timer_key || produtoNome;
                 await loadProductionBoard();
-                openProductionChecklist(produtoNome);
+                openProductionChecklist(produtoNome, timerKey);
                 showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
             } catch(e) {
                 console.error('startPendingOrder:', e);
@@ -4777,7 +4755,23 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function finishBoardItem(itemKey, produtoNome) {
-            if (!confirm(`Concluir produção de "${produtoNome}"?`)) return;
+            // Confirmação inline sem confirm() bloqueante
+            const btn = event && event.target;
+            if (btn && btn.dataset.confirming !== 'true') {
+                btn.dataset.confirming = 'true';
+                const orig = btn.textContent;
+                btn.textContent = '❓ Confirmar?';
+                btn.classList.replace('btn-success', 'btn-warning');
+                setTimeout(() => {
+                    if (btn.dataset.confirming === 'true') {
+                        btn.dataset.confirming = '';
+                        btn.textContent = orig;
+                        btn.classList.replace('btn-warning', 'btn-success');
+                    }
+                }, 3000);
+                return;
+            }
+            if (btn) { btn.dataset.confirming = ''; btn.disabled = true; }
             try {
                 await fetch('/api/pending-orders/finish', {
                     method: 'POST',
@@ -4787,11 +4781,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 showToast('✅ Concluído!', produtoNome, 'success');
                 await loadProductionBoard();
                 await refreshComponentTab();
-            } catch(e) { showToast('Erro', 'Falha ao concluir', 'danger'); }
+            } catch(e) {
+                showToast('Erro', 'Falha ao concluir', 'danger');
+                if (btn) { btn.disabled = false; }
+            }
         }
 
         async function dismissPendingOrder(itemKey) {
-            if (!confirm('Remover este pedido da fila?')) return;
+            const btn = event && event.target;
+            if (btn && btn.dataset.confirming !== 'true') {
+                btn.dataset.confirming = 'true';
+                const orig = btn.textContent;
+                btn.textContent = '❓ Confirmar?';
+                btn.classList.replace('btn-outline-danger', 'btn-danger');
+                setTimeout(() => {
+                    if (btn.dataset.confirming === 'true') {
+                        btn.dataset.confirming = '';
+                        btn.textContent = orig;
+                        btn.classList.replace('btn-danger', 'btn-outline-danger');
+                    }
+                }, 3000);
+                return;
+            }
+            if (btn) { btn.dataset.confirming = ''; btn.disabled = true; }
             try {
                 await fetch('/api/pending-orders/dismiss', {
                     method: 'POST',
@@ -4799,7 +4811,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     body: JSON.stringify({ item_key: itemKey })
                 });
                 await loadProductionBoard();
-            } catch(e) { showToast('Erro', 'Falha ao remover pedido', 'danger'); }
+            } catch(e) {
+                showToast('Erro', 'Falha ao remover pedido', 'danger');
+                if (btn) btn.disabled = false;
+            }
         }
 
         function updateComponentUsage(usageData) {
@@ -4821,7 +4836,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { console.error('Erro ao carregar histórico:', e); }
         }
 
-        // renderActiveTimers mantido como stub (o board substituiu)
         function renderActiveTimers(activeProduction) {}
 
         function renderConsumptionTable(data) {
@@ -4850,8 +4864,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-
-
         function renderProductionHistory(history) {
             const div = document.getElementById('production-history-section');
             if (!div) return;
@@ -4869,18 +4881,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-
-
-        function formatSeconds(s) {
-            s = Math.floor(s || 0);
-            const h = Math.floor(s / 3600).toString().padStart(2, '0');
-            const m = Math.floor((s % 3600) / 60).toString().padStart(2, '0');
-            const sec = (s % 60).toString().padStart(2, '0');
-            return `${h}:${m}:${sec}`;
-        }
-
-
-        /* ✅ DESIGN: WebSocket KPI */
+        /* WebSocket KPI */
         const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
         let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
 
@@ -4910,18 +4911,20 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             };
 
             wsKpi.onerror = (e) => {
-                console.error("Erro WebSocket KPI:", e);
-                showToast('Erro', 'Conexão WebSocket perdida. Tentando reconectar...', 'danger');
+                console.warn("WebSocket KPI erro — reconectando...", e);
+                // Não exibir toast: reconexão automática é silenciosa
             };
 
+            let _kpiReconnectDelay = 3000;
             wsKpi.onclose = () => {
-                console.log("WebSocket KPI desconectado. Reconectando...");
                 setTimeout(() => {
                     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
                     wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
                     setupKpiWebSocket();
-                }, 3000);
+                    _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000); // backoff até 30s
+                }, _kpiReconnectDelay);
             };
+            wsKpi.onopen = () => { _kpiReconnectDelay = 3000; }; // reset ao conectar
         }
 
         setupKpiWebSocket();
@@ -4939,7 +4942,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             div.innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm text-primary" role="status"><span class="visually-hidden">Buscando...</span></div></div>';
 
             try {
-                const data = await fetchAPI(`${API}/products/search?q=${q}`);
+                const data = await fetchAPI(`${API}/products/search?q=${encodeURIComponent(q)}`);
 
                 if(!data.length) {
                     div.innerHTML = '<div class="alert alert-warning">Nenhum resultado encontrado.</div>';
