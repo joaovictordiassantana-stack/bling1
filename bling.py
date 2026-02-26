@@ -2418,14 +2418,16 @@ class Orchestrator:
         """
         global kpi_update_callbacks, kpi_update_lock
         
-        # 1. Monta o payload base
+        # Verifica auth sem disparar refresh (operação lenta que bloquearia o broadcast)
+        import time as _t
+        auth_ok = bool(self.auth._access_token and self.auth._expires_at > _t.time() + 60)
         payload = {
             "type": "full_update",
-            "authenticated": self.auth.is_authenticated() and not auth_error,
+            "authenticated": auth_ok and not auth_error,
             "auth_error": auth_error,
             "is_running": self.is_running(),
             "cache_updated": cache_updated,
-            "auth_url": self.auth.get_authorization_url() # Envia a URL de auth para o frontend
+            "auth_url": self.auth.get_authorization_url()
         }
         
         # 2. Adiciona KPIs se fornecidos (com proteção contra tipos inválidos)
@@ -3195,45 +3197,45 @@ class WebServer:
                 self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
                 return
 
-            # Função de callback para enviar atualizações completas
+            # Callback para enviar atualizações para este cliente
             def kpi_callback(payload):
                 try:
                     ws.send(json.dumps(payload))
                 except ConnectionClosed:
                     raise
-                except Exception as e:
-                    self.logger.exception("Erro enviando via WS.")
-                    raise ConnectionClosed()  # Força desconexão
-                
-            # 1. Envia o estado inicial completo (status, kpis, uso de componentes)
-            # 1. Envia o estado inicial completo
-            try:
-                sales_stats = self.orchestrator.sales._get_state_for_save()
-                
-                # Tenta usar cache se disponível
-                component_usage = getattr(self.orchestrator, '_component_usage_cache', None)
-                
-                if not component_usage:
-                    self.logger.info("🔄 Cache de componentes vazio. Calculando...")
-                    try:
-                        component_usage = self.orchestrator.calculate_component_usage()
-                        self.orchestrator._component_usage_cache = component_usage
-                    except Exception as calc_error:
-                        self.logger.error(f"Falha ao calcular componentes: {calc_error}")
-                        component_usage = {"components": [], "daily_breakdown": []}
-                
-                self.orchestrator.broadcast_kpi_update(
-                    sales_stats=sales_stats,
-                    component_usage=component_usage
-                )
-                self.logger.info("✅ Estado inicial enviado ao WebSocket")
-                
-            except Exception as e:
-                self.logger.exception("Erro ao enviar estado inicial via WS.")
-                
-            # 2. Adiciona o callback à lista global
+                except Exception:
+                    raise ConnectionClosed()
+
+            # 1. Registra o callback PRIMEIRO para não perder nenhum broadcast
             with kpi_update_lock:
                 kpi_update_callbacks.append(kpi_callback)
+
+            # 2. Envia estado inicial diretamente para este cliente (sem broadcast global)
+            #    Usa apenas o que já está em cache — sem cálculos bloqueantes
+            try:
+                sales_stats = self.orchestrator.sales._get_state_for_save()
+                component_usage = getattr(self.orchestrator, '_component_usage_cache', None) or {}
+                auth_ok = bool(self.orchestrator.auth._access_token and
+                               self.orchestrator.auth._expires_at > __import__('time').time() + 60)
+                initial_payload = {
+                    "type": "full_update",
+                    "authenticated": auth_ok,
+                    "auth_error": False,
+                    "is_running": self.orchestrator.is_running(),
+                    "cache_updated": False,
+                    "auth_url": self.orchestrator.auth.get_authorization_url(),
+                }
+                if sales_stats and isinstance(sales_stats, dict):
+                    stats_data = sales_stats.copy()
+                    lr = stats_data.pop('last_recalculated', None)
+                    stats_data['last_update'] = lr.isoformat() if hasattr(lr, 'isoformat') else str(lr)
+                    initial_payload["sales_stats"] = stats_data
+                if component_usage:
+                    initial_payload["component_usage"] = component_usage
+                ws.send(json.dumps(initial_payload))
+                self.logger.info("✅ Estado inicial enviado ao cliente WS.")
+            except Exception as e:
+                self.logger.warning(f"Não foi possível enviar estado inicial ao WS: {e}")
                 
             try:
                 while True:
@@ -4076,30 +4078,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* ✅ DESIGN: Fetch API com Tratamento */
         async function fetchAPI(url, options = {}) {
-            try {
-                const response = await fetch(url, options);
+            const response = await fetch(url, options);
 
-                if (response.status === 401) {
-                    console.error("Sessão expirada (401). Redirecionando para autenticação.");
-                    window.location.href = document.getElementById('auth-link').href;
-                    throw new Error("Sessão expirada. Redirecionamento em curso.");
-                }
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    throw new Error(`Erro na API (${response.status}): ${errorText}`);
-                }
-
-                try {
-                    return await response.json();
-                } catch (e) {
-                    return {};
-                }
-
-            } catch (error) {
-                console.error("Erro em fetchAPI:", error);
-                throw error;
+            if (response.status === 401) {
+                // Token expirado: atualiza UI sem redirecionar (evita loop)
+                isAuthenticated = false;
+                const badge = document.getElementById('status-badge');
+                if (badge) { badge.className = 'badge bg-warning text-dark'; badge.textContent = '🟡 Sessão expirada'; }
+                const authLink = document.getElementById('auth-link');
+                if (authLink) authLink.classList.remove('d-none');
+                throw new Error('401');
             }
+
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => response.statusText);
+                throw new Error(`HTTP ${response.status}: ${errorText}`);
+            }
+
+            return response.json().catch(() => ({}));
         }
 
         /* ✅ DESIGN: Toast com Animação */
@@ -4188,24 +4184,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* Atualizar Status de Autenticação */
         function updateAuthStatus(authenticated, authUrl) {
             const badge = document.getElementById('status-badge');
+            const wasAuthenticated = isAuthenticated;
             isAuthenticated = authenticated;
 
             if (isAuthenticated) {
-                badge.className = 'badge bg-success';
-                badge.textContent = '🟢 Online';
-                document.getElementById('auth-link').classList.add('d-none');
-                document.getElementById('content-tabs').classList.remove('hidden');
-                document.getElementById('auth-required-tabs').classList.add('hidden');
-                // Carrega kits na primeira confirmação de auth
+                if (badge) { badge.className = 'badge bg-success'; badge.textContent = '🟢 Online'; }
+                const al = document.getElementById('auth-link');
+                if (al) al.classList.add('d-none');
+                const ct = document.getElementById('content-tabs');
+                if (ct) ct.classList.remove('hidden');
+                const at = document.getElementById('auth-required-tabs');
+                if (at) at.classList.add('hidden');
                 _onAuthConfirmed();
             } else {
-                badge.className = 'badge bg-danger';
-                badge.textContent = '🔴 Offline';
-                document.getElementById('auth-link').classList.remove('d-none');
-                document.getElementById('content-tabs').classList.add('hidden');
-                document.getElementById('auth-required-tabs').classList.remove('hidden');
+                if (badge) { badge.className = 'badge bg-danger'; badge.textContent = '🔴 Offline'; }
+                const al = document.getElementById('auth-link');
+                if (al) al.classList.remove('d-none');
+                const ct = document.getElementById('content-tabs');
+                if (ct) ct.classList.add('hidden');
+                const at = document.getElementById('auth-required-tabs');
+                if (at) at.classList.remove('hidden');
+                // Reseta flag para recarregar kits quando voltar a autenticar
+                if (wasAuthenticated) _kitsLoaded = false;
             }
-            document.getElementById('auth-link').href = authUrl;
+            const al = document.getElementById('auth-link');
+            if (al && authUrl) al.href = authUrl;
         }
 
         /* ✅ DESIGN: Atualizar KPIs com Animação */
@@ -4475,24 +4478,103 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     clearInterval(timerInterval);
                     timerInterval = null;
                     const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
-                    showToast('✅ Concluído!', produto + ' — ' + formatSeconds(elapsed) + ' registrado.', 'success');
-                    // Fecha modal de forma robusta + remove backdrop
+
+                    // ── Animação de conclusão ──────────────────────────────
                     const modalEl = document.getElementById('productionModal');
                     if (modalEl) {
-                        try {
-                            const bsModal = bootstrap.Modal.getInstance(modalEl);
-                            if (bsModal) bsModal.hide();
-                        } catch(me) {}
-                        // Garante remoção mesmo se hide() falhar
+                        const modalContent = modalEl.querySelector('.modal-content');
+                        const modalBody    = modalEl.querySelector('.modal-body');
+                        const modalFooter  = modalEl.querySelector('.modal-footer');
+
+                        // Congela botões imediatamente
+                        if (modalFooter) modalFooter.style.display = 'none';
+
+                        // Substitui o body pelo painel de sucesso
+                        if (modalBody) {
+                            modalBody.innerHTML = `
+                                <div id="finish-anim" style="
+                                    display:flex; flex-direction:column; align-items:center;
+                                    justify-content:center; min-height:320px; gap:1rem;
+                                    background:linear-gradient(135deg,#064e3b 0%,#065f46 100%);
+                                    border-radius:0 0 12px 12px;">
+
+                                    <!-- Ícone animado -->
+                                    <div id="fa-icon" style="
+                                        width:90px; height:90px; border-radius:50%;
+                                        background:rgba(255,255,255,.12);
+                                        display:flex; align-items:center; justify-content:center;
+                                        font-size:3rem;
+                                        animation: fa-pop .4s cubic-bezier(.34,1.56,.64,1) both;">
+                                        ✅
+                                    </div>
+
+                                    <!-- Título -->
+                                    <div style="color:#fff; font-size:1.5rem; font-weight:800;
+                                                letter-spacing:.02em; text-align:center;
+                                                animation: fa-fadein .3s .2s both;">
+                                        Produção Concluída!
+                                    </div>
+
+                                    <!-- Produto -->
+                                    <div style="color:#6ee7b7; font-size:1rem; font-weight:600;
+                                                text-align:center; max-width:280px;
+                                                animation: fa-fadein .3s .35s both;">
+                                        ${produto.split('||')[0]}
+                                    </div>
+
+                                    <!-- Tempo registrado -->
+                                    <div style="
+                                        background:rgba(255,255,255,.1); border-radius:12px;
+                                        padding:.75rem 2rem; text-align:center;
+                                        animation: fa-fadein .3s .45s both;">
+                                        <div style="color:rgba(255,255,255,.6); font-size:.7rem;
+                                                    text-transform:uppercase; letter-spacing:.1em;">
+                                            Tempo registrado
+                                        </div>
+                                        <div style="color:#fff; font-size:2.2rem; font-weight:700;
+                                                    font-family:monospace; letter-spacing:.05em;
+                                                    text-shadow:0 0 20px rgba(110,231,183,.5);">
+                                            ${formatSeconds(elapsed)}
+                                        </div>
+                                    </div>
+
+                                    <!-- Componentes registrados -->
+                                    <div style="color:rgba(255,255,255,.55); font-size:.82rem;
+                                                text-align:center;
+                                                animation: fa-fadein .3s .55s both;">
+                                        📦 Insumos computados automaticamente
+                                    </div>
+                                </div>
+
+                                <style>
+                                @keyframes fa-pop {
+                                    0%   { transform: scale(0); opacity:0; }
+                                    100% { transform: scale(1); opacity:1; }
+                                }
+                                @keyframes fa-fadein {
+                                    from { opacity:0; transform:translateY(10px); }
+                                    to   { opacity:1; transform:translateY(0); }
+                                }
+                                </style>
+                            `;
+                        }
+
+                        // Fecha após 2.2s
                         setTimeout(() => {
-                            modalEl.remove();
-                            document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
-                            document.body.classList.remove('modal-open');
-                            document.body.style.removeProperty('overflow');
-                            document.body.style.removeProperty('padding-right');
-                        }, 300);
+                            try {
+                                const bsModal = bootstrap.Modal.getInstance(modalEl);
+                                if (bsModal) bsModal.hide();
+                            } catch {}
+                            setTimeout(() => {
+                                modalEl.remove();
+                                document.querySelectorAll('.modal-backdrop').forEach(e => e.remove());
+                                document.body.classList.remove('modal-open');
+                                document.body.style.removeProperty('overflow');
+                                document.body.style.removeProperty('padding-right');
+                            }, 300);
+                        }, 2200);
                     }
-                    // Atualiza board e consumo
+
                     await loadProductionBoard();
                     await refreshComponentTab();
                     return;
@@ -4903,24 +4985,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
-        /* WebSocket KPI */
+        /* WebSocket KPI com reconexão e backoff */
         const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        let wsKpi = new WebSocket(`${protoKpi}://${window.location.host}/ws/kpi-updates`);
+        let wsKpi = null;
+        let _kpiReconnectDelay = 3000; // declarado fora para persistir entre reconexões
+
+        function _connectKpiWs() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
+            setupKpiWebSocket();
+        }
 
         function setupKpiWebSocket() {
+            wsKpi.onopen = () => {
+                _kpiReconnectDelay = 3000; // reset ao conectar com sucesso
+            };
+
             wsKpi.onmessage = (e) => {
-                const data = JSON.parse(e.data);
+                let data;
+                try { data = JSON.parse(e.data); } catch { return; }
 
                 if (data.type === 'full_update') {
                     updateAuthStatus(data.authenticated, data.auth_url);
 
-                    if (data.sales_stats) {
-                        updateKpis(data.sales_stats);
-                    }
-
-                    if (data.component_usage) {
-                        updateComponentUsage(data.component_usage);
-                    }
+                    if (data.sales_stats) updateKpis(data.sales_stats);
+                    if (data.component_usage) updateComponentUsage(data.component_usage);
 
                     const forceLoadButton = document.querySelector('#kits button.btn-primary');
                     if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
@@ -4932,24 +5021,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }
             };
 
-            wsKpi.onerror = (e) => {
-                console.warn("WebSocket KPI erro — reconectando...", e);
-                // Não exibir toast: reconexão automática é silenciosa
-            };
+            wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
 
-            let _kpiReconnectDelay = 3000;
             wsKpi.onclose = () => {
                 setTimeout(() => {
-                    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                    wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
-                    setupKpiWebSocket();
-                    _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000); // backoff até 30s
+                    _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
+                    _connectKpiWs();
                 }, _kpiReconnectDelay);
             };
-            wsKpi.onopen = () => { _kpiReconnectDelay = 3000; }; // reset ao conectar
         }
 
-        setupKpiWebSocket();
+        _connectKpiWs();
 
         /* ✅ DESIGN: Busca de Produtos */
         const btnSearch = document.getElementById('btn-search');
@@ -5187,6 +5269,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 loadKits();
             }
         }
+
+        /* Inicializa conexão WS após declarar todas as funções */
 
         document.addEventListener('DOMContentLoaded', () => {
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
