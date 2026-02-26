@@ -245,6 +245,7 @@ RECIPE_CADEIRA = [
 token_exchange_lock = Lock()
 kpi_update_callbacks: List[Callable] = []
 kpi_update_lock = Lock()
+_cleanup_timer_started = False  # garante que cleanup_timer só é iniciado uma vez
 
 # ============================================================================ 
 # 1. LOGS AVANÇADOS
@@ -352,13 +353,18 @@ def cleanup_kpi_callbacks():
         logger.debug(f"🔗 WebSocket KPI: {n} conexão(ões) ativa(s)")
 
 def start_cleanup_timer():
-    """Inicia timer para limpar callbacks órfãos a cada 5 minutos"""
+    """Inicia timer para limpar callbacks órfãos — idempotente, roda no máximo 1 vez."""
+    global _cleanup_timer_started
+    if _cleanup_timer_started:
+        return
+    _cleanup_timer_started = True
+
     def cleanup_loop():
         while True:
-            time.sleep(300)  # 5 minutos
+            time.sleep(300)
             cleanup_kpi_callbacks()
-    
-    Thread(target=cleanup_loop, daemon=True).start()
+
+    Thread(target=cleanup_loop, daemon=True, name="cleanup_timer").start()
 
 # ============================================================================ 
 # 2. CONFIGURAÇÕES
@@ -381,7 +387,7 @@ class Config:
     
     # Retry e Timeout
     REQUEST_TIMEOUT: int = 30
-    AUTH_TIMEOUT: int = 3 # Timeout curto para auth
+    AUTH_TIMEOUT: int = 20  # Timeout para auth (aumentado para cold start no Render)
     MAX_RETRIES: int = 3
     BASE_DELAY: float = 1.0
     
@@ -831,29 +837,17 @@ class AuthManager:
         save_tokens(data, self.config.TOKENS_FILE)
 
     def reload_tokens_from_disk(self):
-        """
-        Recarrega os tokens do disco para a memória.
-        Útil após OAuth ou quando outro processo atualizou os tokens.
-        """
-        logger.debug("🔄 [DEBUG-AUTH] Recarregando tokens do disco...")
-        
+        """Recarrega tokens do storage (MongoDB ou arquivo) para a memória."""
         try:
             disk_tokens = self._load_tokens()
-            
             self._access_token = disk_tokens.get('access_token')
             self._refresh_token = disk_tokens.get('refresh_token')
             self._expires_at = disk_tokens.get('expires_at', 0)
-            
-            logger.debug(f"✅ [DEBUG-AUTH] Tokens recarregados:")
-            logger.debug(f"   • Access Token: {'Presente' if self._access_token else 'Ausente'}")
-            logger.debug(f"   • Refresh Token: {'Presente' if self._refresh_token else 'Ausente'}")
-            logger.debug(f"   • Expira em: {self._expires_at - time.time():.0f}s")
-            
-            logger.info("✅ Tokens recarregados do disco com sucesso!")
+            status = "válido" if (self._access_token and self._expires_at > time.time() + 60) else                      "refresh disponível" if self._refresh_token else "ausente"
+            logger.info(f"🔑 Tokens carregados — status: {status}")
             return True
-            
         except Exception as e:
-            logger.error(f"❌ [DEBUG-AUTH] Erro ao recarregar tokens: {str(e)}", exc_info=True)
+            logger.error(f"Erro ao recarregar tokens: {e}")
             return False
 
     def is_authenticated(self) -> bool:
@@ -1991,15 +1985,16 @@ class Orchestrator:
         while not self._stop_event.is_set():
             cycle_count += 1
 
-            # ── Aguarda autenticação ──────────────────────────────────────
-            if not self.auth.is_authenticated():
-                logger.info(f"⏸ Ciclo #{cycle_count}: aguardando autenticação...")
+            # ── Verifica autenticação ────────────────────────────────────
+            if not (self.auth._access_token and self.auth._expires_at > time.time() + 60):
+                # access_token expirou — tenta refresh antes de desistir
                 self.auth.reload_tokens_from_disk()
                 if not self.auth.is_authenticated():
-                    # Espera 60s OU até wake_event ser setado
+                    logger.info(f"⏸ Ciclo #{cycle_count}: sem token válido — aguardando...")
                     self._wake_event.wait(60)
                     self._wake_event.clear()
                     continue
+                logger.info(f"🔑 Ciclo #{cycle_count}: token renovado — continuando.")
 
             # ── Processamento ─────────────────────────────────────────────
             try:
@@ -5349,10 +5344,36 @@ def create_app() -> Flask:
     flask_app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'sw-moveis-mdf-secure-key-2025')
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
-    WebServer(config, orchestrator, flask_app) 
-    
-    # Worker iniciado apenas após OAuth — veja /callback
-    
+    WebServer(config, orchestrator, flask_app)
+
+    # 5. Inicia worker automaticamente se já existe token salvo.
+    #    Garante que após reinício do servidor (Render, deploy, idle)
+    #    o sistema volte ao ar sem pedir reautenticação desnecessária.
+    def _try_auto_start():
+        try:
+            time.sleep(2)  # aguarda Flask terminar de subir
+            if orchestrator.is_running():
+                return
+            orchestrator.auth.reload_tokens_from_disk()
+            # Renova via refresh_token se o access_token expirou
+            if (orchestrator.auth._refresh_token and not (
+                    orchestrator.auth._access_token and
+                    orchestrator.auth._expires_at > time.time() + 60)):
+                logger.info("🔄 Auto-start: renovando token via refresh_token...")
+                orchestrator.auth.refresh_token()
+            # Inicia apenas se houver token válido
+            if (orchestrator.auth._access_token and
+                    orchestrator.auth._expires_at > time.time() + 60):
+                orchestrator.start_worker()
+                start_cleanup_timer()
+                logger.info("✅ Worker iniciado automaticamente — token recuperado do storage.")
+            else:
+                logger.info("ℹ️  Nenhum token válido — aguardando autenticação OAuth.")
+        except Exception as e:
+            logger.warning(f"Auto-start: não foi possível iniciar o worker: {e}")
+
+    Thread(target=_try_auto_start, daemon=True, name="auto_start").start()
+
     return flask_app
 
 # Ponto de entrada para Gunicorn/WSGI
