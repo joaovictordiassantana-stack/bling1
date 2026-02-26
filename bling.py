@@ -51,7 +51,6 @@ import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from threading import Lock, Thread, Event
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Callable
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -313,10 +312,10 @@ def setup_logging():
     global memory_handler
     memory_handler = InMemoryLogHandler()
     
-    # Define o log principal para INFO (ou DEBUG se necessário, mas INFO é o padrão)
     logger = logging.getLogger('bling_automacao')
-    
-    logger.setLevel(logging.DEBUG)  # DEBUG temporário para investigação
+    _log_level_str = os.environ.get('BLING_LOG_LEVEL', 'INFO').upper()
+    _log_level = getattr(logging, _log_level_str, logging.INFO)
+    logger.setLevel(_log_level)
     # ✅ Suprime logs repetitivos
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
     logging.getLogger('flask_sock').setLevel(logging.WARNING)
@@ -348,21 +347,11 @@ logger, error_logger = setup_logging()
 
 # ✅ FUNÇÕES DE LIMPEZA DE CALLBACKS (Definidas após o logger)
 def cleanup_kpi_callbacks():
-    """Remove callbacks órfãos a cada 5 minutos"""
-    global kpi_update_callbacks
+    """Log periódico de callbacks KPI ativos (limpeza real ocorre no broadcast)."""
     with kpi_update_lock:
-        # Testa cada callback. Se falhar (ex: objeto órfão), remove.
-        valid = []
-        for cb in kpi_update_callbacks:
-            try:
-                # Tenta acessar um atributo ou chamar o callback. Se falhar, é órfão.
-                _ = getattr(cb, '__name__', 'lambda_or_partial') # Teste robusto
-                valid.append(cb)
-            except:
-                logger.debug("Callback órfão removido.")
-                pass
-        kpi_update_callbacks = valid
-        logger.debug(f"🧹 Callbacks KPI limpos: {len(valid)} ativos")
+        n = len(kpi_update_callbacks)
+    if n > 0:
+        logger.debug(f"🔗 WebSocket KPI: {n} conexão(ões) ativa(s)")
 
 def start_cleanup_timer():
     """Inicia timer para limpar callbacks órfãos a cada 5 minutos"""
@@ -1544,16 +1533,24 @@ class ComponentConsumptionManager:
         return comp
 
     def unregister_component(self, component_name: str, qty: float, product_name: str):
-        """Remove o registro de um componente (desmarcou o checkbox)."""
+        """Remove o consumo de um componente (desmarcou o checkbox)."""
         self._ensure_current_month()
         key = self._current_month_key()
         month_data = self.data[key]
 
         if component_name in month_data['components']:
             comp = month_data['components'][component_name]
-            comp['qtd'] = max(0, round(comp['qtd'] - qty, 3))
-            # Remove o último registro deste produto
-            comp['registros'] = [r for r in comp['registros'] if r['produto'] != product_name]
+            # BUG FIX: Remover apenas o ÚLTIMO registro deste produto
+            # (antes removia todos, perdendo histórico de marcações anteriores no mês)
+            last_idx = None
+            for i in range(len(comp['registros']) - 1, -1, -1):
+                if comp['registros'][i].get('produto') == product_name:
+                    last_idx = i
+                    break
+            if last_idx is not None:
+                removed_qty = comp['registros'][last_idx].get('qtd', qty)
+                comp['registros'].pop(last_idx)
+                comp['qtd'] = max(0, round(comp['qtd'] - removed_qty, 3))
             self._save()
 
     def get_current_month(self):
@@ -1930,11 +1927,9 @@ class Orchestrator:
         self._load_cache()
         self._cache_lock = Lock()
         
-        # ✅ ADICIONE ESTAS LINHAS:
-        self._component_usage_cache = None  # Inicializa o cache de componentes
-        self.logger.debug("Orchestrator inicializado com cache de componentes vazio")
-        
-        # ✅ CORREÇÃO CRÍTICA: Carrega o cache de produtos no startup
+        self._component_usage_cache = None
+
+        # Carrega cache de produtos no startup se autenticado
         if self.auth.is_authenticated():
             self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
             self.process_products_cache()
@@ -1980,19 +1975,8 @@ class Orchestrator:
         """Inicia o worker de fundo para atualização de dados."""
         if not self._running:
             self._running = True
-            self._stop_event = Event() # Evento para sinalizar parada
-            
-            # ✅ ADICIONE: Verifica se é a primeira execução
-            products_empty = len(self._products_cache) == 0
-            kits_empty = len(self._kits_cache) == 0
-            
-            # A lógica de carga inicial foi movida para o callback, pois o token não está disponível aqui.
-            # O worker principal ainda inicia, mas ele se protege com a verificação de token.
-            
-                        # ✅ REMOVIDO: Registro de Webhook (API v3 requer registro manual no painel)
-            # A chamada para self.api.register_webhook foi removida daqui, pois a função agora apenas loga a instrução.
-            # O registro deve ser feito manualmente no painel do Bling.
-            
+            self._stop_event = Event()   # sinaliza parada definitiva
+            self._wake_event = Event()   # sinaliza "acorda agora" sem parar
             self._worker_thread = Thread(target=self._worker_loop, daemon=True)
             self._worker_thread.start()
             self.logger.info("Worker de fundo iniciado.")
@@ -2001,121 +1985,70 @@ class Orchestrator:
         """Para o worker de fundo."""
         self._running = False
         if self._worker_thread and self._worker_thread.is_alive():
-            self._stop_event.set() # Sinaliza para o loop parar
+            self._stop_event.set()
+            # Acorda o worker se estiver em sleep para processar o stop
+            if hasattr(self, '_wake_event'):
+                self._wake_event.set()
             self._worker_thread.join(timeout=5)
             if self._worker_thread.is_alive():
-                self.logger.warning("Worker de fundo não parou em 5s. Forçando término.")
+                self.logger.warning("Worker de fundo não parou em 5s.")
             else:
                 self.logger.info("Worker de fundo parado com sucesso.")
 
     def wake_worker(self):
-        """
-        Acorda o worker imediatamente se estiver dormindo.
-        
-        Útil após OAuth para forçar início imediato do processamento
-        sem esperar os 60 segundos de sleep.
-        """
-        logger.debug("⏰ [DEBUG-WORKER] wake_worker() chamado")
-        
-        if self._running and self._stop_event:
-            logger.info("⏰ Acordando worker (interrompendo sleep)...")
-            self._stop_event.set()  # Interrompe o sleep
-            
-            # Recria o evento para o próximo ciclo
-            import time
-            time.sleep(0.1)  # Pequena pausa para garantir que o worker processou
-            self._stop_event.clear()
-            
-            logger.info("✅ Worker acordado com sucesso!")
+        """Acorda o worker imediatamente se estiver dormindo (sem parar o loop)."""
+        if self._running and hasattr(self, '_wake_event'):
+            self._wake_event.set()
+            logger.info("⏰ Worker acordado para processar imediatamente.")
         else:
-            logger.debug("⚠️ Worker não está rodando ou evento não existe")
+            logger.debug("⚠️ wake_worker: worker não está rodando.")
 
     def is_running(self) -> bool:
         """Verifica se o worker está ativo."""
         return self._running
 
-    def _initial_load(self):
-        """Carrega cache de produtos na primeira execução."""
-        try:
-            self.logger.info("⏳ Carregando cache inicial de produtos/kits...")
-            self.process_products_cache()
-            self.logger.info("✅ Cache inicial carregado com sucesso!")
-        except Exception as e:
-            self.logger.exception("❌ Erro no carregamento inicial.")
-            
+
     def _worker_loop(self):
         cycle_count = 0
-        
-        logger.debug("🔄 [DEBUG-WORKER] Worker loop iniciado")
-        
+        logger.info("🔄 Worker loop iniciado.")
+
         while not self._stop_event.is_set():
             cycle_count += 1
-            
-            logger.debug(f"")
-            logger.debug(f"🔄 [DEBUG-WORKER] ==================== CICLO #{cycle_count} ====================")
-            
-            # Verifica autenticação antes de tudo
-            logger.debug(f"🔍 [DEBUG-WORKER] Verificando autenticação...")
-            is_auth = self.auth.is_authenticated()
-            logger.debug(f"   • is_authenticated() = {is_auth}")
-            
-            if not is_auth:
-                logger.info(f"⏸️ [DEBUG-WORKER] Ciclo #{cycle_count}: Aguardando autenticação...")
-                logger.debug(f"   • Access Token: {'Presente' if self.auth._access_token else 'Ausente'}")
-                logger.debug(f"   • Refresh Token: {'Presente' if self.auth._refresh_token else 'Ausente'}")
-                
-                # Tenta recarregar tokens do disco antes de esperar
-                logger.debug("🔄 [DEBUG-WORKER] Tentando recarregar tokens do disco...")
-                self.auth.reload_tokens_from_disk()
-                
-                # Verifica novamente
-                is_auth_after_reload = self.auth.is_authenticated()
-                logger.debug(f"   • is_authenticated() após reload = {is_auth_after_reload}")
-                
-                if not is_auth_after_reload:
-                    logger.info("⏳ [DEBUG-WORKER] Aguardando 60s para próxima tentativa...")
-                    self._stop_event.wait(60)
-                    continue
-                else:
-                    logger.info("✅ [DEBUG-WORKER] Autenticação OK após reload! Continuando ciclo...")
 
-            logger.debug(f"✅ [DEBUG-WORKER] Autenticação confirmada! Iniciando processamento...")
-            
+            # ── Aguarda autenticação ──────────────────────────────────────
+            if not self.auth.is_authenticated():
+                logger.info(f"⏸ Ciclo #{cycle_count}: aguardando autenticação...")
+                self.auth.reload_tokens_from_disk()
+                if not self.auth.is_authenticated():
+                    # Espera 60s OU até wake_event ser setado
+                    self._wake_event.wait(60)
+                    self._wake_event.clear()
+                    continue
+
+            # ── Processamento ─────────────────────────────────────────────
             try:
-                # Ciclo de Produtos (Cache Pesado)
-                # Força no primeiro ciclo (cycle_count=1) ou a cada 3 ciclos
                 if cycle_count == 1 or cycle_count % 3 == 0:
-                    logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando cache de produtos...")
+                    logger.info(f"🔄 Ciclo #{cycle_count}: atualizando cache de produtos...")
                     self.process_products_cache()
-                
-                # Ciclo de Vendas (KPIs)
-                logger.info(f"🔄 Ciclo #{cycle_count}: Atualizando Pedidos/KPIs...")
+
+                logger.info(f"🔄 Ciclo #{cycle_count}: atualizando pedidos/KPIs...")
                 self.process_sales_orders()
-                
-                # Ciclo de Componentes
+
                 if cycle_count % 2 == 0:
-                    logger.info(f"🔄 Ciclo #{cycle_count}: Calculando componentes...")
+                    logger.info(f"🔄 Ciclo #{cycle_count}: calculando componentes...")
                     usage = self.calculate_component_usage()
                     if usage.get('components'):
                         self._component_usage_cache = usage
                         self.broadcast_kpi_update(component_usage=usage)
 
-            except Exception as e:
-                logger.exception(f"❌ [DEBUG-WORKER] Erro fatal no ciclo #{cycle_count}")
+            except Exception:
+                logger.exception(f"❌ Erro fatal no ciclo #{cycle_count}")
 
-            logger.info(f"✅ [DEBUG-WORKER] Ciclo #{cycle_count} finalizado. Dormindo 10min...")
-            logger.debug(f"🔄 [DEBUG-WORKER] ==================== FIM CICLO #{cycle_count} ====================")
-            logger.debug(f"")
-            
-            # Mantém 10 minutos (600s), mas pode ser interrompido por wake_worker()
-            logger.debug("💤 [DEBUG-WORKER] Entrando em sleep de 600s (ou até ser acordado)...")
-            interrupted = self._stop_event.wait(600)
-            
-            if interrupted:
-                logger.info("⏰ [DEBUG-WORKER] Sleep interrompido! Iniciando próximo ciclo imediatamente...")
-                self._stop_event.clear()  # Limpa o evento para não interromper próximos ciclos
-            else:
-                logger.debug("⏰ [DEBUG-WORKER] Sleep de 600s completado naturalmente")
+            logger.info(f"✅ Ciclo #{cycle_count} finalizado. Próximo em 10min.")
+
+            # Dorme 600s mas acorda se wake_event for setado
+            self._wake_event.wait(600)
+            self._wake_event.clear()
 
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
@@ -2301,8 +2234,8 @@ class Orchestrator:
                         if detalhe and 'data' in detalhe:
                             comp_data = detalhe['data'].get('estrutura', {}).get('componentes', [])
                             produto_normalizado["componentes"] = comp_data
-                    except:
-                        pass
+                    except Exception as _kit_err:
+                        logger.warning(f"Erro ao buscar componentes do kit {p_id}: {_kit_err}")
                     all_kits.append(produto_normalizado)
                 else:
                     all_products.append(produto_normalizado)
@@ -2552,15 +2485,26 @@ class Orchestrator:
             payload["products"] = self.get_all_products()
             payload["kits"] = self.get_all_kits()
                 
-        # 4. Envia o broadcast
+        # 4. Copia a lista com lock, envia sem lock (evita segurar lock durante I/O de rede)
         with kpi_update_lock:
-            for cb in kpi_update_callbacks:
-                try:
-                    cb(payload)
-                except ConnectionClosed:
-                    self.logger.debug("Conexão WebSocket fechada ao tentar enviar full_update.")
-                except Exception as e:
-                    self.logger.exception("Erro ao enviar full_update via callback.")
+            callbacks_snapshot = list(kpi_update_callbacks)
+
+        dead = []
+        for cb in callbacks_snapshot:
+            try:
+                cb(payload)
+            except ConnectionClosed:
+                dead.append(cb)
+            except Exception:
+                self.logger.exception("Erro ao enviar full_update via callback.")
+                dead.append(cb)
+
+        # Remove callbacks mortos
+        if dead:
+            with kpi_update_lock:
+                for cb in dead:
+                    if cb in kpi_update_callbacks:
+                        kpi_update_callbacks.remove(cb)
 
 # ============================================================================ 
 # 8. WEB SERVER (FLASK)
@@ -2616,16 +2560,14 @@ class WebServer:
             signature = request.headers.get('X-Bling-Signature')
             payload = request.data
             if self.config.WEBHOOK_SECRET != 'YOUR_WEBHOOK_SECRET' and signature:
-                expected = hmac.new(self.config.WEBHOOK_SECRET.encode(), payload, hashlib.sha256).hexdigest()
+                expected = hmac.new(key=self.config.WEBHOOK_SECRET.encode(), msg=payload, digestmod=hashlib.sha256).hexdigest()
                 if not hmac.compare_digest(signature, expected):
                     return 'Invalid signature', 403
             try:
                 data = json.loads(payload)
                 event = data.get('evento')
                 if event in ['pedidoCriado', 'pedidoAlterado', 'pedido']:
-                    executor = ThreadPoolExecutor(max_workers=1)
-                    executor.submit(self.orchestrator.process_sales_orders, force=True)
-                    executor.shutdown(wait=False)
+                    Thread(target=self.orchestrator.process_sales_orders, kwargs={'force': True}, daemon=True).start()
                 return 'OK', 200
             except Exception as e:
                 return 'Error', 500
@@ -2641,9 +2583,7 @@ class WebServer:
             stats = self.orchestrator.sales.stats_history
             if not stats or not stats.get('dates'):
                 if not self.orchestrator.sales.daily_count:
-                     executor = ThreadPoolExecutor(max_workers=1)
-                     executor.submit(self.orchestrator.process_sales_orders)
-                     executor.shutdown(wait=False)
+                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
                 return jsonify({"labels": [], "daily": [], "moving_avg": [], "growth": 0, "avg_daily": 0})
             return jsonify({
                 "labels": stats.get('dates', []),
@@ -2667,10 +2607,7 @@ class WebServer:
                 
                 self.orchestrator.sales._recalculation_running = True
 
-            # Executa o recálculo em uma thread separada para não bloquear a requisição HTTP
-            executor = ThreadPoolExecutor(max_workers=1)
-            executor.submit(self.orchestrator.process_sales_orders)
-            executor.shutdown(wait=False)
+            Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
             
             return jsonify({"status": "started", "message": "Recálculo de KPIs iniciado em segundo plano."}), 202
 
@@ -3024,53 +2961,32 @@ class WebServer:
             code = request.args.get('code')
             state = request.args.get('state')
             
-            logger.debug("🔐 [DEBUG-CALLBACK] Callback OAuth recebido")
-            logger.debug(f"   • Code presente: {'Sim' if code else 'Não'}")
-            logger.debug(f"   • State: {state[:20]}..." if state else "   • State: Ausente")
+            logger.info("🔐 Callback OAuth recebido.")
             
             if not code:
-                logger.error("❌ [DEBUG-CALLBACK] Código de autorização não recebido!")
+                logger.error("Código de autorização OAuth não recebido.")
                 return "Erro: Código de autorização não recebido.", 400
                 
-            # Validação do State (CSRF)
-            logger.debug("🔍 [DEBUG-CALLBACK] Validando state OAuth...")
             if not self.orchestrator.auth._validate_oauth_state(state):
-                logger.error("❌ [DEBUG-CALLBACK] State inválido ou expirado!")
+                logger.error("State OAuth inválido ou expirado.")
                 return "Erro: State inválido ou expirado.", 403
-            
-            logger.debug("✅ [DEBUG-CALLBACK] State validado com sucesso")
-            
-            # Troca o código pelo token
-            logger.debug("🔄 [DEBUG-CALLBACK] Trocando code por tokens...")
+
             success = self.orchestrator.auth.exchange_code_for_token(code)
-            
+
             if success:
-                logger.info("✅ [DEBUG-CALLBACK] Tokens obtidos com sucesso!")
-                
-                # 🔧 CORREÇÃO CRÍTICA: Recarrega tokens na memória
-                logger.debug("🔄 [DEBUG-CALLBACK] Recarregando tokens na memória...")
+                logger.info("✅ Autenticação OAuth concluída com sucesso.")
                 self.orchestrator.auth.reload_tokens_from_disk()
-                
-                # Verifica autenticação após reload
-                is_auth = self.orchestrator.auth.is_authenticated()
-                logger.debug(f"🔍 [DEBUG-CALLBACK] is_authenticated() = {is_auth}")
-                
-                # Inicia o worker após autenticação bem-sucedida
+
                 if not self.orchestrator.is_running():
-                    logger.info("🚀 [DEBUG-CALLBACK] Iniciando worker...")
                     self.orchestrator.start_worker()
                     start_cleanup_timer()
-                    logger.info("✅ [DEBUG-CALLBACK] Worker iniciado com sucesso!")
+                    logger.info("🚀 Worker iniciado após autenticação.")
                 else:
-                    logger.debug("ℹ️ [DEBUG-CALLBACK] Worker já está rodando")
-                    # 🔧 NOVO: Acorda o worker imediatamente
-                    logger.debug("⏰ [DEBUG-CALLBACK] Acordando worker para processar imediatamente...")
                     self.orchestrator.wake_worker()
-                
-                logger.info("🔄 [DEBUG-CALLBACK] Redirecionando para dashboard...")
+
                 return redirect('/')
             else:
-                logger.error("❌ [DEBUG-CALLBACK] Erro ao trocar código pelo token!")
+                logger.error("Falha ao trocar código OAuth pelo token.")
                 return "Erro ao trocar código pelo token.", 500
 
         # Rota de Busca com correção de 404 e Imagem
@@ -3266,10 +3182,7 @@ class WebServer:
                         self.logger.info("🔔 Alteração de pedido detectada via Webhook. Iniciando atualização...")
                         
                         # Dispara atualização em background
-                        executor = ThreadPoolExecutor(max_workers=1)
-                        # Força 'force=True' para ignorar o lock de tempo e atualizar na hora
-                        executor.submit(self.orchestrator.process_sales_orders, force=True)
-                        executor.shutdown(wait=False)
+                        Thread(target=self.orchestrator.process_sales_orders, kwargs={'force': True}, daemon=True).start()
                         
                         return jsonify({"status": "ok", "message": "Update triggered"}), 200
 
@@ -4292,17 +4205,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: Atualizar Status de Autenticação */
+        /* Atualizar Status de Autenticação */
         function updateAuthStatus(authenticated, authUrl) {
             const badge = document.getElementById('status-badge');
             isAuthenticated = authenticated;
 
-            if(isAuthenticated) {
+            if (isAuthenticated) {
                 badge.className = 'badge bg-success';
                 badge.textContent = '🟢 Online';
                 document.getElementById('auth-link').classList.add('d-none');
                 document.getElementById('content-tabs').classList.remove('hidden');
                 document.getElementById('auth-required-tabs').classList.add('hidden');
+                // Carrega kits na primeira confirmação de auth
+                _onAuthConfirmed();
             } else {
                 badge.className = 'badge bg-danger';
                 badge.textContent = '🔴 Offline';
@@ -5238,10 +5153,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* ✅ DESIGN: Inicialização */
-        document.addEventListener('DOMContentLoaded', () => {
-            loadKits();
+        /* Inicialização — loadKits só após autenticação confirmada via WS */
+        let _kitsLoaded = false;
 
+        function _onAuthConfirmed() {
+            if (!_kitsLoaded) {
+                _kitsLoaded = true;
+                loadKits();
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
             const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
             if (kpiTab) kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
 
@@ -5250,13 +5172,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
                     loadProductionBoard();
-                    // Inicia polling automático a cada 10s (atualiza timers ao vivo para todos)
                     if (!_boardPoll) {
                         _boardPoll = setInterval(loadProductionBoard, 10000);
                     }
                 });
                 componentUsageTab.addEventListener('hidden.bs.tab', () => {
-                    // Para polling e ticker ao sair da aba (economiza recursos)
                     if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
                     if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
                 });
@@ -5288,9 +5208,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 
-# ============================================================================ 
-# 10. EXECUÇÃO
-# ============================================================================ 
+# ============================================================================
 # 10. EXECUÇÃO
 # ============================================================================
 
@@ -5324,10 +5242,7 @@ def create_app() -> Flask:
     # 4. Inicializa o WebServer (Rotas e WebSockets)
     WebServer(config, orchestrator, flask_app) 
     
-    # 5. LÓGICA DE INÍCIO DO WORKER (REMOVIDA DO STARTUP)
-    # O worker não deve iniciar automaticamente no startup.
-    # Ele deve ser iniciado apenas após a autenticação ou sob demanda.
-    # A chamada para orchestrator.start() e start_cleanup_timer() foi removida daqui.
+    # Worker iniciado apenas após OAuth — veja /callback
     
     return flask_app
 
