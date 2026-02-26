@@ -4216,7 +4216,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             kpiDaily.textContent = dSalesStats.daily;
             kpiWeekly.textContent = dSalesStats.weekly;
-            kpiHistoric.textContent = dSalesStats.historic || dSalesStats.monthly;
+            kpiHistoric.textContent = dSalesStats.monthly;
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
             // Animação de atualização
@@ -4276,7 +4276,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             let checklistHtml = '';
 
             if (isCadeira) {
-                const encodedName = encodeURIComponent(productName);
+                // encodedTimerKey: identifica o timer no servidor (pode ser "nome||item_key")
+                // encodedProductName: nome legível para registro de consumo
+                const encodedTimerKey   = encodeURIComponent(_timerKey);
+                const encodedProductName = encodeURIComponent(productName);
                 checklistHtml = `
                     <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
                     <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
@@ -4286,7 +4289,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                      id="checklist-row-${i}"
                                      style="cursor:pointer; transition: background 0.2s, border-color 0.2s;">
                                     <input class="form-check-input ms-1" type="checkbox" id="check${i}"
-                                        onchange="handleChecklistChange(this, ${i}, '${encodedName}')">
+                                        onchange="handleChecklistChange(this, ${i}, '${encodedTimerKey}', '${encodedProductName}')">
                                     <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
                                         ${item.nome} 
                                         <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
@@ -4360,16 +4363,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const modal = new bootstrap.Modal(document.getElementById('productionModal'));
             modal.show();
 
-            // Carrega estado do timer (usa timer_key) e checklist (usa nome do produto)
+            // Carrega estado do timer (usa timer_key) e checklist (usa timer_key para encontrar o estado correto)
             controlTimer('get', _timerKey);
-            _loadChecklistState(productName);
+            _loadChecklistState(productName, _timerKey);
         }
 
         const checklistState = {};
 
-        async function _loadChecklistState(productName) {
+        async function _loadChecklistState(productName, timerKey) {
+            // Usa timerKey se disponível (para encontrar checklist salvo no timer correto)
+            const keyToLoad = timerKey || productName;
             try {
-                const safe = encodeURIComponent(productName);
+                const safe = encodeURIComponent(keyToLoad);
                 const res = await fetch(`/api/checklist/state/${safe}`);
                 const data = await res.json();
                 const saved = data.checklist || {};
@@ -4401,8 +4406,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        function handleChecklistChange(cb, idx, encodedName) {
-            const productName = decodeURIComponent(encodedName);
+        function handleChecklistChange(cb, idx, encodedTimerKey, encodedProductName) {
+            // encodedTimerKey: chave do timer no servidor (para salvar estado do checklist)
+            // encodedProductName: nome legível (para registrar consumo)
+            const timerKey   = decodeURIComponent(encodedTimerKey);
+            const productName = encodedProductName ? decodeURIComponent(encodedProductName) : timerKey.split('||')[0];
             const isChecked = cb.checked;
             const item = RECIPE_CADEIRA[idx];
             const row = document.getElementById('checklist-row-' + idx);
@@ -4417,21 +4425,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }
             }
 
-            // Salva estado da checklist no servidor
+            // Salva estado da checklist no servidor usando o timerKey correto
             fetch('/api/checklist/state', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ produto: productName, componente: item.nome, checked: isChecked })
+                body: JSON.stringify({ produto: timerKey, componente: item.nome, checked: isChecked })
             }).catch(e => console.error('Erro ao salvar checklist:', e));
 
-            // Registra consumo
+            // Registra consumo usando o nome legível do produto
             registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
             _updateChecklistProgress();
         }
 
         function toggleChecklist(container, idx, productName) {
             const cb = container.querySelector('input[type=checkbox]');
-            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(productName));
+            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(productName), encodeURIComponent(productName));
         }
 
         async function registerConsumption(componentName, qty, unit, productName, checked) {
@@ -4468,13 +4476,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     timerInterval = null;
                     const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
                     showToast('✅ Concluído!', produto + ' — ' + formatSeconds(elapsed) + ' registrado.', 'success');
-                    // Fecha modal de forma robusta
+                    // Fecha modal de forma robusta + remove backdrop
                     const modalEl = document.getElementById('productionModal');
                     if (modalEl) {
                         try {
-                            const bsModal = bootstrap.Modal.getInstance(modalEl) || new bootstrap.Modal(modalEl);
-                            bsModal.hide();
-                        } catch(me) { modalEl.remove(); }
+                            const bsModal = bootstrap.Modal.getInstance(modalEl);
+                            if (bsModal) bsModal.hide();
+                        } catch(me) {}
+                        // Garante remoção mesmo se hide() falhar
+                        setTimeout(() => {
+                            modalEl.remove();
+                            document.querySelectorAll('.modal-backdrop').forEach(el => el.remove());
+                            document.body.classList.remove('modal-open');
+                            document.body.style.removeProperty('overflow');
+                            document.body.style.removeProperty('padding-right');
+                        }, 300);
                     }
                     // Atualiza board e consumo
                     await loadProductionBoard();
@@ -4654,14 +4670,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const safeId  = nome.replace(/[^a-zA-Z0-9]/g,'_');
                     const elapsed = item.tempo_decorrido || 0;
                     const estado  = item.estado || 'paused';
-                    const itemKey = item.item_key || null;
+                    const itemKey  = item.item_key || null;
+                    const timerKey = item.timer_key || nome;  // chave real do timer (pode ser "nome||item_key")
                     const base    = item.base || '—';
                     const cor     = item.cor  || '—';
                     const chkDone = Object.values(item.checklist || {}).filter(Boolean).length;
                     const chkTotal= RECIPE_CADEIRA.length;
 
-                    // Guarda estado para ticker local
-                    _boardTimerState[nome] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
+                    // Guarda estado para ticker local com a chave correta
+                    _boardTimerState[timerKey] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
 
                     const finishBtn = itemKey
                         ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome)">✅ Concluir</button>`
@@ -4686,7 +4703,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             <span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>
                         </td>
                         <td class="text-center">
-                            <button class="btn btn-xs btn-outline-primary btn-sm" data-nome="${nomeSafe}" onclick="openProductionChecklist(this.dataset.nome)">🛠 Abrir</button>
+                            <button class="btn btn-xs btn-outline-primary btn-sm"
+                                data-nome="${nomeSafe}"
+                                data-tkey="${encodeURIComponent(timerKey)}"
+                                onclick="openProductionChecklist(this.dataset.nome, decodeURIComponent(this.dataset.tkey))">🛠 Abrir</button>
                             ${finishBtn}
                         </td>
                     </tr>`;
@@ -4720,10 +4740,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             // ── Ticker local (1s) ────────────────────────────────────────
             _boardTick = setInterval(() => {
-                Object.entries(_boardTimerState).forEach(([nome, s]) => {
+                Object.entries(_boardTimerState).forEach(([tkey, s]) => {
                     if (s.estado !== 'running') return;
                     const elapsed = s.base + (Date.now() / 1000 - s.startedAt);
-                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g, '_');
+                    // O safeId do elemento usa o nome do produto (parte antes do ||)
+                    const displayNome = tkey.includes('||') ? tkey.split('||')[0] : tkey;
+                    const safeId = displayNome.replace(/[^a-zA-Z0-9]/g, '_');
                     const el = document.getElementById('btimer_' + safeId);
                     if (el) el.textContent = formatSeconds(Math.floor(elapsed));
                 });
