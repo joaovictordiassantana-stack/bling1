@@ -1140,35 +1140,54 @@ class SalesManager:
         daily_counts_chart = defaultdict(int) 
         monthly_report = defaultdict(int)
 
+        ignorados = 0
+        formatos_falhos = []
         for o in all_orders:
             try:
                 date_str = o.get('data') or o.get('dataEmissao')
-                if not date_str: continue
-                try:
-                    dt = datetime.fromisoformat(date_str.replace(' ', 'T'))
-                except:
+                if not date_str:
+                    ignorados += 1
+                    continue
+
+                # Suporta: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM:SS', 'DD/MM/YYYY'
+                date_part = str(date_str).split('T')[0].split(' ')[0].strip()
+                dt = None
+                for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
                     try:
-                        dt = datetime.strptime(date_str.split(' ')[0], "%Y-%m-%d")
-                    except:
+                        dt = datetime.strptime(date_part, fmt)
+                        break
+                    except ValueError:
                         continue
+
+                if dt is None:
+                    ignorados += 1
+                    if len(formatos_falhos) < 3:
+                        formatos_falhos.append(date_str)
+                    continue
+
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=tz_br)
-                
+
                 dt_pedido = dt.date()
-                
+
                 if dt.year == now.year:
                     monthly_report[dt.month] += 1
-                
-                # KPIs Estáticos
+
+                # KPIs
                 if dt_pedido == hoje: daily_orders.append(o)
                 if dt_pedido >= inicio_semana: weekly_orders.append(o)
                 if dt_pedido >= inicio_mes: monthly_orders.append(o)
-                
-                # Dados para o Gráfico (Últimos 30 dias)
+
                 if dt_pedido >= inicio_grafico:
                     daily_counts_chart[dt_pedido] += 1
-            except Exception:
+
+            except Exception as e:
+                ignorados += 1
+                self.logger.debug(f"Erro ao processar pedido {o.get('id','?')}: {e}")
                 continue
+
+        if ignorados > 0:
+            self.logger.warning(f"⚠️ {ignorados}/{len(all_orders)} pedidos ignorados por data inválida. Amostras: {formatos_falhos}")
 
         # Gera eixo X do gráfico (30 dias corridos)
         dates = [(inicio_grafico + timedelta(days=i)) for i in range(30)]
@@ -1181,29 +1200,35 @@ class SalesManager:
         prev_week = sum(counts[-14:-7])
         growth = ((last_week - prev_week) / prev_week * 100) if prev_week else 0
 
+        pedidos_processados = len(daily_orders) + len(weekly_orders) + len(monthly_orders) + len(daily_counts_chart)
+
+        # Só atualiza KPIs se pelo menos 1 pedido foi processado com sucesso
+        # Isso evita que uma falha de parse sobrescreva KPIs válidos com zeros
+        if pedidos_processados == 0 and len(all_orders) > 0:
+            self.logger.warning(f"⚠️ Nenhum pedido processado de {len(all_orders)} recebidos — mantendo KPIs anteriores.")
+            return
+
         with self.lock:
             self.daily_count = len(daily_orders)
             self.weekly_count = len(weekly_orders)
-            # Atualiza o contador do mês ATUAL para manter o KPI do topo do dashboard
             self.monthly_count = len(monthly_orders)
             self.historic_count = len(all_orders)
-            
-            # Salva o relatório completo de todos os meses em history_data
+
             self.history_data['yearly_monthly_report'] = dict(monthly_report)
-            
+
             self.stats_history = {
                 'dates': [d.isoformat() for d in dates],
                 'daily': counts,
-                'moving_avg': moving_avg,
+                'moving_avg': [round(v, 2) for v in moving_avg],
                 'growth': round(growth, 1),
                 'avg_daily': round(sum(counts[-30:]) / 30, 1) if len(counts) >= 30 else 0
             }
             self.last_recalculated = now
             self._orders_cache = {o.get('id'): o for o in all_orders[-100:]}
-            
+
         save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
-        self._save_sales_history()  # salva histórico de pedidos separado
-        self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
+        self._save_sales_history()
+        self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count} | Histórico: {len(all_orders)} pedidos")
 
 class ProductionTimer:
     """Gerencia cronômetros de produção e histórico detalhado."""
@@ -2172,11 +2197,13 @@ class Orchestrator:
             
             # Parâmetros compatíveis
             # Busca Janela Móvel (Últimos 30 dias)
+            # API Bling V3: datas só como 'YYYY-MM-DD', sem hora
+            # 'situacao' é parâmetro da V2 — na V3 é ignorado ou causa 400
+            # Buscamos TODOS os pedidos do mês e filtramos em memória
             params = {
                 'dataEmissaoInicial': start_date.strftime('%Y-%m-%d'),
-                'dataEmissaoFinal': now.strftime('%Y-%m-%d %H:%M:%S'),
-                'situacao': 'F', # Faturado. Mude para None ou remova se quiser todos os status.
-                'limite': 100 
+                'dataEmissaoFinal': now.strftime('%Y-%m-%d'),
+                'limite': 100,
             }
             
             all_orders = []
@@ -2184,31 +2211,35 @@ class Orchestrator:
             
             while True:
                 params['pagina'] = page
-                self.logger.debug(f"Buscando página {page} de pedidos...")
+                self.logger.info(f"🔍 Buscando pedidos página {page} | params: {params}")
                 try:
                     response = self.api.get('pedidos/vendas', params=params)
                 except Exception as e:
                     self.logger.error(f"Erro na API ao buscar pedidos: {e}")
-                    break # Se der erro na API, para o loop mas processa o que já pegou
-                
+                    break
+
                 if response is None:
-                    self.logger.debug(f"Resposta da API nula na página {page}")
+                    self.logger.warning(f"⚠️ API retornou None na página {page} — token expirado ou erro HTTP. KPIs não serão zerados.")
                     break
     
                 data = []
                 if isinstance(response, dict):
-                    # Formato V3 Padrão
                     if 'data' in response:
                         data = response['data']
-                    # Formato Legado / Webhook antigo
+                        # Bling V3: response.data pode vir com paginação
+                        # Logar chaves da resposta para diagnóstico
+                        if page == 1:
+                            self.logger.info(f"📄 Resposta API V3 — chaves: {list(response.keys())} | itens página 1: {len(data)}")
                     elif 'retorno' in response and 'pedidos' in response['retorno']:
                         data = response['retorno']['pedidos']
-                        # Normaliza lista antiga se necessário
                         if data and isinstance(data[0], dict) and 'pedido' in data[0]:
                             data = [d['pedido'] for d in data]
+                        self.logger.info(f"📄 Resposta formato V2 legacy | itens: {len(data)}")
+                    else:
+                        self.logger.warning(f"⚠️ Estrutura de resposta inesperada. Chaves: {list(response.keys())} | Raw[:200]: {str(response)[:200]}")
                 elif isinstance(response, list):
-                    # Se o Bling retornar a lista direta
                     data = response
+                    self.logger.info(f"📄 Resposta como lista direta | itens: {len(data)}")
                 # -------------------------------------
                 
                 self.logger.debug(f"Página {page} retornou {len(data) if data else 0} pedidos.")
@@ -2242,23 +2273,24 @@ class Orchestrator:
                     if o.get('id'):
                         valid_orders.append(o)
 
-                self.logger.debug(f"{len(valid_orders)} pedidos válidos após normalização inicial.")
-                # 1. Mescla pedidos novos com histórico existente (por ID)
-                #    Não substitui para não perder pedidos de ciclos anteriores
-                existing_ids = {o.get('id') for o in self.sales._sales_history if o.get('id')}
+                if valid_orders:
+                    sample_dates = [o.get('data', '?') for o in valid_orders[:3]]
+                    self.logger.info(f"✅ {len(valid_orders)} pedidos válidos. Amostras de datas: {sample_dates}")
+                else:
+                    self.logger.warning(f"⚠️ 0 pedidos válidos de {len(all_orders)} recebidos. Nenhum tinha 'id' + 'data'.")
+                    sample_raw = [{k: v for k, v in o.items() if k in ('id', 'data', 'dataEmissao', 'dataSaida', 'numero')} for o in all_orders[:3]]
+                    self.logger.warning(f"Amostras raw: {sample_raw}")
+                # 1. Mescla pedidos novos com histórico (O(1) por dict, não O(n²))
+                history_map = {o['id']: o for o in self.sales._sales_history if o.get('id')}
                 for o in valid_orders:
-                    if o.get('id') and o['id'] not in existing_ids:
-                        self.sales._sales_history.append(o)
-                        existing_ids.add(o['id'])
-                    elif o.get('id'):
-                        # Atualiza o pedido existente (pode ter mudado de situação)
-                        for i, ex in enumerate(self.sales._sales_history):
-                            if ex.get('id') == o['id']:
-                                self.sales._sales_history[i] = o
-                                break
-                # Limita a 2000 pedidos mais recentes para não crescer infinitamente
-                if len(self.sales._sales_history) > 2000:
-                    self.sales._sales_history = self.sales._sales_history[-2000:]
+                    if o.get('id'):
+                        history_map[o['id']] = o  # insere ou atualiza
+                # Reconstrói lista ordenada por data (mais recente por último)
+                merged = sorted(history_map.values(),
+                                key=lambda x: x.get('data', ''), reverse=False)
+                # Limita a 2000 mais recentes
+                self.sales._sales_history = merged[-2000:]
+                self.logger.info(f"📦 Histórico de pedidos: {len(valid_orders)} novos/atualizados, {len(self.sales._sales_history)} total em memória.")
                 
                 # 2. Recalcula as estatísticas
                 self.sales.recalculate_from_orders(self.sales._sales_history)
