@@ -1047,8 +1047,22 @@ class SalesManager:
                 self.history_data = data.get('history_data', {})
                 self.stats_history = data.get('stats_history', {'dates': [], 'daily': [], 'moving_avg': [], 'growth': 0, 'avg_daily': 0})
                 self._orders_cache = data.get('orders_cache', {})
-                self._sales_history = data.get('sales_history', [])
+                # sales_history agora é salvo separado (ver _save_sales_history)
+                inline = data.get('sales_history', [])  # compatibilidade com dados antigos
+                if inline:
+                    self._sales_history = inline
                 
+                # Carrega sales_history da coleção separada
+                if not self._sales_history and MONGO_AVAILABLE:
+                    try:
+                        hist_doc = MongoStore.get('sales_history', 'history')
+                        loaded = hist_doc.get('orders', [])
+                        if loaded:
+                            self._sales_history = loaded
+                            logger.info(f"✅ sales_history: {len(loaded)} pedidos carregados do MongoDB")
+                    except Exception:
+                        pass
+
                 last_recalc = data.get('last_recalculated')
                 if isinstance(last_recalc, str):
                     try:
@@ -1081,10 +1095,27 @@ class SalesManager:
                 "historic": self.historic_count,
                 "history_data": self.history_data,
                 "stats_history": self.stats_history,
-                "orders_cache": self._orders_cache,
-                "sales_history": self._sales_history,
+                # sales_history salvo separadamente (evita doc > 16MB no MongoDB)
+                # orders_cache é derivado e não precisa persistir
                 "last_recalculated": self.last_recalculated.isoformat()
             }
+
+    def _save_sales_history(self):
+        """Salva o histórico de pedidos separadamente para não estourar o doc de stats."""
+        try:
+            # Salva apenas os campos essenciais de cada pedido (reduz tamanho drasticamente)
+            compact = [
+                {'id': o.get('id'), 'data': o.get('data'), 'itens': o.get('itens', []),
+                 'contato': o.get('contato'), 'numero': o.get('numero')}
+                for o in self._sales_history
+            ]
+            if MONGO_AVAILABLE:
+                try:
+                    MongoStore.set('sales_history', {'orders': compact}, 'history')
+                except Exception as e:
+                    logger.error(f"Erro ao salvar sales_history no MongoDB: {e}")
+        except Exception as e:
+            logger.error(f"Erro ao compactar sales_history: {e}")
 
     def recalculate_from_orders(self, all_orders):
         """Recalcula métricas e histórico baseado na lista de pedidos."""
@@ -1171,6 +1202,7 @@ class SalesManager:
             self._orders_cache = {o.get('id'): o for o in all_orders[-100:]}
             
         save_stats(self._get_state_for_save(), self.config.SALES_STATS_FILE)
+        self._save_sales_history()  # salva histórico de pedidos separado
         self.logger.info(f"✅ Estatísticas atualizadas: D:{self.daily_count} W:{self.weekly_count} M:{self.monthly_count}")
 
 class ProductionTimer:
@@ -1186,31 +1218,41 @@ class ProductionTimer:
             self._launch_background_saver(nome)
 
     def _load(self):
-        # Tenta MongoDB primeiro, fallback para arquivo
+        """Carrega timers — MongoDB primeiro, arquivo como fallback real."""
         if MONGO_AVAILABLE:
             try:
                 data = MongoStore.get('production_timers', 'timers')
-                return data.get('timers', {})
-            except Exception:
-                pass
-        if not self.FILE_PATH.exists(): return {}
+                timers = data.get('timers', {})
+                if timers:  # só usa MongoDB se retornou dados de fato
+                    return timers
+                # MongoDB vazio — pode ser falha silenciosa, tenta arquivo
+                logger.info("MongoDB retornou timers vazio — verificando arquivo local...")
+            except Exception as e:
+                logger.warning(f"Falha ao carregar timers do MongoDB: {e}")
+        if not self.FILE_PATH.exists():
+            return {}
         try:
-            with open(self.FILE_PATH, 'r') as f: return json.load(f)
-        except: return {}
+            with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if data:
+                    logger.info(f"✅ Timers carregados do arquivo local: {len(data)} timers")
+                return data
+        except Exception as e:
+            logger.error(f"Erro ao carregar timers do arquivo: {e}")
+            return {}
 
     def _save(self):
-        """Salva no MongoDB (principal) e arquivo (fallback)."""
+        """Salva timers — MongoDB E arquivo local (dupla redundância)."""
         if MONGO_AVAILABLE:
             try:
                 MongoStore.set('production_timers', {'timers': self.timers}, 'timers')
-                return
             except Exception as e:
                 logger.error(f"Erro ao salvar timers no MongoDB: {e}")
-        # Fallback arquivo
+        # Sempre salva no arquivo também (seguro contra falha do MongoDB)
         temp_file = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.timers, f, indent=4)
+                json.dump(self.timers, f, indent=4, ensure_ascii=False)
             shutil.move(str(temp_file), str(self.FILE_PATH))
         except Exception as e:
             logger.error(f"Erro ao salvar timers em arquivo: {e}")
@@ -1297,12 +1339,19 @@ class ProductionTimer:
 
         # Recupera checklist antes de pausar
         checklist_marcado = {}
+        if produto_nome not in self.timers:
+            # Tenta recarregar do storage antes de desistir
+            reloaded = self._load()
+            if produto_nome in reloaded:
+                self.timers[produto_nome] = reloaded[produto_nome]
+                logger.info(f"🔄 Timer '{produto_nome}' recuperado do storage")
+
         if produto_nome in self.timers:
             checklist_marcado = self.timers[produto_nome].get('checklist', {})
             status = self.pause(produto_nome)
             total_seconds = status['elapsed']
         else:
-            # Timer não existe (concluído direto do board sem abrir modal)
+            # Timer realmente não existe
             total_seconds = 0
             logger.info(f"⚠️ Timer não encontrado para '{produto_nome}' — registrando com tempo 0")
 
@@ -1373,43 +1422,69 @@ class ProductionTimer:
     def _add_to_history(self, registro):
         """Salva no histórico mensal — MongoDB principal, arquivo fallback."""
         mes_chave = datetime.now().strftime('%Y-%m')
+        # Garante que o registro é serializável (converte tipos Python para primitivos)
+        def _clean(obj):
+            if isinstance(obj, dict):
+                return {k: _clean(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_clean(i) for i in obj]
+            if isinstance(obj, bool):
+                return obj
+            if isinstance(obj, (int, float)):
+                return obj
+            return str(obj) if obj is not None else None
+        reg_clean = _clean(registro)
+
+        saved = False
         if MONGO_AVAILABLE:
             try:
                 _mongo_db['production_history'].update_one(
                     {'_id': mes_chave},
-                    {'$push': {'registros': registro}},
+                    {'$push': {'registros': reg_clean}},
                     upsert=True
                 )
-                return
+                saved = True
             except Exception as e:
                 logger.error(f"Erro ao salvar histórico no MongoDB: {e}")
-        # Fallback arquivo
+        # Sempre salva no arquivo também como backup redundante
         try:
+            history = {}
             if self.HISTORY_PATH.exists():
-                with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
-            else: history = {}
-            if mes_chave not in history: history[mes_chave] = []
-            history[mes_chave].append(registro)
+                with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+            if mes_chave not in history:
+                history[mes_chave] = []
+            history[mes_chave].append(reg_clean)
             temp = self.HISTORY_PATH.with_suffix('.tmp')
-            with open(temp, 'w') as f: json.dump(history, f)
+            with open(temp, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False)
             shutil.move(str(temp), str(self.HISTORY_PATH))
+            if not saved:
+                logger.info(f"Histórico salvo em arquivo (fallback).")
         except Exception as e:
             logger.error(f"Erro ao salvar histórico em arquivo: {e}")
 
     def get_monthly_history_details(self):
-        """Retorna a lista detalhada do mês atual — MongoDB ou arquivo."""
+        """Retorna a lista detalhada do mês atual — MongoDB primeiro, arquivo fallback."""
         mes_chave = datetime.now().strftime('%Y-%m')
         if MONGO_AVAILABLE:
             try:
                 doc = _mongo_db['production_history'].find_one({'_id': mes_chave})
-                return (doc or {}).get('registros', [])
-            except Exception:
-                pass
-        if not self.HISTORY_PATH.exists(): return []
+                registros = (doc or {}).get('registros', [])
+                if registros:
+                    return registros
+                # MongoDB vazio — tenta arquivo (pode ter dados mais recentes)
+            except Exception as e:
+                logger.warning(f"Falha ao carregar histórico do MongoDB: {e}")
+        if not self.HISTORY_PATH.exists():
+            return []
         try:
-            with open(self.HISTORY_PATH, 'r') as f: history = json.load(f)
+            with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f:
+                history = json.load(f)
             return history.get(mes_chave, [])
-        except: return []
+        except Exception as e:
+            logger.error(f"Erro ao carregar histórico do arquivo: {e}")
+            return []
 
 class ComponentConsumptionManager:
     """
@@ -1426,25 +1501,33 @@ class ComponentConsumptionManager:
         return datetime.now().strftime('%Y-%m')
 
     def _load(self):
+        """Carrega consumo — MongoDB primeiro, arquivo como fallback real."""
         if MONGO_AVAILABLE:
             try:
                 doc = MongoStore.get('component_consumption', 'main')
-                return doc.get('data', {})
-            except Exception:
-                pass
+                data = doc.get('data', {})
+                if data:
+                    return data
+                logger.info("MongoDB retornou consumo vazio — verificando arquivo local...")
+            except Exception as e:
+                logger.warning(f"Falha ao carregar consumo do MongoDB: {e}")
         if not self.FILE_PATH.exists():
             return {}
         try:
             with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
+                data = json.load(f)
+                if data:
+                    logger.info(f"✅ Consumo carregado do arquivo local")
+                return data
+        except Exception as e:
+            logger.error(f"Erro ao carregar consumo do arquivo: {e}")
             return {}
 
     def _save(self):
+        """Salva consumo — MongoDB E arquivo local (dupla redundância)."""
         if MONGO_AVAILABLE:
             try:
                 MongoStore.set('component_consumption', {'data': self.data}, 'main')
-                return
             except Exception as e:
                 logger.error(f"Erro ao salvar consumo no MongoDB: {e}")
         temp = self.FILE_PATH.with_suffix('.tmp')
@@ -1639,28 +1722,45 @@ class PendingOrdersManager:
         self.data = self._load()
 
     def _load(self):
+        """Carrega pending_orders — MongoDB primeiro, arquivo fallback.
+        Garante que item_key está presente dentro de cada doc."""
         if MONGO_AVAILABLE:
             try:
-                return MongoStore.get_all('pending_orders')
-            except Exception:
-                pass
+                data = MongoStore.get_all('pending_orders')
+                if data:
+                    # Injeta item_key dentro do doc (get_all remove o _id)
+                    for key, doc in data.items():
+                        if 'item_key' not in doc or not doc['item_key']:
+                            doc['item_key'] = key
+                    logger.info(f"✅ PendingOrders: {len(data)} itens carregados do MongoDB")
+                    return data
+                logger.info("MongoDB retornou pending_orders vazio — verificando arquivo local...")
+            except Exception as e:
+                logger.warning(f"Falha ao carregar pending_orders do MongoDB: {e}")
         if not self.FILE_PATH.exists():
             return {}
         try:
             with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
+                data = json.load(f)
+                if data:
+                    # Mesma garantia para arquivo
+                    for key, doc in data.items():
+                        if 'item_key' not in doc or not doc['item_key']:
+                            doc['item_key'] = key
+                    logger.info(f"✅ PendingOrders: {len(data)} itens carregados do arquivo local")
+                return data
+        except Exception as e:
+            logger.error(f"Erro ao carregar pending_orders do arquivo: {e}")
             return {}
 
     def _save(self):
+        """Salva pending_orders — MongoDB E arquivo local (dupla redundância)."""
         if MONGO_AVAILABLE:
             try:
                 for key, val in self.data.items():
                     MongoStore.upsert('pending_orders', key, val)
-                return
             except Exception as e:
                 logger.error(f"Erro ao salvar pending_orders no MongoDB: {e}")
-        # Fallback arquivo
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
@@ -1734,31 +1834,52 @@ class PendingOrdersManager:
         return [v for v in self.data.values() if v.get('status') == 'in_production']
 
     def get_done(self):
-        """Retorna todos os itens concluídos este mês."""
-        return [v for v in self.data.values() if v.get('status') == 'done']
+        """Retorna todos os itens concluídos no mês atual."""
+        mes_atual = datetime.now().strftime('%Y-%m')
+        result = []
+        for v in self.data.values():
+            if v.get('status') != 'done':
+                continue
+            # Filtra pelo mês de conclusão (campo mes_conclusao) ou added_at
+            mes = v.get('mes_conclusao') or (v.get('finished_at', '')[:7] if v.get('finished_at') else '')
+            if not mes:
+                mes = v.get('added_at', '')[:7]
+            if mes == mes_atual:
+                result.append(v)
+        return result
 
     def get_all(self):
         return list(self.data.values())
 
     def reset_if_new_month(self):
         """
-        Todo início de mês remove itens 'done' e 'waiting' do mês anterior.
-        Itens em produção (in_production) são pausados para não se perder.
+        Todo início de mês remove itens antigos da fila.
+        Regras:
+        - 'done': só remove se mes_conclusao (ou finished_at) for de mês anterior
+        - 'waiting'/'in_production': remove se added_at for de mês anterior
+        Itens 'done' do mês atual são mantidos como histórico visível.
         """
         agora = datetime.now()
         mes_atual = f"{agora.year}-{agora.month:02d}"
         to_remove = []
         for key, item in self.data.items():
-            added = item.get('added_at', '')
-            if not added:
-                continue
+            status = item.get('status', 'waiting')
             try:
-                dt = datetime.fromisoformat(added)
-                item_mes = f"{dt.year}-{dt.month:02d}"
-                if item_mes != mes_atual:  # Limpa tudo do mês anterior
+                if status == 'done':
+                    # Para itens concluídos, usa o mês de conclusão
+                    mes_ref = item.get('mes_conclusao', '')
+                    if not mes_ref:
+                        fin = item.get('finished_at', '')
+                        mes_ref = fin[:7] if fin else item.get('added_at', '')[:7]
+                else:
+                    # Para itens em espera/produção, usa quando foi adicionado
+                    mes_ref = item.get('added_at', '')[:7]
+
+                if mes_ref and mes_ref != mes_atual:
                     to_remove.append(key)
             except Exception:
                 pass
+
         if to_remove:
             for key in to_remove:
                 del self.data[key]
@@ -1767,7 +1888,7 @@ class PendingOrdersManager:
                         MongoStore.remove('pending_orders', key)
                     except Exception:
                         pass
-            if to_remove and not MONGO_AVAILABLE:
+            if not MONGO_AVAILABLE:
                 self._save()
             logger.info(f"🗓️ Reset mensal: {len(to_remove)} itens antigos removidos da fila.")
         return len(to_remove)
@@ -1841,13 +1962,23 @@ class PendingOrdersManager:
                 }
 
                 for unit in range(qtd):
-                    sub_key = f"{order_id}_{idx}_{unit}"
-                    if sub_key not in self.data:
+                    # Chave estável: order_id + SKU + posição (não índice do loop externo)
+                    sku_safe = (sku_raw or nome_raw[:20]).replace(' ', '_').replace('/', '_')
+                    sub_key = f"{order_id}_{sku_safe}_{unit}"
+                    # Evita duplicar itens já existentes em qualquer status
+                    already = any(
+                        v.get('order_id') == str(order_id)
+                        and v.get('sku') == sku_raw
+                        and v.get('qtd_unit_idx', unit) == unit
+                        for v in self.data.values()
+                    )
+                    if sub_key not in self.data and not already:
                         self.data[sub_key] = {
                             **item_data,
                             'qtd': 1,
                             'order_id': order_id,
                             'item_key': sub_key,
+                            'qtd_unit_idx': unit,
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
                         }
@@ -2112,8 +2243,22 @@ class Orchestrator:
                         valid_orders.append(o)
 
                 self.logger.debug(f"{len(valid_orders)} pedidos válidos após normalização inicial.")
-                # 1. Substitui o histórico de vendas pelo resultado da busca (Reset Mensal)
-                self.sales._sales_history = valid_orders
+                # 1. Mescla pedidos novos com histórico existente (por ID)
+                #    Não substitui para não perder pedidos de ciclos anteriores
+                existing_ids = {o.get('id') for o in self.sales._sales_history if o.get('id')}
+                for o in valid_orders:
+                    if o.get('id') and o['id'] not in existing_ids:
+                        self.sales._sales_history.append(o)
+                        existing_ids.add(o['id'])
+                    elif o.get('id'):
+                        # Atualiza o pedido existente (pode ter mudado de situação)
+                        for i, ex in enumerate(self.sales._sales_history):
+                            if ex.get('id') == o['id']:
+                                self.sales._sales_history[i] = o
+                                break
+                # Limita a 2000 pedidos mais recentes para não crescer infinitamente
+                if len(self.sales._sales_history) > 2000:
+                    self.sales._sales_history = self.sales._sales_history[-2000:]
                 
                 # 2. Recalcula as estatísticas
                 self.sales.recalculate_from_orders(self.sales._sales_history)
@@ -2867,9 +3012,6 @@ class WebServer:
         def api_pending_orders_sync(token):
             """Força sincronização imediata dos pedidos do Bling com a fila pendente."""
             try:
-                # Reset mensal antes de sincronizar
-                pending_orders.reset_if_new_month()
-
                 with self.orchestrator._cache_lock:
                     cache_flat = {**self.orchestrator._products_cache, **self.orchestrator._kits_cache}
                 orders = self.orchestrator.sales._sales_history or []
