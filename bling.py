@@ -5195,7 +5195,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             } catch(e) {
                 if (e.message === '401') {
-                    div.innerHTML = '<div class="alert alert-warning">🔐 Sessão expirada. <a href="#" onclick="document.getElementById('auth-link').click()">Clique aqui para reautenticar</a>.</div>';
+                    div.innerHTML = '<div class="alert alert-warning">🔐 Sessão expirada. <a href="/auth">Clique aqui para reautenticar</a>.</div>';
                 } else {
                     div.innerHTML = '<div class="alert alert-danger">⚠️ Erro ao carregar lista. Verifique os logs do servidor.</div>';
                 }
