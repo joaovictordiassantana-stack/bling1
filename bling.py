@@ -736,18 +736,17 @@ class BlingAPIClient:
     def delete(self, endpoint: str) -> Optional[Dict[str, Any]]:
         return self._request('DELETE', endpoint)
 
+    def register_webhook(self, event: str, url: str):
+        """
+        Na API v3 do Bling, o registro de webhooks deve ser feito manualmente
+        no painel do desenvolvedor (Cadastro de Aplicativos > Webhooks).
+        """
+        self.logger.info(f"📢 Configure o webhook '{event}' manualmente no painel do Bling → {url}")
+        return {"status": "manual_config_required"}
+
 # ============================================================================ 
 # 5. AUTH MANAGER
 # ============================================================================
-
-    def register_webhook(self, event: str, url: str):
-        """
-        Nota: Na API v3 do Bling, o registro de webhooks deve ser feito manualmente 
-        no painel do desenvolvedor (Cadastro de Aplicativos > Webhooks).
-        Esta função foi mantida para compatibilidade, mas agora apenas loga a instrução.
-        """
-        self.logger.info(f"📢 Lembrete: Configure o webhook para '{event}' manualmente no painel do Bling apontando para: {url}")
-        return {"status": "manual_config_required"}
 
 class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
@@ -1027,7 +1026,7 @@ class SalesManager:
     _sales_history: List[Dict[str, Any]] = field(default_factory=list)
     
     # Novo: Histórico para Gráfico
-    stats_history: Dict[str, Any] = field(default_factory=lambda: {'dates': [], 'daily_counts': [], 'moving_avg': [], 'growth': 0})
+    stats_history: Dict[str, Any] = field(default_factory=lambda: {'dates': [], 'daily': [], 'moving_avg': [], 'growth': 0, 'avg_daily': 0})
     
     last_recalculated: datetime = field(default_factory=datetime.now)
     lock: Lock = field(default_factory=Lock)
@@ -1046,7 +1045,7 @@ class SalesManager:
                 self.monthly_count = data.get('monthly', 0)
                 self.historic_count = data.get('historic', 0)
                 self.history_data = data.get('history_data', {})
-                self.stats_history = data.get('stats_history', {'dates': [], 'daily_counts': [], 'moving_avg': [], 'growth': 0})
+                self.stats_history = data.get('stats_history', {'dates': [], 'daily': [], 'moving_avg': [], 'growth': 0, 'avg_daily': 0})
                 self._orders_cache = data.get('orders_cache', {})
                 self._sales_history = data.get('sales_history', [])
                 
@@ -1895,15 +1894,14 @@ class Orchestrator:
         self._worker_thread = None
         self._products_cache = {}
         self._kits_cache = {}
-        self._load_cache()
-        self._cache_lock = Lock()
-        
+        self._cache_lock = Lock()          # ← criado ANTES de _load_cache (evita AttributeError)
         self._component_usage_cache = None
+        self._load_cache()
 
-        # Carrega cache de produtos no startup se autenticado
-        if self.auth.is_authenticated():
-            self.logger.info("📦 Carregando cache inicial de produtos (process_products_cache)")
-            self.process_products_cache()
+        # Carrega cache em background — não bloqueia o boot do Flask
+        if self.auth._access_token and self.auth._expires_at > __import__('time').time() + 60:
+            self.logger.info("📦 Agendando cache inicial de produtos em background...")
+            Thread(target=self.process_products_cache, daemon=True, name="cache_init").start()
         else:
             self.logger.info("⏳ Cache de produtos adiado — aguardando autenticação OAuth")
 
@@ -2525,26 +2523,16 @@ class WebServer:
             
             return redirect(auth_url)
 
-        # Novo Endpoint: Listagem de Pedidos em Cache
+        # Rota /api/webhook mantida como alias para /webhook (retrocompatibilidade)
         @self.app.route('/api/webhook', methods=['POST'])
         def api_webhook():
-            signature = request.headers.get('X-Bling-Signature')
-            payload = request.data
-            if self.config.WEBHOOK_SECRET != 'YOUR_WEBHOOK_SECRET' and signature:
-                expected = hmac.new(key=self.config.WEBHOOK_SECRET.encode(), msg=payload, digestmod=hashlib.sha256).hexdigest()
-                if not hmac.compare_digest(signature, expected):
-                    return 'Invalid signature', 403
-            try:
-                data = json.loads(payload)
-                event = data.get('evento')
-                if event in ['pedidoCriado', 'pedidoAlterado', 'pedido']:
-                    Thread(target=self.orchestrator.process_sales_orders, kwargs={'force': True}, daemon=True).start()
-                return 'OK', 200
-            except Exception as e:
-                return 'Error', 500
+            """Alias de /webhook para retrocompatibilidade."""
+            # Redireciona internamente para o handler principal com validação completa
+            return redirect('/webhook', code=307)
 
         @self.app.route("/api/orders")
-        def list_orders():
+        @token_required
+        def list_orders(token):
             return jsonify(list(self.orchestrator.sales._orders_cache.values()))
 
         # Novo Endpoint: Histórico de Vendas para Dashboard
@@ -2580,11 +2568,17 @@ class WebServer:
             return jsonify({"status": "started", "message": "Recálculo iniciado em segundo plano."}), 202
 
         @self.app.route('/api/timer/action', methods=['POST'])
-        def api_timer_action():
-            data = request.json
-            action = data.get('action') # start, pause, reset, finish
-            produto = data.get('produto')
-            
+        @token_required
+        def api_timer_action(token):
+            data = request.json or {}
+            action  = data.get('action', '').strip()
+            produto = data.get('produto', '').strip()
+
+            if not action or not produto:
+                return jsonify({'error': 'action e produto são obrigatórios'}), 400
+            if action not in ('start', 'pause', 'reset', 'finish', 'get'):
+                return jsonify({'error': f'action inválida: {action}'}), 400
+
             if action == 'start':
                 status = production_timer.start(produto)
             elif action == 'pause':
@@ -2609,7 +2603,8 @@ class WebServer:
             return jsonify(status)
 
         @self.app.route('/api/production/board')
-        def api_production_board():
+        @token_required
+        def api_production_board(token):
             """
             Retorna snapshot completo da aba de produção.
             - waiting: pedidos do Bling aguardando alguém clicar em Produzir
@@ -2710,13 +2705,15 @@ class WebServer:
             })
 
         @self.app.route('/api/checklist/state/<path:produto>', methods=['GET'])
-        def api_checklist_get(produto):
+        @token_required
+        def api_checklist_get(token, produto):
             """Retorna estado salvo da checklist de um produto em produção."""
             t = production_timer.timers.get(produto, {})
             return jsonify({'checklist': t.get('checklist', {})})
 
         @self.app.route('/api/checklist/state', methods=['POST'])
-        def api_checklist_set():
+        @token_required
+        def api_checklist_set(token):
             """Salva estado de um item da checklist no servidor (persiste)."""
             data = request.json
             produto = data.get('produto', '')
@@ -2740,7 +2737,8 @@ class WebServer:
             return jsonify({'ok': True})
 
         @self.app.route('/api/consumption/register', methods=['POST'])
-        def api_consumption_register():
+        @token_required
+        def api_consumption_register(token):
             """Registra ou remove consumo de componente via checklist."""
             data = request.json
             component_name = data.get('component_name', '')
@@ -2770,7 +2768,8 @@ class WebServer:
             return jsonify({'success': True, 'result': result})
 
         @self.app.route('/api/consumption/summary')
-        def api_consumption_summary():
+        @token_required
+        def api_consumption_summary(token):
             """Retorna o resumo de consumo do mês atual."""
             return jsonify({
                 'month': component_consumption._current_month_key(),
@@ -2799,7 +2798,8 @@ class WebServer:
         # =====================================================================
 
         @self.app.route('/api/pending-orders')
-        def api_pending_orders():
+        @token_required
+        def api_pending_orders(token):
             """Retorna pedidos: aguardando, em produção e concluídos do mês."""
             return jsonify({
                 'waiting': pending_orders.get_waiting(),
@@ -2814,7 +2814,8 @@ class WebServer:
             })
 
         @self.app.route('/api/pending-orders/start', methods=['POST'])
-        def api_pending_orders_start():
+        @token_required
+        def api_pending_orders_start(token):
             """Move pedido de 'Em Espera' para 'Em Produção' e inicia timer."""
             data = request.json
             item_key = data.get('item_key', '')
@@ -2832,7 +2833,8 @@ class WebServer:
             return jsonify({'success': True, 'item': item, 'timer_key': timer_key})
 
         @self.app.route('/api/pending-orders/finish', methods=['POST'])
-        def api_pending_orders_finish():
+        @token_required
+        def api_pending_orders_finish(token):
             """Finaliza produção de um pedido pendente."""
             data = request.json
             item_key = data.get('item_key', '')
@@ -2850,7 +2852,8 @@ class WebServer:
             return jsonify({'success': True, 'item': item})
 
         @self.app.route('/api/pending-orders/dismiss', methods=['POST'])
-        def api_pending_orders_dismiss():
+        @token_required
+        def api_pending_orders_dismiss(token):
             """Remove um item da fila de pendentes."""
             data = request.json
             item_key = data.get('item_key', '')
@@ -3039,12 +3042,17 @@ class WebServer:
 
         @self.app.route('/_health')
         def health_check():
-            """Endpoint de health check para orquestradores."""
+            """Endpoint de health check — rápido, sem side effects."""
+            import time as _t
+            auth = self.orchestrator.auth
+            # Verifica token direto, sem chamar refresh_token (operação lenta)
+            auth_valid = bool(auth._access_token and auth._expires_at > _t.time() + 60)
             status = {
                 "status": "ok",
                 "worker_running": self.orchestrator.is_running(),
-                "auth_valid": self.orchestrator.auth.is_authenticated(),
-                "cache_loaded": self.orchestrator.is_cache_loaded()
+                "auth_valid": auth_valid,
+                "cache_loaded": self.orchestrator.is_cache_loaded(),
+                "mongodb": MONGO_AVAILABLE,
             }
             return jsonify(status), 200
 
@@ -3255,6 +3263,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SW Móveis MDF — Painel de Gestão</title>
+    <link rel="icon" href="https://i.imgur.com/j79HO6n.png" type="image/png">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -3858,7 +3867,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </a>
             <div class="d-flex align-items-center gap-3">
-                <span id="status-badge" class="badge bg-secondary">Carregando...</span>
+                <span id="status-badge" class="badge bg-secondary" title="Aguardando WebSocket...">⏳ Conectando...</span>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
             </div>
         </div>
@@ -4091,6 +4100,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
 
             return response.json().catch(() => ({}));
+        }
+
+        /* Sanitização contra XSS — escapa dados externos antes de inserir no DOM */
+        function escapeHtml(str) {
+            if (str == null) return '—';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
         /* ✅ DESIGN: Toast com Animação */
@@ -4435,9 +4455,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             _updateChecklistProgress();
         }
 
-        function toggleChecklist(container, idx, productName) {
+        function toggleChecklist(container, idx, productName, timerKey) {
             const cb = container.querySelector('input[type=checkbox]');
-            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(productName), encodeURIComponent(productName));
+            const tkey = timerKey || productName;
+            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(tkey), encodeURIComponent(productName));
         }
 
         async function registerConsumption(componentName, qty, unit, productName, checked) {
@@ -4709,10 +4730,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         : '';
                     html += `<tr>
                         <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
-                        <td class="text-muted small">${item.base || '—'}</td>
-                        <td class="text-muted small">${item.cor || '—'}</td>
+                        <td class="text-muted small">${escapeHtml(item.base)}</td>
+                        <td class="text-muted small">${escapeHtml(item.cor)}</td>
                         <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
-                        <td class="text-muted small">${item.cliente || '—'}</td>
+                        <td class="text-muted small">${escapeHtml(item.cliente)}</td>
                         <td class="text-center">
                             <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
                                 data-ikey="${item.item_key}"
@@ -4720,7 +4741,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 onclick="startPendingOrder(this.dataset.ikey, this.dataset.pnome)">▶ Produzir</button>
                             <button class="btn btn-xs btn-outline-secondary btn-sm"
                                 data-dkey="${item.item_key}"
-                                onclick="dismissPendingOrder(this.dataset.dkey)">✕</button>
+                                onclick="dismissPendingOrder(this.dataset.dkey, event)">✕</button>
                         </td>
                     </tr>`;
                 });
@@ -4758,7 +4779,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     _boardTimerState[timerKey] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
 
                     const finishBtn = itemKey
-                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome)">✅ Concluir</button>`
+                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome, event)">✅ Concluir</button>`
                         : `<button class="btn btn-xs btn-success btn-sm ms-1" data-pnome="${nomeSafe}" onclick="controlTimer('finish', this.dataset.pnome)">✅ Concluir</button>`;
 
                     const imgUrlProd = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
@@ -4803,10 +4824,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
                     html += `<tr class="table-success">
                         <td class="ps-3 fw-bold text-success">${nome}</td>
-                        <td class="text-muted small">${item.base || '—'}</td>
+                        <td class="text-muted small">${escapeHtml(item.base)}</td>
                         <td class="text-muted small">${item.cor  || '—'}</td>
                         <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
-                        <td class="text-muted small">${item.cliente || '—'}</td>
+                        <td class="text-muted small">${escapeHtml(item.cliente)}</td>
                         <td class="text-center"><span class="badge bg-success">✅ Concluído</span><br><small class="text-muted">${fin}</small></td>
                     </tr>`;
                 });
@@ -4853,9 +4874,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        async function finishBoardItem(itemKey, produtoNome) {
+        async function finishBoardItem(itemKey, produtoNome, evt) {
             // Confirmação inline sem confirm() bloqueante
-            const btn = event && event.target;
+            const btn = (evt && evt.target) || (typeof event !== 'undefined' && event && event.target) || null;
             if (btn && btn.dataset.confirming !== 'true') {
                 btn.dataset.confirming = 'true';
                 const orig = btn.textContent;
@@ -4886,8 +4907,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        async function dismissPendingOrder(itemKey) {
-            const btn = event && event.target;
+        async function dismissPendingOrder(itemKey, evt) {
+            const btn = (evt && evt.target) || (typeof event !== 'undefined' && event && event.target) || null;
             if (btn && btn.dataset.confirming !== 'true') {
                 btn.dataset.confirming = 'true';
                 const orig = btn.textContent;
@@ -4975,13 +4996,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
                 <tbody>${reversed.map(h => `<tr>
                     <td class="ps-3 small text-muted">${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
-                    <td class="fw-bold">${h.produto}</td>
+                    <td class="fw-bold">${escapeHtml(h.produto)}</td>
                     <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos)}</td>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
         /* WebSocket KPI com reconexão e backoff */
-        const protoKpi = window.location.protocol === 'https:' ? 'wss' : 'ws';
         let wsKpi = null;
         let _kpiReconnectDelay = 3000; // declarado fora para persistir entre reconexões
 
@@ -5174,7 +5194,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 div.innerHTML = html;
 
             } catch(e) {
-                div.innerHTML = 'Erro ao carregar lista. Verifique os logs.';
+                if (e.message === '401') {
+                    div.innerHTML = '<div class="alert alert-warning">🔐 Sessão expirada. <a href="#" onclick="document.getElementById('auth-link').click()">Clique aqui para reautenticar</a>.</div>';
+                } else {
+                    div.innerHTML = '<div class="alert alert-danger">⚠️ Erro ao carregar lista. Verifique os logs do servidor.</div>';
+                }
             }
         }
 
