@@ -1440,7 +1440,8 @@ class ProductionTimer:
                 "tempo_decorrido": int(current_total),
                 "inicio": data.get('created_at', ''),
                 "checklist_count": sum(1 for v in data.get('checklist', {}).values() if v),
-                "checklist_total": len(data.get('checklist', {})),
+                "checklist_total": len(RECIPE_CADEIRA) if 'CADEIRA' in nome.upper() else 0,
+                "has_recipe": 'CADEIRA' in nome.upper(),
             })
         return active
 
@@ -1829,12 +1830,14 @@ class PendingOrdersManager:
             self._save_one(item_key)
         return self.data.get(item_key)
 
-    def finish_production(self, item_key: str):
+    def finish_production(self, item_key: str, tempo_segundos: int = None):
         """Move item para status 'done' — persiste no MongoDB para não sumir ao reiniciar."""
         if item_key in self.data:
             self.data[item_key]['status'] = 'done'
             self.data[item_key]['finished_at'] = datetime.now().isoformat()
             self.data[item_key]['mes_conclusao'] = datetime.now().strftime('%Y-%m')
+            if tempo_segundos is not None:
+                self.data[item_key]['tempo_producao'] = tempo_segundos
             self._save_one(item_key)
         return self.data.get(item_key)
 
@@ -2764,6 +2767,19 @@ class WebServer:
                 status = production_timer.reset(produto)
             elif action == 'finish':
                 status = production_timer.stop_and_log(produto)
+                tempo_prod = status.get('elapsed') or 0
+                # Finaliza o pending_order vinculado a este timer_key
+                if '||' in produto:
+                    ikey = produto.split('||', 1)[1]
+                    if ikey in pending_orders.data:
+                        pending_orders.finish_production(ikey, tempo_segundos=tempo_prod)
+                else:
+                    # Fallback: busca por nome do produto em status in_production
+                    for ikey, pitem in list(pending_orders.data.items()):
+                        nome_item = pitem.get('nome') or pitem.get('nome_original', '')
+                        if nome_item == produto and pitem.get('status') == 'in_production':
+                            pending_orders.finish_production(ikey, tempo_segundos=tempo_prod)
+                            break
             else:
                 status = production_timer.get_status(produto)
                 
@@ -2873,11 +2889,34 @@ class WebServer:
                     if cor_r: enriched['cor'] = cor_r
                 waiting_enriched.append(enriched)
 
+            # Enriquece done com tempo de produção
+            # Prioridade: tempo salvo no item > tempo do histórico de produção (por nome)
+            done_items = pending_orders.get_done()
+            hist_registros = production_timer.get_monthly_history_details()
+            # Mapa: nome_produto (upper) -> lista de registros (pode ter múltiplas conclusões)
+            hist_map = {}
+            for reg in hist_registros:
+                nome_h = (reg.get('produto') or '').strip().upper()
+                if nome_h:
+                    if nome_h not in hist_map:
+                        hist_map[nome_h] = []
+                    hist_map[nome_h].append(reg.get('tempo_segundos', 0))
+
+            done_enriched = []
+            for item in done_items:
+                enriched_done = dict(item)
+                nome_up = (item.get('nome') or item.get('nome_original', '')).strip().upper()
+                # Se o item já tem tempo_producao salvo, usa esse; senão pega do histórico
+                if not enriched_done.get('tempo_producao') and nome_up in hist_map:
+                    tempos = hist_map[nome_up]
+                    enriched_done['tempo_producao'] = tempos[-1] if tempos else 0
+                done_enriched.append(enriched_done)
+
             return jsonify({
                 'waiting': waiting_enriched,
                 'in_production': in_prod,
                 'orphan_timers': orphan,
-                'done': pending_orders.get_done(),
+                'done': done_enriched,
                 'server_time': time.time(),
             })
 
@@ -3019,14 +3058,30 @@ class WebServer:
             if not item_key:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             item_data = pending_orders.data.get(item_key, {})
-            timer_key = item_data.get('timer_key') or (f"{produto_nome}||{item_key}" if produto_nome else None)
-            item = pending_orders.finish_production(item_key)
-            # Finaliza o timer usando o timer_key único
+            # Prioridade: timer_key do cliente > timer_key salvo no item > reconstruído
+            timer_key = (
+                data.get('timer_key') or
+                item_data.get('timer_key') or
+                (f"{produto_nome}||{item_key}" if produto_nome else None)
+            )
+            # Para o timer ANTES de finalizar o pedido (para capturar o tempo)
+            tempo_producao = None
             if timer_key:
-                production_timer.stop_and_log(timer_key)
+                result = production_timer.stop_and_log(timer_key)
+                tempo_producao = result.get('elapsed') or 0
+                # Se tempo=0 e tem || no timer_key, tenta fallback pelo nome
+                if tempo_producao == 0 and '||' in timer_key:
+                    nome_fallback = timer_key.split('||')[0]
+                    if nome_fallback in production_timer.timers:
+                        result2 = production_timer.stop_and_log(nome_fallback)
+                        tempo_producao = result2.get('elapsed') or 0
             elif produto_nome:
-                production_timer.stop_and_log(produto_nome)
-            return jsonify({'success': True, 'item': item})
+                result = production_timer.stop_and_log(produto_nome)
+                tempo_producao = result.get('elapsed') or 0
+
+            # Finaliza o pedido com o tempo capturado
+            item = pending_orders.finish_production(item_key, tempo_segundos=tempo_producao)
+            return jsonify({'success': True, 'item': item, 'tempo_producao': tempo_producao})
 
         @self.app.route('/api/pending-orders/dismiss', methods=['POST'])
         @token_required
@@ -4668,6 +4723,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     clearInterval(timerInterval);
                     timerInterval = null;
                     const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
+                    // Recarrega o board para remover o item da lista in_production
+                    if (typeof loadProductionBoard === 'function') {
+                        setTimeout(() => loadProductionBoard(), 800);
+                    }
 
                     // ── Animação de conclusão ──────────────────────────────
                     const modalEl = document.getElementById('productionModal');
@@ -4904,7 +4963,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         : '';
                     html += `<tr>
                         <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
-                        <td class="text-muted small">${escapeHtml(item.base)}</td>
+                        <td class="text-muted small">${escapeHtml(item.base || '—')}</td>
                         <td class="text-muted small">${escapeHtml(item.cor)}</td>
                         <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
                         <td class="text-muted small">${escapeHtml(item.cliente)}</td>
@@ -4946,15 +5005,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const timerKey = item.timer_key || nome;  // chave real do timer (pode ser "nome||item_key")
                     const base    = item.base || '—';
                     const cor     = item.cor  || '—';
-                    const chkDone = Object.values(item.checklist || {}).filter(Boolean).length;
-                    const chkTotal= RECIPE_CADEIRA.length;
+                    // Checklist: só mostrar para produtos com receita (cadeiras)
+                    const isCadeira = nome.toUpperCase().includes('CADEIRA');
+                    const chkDone = isCadeira ? Object.values(item.checklist || {}).filter(Boolean).length : null;
+                    const chkTotal = isCadeira ? RECIPE_CADEIRA.length : null;
 
                     // Guarda estado para ticker local com a chave correta
                     _boardTimerState[timerKey] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
 
+                    const timerKeySafe = timerKey ? encodeURIComponent(timerKey) : '';
                     const finishBtn = itemKey
-                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome, event)">✅ Concluir</button>`
-                        : `<button class="btn btn-xs btn-success btn-sm ms-1" data-pnome="${nomeSafe}" onclick="controlTimer('finish', this.dataset.pnome)">✅ Concluir</button>`;
+                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" data-tkey="${timerKeySafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome, event, decodeURIComponent(this.dataset.tkey))">✅ Concluir</button>`
+                        : `<button class="btn btn-xs btn-success btn-sm ms-1" data-tkey="${timerKeySafe}" data-pnome="${nomeSafe}" onclick="controlTimer('finish', decodeURIComponent(this.dataset.tkey) || this.dataset.pnome)">✅ Concluir</button>`;
 
                     const imgUrlProd = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
                     const imgTagProd = imgUrlProd ? `<img src="${imgUrlProd}" alt="" loading="lazy" style="width:38px;height:38px;object-fit:contain;border-radius:5px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">` : '';
@@ -4972,7 +5034,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </span>
                         </td>
                         <td class="text-center">
-                            <span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>
+                            ${chkTotal !== null
+                                ? `<span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>`
+                                : `<span class="text-muted small">—</span>`}
                         </td>
                         <td class="text-center">
                             <button class="btn btn-xs btn-outline-primary btn-sm"
@@ -4992,17 +5056,23 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <small class="fw-bold text-success">✅ CONCLUÍDOS ESTE MÊS (${done.length})</small>
                 </div>
                 <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+                    <thead class="table-success"><tr>
+                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
+                        <th>#Pedido</th><th>Cliente</th><th class="text-center">Tempo</th><th class="text-center">Concluído em</th>
+                    </tr></thead>
                     <tbody>`;
                 done.slice().reverse().forEach(item => {
-                    const nome = (item.nome || item.nome_original || 'N/D').replace(/'/g,'&#39;');
+                    const nome = escapeHtml(item.nome || item.nome_original || 'N/D');
                     const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                    const tempo = item.tempo_producao ? `<span class="font-monospace text-primary fw-bold">${formatSeconds(item.tempo_producao)}</span>` : '<span class="text-muted">—</span>';
                     html += `<tr class="table-success">
                         <td class="ps-3 fw-bold text-success">${nome}</td>
-                        <td class="text-muted small">${escapeHtml(item.base)}</td>
-                        <td class="text-muted small">${item.cor  || '—'}</td>
-                        <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
-                        <td class="text-muted small">${escapeHtml(item.cliente)}</td>
-                        <td class="text-center"><span class="badge bg-success">✅ Concluído</span><br><small class="text-muted">${fin}</small></td>
+                        <td class="text-muted small">${escapeHtml(item.base || '—')}</td>
+                        <td class="text-muted small">${escapeHtml(item.cor || '—')}</td>
+                        <td class="text-muted small">#${escapeHtml(String(item.pedido_numero || item.order_id || '—'))}</td>
+                        <td class="text-muted small">${escapeHtml(item.cliente || '—')}</td>
+                        <td class="text-center">${tempo}</td>
+                        <td class="text-center"><small class="text-muted">${fin}</small></td>
                     </tr>`;
                 });
                 html += `</tbody></table></div>`;
@@ -5048,7 +5118,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        async function finishBoardItem(itemKey, produtoNome, evt) {
+        async function finishBoardItem(itemKey, produtoNome, evt, timerKey) {
             // Confirmação inline sem confirm() bloqueante
             const btn = (evt && evt.target) || (typeof event !== 'undefined' && event && event.target) || null;
             if (btn && btn.dataset.confirming !== 'true') {
@@ -5070,7 +5140,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 await fetch('/api/pending-orders/finish', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
+                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome, timer_key: timerKey || null })
                 });
                 showToast('✅ Concluído!', produtoNome, 'success');
                 await loadProductionBoard();
