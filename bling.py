@@ -1358,8 +1358,10 @@ class ProductionTimer:
             self._save()
         return self.get_status(produto_nome)
 
-    def stop_and_log(self, produto_nome):
-        """Finaliza produção: pausa timer, registra componentes e salva histórico."""
+    def stop_and_log(self, produto_nome, extra_info: dict = None):
+        """Finaliza produção: pausa timer, registra componentes e salva histórico.
+        extra_info: dados extras do pedido (pedido_numero, cliente, base, cor, item_key)
+        """
         nome_real = produto_nome.split('||')[0] if '||' in produto_nome else produto_nome
 
         # Recupera checklist antes de pausar
@@ -1402,7 +1404,13 @@ class ProductionTimer:
             "tempo_segundos": total_seconds,
             "data_conclusao": datetime.now().isoformat(),
             "timestamp": time.time(),
-            "checklist": checklist_marcado
+            "checklist": checklist_marcado,
+            # Campos enriquecidos do pedido (se disponíveis)
+            "pedido_numero": (extra_info or {}).get('pedido_numero', ''),
+            "cliente": (extra_info or {}).get('cliente', ''),
+            "base": (extra_info or {}).get('base', ''),
+            "cor": (extra_info or {}).get('cor', ''),
+            "item_key": (extra_info or {}).get('item_key', ''),
         }
         self._add_to_history(registro)
 
@@ -1780,13 +1788,28 @@ class PendingOrdersManager:
             return {}
 
     def _save(self):
-        """Salva pending_orders — MongoDB E arquivo local (dupla redundância)."""
+        """Salva pending_orders — MongoDB E arquivo local (dupla redundância).
+        IMPORTANTE: sincroniza o MongoDB removendo itens que não estão mais em self.data.
+        """
         if MONGO_AVAILABLE:
             try:
+                # Descobre quais chaves existem no MongoDB
+                existing_keys = set()
+                for doc in _mongo_db['pending_orders'].find({}, {'_id': 1}):
+                    existing_keys.add(str(doc['_id']))
+                current_keys = set(self.data.keys())
+                # Remove do MongoDB itens que foram deletados de self.data
+                for key_to_del in existing_keys - current_keys:
+                    try:
+                        _mongo_db['pending_orders'].delete_one({'_id': key_to_del})
+                    except Exception:
+                        pass
+                # Upserta os itens atuais
                 for key, val in self.data.items():
                     MongoStore.upsert('pending_orders', key, val)
             except Exception as e:
                 logger.error(f"Erro ao salvar pending_orders no MongoDB: {e}")
+        # Sempre salva arquivo como backup
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
@@ -1842,16 +1865,23 @@ class PendingOrdersManager:
         return self.data.get(item_key)
 
     def dismiss(self, item_key: str):
-        """Remove item da fila."""
+        """Remove item da fila — deleta do MongoDB E do arquivo."""
         if item_key in self.data:
             del self.data[item_key]
-            if MONGO_AVAILABLE:
-                try:
-                    MongoStore.remove('pending_orders', item_key)
-                except Exception:
-                    pass
-            else:
-                self._save()
+        # Remove do MongoDB independentemente (pode existir lá mesmo se não estiver em self.data)
+        if MONGO_AVAILABLE:
+            try:
+                _mongo_db['pending_orders'].delete_one({'_id': item_key})
+            except Exception as e:
+                logger.error(f"Erro ao remover {item_key} do MongoDB: {e}")
+        # Atualiza arquivo local
+        temp = self.FILE_PATH.with_suffix('.tmp')
+        try:
+            with open(temp, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=4, ensure_ascii=False)
+            shutil.move(str(temp), str(self.FILE_PATH))
+        except Exception as e:
+            logger.error(f"Erro ao remover item do arquivo: {e}")
 
     def get_waiting(self):
         """Retorna todos os itens aguardando produção."""
@@ -1913,11 +1943,17 @@ class PendingOrdersManager:
                 del self.data[key]
                 if MONGO_AVAILABLE:
                     try:
-                        MongoStore.remove('pending_orders', key)
+                        _mongo_db['pending_orders'].delete_one({'_id': key})
                     except Exception:
                         pass
-            if not MONGO_AVAILABLE:
-                self._save()
+            # Sempre atualiza arquivo também
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception:
+                pass
             logger.info(f"🗓️ Reset mensal: {len(to_remove)} itens antigos removidos da fila.")
         return len(to_remove)
 
@@ -2889,34 +2925,11 @@ class WebServer:
                     if cor_r: enriched['cor'] = cor_r
                 waiting_enriched.append(enriched)
 
-            # Enriquece done com tempo de produção
-            # Prioridade: tempo salvo no item > tempo do histórico de produção (por nome)
-            done_items = pending_orders.get_done()
-            hist_registros = production_timer.get_monthly_history_details()
-            # Mapa: nome_produto (upper) -> lista de registros (pode ter múltiplas conclusões)
-            hist_map = {}
-            for reg in hist_registros:
-                nome_h = (reg.get('produto') or '').strip().upper()
-                if nome_h:
-                    if nome_h not in hist_map:
-                        hist_map[nome_h] = []
-                    hist_map[nome_h].append(reg.get('tempo_segundos', 0))
-
-            done_enriched = []
-            for item in done_items:
-                enriched_done = dict(item)
-                nome_up = (item.get('nome') or item.get('nome_original', '')).strip().upper()
-                # Se o item já tem tempo_producao salvo, usa esse; senão pega do histórico
-                if not enriched_done.get('tempo_producao') and nome_up in hist_map:
-                    tempos = hist_map[nome_up]
-                    enriched_done['tempo_producao'] = tempos[-1] if tempos else 0
-                done_enriched.append(enriched_done)
-
             return jsonify({
                 'waiting': waiting_enriched,
                 'in_production': in_prod,
                 'orphan_timers': orphan,
-                'done': done_enriched,
+                'done': [],  # Removido do board — use /api/production/history
                 'server_time': time.time(),
             })
 
@@ -2993,6 +3006,31 @@ class WebServer:
                 'logs': component_consumption.get_current_month().get('checklist_logs', [])[-50:]
             })
 
+        @self.app.route('/api/production/history')
+        @token_required
+        def api_production_history_route(token):
+            """Retorna histórico de finalizações do mês atual — fonte única de verdade."""
+            historico = production_timer.get_monthly_history_details()
+            # Enriquece itens sem pedido_numero com dados do pending_orders (por nome)
+            nome_to_item = {}
+            for v in pending_orders.data.values():
+                if v.get('status') == 'done':
+                    nome_key = (v.get('nome') or v.get('nome_original', '')).strip().upper()
+                    if nome_key and nome_key not in nome_to_item:
+                        nome_to_item[nome_key] = v
+            enriched = []
+            for reg in historico:
+                r = dict(reg)
+                nome_up = r.get('produto', '').strip().upper()
+                if not r.get('pedido_numero') and nome_up in nome_to_item:
+                    item = nome_to_item[nome_up]
+                    r.setdefault('pedido_numero', item.get('pedido_numero', ''))
+                    r.setdefault('cliente', item.get('cliente', ''))
+                    r.setdefault('base', item.get('base', ''))
+                    r.setdefault('cor', item.get('cor', ''))
+                enriched.append(r)
+            return jsonify({'history': enriched, 'total': len(enriched)})
+
         @self.app.route('/api/consumption/history')
         def api_consumption_history():
             """Retorna histórico de todos os meses."""
@@ -3064,19 +3102,27 @@ class WebServer:
                 item_data.get('timer_key') or
                 (f"{produto_nome}||{item_key}" if produto_nome else None)
             )
+            # Dados enriquecidos do pedido para o histórico
+            item_data_for_history = {
+                'pedido_numero': item_data.get('pedido_numero', ''),
+                'cliente': item_data.get('cliente', ''),
+                'base': item_data.get('base', ''),
+                'cor': item_data.get('cor', ''),
+                'item_key': item_key,
+            }
             # Para o timer ANTES de finalizar o pedido (para capturar o tempo)
             tempo_producao = None
             if timer_key:
-                result = production_timer.stop_and_log(timer_key)
+                result = production_timer.stop_and_log(timer_key, extra_info=item_data_for_history)
                 tempo_producao = result.get('elapsed') or 0
                 # Se tempo=0 e tem || no timer_key, tenta fallback pelo nome
                 if tempo_producao == 0 and '||' in timer_key:
                     nome_fallback = timer_key.split('||')[0]
                     if nome_fallback in production_timer.timers:
-                        result2 = production_timer.stop_and_log(nome_fallback)
+                        result2 = production_timer.stop_and_log(nome_fallback, extra_info=item_data_for_history)
                         tempo_producao = result2.get('elapsed') or 0
             elif produto_nome:
-                result = production_timer.stop_and_log(produto_nome)
+                result = production_timer.stop_and_log(produto_nome, extra_info=item_data_for_history)
                 tempo_producao = result.get('elapsed') or 0
 
             # Finaliza o pedido com o tempo capturado
@@ -4281,11 +4327,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </div>
                         </div>
 
-                        <!-- HISTÓRICO DE FINALIZAÇÕES -->
+                        <!-- HISTÓRICO DE FINALIZAÇÕES (fonte única: production_history MongoDB) -->
                         <div class="card border-0 shadow-sm">
-                            <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%) !important;">
-                                <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
-                                <small class="text-white-50">Registro de cada produto finalizado com tempo de produção</small>
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%) !important;">
+                                <div>
+                                    <h5 class="mb-0">📜 Histórico de Finalizações</h5>
+                                    <small class="text-white-50">Todos os produtos concluídos este mês — persiste entre sessões</small>
+                                </div>
+                                <span class="badge bg-light text-dark" id="history-total-badge">0</span>
                             </div>
                             <div class="card-body p-0" id="production-history-section">
                                 <div class="text-center py-4 text-muted">⏳ Carregando histórico...</div>
@@ -5050,35 +5099,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 html += `</tbody></table></div>`;
             }
 
-            // ── Concluídos ──────────────────────────────────────────────
-            if (done.length > 0) {
-                html += `<div class="border-top px-3 py-2 mt-1" style="background:#f0fdf4;">
-                    <small class="fw-bold text-success">✅ CONCLUÍDOS ESTE MÊS (${done.length})</small>
-                </div>
-                <div class="table-responsive"><table class="table table-sm align-middle mb-0">
-                    <thead class="table-success"><tr>
-                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
-                        <th>#Pedido</th><th>Cliente</th><th class="text-center">Tempo</th><th class="text-center">Concluído em</th>
-                    </tr></thead>
-                    <tbody>`;
-                done.slice().reverse().forEach(item => {
-                    const nome = escapeHtml(item.nome || item.nome_original || 'N/D');
-                    const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
-                    const tempo = item.tempo_producao ? `<span class="font-monospace text-primary fw-bold">${formatSeconds(item.tempo_producao)}</span>` : '<span class="text-muted">—</span>';
-                    html += `<tr class="table-success">
-                        <td class="ps-3 fw-bold text-success">${nome}</td>
-                        <td class="text-muted small">${escapeHtml(item.base || '—')}</td>
-                        <td class="text-muted small">${escapeHtml(item.cor || '—')}</td>
-                        <td class="text-muted small">#${escapeHtml(String(item.pedido_numero || item.order_id || '—'))}</td>
-                        <td class="text-muted small">${escapeHtml(item.cliente || '—')}</td>
-                        <td class="text-center">${tempo}</td>
-                        <td class="text-center"><small class="text-muted">${fin}</small></td>
-                    </tr>`;
-                });
-                html += `</tbody></table></div>`;
-            }
-
-            div.innerHTML = html;
+            div.innerHTML = html || '<div class="text-center py-4 text-muted"><small>Nenhum pedido em espera ou em produção.</small></div>';
 
             // ── Ticker local (1s) ────────────────────────────────────────
             _boardTick = setInterval(() => {
@@ -5144,6 +5165,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 });
                 showToast('✅ Concluído!', produtoNome, 'success');
                 await loadProductionBoard();
+                await loadProductionHistory();
                 await refreshComponentTab();
             } catch(e) {
                 showToast('Erro', 'Falha ao concluir', 'danger');
@@ -5182,11 +5204,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function updateComponentUsage(usageData) {
-            if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
+            // Quando recebe update via WebSocket, recarrega histórico da fonte real
+            if (usageData && usageData.history_production) {
+                renderProductionHistory(usageData.history_production);
+            } else if (document.getElementById('component-usage')?.classList.contains('active')) {
+                loadProductionHistory();
+            }
         }
 
         async function refreshComponentTab() {
             await loadProductionBoard();
+            await loadProductionHistory();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
@@ -5194,10 +5222,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('consumption-table-section').innerHTML =
                     '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
             }
-            try {
-                const usageData = await fetchAPI('/api/components/usage');
-                if (usageData.history_production) renderProductionHistory(usageData.history_production);
-            } catch(e) { console.error('Erro ao carregar histórico:', e); }
         }
 
         function renderActiveTimers(activeProduction) {}
@@ -5228,21 +5252,64 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </tr>`).join('')}</tbody></table></div>`;
         }
 
+        async function loadProductionHistory() {
+            const div = document.getElementById('production-history-section');
+            const badge = document.getElementById('history-total-badge');
+            if (!div) return;
+            try {
+                const data = await fetchAPI('/api/production/history');
+                renderProductionHistory(data.history || []);
+                if (badge) badge.textContent = data.total || 0;
+            } catch(e) {
+                div.innerHTML = '<div class="alert alert-danger m-3 small">Erro ao carregar histórico.</div>';
+            }
+        }
+
         function renderProductionHistory(history) {
             const div = document.getElementById('production-history-section');
             if (!div) return;
+            const badge = document.getElementById('history-total-badge');
             const reversed = [...(history || [])].reverse();
+            if (badge) badge.textContent = reversed.length;
             if (reversed.length === 0) {
-                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado este mês.</div>';
+                div.innerHTML = '<div class="text-center py-5"><div style="font-size:2.5rem;opacity:.3;">📋</div><p class="text-muted mt-2">Nenhum produto finalizado este mês.</p><small class="text-muted">Ao concluir uma produção, ela aparecerá aqui e persiste entre sessões.</small></div>';
                 return;
             }
-            div.innerHTML = `<div class="table-responsive" style="max-height:320px;overflow-y:auto;"><table class="table table-sm table-striped align-middle mb-0">
-                <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
-                <tbody>${reversed.map(h => `<tr>
-                    <td class="ps-3 small text-muted">${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
-                    <td class="fw-bold">${escapeHtml(h.produto)}</td>
-                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos)}</td>
-                </tr>`).join('')}</tbody></table></div>`;
+            div.innerHTML = `
+                <div class="table-responsive" style="max-height:420px;overflow-y:auto;">
+                    <table class="table table-sm table-hover align-middle mb-0">
+                        <thead class="table-dark sticky-top" style="top:0;z-index:1;">
+                            <tr>
+                                <th class="ps-3" style="min-width:140px;">Data/Hora</th>
+                                <th style="min-width:160px;">Produto</th>
+                                <th>Base</th>
+                                <th>Cor</th>
+                                <th>#Pedido</th>
+                                <th>Cliente</th>
+                                <th class="text-center" style="min-width:90px;">⏱ Produção</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${reversed.map((h, i) => {
+                                const dt = h.data_conclusao ? new Date(h.data_conclusao).toLocaleString('pt-BR') : '—';
+                                const rowClass = i % 2 === 0 ? '' : 'table-light';
+                                return `<tr class="${rowClass}">
+                                    <td class="ps-3 small text-muted">${dt}</td>
+                                    <td class="fw-bold">${escapeHtml(h.produto || '—')}</td>
+                                    <td class="small text-muted">${escapeHtml(h.base || '—')}</td>
+                                    <td class="small text-muted">${escapeHtml(h.cor || '—')}</td>
+                                    <td class="small text-muted">${h.pedido_numero ? '#' + escapeHtml(String(h.pedido_numero)) : '<span class="text-muted">—</span>'}</td>
+                                    <td class="small text-muted">${escapeHtml(h.cliente || '—')}</td>
+                                    <td class="text-center">
+                                        ${h.tempo_segundos
+                                            ? `<span class="badge font-monospace fw-bold" style="background:linear-gradient(135deg,#4f46e5,#7c3aed);color:white;padding:.3rem .7rem;">${formatSeconds(h.tempo_segundos)}</span>`
+                                            : '<span class="text-muted small">—</span>'}
+                                    </td>
+                                </tr>`;
+                            }).join('')}
+                        </tbody>
+                    </table>
+                </div>`;
         }
 
         /* WebSocket KPI com reconexão e backoff */
@@ -5544,6 +5611,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
                     loadProductionBoard();
+                    loadProductionHistory();
+                    // Polling: atualiza timers ao vivo para todos (10s)
                     if (!_boardPoll) {
                         _boardPoll = setInterval(loadProductionBoard, 10000);
                     }
