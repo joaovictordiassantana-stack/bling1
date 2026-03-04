@@ -1101,17 +1101,28 @@ class SalesManager:
             }
 
     def _save_sales_history(self):
-        """Salva o histórico de pedidos separadamente para não estourar o doc de stats."""
+        """Salva histórico de pedidos no MongoDB preservando itens e data normalizada."""
         try:
-            # Salva apenas os campos essenciais de cada pedido (reduz tamanho drasticamente)
-            compact = [
-                {'id': o.get('id'), 'data': o.get('data'), 'itens': o.get('itens', []),
-                 'contato': o.get('contato'), 'numero': o.get('numero')}
-                for o in self._sales_history
-            ]
+            compact = []
+            for o in self._sales_history:
+                # Normaliza data: usa qualquer campo disponível
+                data_val = o.get('data') or o.get('dataEmissao') or o.get('dataSaida') or ''
+                # Preserva itens: essenciais para sync_from_orders no próximo boot
+                itens = o.get('itens', [])
+                compact.append({
+                    'id': o.get('id'),
+                    'data': data_val,
+                    'dataEmissao': data_val,  # redundância para compatibilidade
+                    'numero': o.get('numero'),
+                    'contato': o.get('contato'),
+                    'itens': itens,  # CRÍTICO: preserva itens para sync pós-restart
+                })
+            # Filtra entradas sem id (inválidas)
+            compact = [o for o in compact if o.get('id')]
             if MONGO_AVAILABLE:
                 try:
                     MongoStore.set('sales_history', {'orders': compact}, 'history')
+                    logger.info(f"✅ sales_history salvo: {len(compact)} pedidos no MongoDB")
                 except Exception as e:
                     logger.error(f"Erro ao salvar sales_history no MongoDB: {e}")
         except Exception as e:
@@ -1535,33 +1546,49 @@ class ComponentConsumptionManager:
         return datetime.now().strftime('%Y-%m')
 
     def _load(self):
-        """Carrega consumo — MongoDB primeiro, arquivo como fallback real."""
+        """Carrega consumo — MongoDB + arquivo com merge para máxima redundância."""
+        mongo_data = {}
+        file_data = {}
         if MONGO_AVAILABLE:
             try:
                 doc = MongoStore.get('component_consumption', 'main')
-                data = doc.get('data', {})
-                if data:
-                    return data
-                logger.info("MongoDB retornou consumo vazio — verificando arquivo local...")
+                mongo_data = doc.get('data', {})
+                if mongo_data:
+                    logger.info(f"✅ Consumo carregado do MongoDB: {list(mongo_data.keys())}")
             except Exception as e:
                 logger.warning(f"Falha ao carregar consumo do MongoDB: {e}")
-        if not self.FILE_PATH.exists():
+        if self.FILE_PATH.exists():
+            try:
+                with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
+                    file_data = json.load(f)
+                    if file_data and not mongo_data:
+                        logger.info(f"✅ Consumo carregado do arquivo local: {list(file_data.keys())}")
+            except Exception as e:
+                logger.error(f"Erro ao carregar consumo do arquivo: {e}")
+        # Merge: MongoDB como base, arquivo preenche meses ausentes
+        if not mongo_data and not file_data:
             return {}
-        try:
-            with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if data:
-                    logger.info(f"✅ Consumo carregado do arquivo local")
-                return data
-        except Exception as e:
-            logger.error(f"Erro ao carregar consumo do arquivo: {e}")
-            return {}
+        if not mongo_data:
+            return file_data
+        if not file_data:
+            return mongo_data
+        # Merge por mês: MongoDB tem precedência, arquivo preenche meses faltantes
+        merged = dict(file_data)
+        merged.update(mongo_data)  # MongoDB sobrescreve arquivo para meses em comum
+        return merged
 
     def _save(self):
         """Salva consumo — MongoDB E arquivo local (dupla redundância)."""
+        # Nunca salva se data é vazio (protege contra apagar dados reais no MongoDB)
+        if not self.data:
+            logger.warning("⛔ _save de consumo ignorado: self.data vazio (proteção anti-apagamento)")
+            return
+        mes_count = len(self.data)
+        comp_count = sum(len(v.get('components', {})) for v in self.data.values())
         if MONGO_AVAILABLE:
             try:
                 MongoStore.set('component_consumption', {'data': self.data}, 'main')
+                logger.debug(f"✅ Consumo salvo no MongoDB: {mes_count} mês(es), {comp_count} componente(s)")
             except Exception as e:
                 logger.error(f"Erro ao salvar consumo no MongoDB: {e}")
         temp = self.FILE_PATH.with_suffix('.tmp')
@@ -1573,14 +1600,17 @@ class ComponentConsumptionManager:
             logger.error(f"Erro ao salvar consumo em arquivo: {e}")
 
     def _ensure_current_month(self):
-        """Garante que existe a estrutura para o mês atual."""
+        """Garante estrutura para o mês atual — só salva se houver dados pré-existentes."""
         key = self._current_month_key()
         if key not in self.data:
             self.data[key] = {
-                'components': {},   # nome -> {qtd, un, registros: [...]}
-                'checklist_logs': []  # Histórico de cada item marcado
+                'components': {},
+                'checklist_logs': []
             }
-            self._save()
+            # Só persiste se já tem outros meses (evita sobrescrever MongoDB com {} vazio)
+            # O save real acontece quando register_component for chamado
+            if len(self.data) > 1:
+                self._save()
 
     def register_component(self, component_name: str, qty: float, unit: str, product_name: str):
         """Registra uso de um componente via checklist."""
@@ -2353,6 +2383,12 @@ class Orchestrator:
                 except Exception as e:
                     self.logger.warning(f"Erro ao sincronizar pending_orders: {e}")
                 
+                # Salva stats + history no MongoDB ANTES de broadcastar
+                try:
+                    save_stats(self.sales._get_state_for_save(), self.config.SALES_STATS_FILE)
+                    self.sales._save_sales_history()
+                except Exception as _se:
+                    self.logger.warning(f"Erro ao persistir stats após recálculo: {_se}")
                 # Manda atualização pro Front (Gráfico)
                 self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
             else:
@@ -3355,10 +3391,13 @@ class WebServer:
         @self.app.route('/api/components/usage')
         @token_required
         def api_component_usage(token):
+            # Sempre recalcula — nunca serve cache para history_production
+            # (garante que finalizações recentes aparecem imediatamente)
             """Retorna uso de componentes (do cache do worker)."""
             try:
                 # Retorna cache se disponível E não vazio
-                cache = getattr(self.orchestrator, '_component_usage_cache', None)
+                cache = None  # Sempre recalcula para garantir history atualizado
+                _old_cache = getattr(self.orchestrator, '_component_usage_cache', None)
                 
                 if cache and (cache.get('components') or cache.get('daily_breakdown')):
                     self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
@@ -5289,11 +5328,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
             div.innerHTML = `<div class="table-responsive" style="max-height:320px;overflow-y:auto;"><table class="table table-sm table-striped align-middle mb-0">
                 <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
-                <tbody>${reversed.map(h => `<tr>
-                    <td class="ps-3 small text-muted">${new Date(h.data_conclusao).toLocaleString('pt-BR')}</td>
-                    <td class="fw-bold">${escapeHtml(h.produto)}</td>
-                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos)}</td>
-                </tr>`).join('')}</tbody></table></div>`;
+                <tbody>${reversed.map(h => {
+                    const dt = h.data_conclusao ? new Date(h.data_conclusao) : null;
+                    const dtStr = (dt && !isNaN(dt)) ? dt.toLocaleString('pt-BR') : (h.data_conclusao || '—');
+                    const nome = h.produto || h.nome || 'N/D';
+                    return `<tr>
+                    <td class="ps-3 small text-muted">${dtStr}</td>
+                    <td class="fw-bold">${escapeHtml(nome)}</td>
+                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos || 0)}</td>
+                </tr>`;
+                }).join('')}</tbody></table></div>`;
         }
 
         /* WebSocket KPI com reconexão e backoff */
