@@ -1103,20 +1103,12 @@ class SalesManager:
     def _save_sales_history(self):
         """Salva o histórico de pedidos separadamente para não estourar o doc de stats."""
         try:
-            # Salva campos essenciais — garante que 'data' está sempre presente
-            compact = []
-            for o in self._sales_history:
-                data_val = o.get('data') or o.get('dataEmissao') or o.get('dataSaida') or ''
-                compact.append({
-                    'id': o.get('id'),
-                    'data': data_val,           # normalizado — sempre presente
-                    'dataEmissao': data_val,     # redundância para compatibilidade
-                    'itens': o.get('itens', []),
-                    'contato': o.get('contato'),
-                    'numero': o.get('numero'),
-                })
-            # Remove entradas sem id ou data (inválidas)
-            compact = [o for o in compact if o.get('id') and o.get('data')]
+            # Salva apenas os campos essenciais de cada pedido (reduz tamanho drasticamente)
+            compact = [
+                {'id': o.get('id'), 'data': o.get('data'), 'itens': o.get('itens', []),
+                 'contato': o.get('contato'), 'numero': o.get('numero')}
+                for o in self._sales_history
+            ]
             if MONGO_AVAILABLE:
                 try:
                     MongoStore.set('sales_history', {'orders': compact}, 'history')
@@ -1256,10 +1248,16 @@ class ProductionTimer:
             try:
                 data = MongoStore.get('production_timers', 'timers')
                 timers = data.get('timers', {})
-                if timers:  # só usa MongoDB se retornou dados de fato
+                # Se MongoDB retornou o documento (mesmo com timers vazio), usa ele
+                # (timers vazio = sem produções ativas, é estado válido)
+                if data:  # documento existe no MongoDB
+                    if timers:
+                        logger.info(f"✅ Timers carregados do MongoDB: {len(timers)} timer(s) ativo(s)")
+                    else:
+                        logger.info("✅ MongoDB: nenhum timer ativo (estado válido)")
                     return timers
-                # MongoDB vazio — pode ser falha silenciosa, tenta arquivo
-                logger.info("MongoDB retornou timers vazio — verificando arquivo local...")
+                # MongoDB sem documento — tenta arquivo como fallback
+                logger.info("MongoDB sem doc de timers — verificando arquivo local...")
             except Exception as e:
                 logger.warning(f"Falha ao carregar timers do MongoDB: {e}")
         if not self.FILE_PATH.exists():
@@ -1366,10 +1364,8 @@ class ProductionTimer:
             self._save()
         return self.get_status(produto_nome)
 
-    def stop_and_log(self, produto_nome, extra_info: dict = None):
-        """Finaliza produção: pausa timer, registra componentes e salva histórico.
-        extra_info: dict opcional com pedido_numero, cliente, base, cor, item_key
-        """
+    def stop_and_log(self, produto_nome):
+        """Finaliza produção: pausa timer, registra componentes e salva histórico."""
         nome_real = produto_nome.split('||')[0] if '||' in produto_nome else produto_nome
 
         # Recupera checklist antes de pausar
@@ -1412,12 +1408,7 @@ class ProductionTimer:
             "tempo_segundos": total_seconds,
             "data_conclusao": datetime.now().isoformat(),
             "timestamp": time.time(),
-            "checklist": checklist_marcado,
-            "pedido_numero": (extra_info or {}).get('pedido_numero', ''),
-            "cliente":       (extra_info or {}).get('cliente', ''),
-            "base":          (extra_info or {}).get('base', ''),
-            "cor":           (extra_info or {}).get('cor', ''),
-            "item_key":      (extra_info or {}).get('item_key', ''),
+            "checklist": checklist_marcado
         }
         self._add_to_history(registro)
 
@@ -1478,15 +1469,20 @@ class ProductionTimer:
 
         saved = False
         if MONGO_AVAILABLE:
-            try:
-                _mongo_db['production_history'].update_one(
-                    {'_id': mes_chave},
-                    {'$push': {'registros': reg_clean}},
-                    upsert=True
-                )
-                saved = True
-            except Exception as e:
-                logger.error(f"Erro ao salvar histórico no MongoDB: {e}")
+            for _attempt in range(3):  # até 3 tentativas
+                try:
+                    _mongo_db['production_history'].update_one(
+                        {'_id': mes_chave},
+                        {'$push': {'registros': reg_clean}},
+                        upsert=True
+                    )
+                    saved = True
+                    logger.info(f"✅ Histórico salvo no MongoDB: {reg_clean.get('produto','?')} ({int(reg_clean.get('tempo_segundos',0))}s)")
+                    break
+                except Exception as e:
+                    logger.error(f"Erro ao salvar histórico no MongoDB (tentativa {_attempt+1}/3): {e}")
+                    if _attempt < 2:
+                        time.sleep(1)
         # Sempre salva no arquivo também como backup redundante
         try:
             history = {}
@@ -1506,26 +1502,41 @@ class ProductionTimer:
             logger.error(f"Erro ao salvar histórico em arquivo: {e}")
 
     def get_monthly_history_details(self):
-        """Retorna a lista detalhada do mês atual — MongoDB primeiro, arquivo fallback."""
+        """Retorna histórico do mês — faz merge de MongoDB + arquivo (máxima redundância)."""
         mes_chave = datetime.now().strftime('%Y-%m')
+        mongo_registros = []
+        file_registros = []
+
         if MONGO_AVAILABLE:
             try:
                 doc = _mongo_db['production_history'].find_one({'_id': mes_chave})
-                registros = (doc or {}).get('registros', [])
-                if registros:
-                    return registros
-                # MongoDB vazio — tenta arquivo (pode ter dados mais recentes)
+                mongo_registros = (doc or {}).get('registros', [])
             except Exception as e:
                 logger.warning(f"Falha ao carregar histórico do MongoDB: {e}")
-        if not self.HISTORY_PATH.exists():
-            return []
-        try:
-            with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f:
-                history = json.load(f)
-            return history.get(mes_chave, [])
-        except Exception as e:
-            logger.error(f"Erro ao carregar histórico do arquivo: {e}")
-            return []
+
+        if self.HISTORY_PATH.exists():
+            try:
+                with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f:
+                    history = json.load(f)
+                file_registros = history.get(mes_chave, [])
+            except Exception as e:
+                logger.error(f"Erro ao carregar histórico do arquivo: {e}")
+
+        # Merge: usa MongoDB como base, adiciona do arquivo apenas registros não duplicados
+        # Identifica por timestamp + produto (fingerprint único)
+        if not mongo_registros:
+            return file_registros
+        if not file_registros:
+            return mongo_registros
+        # Dedup por timestamp
+        seen = {r.get('timestamp', '') for r in mongo_registros if r.get('timestamp')}
+        extras = [r for r in file_registros if r.get('timestamp', '') not in seen]
+        merged = mongo_registros + extras
+        # Ordena por timestamp
+        merged.sort(key=lambda r: r.get('timestamp', 0))
+        if extras:
+            logger.info(f"📋 Histórico: {len(mongo_registros)} MongoDB + {len(extras)} arquivo = {len(merged)} total")
+        return merged
 
 class ComponentConsumptionManager:
     """
@@ -1536,6 +1547,7 @@ class ComponentConsumptionManager:
 
     def __init__(self):
         self.data = self._load()
+        self._restore_in_production_to_waiting()
         self._ensure_current_month()
 
     def _current_month_key(self):
@@ -1688,15 +1700,29 @@ _BASE_TYPES_ECB = [
     "BASE GIRATORIA", "BASE GIRATÓRIA", "BASE MADEIRA", "BASE INOX",
 ]
 _COR_TYPES_ECB = [
+    # Courvim
     "COURVIM PRETO","COURVIM BRANCO","COURVIM CARAMELO","COURVIM CINZA",
-    "COURVIM AZUL","COURVIM VERDE","COURVIM ROSA","COURVIM VINHO","COURVIM",
+    "COURVIM AZUL","COURVIM VERDE","COURVIM ROSA","COURVIM VINHO",
+    "COURVIM MARROM","COURVIM BEGE","COURVIM NUDE","COURVIM CREME","COURVIM",
+    # Veludo
     "VELUDO PRETO","VELUDO CINZA","VELUDO AZUL","VELUDO VERDE",
-    "VELUDO ROSA","VELUDO BEGE","VELUDO VINHO","VELUDO AMARELO","VELUDO",
-    "LINHO BEGE","LINHO CINZA","LINHO PRETO","LINHO BRANCO","LINHO",
-    "TECIDO PRETO","TECIDO CINZA","TECIDO BEGE","TECIDO BRANCO","TECIDO",
-    "MARSALA","BORDO","BORDÔ","CARAMELO","NUDE","CREME",
-    "PRETO","BRANCO","CINZA","BEGE","MARROM",
-    "AZUL","VERDE","ROSA","AMARELO","LARANJA","VINHO",
+    "VELUDO ROSA","VELUDO BEGE","VELUDO VINHO","VELUDO AMARELO",
+    "VELUDO MARROM","VELUDO NUDE","VELUDO CREME","VELUDO",
+    # Linho
+    "LINHO BEGE","LINHO CINZA","LINHO PRETO","LINHO BRANCO",
+    "LINHO NATURAL","LINHO CREME","LINHO",
+    # Tecido
+    "TECIDO PRETO","TECIDO CINZA","TECIDO BEGE","TECIDO BRANCO",
+    "TECIDO MARROM","TECIDO AZUL","TECIDO VERDE","TECIDO ROSA","TECIDO",
+    # Couro / Sintético
+    "COURO PRETO","COURO BRANCO","COURO CARAMELO","COURO MARROM","COURO",
+    "SINTÉTICO PRETO","SINTÉTICO BRANCO","SINTETICO PRETO","SINTETICO BRANCO",
+    # Cores avulsas
+    "MARSALA","BORDO","BORDÔ","CARAMELO","NUDE","CREME","NATURAL",
+    "PRETO","BRANCO","CINZA ESCURO","CINZA CLARO","CINZA",
+    "BEGE ESCURO","BEGE CLARO","BEGE","MARROM ESCURO","MARROM",
+    "AZUL MARINHO","AZUL ROYAL","AZUL","VERDE MUSGO","VERDE ESCURO","VERDE",
+    "ROSA CHOQUE","ROSA CLARO","ROSA","AMARELO","LARANJA","VINHO","ROXO",
 ]
 
 def _extract_base_cor(nome: str):
@@ -1718,9 +1744,13 @@ def _extract_base_cor(nome: str):
         s = m_base.start(1)
         base = nome[s : s + len(m_base.group(1))].strip()
 
-    # 2. Separador " - " ou " / "
+    # 2. Separador " - " ou " / " ou " | " ou espaços ao redor de "-"
     if not base or not cor:
-        sep = " - " if " - " in nome else (" / " if " / " in nome else None)
+        sep = None
+        for _s in [" - ", " / ", " | ", "- ", " -"]:
+            if _s in nome:
+                sep = _s
+                break
         if sep:
             for parte in [p.strip() for p in nome.split(sep)]:
                 pu = parte.upper()
@@ -1762,6 +1792,22 @@ class PendingOrdersManager:
     def __init__(self):
         self.data = self._load()
 
+    def _restore_in_production_to_waiting(self):
+        """Ao reiniciar: itens 'in_production' voltam para 'waiting'.
+        O timer foi pausado pelo ProductionTimer._auto_pause_on_restart.
+        O usuário precisa clicar em Produzir novamente para retomar.
+        Garante que itens não fiquem presos em 'in_production' para sempre.
+        """
+        changed = False
+        for key, item in self.data.items():
+            if item.get('status') == 'in_production':
+                item['status'] = 'waiting'
+                item.pop('started_at', None)  # remove timestamp de início
+                changed = True
+                logger.info(f"♻️ Restart: item '{item.get('nome','?')}' voltou para fila de espera (timer pausado).")
+        if changed:
+            self._save()
+
     def _load(self):
         """Carrega pending_orders — MongoDB primeiro, arquivo fallback.
         Garante que item_key está presente dentro de cada doc."""
@@ -1782,18 +1828,14 @@ class PendingOrdersManager:
             return {}
         try:
             with open(self.FILE_PATH, 'r', encoding='utf-8') as f:
-                raw = json.load(f)
-            if not isinstance(raw, dict):
-                return {}
-            data = {}
-            for key, doc in raw.items():
-                if not isinstance(doc, dict):
-                    continue
-                if 'item_key' not in doc or not doc['item_key']:
-                    doc['item_key'] = key
-                data[key] = doc
-            logger.info(f"✅ PendingOrders: {len(data)} itens carregados do arquivo local")
-            return data
+                data = json.load(f)
+                if data:
+                    # Mesma garantia para arquivo
+                    for key, doc in data.items():
+                        if 'item_key' not in doc or not doc['item_key']:
+                            doc['item_key'] = key
+                    logger.info(f"✅ PendingOrders: {len(data)} itens carregados do arquivo local")
+                return data
         except Exception as e:
             logger.error(f"Erro ao carregar pending_orders do arquivo: {e}")
             return {}
@@ -1802,10 +1844,12 @@ class PendingOrdersManager:
         """Salva pending_orders — sincroniza MongoDB (upsert novos + delete removidos) + arquivo."""
         if MONGO_AVAILABLE:
             try:
-                existing_keys = {str(d['_id']) for d in _mongo_db['pending_orders'].find({}, {'_id': 1})}
-                current_keys  = set(self.data.keys())
-                for key_del in existing_keys - current_keys:
+                # Remove do MongoDB itens que foram deletados de self.data
+                existing_mongo = {str(doc['_id']) for doc in _mongo_db['pending_orders'].find({}, {'_id': 1})}
+                current_keys = set(self.data.keys())
+                for key_del in existing_mongo - current_keys:
                     _mongo_db['pending_orders'].delete_one({'_id': key_del})
+                # Upserta os itens atuais
                 for key, val in self.data.items():
                     MongoStore.upsert('pending_orders', key, val)
             except Exception as e:
@@ -1865,14 +1909,16 @@ class PendingOrdersManager:
         return self.data.get(item_key)
 
     def dismiss(self, item_key: str):
-        """Remove item da fila — deleta do MongoDB E do arquivo."""
+        """Remove item da fila — sincroniza MongoDB E arquivo."""
         if item_key in self.data:
             del self.data[item_key]
+        # Sempre sincroniza ambos storages, independente de qual está disponível
         if MONGO_AVAILABLE:
             try:
                 _mongo_db['pending_orders'].delete_one({'_id': item_key})
             except Exception as e:
-                logger.error(f"dismiss: erro ao remover {item_key} do MongoDB: {e}")
+                logger.error(f"dismiss: erro MongoDB ao remover {item_key}: {e}")
+        # Sempre salva arquivo também (fallback robusto)
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
@@ -1941,11 +1987,11 @@ class PendingOrdersManager:
                 del self.data[key]
                 if MONGO_AVAILABLE:
                     try:
-                        MongoStore.remove('pending_orders', key)
+                        _mongo_db['pending_orders'].delete_one({'_id': key})
                     except Exception:
                         pass
-            if not MONGO_AVAILABLE:
-                self._save()
+            # Sempre salva arquivo (mantém sincronizado com MongoDB)
+            self._save()
             logger.info(f"🗓️ Reset mensal: {len(to_remove)} itens antigos removidos da fila.")
         return len(to_remove)
 
@@ -2342,14 +2388,13 @@ class Orchestrator:
                 # Manda atualização pro Front (Gráfico)
                 self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
             else:
-                self.logger.warning("⚠️ Nenhum pedido encontrado na busca API. Verificar autenticação e configuração.")
+                self.logger.warning("Nenhum pedido encontrado na busca.")
 
         except Exception as e:
             self.logger.exception(f"Erro fatal no processamento de pedidos: {e}")
         finally:
             with self.sales.recalculation_lock:
                 self.sales._recalculation_running = False
-            self.logger.debug("process_sales_orders finalizado — _recalculation_running = False")
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
@@ -3022,30 +3067,6 @@ class WebServer:
                 'logs': component_consumption.get_current_month().get('checklist_logs', [])[-50:]
             })
 
-        @self.app.route('/api/production/history')
-        @token_required
-        def api_production_history_route(token):
-            """Histórico de finalizações do mês — fonte única de verdade."""
-            historico = production_timer.get_monthly_history_details()
-            nome_to_item = {}
-            for v in pending_orders.data.values():
-                if v.get('status') == 'done':
-                    nome_key = (v.get('nome') or v.get('nome_original', '')).strip().upper()
-                    if nome_key and nome_key not in nome_to_item:
-                        nome_to_item[nome_key] = v
-            enriched = []
-            for reg in historico:
-                r = dict(reg)
-                nome_up = r.get('produto', '').strip().upper()
-                if not r.get('pedido_numero') and nome_up in nome_to_item:
-                    item = nome_to_item[nome_up]
-                    r.setdefault('pedido_numero', item.get('pedido_numero', ''))
-                    r.setdefault('cliente', item.get('cliente', ''))
-                    r.setdefault('base', item.get('base', ''))
-                    r.setdefault('cor', item.get('cor', ''))
-                enriched.append(r)
-            return jsonify({'history': enriched, 'total': len(enriched)})
-
         @self.app.route('/api/consumption/history')
         def api_consumption_history():
             """Retorna histórico de todos os meses."""
@@ -3117,27 +3138,19 @@ class WebServer:
                 item_data.get('timer_key') or
                 (f"{produto_nome}||{item_key}" if produto_nome else None)
             )
-            # Dados enriquecidos do pedido para o histórico
-            item_data_for_history = {
-                'pedido_numero': item_data.get('pedido_numero', ''),
-                'cliente':       item_data.get('cliente', ''),
-                'base':          item_data.get('base', ''),
-                'cor':           item_data.get('cor', ''),
-                'item_key':      item_key,
-            }
             # Para o timer ANTES de finalizar o pedido (para capturar o tempo)
             tempo_producao = None
             if timer_key:
-                result = production_timer.stop_and_log(timer_key, extra_info=item_data_for_history)
+                result = production_timer.stop_and_log(timer_key)
                 tempo_producao = result.get('elapsed') or 0
                 # Se tempo=0 e tem || no timer_key, tenta fallback pelo nome
                 if tempo_producao == 0 and '||' in timer_key:
                     nome_fallback = timer_key.split('||')[0]
                     if nome_fallback in production_timer.timers:
-                        result2 = production_timer.stop_and_log(nome_fallback, extra_info=item_data_for_history)
+                        result2 = production_timer.stop_and_log(nome_fallback)
                         tempo_producao = result2.get('elapsed') or 0
             elif produto_nome:
-                result = production_timer.stop_and_log(produto_nome, extra_info=item_data_for_history)
+                result = production_timer.stop_and_log(produto_nome)
                 tempo_producao = result.get('elapsed') or 0
 
             # Finaliza o pedido com o tempo capturado
@@ -3248,6 +3261,17 @@ class WebServer:
         @self.app.route('/products/search') # Aceita as duas chamadas
         @token_required
         def api_products_search(token):
+            # Se cache vazio, dispara carregamento imediato em background
+            with self.orchestrator._cache_lock:
+                cache_empty = (len(self.orchestrator._products_cache) == 0 and
+                               len(self.orchestrator._kits_cache) == 0)
+            if cache_empty:
+                self.logger.info("🔄 Cache vazio na busca — iniciando carregamento em background...")
+                if not getattr(self.orchestrator, '_cache_loading', False):
+                    self.orchestrator._cache_loading = True
+                    Thread(target=self.orchestrator.process_products_cache, daemon=True).start()
+                return jsonify([]), 200
+
             query = request.args.get('q', '').lower().strip()
             results = []
             
@@ -4955,16 +4979,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         async function syncAndRefreshPending() {
             const btn = document.querySelector('[onclick="syncAndRefreshPending()"]');
             if (btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
-            // Feedback visual imediato no painel
-            const boardDiv = document.getElementById('production-board-section');
-            if (boardDiv && boardDiv.innerHTML.includes('Nenhum pedido')) {
-                boardDiv.innerHTML = '<div class="text-center py-4 text-muted"><div class="spinner-border spinner-border-sm me-2" role="status"></div>Buscando pedidos do Bling...</div>';
-            }
             try {
                 const res = await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
                 if (res.message) showToast('Info', res.message, 'info');
-                else if (res.added > 0) showToast('Sucesso', `${res.added} novos itens adicionados à fila.`, 'success');
-                else showToast('Info', 'Fila já atualizada — aguarde o worker buscar os itens.', 'info');
+                else showToast('Sucesso', `${res.added || 0} novos itens adicionados.`, 'success');
             } catch(e) {
                 showToast('Aviso', 'Faça login para sincronizar.', 'warning');
             } finally {
@@ -5003,13 +5021,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const db = document.getElementById('done-count-badge');
             if (wb) wb.textContent = waiting.length;
             if (ib) ib.textContent = inProd.length + orphans.length;
-            // done badge: atualiza via histórico (assíncrono, não bloqueia o render)
-            if (db) {
-                const histBadge = document.getElementById('history-total-badge');
-                if (histBadge && histBadge.textContent !== '0') {
-                    db.textContent = histBadge.textContent;
-                }
-            }
+            if (db) db.textContent = done.length;
 
             // Para ticker anterior
             if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
@@ -5217,7 +5229,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 });
                 showToast('✅ Concluído!', produtoNome, 'success');
                 await loadProductionBoard();
-                if (typeof loadProductionHistory === 'function') await loadProductionHistory();
                 await refreshComponentTab();
             } catch(e) {
                 showToast('Erro', 'Falha ao concluir', 'danger');
@@ -5256,86 +5267,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function updateComponentUsage(usageData) {
-            // Quando recebe via WS, recarrega histórico da fonte real (API)
-            const onProducaoTab = document.getElementById('component-usage')
-                ?.classList.contains('active');
-            if (onProducaoTab && typeof loadProductionHistory === 'function') {
-                loadProductionHistory();
-            } else if (usageData && usageData.history_production) {
-                renderProductionHistory(usageData.history_production);
-            }
-        }
-
-        async function loadProductionHistory() {
-            const div = document.getElementById('production-history-section');
-            const badge = document.getElementById('history-total-badge');
-            if (!div) return;
-            try {
-                const data = await fetchAPI('/api/production/history');
-                renderProductionHistory(data.history || []);
-                if (badge) badge.textContent = data.total || 0;
-                // Atualiza done badge no header do painel
-                const db = document.getElementById('done-count-badge');
-                if (db) db.textContent = data.total || 0;
-            } catch(e) {
-                div.innerHTML = '<div class="alert alert-danger m-3 small">Erro ao carregar histórico.</div>';
-            }
-        }
-
-        function renderProductionHistory(history) {
-            const div = document.getElementById('production-history-section');
-            if (!div) return;
-            const badge = document.getElementById('history-total-badge');
-            const reversed = [...(history || [])].reverse();
-            if (badge) badge.textContent = reversed.length;
-            if (reversed.length === 0) {
-                div.innerHTML = '<div class="text-center py-5"><div style="font-size:2.5rem;opacity:.3;">📋</div><p class="text-muted mt-2">Nenhum produto finalizado este mês.</p><small class="text-muted">Ao concluir uma produção, ela aparece aqui e persiste entre sessões.</small></div>';
-                return;
-            }
-            div.innerHTML = `
-                <div class="table-responsive" style="max-height:420px;overflow-y:auto;">
-                    <table class="table table-sm table-hover align-middle mb-0">
-                        <thead class="table-dark sticky-top" style="top:0;z-index:1;">
-                            <tr>
-                                <th class="ps-3" style="min-width:140px;">Data/Hora</th>
-                                <th style="min-width:160px;">Produto</th>
-                                <th>Base</th><th>Cor</th>
-                                <th>#Pedido</th><th>Cliente</th>
-                                <th class="text-center" style="min-width:90px;">⏱ Produção</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            ${reversed.map((h, i) => {
-                                const dt = h.data_conclusao ? new Date(h.data_conclusao).toLocaleString('pt-BR') : '—';
-                                return `<tr class="${i%2===0?'':'table-light'}">
-                                    <td class="ps-3 small text-muted">${dt}</td>
-                                    <td class="fw-bold">${escapeHtml(h.produto || '—')}</td>
-                                    <td class="small text-muted">${escapeHtml(h.base || '—')}</td>
-                                    <td class="small text-muted">${escapeHtml(h.cor || '—')}</td>
-                                    <td class="small text-muted">${h.pedido_numero ? '#'+escapeHtml(String(h.pedido_numero)) : '—'}</td>
-                                    <td class="small text-muted">${escapeHtml(h.cliente || '—')}</td>
-                                    <td class="text-center">
-                                        ${h.tempo_segundos
-                                            ? '<span class="badge font-monospace fw-bold" style="background:linear-gradient(135deg,#4f46e5,#7c3aed);color:white;padding:.3rem .7rem;">'+formatSeconds(h.tempo_segundos)+'</span>'
-                                            : '<span class="text-muted small">—</span>'}
-                                    </td>
-                                </tr>`;
-                            }).join('')}
-                        </tbody>
-                    </table>
-                </div>`;
+            if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
 
         async function refreshComponentTab() {
             await loadProductionBoard();
-            if (typeof loadProductionHistory === 'function') await loadProductionHistory();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
             } catch(e) {
-                const el = document.getElementById('consumption-table-section');
-                if (el) el.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
+                document.getElementById('consumption-table-section').innerHTML =
+                    '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
             }
+            try {
+                const usageData = await fetchAPI('/api/components/usage');
+                if (usageData.history_production) renderProductionHistory(usageData.history_production);
+            } catch(e) { console.error('Erro ao carregar histórico:', e); }
         }
 
         function renderActiveTimers(activeProduction) {}
@@ -5398,7 +5345,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _kpiReconnectDelay = 3000; // reset ao conectar com sucesso
             };
 
-            let _wsFirstUpdateDone = false;
+            let _wsFirstAuthDone = false;
             wsKpi.onmessage = (e) => {
                 let data;
                 try { data = JSON.parse(e.data); } catch { return; }
@@ -5409,19 +5356,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     if (data.sales_stats) updateKpis(data.sales_stats);
                     if (data.component_usage) updateComponentUsage(data.component_usage);
 
-                    // Auto-sync de pedidos: na primeira mensagem autenticada com dados
-                    // dispara sincronização silenciosa para popular o painel de produção
-                    if (data.authenticated && data.sales_stats && !_wsFirstUpdateDone) {
-                        _wsFirstUpdateDone = true;
-                        // Sync silencioso (sem toast) para popular os pedidos pendentes
+                    // Na primeira mensagem autenticada: sincroniza pedidos + recarrega board
+                    if (data.authenticated && !_wsFirstAuthDone) {
+                        _wsFirstAuthDone = true;
+                        // Sync silencioso de pedidos pendentes
                         fetch('/api/pending-orders/sync', { method: 'POST' })
                             .then(r => r.ok ? r.json() : null)
-                            .then(res => {
-                                if (res && typeof loadProductionBoard === 'function') {
-                                    loadProductionBoard();
-                                }
-                            })
-                            .catch(() => {});
+                            .catch(() => null);
+                        // Se estiver na aba de produção, recarrega board
+                        const prodTab = document.getElementById('component-usage');
+                        if (prodTab && prodTab.classList.contains('active')) {
+                            loadProductionBoard();
+                        }
                     }
 
                     const forceLoadButton = document.querySelector('#kits button.btn-primary');
@@ -5437,7 +5383,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
 
             wsKpi.onclose = () => {
-                _wsFirstUpdateDone = false; // reseta para re-sincronizar ao reconectar
+                _wsFirstAuthDone = false; // reseta para re-sincronizar ao reconectar
                 setTimeout(() => {
                     _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
                     _connectKpiWs();
@@ -5463,7 +5409,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const data = await fetchAPI(`${API}/products/search?q=${encodeURIComponent(q)}`);
 
                 if(!data.length) {
-                    div.innerHTML = '<div class="alert alert-warning">Nenhum resultado encontrado.</div>';
+                    div.innerHTML = `<div class="alert alert-warning">
+                        <strong>Nenhum resultado encontrado.</strong><br>
+                        <small>Se o sistema acabou de reiniciar, o cache de produtos pode estar carregando (leva ~2 min). Tente novamente em instantes ou clique em <b>Produtos → Recarregar Lista</b>.</small>
+                    </div>`;
                     return;
                 }
 
@@ -5686,14 +5635,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _kitsLoaded = true;
                 loadKits();
             }
-            // Carrega o board de produção sempre que autenticação é confirmada
-            if (typeof loadProductionBoard === 'function') {
-                loadProductionBoard();
-            }
-            // Reseta flag do WS para re-disparar sync ao reconectar
-            if (typeof _wsFirstUpdateDone !== 'undefined') {
-                // deixa _wsFirstUpdateDone como está para não re-sincronizar múltiplas vezes
-            }
         }
 
         /* Inicializa conexão WS após declarar todas as funções */
@@ -5707,7 +5648,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
                     loadProductionBoard();
-                    if (typeof loadProductionHistory === 'function') loadProductionHistory();
                     if (!_boardPoll) {
                         _boardPoll = setInterval(loadProductionBoard, 10000);
                     }
