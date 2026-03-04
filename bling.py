@@ -1248,16 +1248,10 @@ class ProductionTimer:
             try:
                 data = MongoStore.get('production_timers', 'timers')
                 timers = data.get('timers', {})
-                # Se MongoDB retornou o documento (mesmo com timers vazio), usa ele
-                # (timers vazio = sem produções ativas, é estado válido)
-                if data:  # documento existe no MongoDB
-                    if timers:
-                        logger.info(f"✅ Timers carregados do MongoDB: {len(timers)} timer(s) ativo(s)")
-                    else:
-                        logger.info("✅ MongoDB: nenhum timer ativo (estado válido)")
+                if data:  # doc existe no MongoDB (mesmo sem timers ativos)
+                    logger.info(f"✅ Timers MongoDB: {len(timers)} ativo(s)")
                     return timers
-                # MongoDB sem documento — tenta arquivo como fallback
-                logger.info("MongoDB sem doc de timers — verificando arquivo local...")
+                logger.info("MongoDB sem doc de timers — verificando arquivo...")
             except Exception as e:
                 logger.warning(f"Falha ao carregar timers do MongoDB: {e}")
         if not self.FILE_PATH.exists():
@@ -1469,7 +1463,7 @@ class ProductionTimer:
 
         saved = False
         if MONGO_AVAILABLE:
-            for _attempt in range(3):  # até 3 tentativas
+            for _att in range(3):
                 try:
                     _mongo_db['production_history'].update_one(
                         {'_id': mes_chave},
@@ -1477,12 +1471,11 @@ class ProductionTimer:
                         upsert=True
                     )
                     saved = True
-                    logger.info(f"✅ Histórico salvo no MongoDB: {reg_clean.get('produto','?')} ({int(reg_clean.get('tempo_segundos',0))}s)")
+                    logger.info(f"✅ Histórico MongoDB: {reg_clean.get('produto','?')} ({int(reg_clean.get('tempo_segundos',0))}s)")
                     break
                 except Exception as e:
-                    logger.error(f"Erro ao salvar histórico no MongoDB (tentativa {_attempt+1}/3): {e}")
-                    if _attempt < 2:
-                        time.sleep(1)
+                    logger.error(f"Histórico MongoDB tentativa {_att+1}/3: {e}")
+                    if _att < 2: time.sleep(1)
         # Sempre salva no arquivo também como backup redundante
         try:
             history = {}
@@ -1502,40 +1495,29 @@ class ProductionTimer:
             logger.error(f"Erro ao salvar histórico em arquivo: {e}")
 
     def get_monthly_history_details(self):
-        """Retorna histórico do mês — faz merge de MongoDB + arquivo (máxima redundância)."""
+        """Retorna histórico do mês — merge MongoDB + arquivo (máxima redundância)."""
         mes_chave = datetime.now().strftime('%Y-%m')
-        mongo_registros = []
-        file_registros = []
-
+        mongo_regs = []
+        file_regs  = []
         if MONGO_AVAILABLE:
             try:
                 doc = _mongo_db['production_history'].find_one({'_id': mes_chave})
-                mongo_registros = (doc or {}).get('registros', [])
+                mongo_regs = (doc or {}).get('registros', [])
             except Exception as e:
                 logger.warning(f"Falha ao carregar histórico do MongoDB: {e}")
-
         if self.HISTORY_PATH.exists():
             try:
                 with open(self.HISTORY_PATH, 'r', encoding='utf-8') as f:
-                    history = json.load(f)
-                file_registros = history.get(mes_chave, [])
+                    file_regs = json.load(f).get(mes_chave, [])
             except Exception as e:
                 logger.error(f"Erro ao carregar histórico do arquivo: {e}")
-
-        # Merge: usa MongoDB como base, adiciona do arquivo apenas registros não duplicados
-        # Identifica por timestamp + produto (fingerprint único)
-        if not mongo_registros:
-            return file_registros
-        if not file_registros:
-            return mongo_registros
-        # Dedup por timestamp
-        seen = {r.get('timestamp', '') for r in mongo_registros if r.get('timestamp')}
-        extras = [r for r in file_registros if r.get('timestamp', '') not in seen]
-        merged = mongo_registros + extras
-        # Ordena por timestamp
-        merged.sort(key=lambda r: r.get('timestamp', 0))
-        if extras:
-            logger.info(f"📋 Histórico: {len(mongo_registros)} MongoDB + {len(extras)} arquivo = {len(merged)} total")
+        if not mongo_regs:
+            return file_regs
+        if not file_regs:
+            return mongo_regs
+        seen   = {r.get('timestamp', '') for r in mongo_regs if r.get('timestamp')}
+        extras = [r for r in file_regs if r.get('timestamp', '') not in seen]
+        merged = sorted(mongo_regs + extras, key=lambda r: r.get('timestamp', 0))
         return merged
 
 class ComponentConsumptionManager:
@@ -1547,7 +1529,6 @@ class ComponentConsumptionManager:
 
     def __init__(self):
         self.data = self._load()
-        self._restore_in_production_to_waiting()
         self._ensure_current_month()
 
     def _current_month_key(self):
@@ -1700,27 +1681,19 @@ _BASE_TYPES_ECB = [
     "BASE GIRATORIA", "BASE GIRATÓRIA", "BASE MADEIRA", "BASE INOX",
 ]
 _COR_TYPES_ECB = [
-    # Courvim
     "COURVIM PRETO","COURVIM BRANCO","COURVIM CARAMELO","COURVIM CINZA",
     "COURVIM AZUL","COURVIM VERDE","COURVIM ROSA","COURVIM VINHO",
-    "COURVIM MARROM","COURVIM BEGE","COURVIM NUDE","COURVIM CREME","COURVIM",
-    # Veludo
+    "COURVIM MARROM","COURVIM BEGE","COURVIM NUDE","COURVIM",
     "VELUDO PRETO","VELUDO CINZA","VELUDO AZUL","VELUDO VERDE",
     "VELUDO ROSA","VELUDO BEGE","VELUDO VINHO","VELUDO AMARELO",
     "VELUDO MARROM","VELUDO NUDE","VELUDO CREME","VELUDO",
-    # Linho
-    "LINHO BEGE","LINHO CINZA","LINHO PRETO","LINHO BRANCO",
-    "LINHO NATURAL","LINHO CREME","LINHO",
-    # Tecido
+    "LINHO BEGE","LINHO CINZA","LINHO PRETO","LINHO BRANCO","LINHO NATURAL","LINHO",
     "TECIDO PRETO","TECIDO CINZA","TECIDO BEGE","TECIDO BRANCO",
     "TECIDO MARROM","TECIDO AZUL","TECIDO VERDE","TECIDO ROSA","TECIDO",
-    # Couro / Sintético
     "COURO PRETO","COURO BRANCO","COURO CARAMELO","COURO MARROM","COURO",
-    "SINTÉTICO PRETO","SINTÉTICO BRANCO","SINTETICO PRETO","SINTETICO BRANCO",
-    # Cores avulsas
     "MARSALA","BORDO","BORDÔ","CARAMELO","NUDE","CREME","NATURAL",
     "PRETO","BRANCO","CINZA ESCURO","CINZA CLARO","CINZA",
-    "BEGE ESCURO","BEGE CLARO","BEGE","MARROM ESCURO","MARROM",
+    "BEGE ESCURO","BEGE CLARO","BEGE","MARROM",
     "AZUL MARINHO","AZUL ROYAL","AZUL","VERDE MUSGO","VERDE ESCURO","VERDE",
     "ROSA CHOQUE","ROSA CLARO","ROSA","AMARELO","LARANJA","VINHO","ROXO",
 ]
@@ -1744,7 +1717,7 @@ def _extract_base_cor(nome: str):
         s = m_base.start(1)
         base = nome[s : s + len(m_base.group(1))].strip()
 
-    # 2. Separador " - " ou " / " ou " | " ou espaços ao redor de "-"
+    # 2. Separador " - ", " / ", " | " ou "-" simples
     if not base or not cor:
         sep = None
         for _s in [" - ", " / ", " | ", "- ", " -"]:
@@ -1791,20 +1764,20 @@ class PendingOrdersManager:
 
     def __init__(self):
         self.data = self._load()
+        self._restore_in_production_to_waiting()
 
     def _restore_in_production_to_waiting(self):
-        """Ao reiniciar: itens 'in_production' voltam para 'waiting'.
-        O timer foi pausado pelo ProductionTimer._auto_pause_on_restart.
-        O usuário precisa clicar em Produzir novamente para retomar.
-        Garante que itens não fiquem presos em 'in_production' para sempre.
+        """Ao reiniciar: itens in_production voltam para waiting.
+        O timer foi pausado pelo _auto_pause_on_restart. O usuário
+        clica em Produzir novamente para retomar.
         """
         changed = False
         for key, item in self.data.items():
             if item.get('status') == 'in_production':
                 item['status'] = 'waiting'
-                item.pop('started_at', None)  # remove timestamp de início
+                item.pop('started_at', None)
                 changed = True
-                logger.info(f"♻️ Restart: item '{item.get('nome','?')}' voltou para fila de espera (timer pausado).")
+                logger.info(f"♻️ Restart: '{item.get('nome','?')}'  voltou para fila de espera.")
         if changed:
             self._save()
 
@@ -1841,15 +1814,13 @@ class PendingOrdersManager:
             return {}
 
     def _save(self):
-        """Salva pending_orders — sincroniza MongoDB (upsert novos + delete removidos) + arquivo."""
+        """Salva pending_orders — upsert novos + delete removidos no MongoDB + arquivo."""
         if MONGO_AVAILABLE:
             try:
-                # Remove do MongoDB itens que foram deletados de self.data
-                existing_mongo = {str(doc['_id']) for doc in _mongo_db['pending_orders'].find({}, {'_id': 1})}
-                current_keys = set(self.data.keys())
-                for key_del in existing_mongo - current_keys:
-                    _mongo_db['pending_orders'].delete_one({'_id': key_del})
-                # Upserta os itens atuais
+                existing = {str(d['_id']) for d in _mongo_db['pending_orders'].find({}, {'_id': 1})}
+                current  = set(self.data.keys())
+                for k in existing - current:
+                    _mongo_db['pending_orders'].delete_one({'_id': k})
                 for key, val in self.data.items():
                     MongoStore.upsert('pending_orders', key, val)
             except Exception as e:
@@ -1912,20 +1883,18 @@ class PendingOrdersManager:
         """Remove item da fila — sincroniza MongoDB E arquivo."""
         if item_key in self.data:
             del self.data[item_key]
-        # Sempre sincroniza ambos storages, independente de qual está disponível
         if MONGO_AVAILABLE:
             try:
                 _mongo_db['pending_orders'].delete_one({'_id': item_key})
             except Exception as e:
-                logger.error(f"dismiss: erro MongoDB ao remover {item_key}: {e}")
-        # Sempre salva arquivo também (fallback robusto)
+                logger.error(f"dismiss: erro MongoDB {item_key}: {e}")
         temp = self.FILE_PATH.with_suffix('.tmp')
         try:
             with open(temp, 'w', encoding='utf-8') as f:
                 json.dump(self.data, f, indent=4, ensure_ascii=False)
             shutil.move(str(temp), str(self.FILE_PATH))
         except Exception as e:
-            logger.error(f"dismiss: erro ao salvar arquivo: {e}")
+            logger.error(f"dismiss: erro arquivo: {e}")
 
     def get_waiting(self):
         """Retorna todos os itens aguardando produção."""
@@ -1990,8 +1959,7 @@ class PendingOrdersManager:
                         _mongo_db['pending_orders'].delete_one({'_id': key})
                     except Exception:
                         pass
-            # Sempre salva arquivo (mantém sincronizado com MongoDB)
-            self._save()
+            self._save()  # sempre sincroniza arquivo
             logger.info(f"🗓️ Reset mensal: {len(to_remove)} itens antigos removidos da fila.")
         return len(to_remove)
 
@@ -3261,17 +3229,15 @@ class WebServer:
         @self.app.route('/products/search') # Aceita as duas chamadas
         @token_required
         def api_products_search(token):
-            # Se cache vazio, dispara carregamento imediato em background
             with self.orchestrator._cache_lock:
                 cache_empty = (len(self.orchestrator._products_cache) == 0 and
                                len(self.orchestrator._kits_cache) == 0)
             if cache_empty:
-                self.logger.info("🔄 Cache vazio na busca — iniciando carregamento em background...")
+                self.logger.info("🔄 Cache vazio na busca — iniciando em background...")
                 if not getattr(self.orchestrator, '_cache_loading', False):
                     self.orchestrator._cache_loading = True
                     Thread(target=self.orchestrator.process_products_cache, daemon=True).start()
                 return jsonify([]), 200
-
             query = request.args.get('q', '').lower().strip()
             results = []
             
@@ -5356,14 +5322,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     if (data.sales_stats) updateKpis(data.sales_stats);
                     if (data.component_usage) updateComponentUsage(data.component_usage);
 
-                    // Na primeira mensagem autenticada: sincroniza pedidos + recarrega board
+                    // Primeira mensagem autenticada: sync pedidos + recarrega board
                     if (data.authenticated && !_wsFirstAuthDone) {
                         _wsFirstAuthDone = true;
-                        // Sync silencioso de pedidos pendentes
-                        fetch('/api/pending-orders/sync', { method: 'POST' })
-                            .then(r => r.ok ? r.json() : null)
-                            .catch(() => null);
-                        // Se estiver na aba de produção, recarrega board
+                        fetch('/api/pending-orders/sync', { method: 'POST' }).catch(() => {});
                         const prodTab = document.getElementById('component-usage');
                         if (prodTab && prodTab.classList.contains('active')) {
                             loadProductionBoard();
@@ -5383,7 +5345,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
 
             wsKpi.onclose = () => {
-                _wsFirstAuthDone = false; // reseta para re-sincronizar ao reconectar
+                _wsFirstAuthDone = false;
                 setTimeout(() => {
                     _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
                     _connectKpiWs();
@@ -5411,7 +5373,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 if(!data.length) {
                     div.innerHTML = `<div class="alert alert-warning">
                         <strong>Nenhum resultado encontrado.</strong><br>
-                        <small>Se o sistema acabou de reiniciar, o cache de produtos pode estar carregando (leva ~2 min). Tente novamente em instantes ou clique em <b>Produtos → Recarregar Lista</b>.</small>
+                        <small>Se o sistema acabou de reiniciar, o cache pode estar carregando (~2 min). Tente novamente em instantes ou vá em <b>Produtos → Recarregar Lista</b>.</small>
                     </div>`;
                     return;
                 }
