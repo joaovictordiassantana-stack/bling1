@@ -69,14 +69,15 @@ except ImportError:
 
 # Filtro: suprime log de erro residual do gunicorn control server
 # Caso o event loop não seja encontrado mesmo após o patch acima
-import logging as _log_setup
-for _guni_logger in ('gunicorn.arbiter', 'gunicorn.error', 'gunicorn'):
-    _log_setup.getLogger(_guni_logger).addFilter(
-        type('_SuppressNoLoop', (_log_setup.Filter,), {
-            'filter': staticmethod(lambda r: 'no running event loop' not in r.getMessage())
-        })()
-    )
-del _log_setup, _guni_logger
+def _setup_gunicorn_filters():
+    import logging as _log_setup
+    for _name in ('gunicorn.arbiter', 'gunicorn.error', 'gunicorn'):
+        _log_setup.getLogger(_name).addFilter(
+            type('_SuppressNoLoop', (_log_setup.Filter,), {
+                'filter': staticmethod(lambda r: 'no running event loop' not in r.getMessage())
+            })()
+        )
+_setup_gunicorn_filters()
 
 # ============================================================================
 # MONGODB — Camada de Persistência Central
@@ -148,18 +149,8 @@ class MongoStore:
 
     @staticmethod
     def upsert(collection: str, doc_id: str, data: dict) -> bool:
-        if not MONGO_AVAILABLE:
-            return False
-        try:
-            payload = {k: v for k, v in data.items() if k != '_id'}
-            _mongo_db[collection].update_one(
-                {'_id': doc_id},
-                {'$set': payload},
-                upsert=True
-            )
-            return True
-        except Exception:
-            return False
+        """Alias de set() — mantido para compatibilidade com chamadas existentes."""
+        return MongoStore.set(collection, data, doc_id)
 
     @staticmethod
     def remove(collection: str, doc_id: str) -> bool:
@@ -255,7 +246,8 @@ class InMemoryLogHandler(logging.Handler):
     """Handler de log que armazena os registros em memória para o WebSocket."""
     def __init__(self, max_logs=100):
         super().__init__()
-        self.logs = []
+        from collections import deque
+        self.logs = deque(maxlen=max_logs)  # O(1) rotation vs O(n) list.pop(0)
         self.max_logs = max_logs
         self.formatter = logging.Formatter(
             '%(asctime)s - %(levelname)s - %(message)s',
@@ -272,9 +264,7 @@ class InMemoryLogHandler(logging.Handler):
                 'message': self.format(record),
                 'name': record.name
             }
-            self.logs.append(log_entry)
-            if len(self.logs) > self.max_logs:
-                self.logs.pop(0)
+            self.logs.append(log_entry)  # deque(maxlen) descarta o mais antigo automaticamente
             with self.ws_lock:
                 dead = []
                 for cb in self.ws_callbacks:
@@ -288,9 +278,10 @@ class InMemoryLogHandler(logging.Handler):
             self.handleError(record)
 
     def get_logs(self, limit=None):
+        logs_list = list(self.logs)
         if limit:
-            return self.logs[-limit:]
-        return self.logs.copy()
+            return logs_list[-limit:]
+        return logs_list
 
     def add_ws_callback(self, callback):
         with self.ws_lock:
@@ -374,12 +365,10 @@ class Config:
     """Configurações globais da aplicação."""
     
     # Bling OAuth
-    CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', 'YOUR_CLIENT_ID')
-    CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'YOUR_CLIENT_SECRET')
-    WEBHOOK_SECRET: str = os.environ.get('BLING_WEBHOOK_SECRET', 'YOUR_WEBHOOK_SECRET')
-    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI')
-    if not REDIRECT_URI:
-        pass
+    CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', '')
+    CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', '')
+    WEBHOOK_SECRET: str = os.environ.get('BLING_WEBHOOK_SECRET', '')
+    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', '')
     
     # API
     BLING_API_URL: str = 'https://www.bling.com.br/Api/v3'
@@ -574,6 +563,25 @@ def safe_iter(data):
         return data
     return []
 
+def _parse_order_date(date_str) -> Optional[datetime]:
+    """
+    Centraliza o parse de datas de pedidos do Bling.
+    Suporta: 'YYYY-MM-DD', 'YYYY-MM-DD HH:MM', 'YYYY-MM-DDTHH:MM', 'DD/MM/YYYY'.
+    Retorna None se não conseguir parsear.
+    """
+    if not date_str:
+        return None
+    try:
+        date_clean = str(date_str).split(' ')[0].split('T')[0].strip()
+        for fmt in ('%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
+            try:
+                return datetime.strptime(date_clean, fmt)
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return None
+
 def safe_get(data, key, default=None):
     """Acesso seguro a chaves de dicionário."""
     if isinstance(data, dict):
@@ -697,8 +705,8 @@ class BlingAPIClient:
                     return None
 
             if response.status_code == 429:
-                self.logger.warning(f"Rate limit (429) em {endpoint}.")
-                raise requests.exceptions.HTTPError(response=response)
+                self.logger.warning(f"Rate limit (429) em {endpoint}. urllib3 já retentará automaticamente.")
+                # Não levanta exceção aqui — o Retry adapter já tratou via status_forcelist
 
             response.raise_for_status()
             
@@ -709,9 +717,24 @@ class BlingAPIClient:
 
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             self.logger.error(f"Erro de Conexão (Reset/Queda) em {endpoint}: {str(e)}")
-            # Força recriação da sessão no próximo uso se a conexão estiver corrompida
+            # Recria sessão com todos os adapters e headers configurados corretamente
             self.session.close()
             self.session = requests.Session()
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["GET", "POST", "PUT", "DELETE"],
+                raise_on_status=False
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
+            self.session.headers.update({
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'SWMoveis/4.6 (Integracao Bling)'
+            })
             return None
             
         except requests.exceptions.HTTPError as e:
@@ -778,13 +801,14 @@ class AuthManager:
         saved_state = self._load_oauth_state()
         if not saved_state or not state:
             return False
-        
-        is_valid = (saved_state == state)
+
+        # Usa compare_digest para evitar timing attacks (bug #10)
+        is_valid = hmac.compare_digest(saved_state, state)
         if is_valid:
-            # ✅ MELHORIA: Não limpamos imediatamente para permitir retentativas rápidas (F5)
-            # O state será limpo naturalmente na próxima geração de URL de auth
-            self.logger.info(f"State OAuth validado com sucesso: {state}")
-            
+            # Limpa o state imediatamente após uso para impedir reutilização (CSRF)
+            self._clean_oauth_state()
+            self.logger.info(f"State OAuth validado com sucesso e limpo.")
+
         return is_valid
 
     def _clean_oauth_state(self):
@@ -798,17 +822,18 @@ class AuthManager:
     
     def __init__(self, config: Config):
         self.config = config
-        
+
+        if not self.config.CLIENT_ID or not self.config.CLIENT_SECRET:
+            raise ValueError("CRÍTICO: BLING_CLIENT_ID e BLING_CLIENT_SECRET devem estar configurados nas variáveis de ambiente!")
         if not self.config.REDIRECT_URI:
             raise ValueError("CRÍTICO: BLING_REDIRECT_URI não configurada nas variáveis de ambiente!")
-        # ---------------------------------
 
         self.logger = logging.getLogger('bling_automacao')
         self._tokens = self._load_tokens()
         self._access_token = self._tokens.get('access_token')
         self._refresh_token = self._tokens.get('refresh_token')
         self._expires_at = self._tokens.get('expires_at', 0)
-        self._initial_load_failed = True
+        self._initial_load_failed = False  # será True se a carga inicial falhar
         
         # Se não houver refresh token no arquivo, mas houver na variável de ambiente, usa o da env
         if not self._refresh_token and self.config.INITIAL_REFRESH_TOKEN:
@@ -910,7 +935,7 @@ class AuthManager:
         if not self._refresh_token:
             if not self._initial_load_failed:
                 self.logger.warning("Não há refresh token disponível para renovação.")
-            self._initial_load_failed = False
+            self._initial_load_failed = True  # marca falha para suprimir logs repetitivos
             return False
             
         self.logger.info("Verificando necessidade de renovação do token...")
@@ -2003,6 +2028,13 @@ class PendingOrdersManager:
         mes_atual = agora.month
         ano_atual = agora.year
 
+        # Pré-computa conjuntos para lookup O(1) — evita O(n²) no loop interno
+        existing_keys = set(self.data.keys())
+        existing_order_sku_idx = {
+            (v.get('order_id'), v.get('sku'), v.get('qtd_unit_idx'))
+            for v in self.data.values()
+        }
+
         for pedido in orders:
             order_id = str(pedido.get('id', ''))
             if not order_id:
@@ -2011,14 +2043,9 @@ class PendingOrdersManager:
             # ── Filtro: apenas pedidos do mês atual ─────────────────────────
             data_str = pedido.get('data') or pedido.get('dataEmissao') or ''
             if data_str:
-                try:
-                    data_limpa = str(data_str).split(' ')[0].split('T')[0]
-                    dt = (datetime.strptime(data_limpa, '%Y-%m-%d') if '-' in data_limpa
-                          else datetime.strptime(data_limpa, '%d/%m/%Y'))
-                    if dt.month != mes_atual or dt.year != ano_atual:
-                        continue  # Ignora pedidos de outros meses
-                except Exception:
-                    pass  # Se não conseguir parsear a data, deixa passar
+                dt = _parse_order_date(data_str)
+                if dt and (dt.month != mes_atual or dt.year != ano_atual):
+                    continue
 
             itens = pedido.get('itens', [])
             if not itens:
@@ -2062,17 +2089,12 @@ class PendingOrdersManager:
                 }
 
                 for unit in range(qtd):
-                    # Chave estável: order_id + SKU + posição (não índice do loop externo)
                     sku_safe = (sku_raw or nome_raw[:20]).replace(' ', '_').replace('/', '_')
                     sub_key = f"{order_id}_{sku_safe}_{unit}"
-                    # Evita duplicar itens já existentes em qualquer status
-                    already = any(
-                        v.get('order_id') == str(order_id)
-                        and v.get('sku') == sku_raw
-                        and v.get('qtd_unit_idx', unit) == unit
-                        for v in self.data.values()
-                    )
-                    if sub_key not in self.data and not already:
+                    # Lookup O(1) usando sets pré-computados
+                    already = (sub_key in existing_keys or
+                                (str(order_id), sku_raw, unit) in existing_order_sku_idx)
+                    if not already:
                         self.data[sub_key] = {
                             **item_data,
                             'qtd': 1,
@@ -2082,6 +2104,8 @@ class PendingOrdersManager:
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
                         }
+                        existing_keys.add(sub_key)
+                        existing_order_sku_idx.add((str(order_id), sku_raw, unit))
                         self._save_one(sub_key)
                         added += 1
 
@@ -2527,14 +2551,12 @@ class Orchestrator:
         for o in orders:
             data_str = o.get('data') or o.get('dataEmissao') or ''
             if data_str:
-                try:
-                    dl = str(data_str).split(' ')[0].split('T')[0]
-                    dt = (datetime.strptime(dl, '%Y-%m-%d') if '-' in dl
-                          else datetime.strptime(dl, '%d/%m/%Y'))
+                dt = _parse_order_date(data_str)
+                if dt:
                     if dt.month == agora_fetch.month and dt.year == agora_fetch.year:
                         orders_mes.append(o)
-                except Exception:
-                    orders_mes.append(o)
+                else:
+                    orders_mes.append(o)  # data não parseável: inclui por segurança
             else:
                 orders_mes.append(o)
         orders_to_fetch = [o for o in orders_mes if str(o.get('id', '')) not in already_have]
@@ -2588,22 +2610,16 @@ class Orchestrator:
             todos_pedidos = []
             if hasattr(self, 'sales') and self.sales:
                 with self.sales.lock:
-                    # Pegamos apenas os últimos 500 pedidos para não travar o sistema
-                    todos_pedidos = list(self.sales._sales_history or [])[-500:]
+                    todos_pedidos = list(self.sales._sales_history or [])
 
             for pedido in todos_pedidos:
                 data_str = pedido.get('data')
                 if not data_str: continue
 
                 try:
-                    # Robusto: suporta '2025-02-19', '2025-02-19 10:00', '2025-02-19T10:00'
-                    data_limpa = str(data_str).split(' ')[0].split('T')[0]
-
-                    if '-' in data_limpa:
-                        dt_pedido = datetime.strptime(data_limpa, "%Y-%m-%d")
-                    else:
-                        dt_pedido = datetime.strptime(data_limpa, "%d/%m/%Y")
-
+                    dt_pedido = _parse_order_date(data_str)
+                    if dt_pedido is None:
+                        continue
                     if dt_pedido.month != mes_atual or dt_pedido.year != ano_atual:
                         continue
 
@@ -5717,9 +5733,16 @@ def create_app() -> Flask:
     # 3. Inicializa o Flask
     flask_app = Flask(__name__)
     
-    # ✅ REGRA DE OURO: Define uma SECRET_KEY estável para persistência de sessão
-    # Isso evita que o Flask invalide cookies a cada reinício do servidor.
-    flask_app.config['SECRET_KEY'] = os.environ.get('FLASK_SECRET_KEY', 'sw-moveis-mdf-secure-key-2025')
+    # ✅ REGRA DE OURO: Define uma SECRET_KEY estável para persistência de sessão.
+    # CRÍTICO: Sempre configure FLASK_SECRET_KEY como variável de ambiente em produção.
+    _secret = os.environ.get('FLASK_SECRET_KEY')
+    if not _secret:
+        logger.warning(
+            "⚠️  FLASK_SECRET_KEY não configurada! Usando chave temporária gerada aleatoriamente. "
+            "Configure essa variável em produção para evitar invalidação de sessões ao reiniciar."
+        )
+        _secret = secrets.token_hex(32)
+    flask_app.config['SECRET_KEY'] = _secret
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
     WebServer(config, orchestrator, flask_app)
@@ -5759,14 +5782,14 @@ app = create_app()
 
 if __name__ == '__main__':
     # Apenas para testes locais
-    
+
     # Lógica de worker para ambiente local (apenas 1 processo)
     # Garante que o worker inicie no ambiente local
-    orchestrator = app.orchestrator # Acessa o orchestrator criado em create_app
-    if not orchestrator.is_running():
-        orchestrator.start_worker()
+    _orchestrator = app.orchestrator  # atribuído em WebServer.__init__ via flask_app.orchestrator
+    if not _orchestrator.is_running():
+        _orchestrator.start_worker()
         start_cleanup_timer()
         logger.info("✅ Worker de fundo iniciado em modo local.")
-        
+
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
