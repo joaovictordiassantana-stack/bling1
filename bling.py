@@ -119,16 +119,28 @@ class MongoStore:
             return {}
 
     @staticmethod
-    def set(collection: str, data: dict, doc_id: str = 'main') -> bool:
+    def set(collection: str, data: dict, doc_id: str = 'main', replace: bool = False) -> bool:
+        """
+        Salva documento no MongoDB.
+        replace=True: substitui o documento inteiro (útil para dados nested complexos).
+        replace=False (padrão): usa $set — merge de campos (seguro para atualizações parciais).
+        """
         if not MONGO_AVAILABLE:
             return False
         try:
             payload = {k: v for k, v in data.items() if k != '_id'}
-            _mongo_db[collection].update_one(
-                {'_id': doc_id},
-                {'$set': payload},
-                upsert=True
-            )
+            if replace:
+                _mongo_db[collection].replace_one(
+                    {'_id': doc_id},
+                    {'_id': doc_id, **payload},
+                    upsert=True
+                )
+            else:
+                _mongo_db[collection].update_one(
+                    {'_id': doc_id},
+                    {'$set': payload},
+                    upsert=True
+                )
             return True
         except Exception:
             return False
@@ -440,17 +452,20 @@ def load_tokens_safe(path: Path | str = "tokens.json"):
         return {}
 
 def save_tokens(data: Dict[str, Any], path: Path | str = "tokens.json"):
-    # MongoDB primeiro
+    """Salva tokens em MongoDB E arquivo local (dupla redundância — nunca perde token)."""
     if MONGO_AVAILABLE:
         try:
             MongoStore.set('auth_tokens', data, 'tokens')
             logger.info("Tokens salvos no MongoDB.")
-            return
         except Exception as e:
             logger.error(f"Erro ao salvar tokens no MongoDB: {e}")
+    # Sempre salva no arquivo também — fallback garantido se MongoDB falhar no próximo boot
     if isinstance(path, str): path = Path(path)
-    atomic_write_json(data, path)
-    logger.info("Tokens salvos em arquivo (fallback).")
+    try:
+        atomic_write_json(data, path)
+        logger.debug("Tokens salvos em arquivo local (backup).")
+    except Exception as e:
+        logger.error(f"Erro ao salvar tokens em arquivo: {e}")
 
 def load_stats_safe(path: Path):
     """Carrega as estatísticas de vendas — MongoDB primeiro, arquivo fallback."""
@@ -479,7 +494,7 @@ def load_stats_safe(path: Path):
         return None
 
 def save_stats(data: Dict[str, Any], path: Path):
-    """Salva as estatísticas de vendas — MongoDB primeiro, arquivo fallback."""
+    """Salva estatísticas em MongoDB E arquivo local (dupla redundância)."""
     data_to_save = data.copy()
     if 'last_recalculated' in data_to_save and isinstance(data_to_save['last_recalculated'], datetime):
         data_to_save['last_recalculated'] = data_to_save['last_recalculated'].isoformat()
@@ -487,11 +502,14 @@ def save_stats(data: Dict[str, Any], path: Path):
         try:
             MongoStore.set('sales_stats', data_to_save, 'stats')
             logger.info("Estatísticas salvas no MongoDB.")
-            return
         except Exception as e:
             logger.error(f"Erro ao salvar stats no MongoDB: {e}")
-    atomic_write_json(data_to_save, path)
-    logger.info("Estatísticas salvas em arquivo (fallback).")
+    # Sempre salva no arquivo também
+    try:
+        atomic_write_json(data_to_save, path)
+        logger.debug("Estatísticas salvas em arquivo local (backup).")
+    except Exception as e:
+        logger.error(f"Erro ao salvar stats em arquivo: {e}")
 
 def safe_dict(data):
     """
@@ -527,17 +545,14 @@ def load_products_cache(cache_file):
         return {}
 
 def save_products_cache(cache_file, products, kits):
-    """
-    Salva cache de produtos e kits no disco.
-    """
+    """Salva cache de produtos e kits em MongoDB E arquivo local (dupla redundância)."""
     total_produtos = len(products or []) + len(kits or [])
     logger.debug(f"save_products_cache chamado. products={len(products or [])} kits={len(kits or [])} total={total_produtos}")
-    
-    # ✅ 3. Nunca salvar cache se produtos == 0
+
     if total_produtos == 0:
-        logger.warning("⛔ Cache vazio ignorado. Não salvando no disco. Isto indica que a API não retornou produtos ou que o parsing falhou.")
+        logger.warning("⛔ Cache vazio ignorado. API não retornou produtos ou parsing falhou.")
         return
-        
+
     payload = {
         "updated_at": datetime.now().isoformat(),
         "products": products or [],
@@ -547,13 +562,12 @@ def save_products_cache(cache_file, products, kits):
         try:
             MongoStore.set('products_cache', payload, 'cache')
             logger.info(f"Cache de produtos salvo no MongoDB. Total: {total_produtos}")
-            return
         except Exception as e:
             logger.error(f"Erro ao salvar cache no MongoDB: {e}")
+    # Sempre salva no arquivo também
     try:
         atomic_write_json(payload, cache_file)
-        skus = [p.get('sku') for p in (products or [])[:5]] + [k.get('sku') for k in (kits or [])[:5]]
-        logger.info(f"Cache salvo em arquivo com sample skus: {skus}. Total: {total_produtos}")
+        logger.debug(f"Cache salvo em arquivo local (backup). Total: {total_produtos}")
     except Exception as e:
         logger.exception("Erro ao salvar cache de produtos em arquivo.")
 
@@ -1088,6 +1102,19 @@ class SalesManager:
                     except Exception:
                         pass
 
+                # Fallback: carrega do arquivo local se MongoDB não trouxe nada
+                if not self._sales_history:
+                    sales_history_file = self.config.SALES_STATS_FILE.parent / 'sales_history.json'
+                    if sales_history_file.exists():
+                        try:
+                            with open(sales_history_file, 'r', encoding='utf-8') as f:
+                                loaded = json.load(f).get('orders', [])
+                            if loaded:
+                                self._sales_history = loaded
+                                logger.info(f"✅ sales_history: {len(loaded)} pedidos carregados do arquivo local")
+                        except Exception as e:
+                            logger.warning(f"Falha ao carregar sales_history do arquivo: {e}")
+
                 last_recalc = data.get('last_recalculated')
                 if isinstance(last_recalc, str):
                     try:
@@ -1126,30 +1153,37 @@ class SalesManager:
             }
 
     def _save_sales_history(self):
-        """Salva histórico de pedidos no MongoDB preservando itens e data normalizada."""
+        """Salva histórico de pedidos em MongoDB E arquivo local (dupla redundância)."""
         try:
             compact = []
             for o in self._sales_history:
-                # Normaliza data: usa qualquer campo disponível
                 data_val = o.get('data') or o.get('dataEmissao') or o.get('dataSaida') or ''
-                # Preserva itens: essenciais para sync_from_orders no próximo boot
                 itens = o.get('itens', [])
                 compact.append({
                     'id': o.get('id'),
                     'data': data_val,
-                    'dataEmissao': data_val,  # redundância para compatibilidade
+                    'dataEmissao': data_val,
                     'numero': o.get('numero'),
                     'contato': o.get('contato'),
-                    'itens': itens,  # CRÍTICO: preserva itens para sync pós-restart
+                    'itens': itens,
                 })
-            # Filtra entradas sem id (inválidas)
             compact = [o for o in compact if o.get('id')]
+
             if MONGO_AVAILABLE:
                 try:
                     MongoStore.set('sales_history', {'orders': compact}, 'history')
-                    logger.info(f"✅ sales_history salvo: {len(compact)} pedidos no MongoDB")
+                    logger.info(f"✅ sales_history salvo no MongoDB: {len(compact)} pedidos")
                 except Exception as e:
                     logger.error(f"Erro ao salvar sales_history no MongoDB: {e}")
+
+            # Sempre salva no arquivo também
+            sales_history_file = self.config.SALES_STATS_FILE.parent / 'sales_history.json'
+            try:
+                atomic_write_json({'orders': compact}, sales_history_file)
+                logger.debug(f"sales_history salvo em arquivo local (backup): {len(compact)} pedidos")
+            except Exception as e:
+                logger.error(f"Erro ao salvar sales_history em arquivo: {e}")
+
         except Exception as e:
             logger.error(f"Erro ao compactar sales_history: {e}")
 
@@ -1306,7 +1340,7 @@ class ProductionTimer:
         """Salva timers — MongoDB E arquivo local (dupla redundância)."""
         if MONGO_AVAILABLE:
             try:
-                MongoStore.set('production_timers', {'timers': self.timers}, 'timers')
+                MongoStore.set('production_timers', {'timers': self.timers}, 'timers', replace=True)
             except Exception as e:
                 logger.error(f"Erro ao salvar timers no MongoDB: {e}")
         # Sempre salva no arquivo também (seguro contra falha do MongoDB)
@@ -1409,15 +1443,18 @@ class ProductionTimer:
 
         if produto_nome in self.timers:
             checklist_marcado = self.timers[produto_nome].get('checklist', {})
+            timer_existed = True
             status = self.pause(produto_nome)
             total_seconds = status['elapsed']
         else:
             # Timer realmente não existe
+            timer_existed = False
             total_seconds = 0
             logger.info(f"⚠️ Timer não encontrado para '{produto_nome}' — registrando com tempo 0")
 
-        # Isso garante que a produção que esqueceu de marcar seja contabilizada
-        if 'CADEIRA' in nome_real.upper():
+        # Auto-registra componentes NÃO marcados no checklist (apenas se timer existiu)
+        # Se timer não existiu, não auto-registra para evitar duplicação de componentes
+        if timer_existed and 'CADEIRA' in nome_real.upper():
             auto_registrados = 0
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
@@ -1497,7 +1534,7 @@ class ProductionTimer:
             return str(obj) if obj is not None else None
         reg_clean = _clean(registro)
 
-        saved = False
+        saved_mongo = False
         if MONGO_AVAILABLE:
             for _att in range(3):
                 try:
@@ -1506,12 +1543,13 @@ class ProductionTimer:
                         {'$push': {'registros': reg_clean}},
                         upsert=True
                     )
-                    saved = True
+                    saved_mongo = True
                     logger.info(f"✅ Histórico MongoDB: {reg_clean.get('produto','?')} ({int(reg_clean.get('tempo_segundos',0))}s)")
                     break
                 except Exception as e:
                     logger.error(f"Histórico MongoDB tentativa {_att+1}/3: {e}")
                     if _att < 2: time.sleep(1)
+
         # Sempre salva no arquivo também como backup redundante
         try:
             history = {}
@@ -1525,10 +1563,12 @@ class ProductionTimer:
             with open(temp, 'w', encoding='utf-8') as f:
                 json.dump(history, f, ensure_ascii=False)
             shutil.move(str(temp), str(self.HISTORY_PATH))
-            if not saved:
-                logger.info(f"Histórico salvo em arquivo (fallback).")
+            if not saved_mongo:
+                logger.info(f"✅ Histórico salvo em arquivo local (MongoDB indisponível).")
         except Exception as e:
             logger.error(f"Erro ao salvar histórico em arquivo: {e}")
+            if not saved_mongo:
+                logger.error(f"❌ CRÍTICO: Histórico de '{reg_clean.get('produto','?')}' NÃO foi salvo em nenhum storage!")
 
     def get_monthly_history_details(self):
         """Retorna histórico do mês — merge MongoDB + arquivo (máxima redundância)."""
@@ -1604,15 +1644,15 @@ class ComponentConsumptionManager:
 
     def _save(self):
         """Salva consumo — MongoDB E arquivo local (dupla redundância)."""
-        # Nunca salva se data é vazio (protege contra apagar dados reais no MongoDB)
-        if not self.data:
-            logger.warning("⛔ _save de consumo ignorado: self.data vazio (proteção anti-apagamento)")
+        # Protege contra apagar dados reais: só bloqueia se data é None ou não é dict
+        if self.data is None:
+            logger.warning("⛔ _save de consumo ignorado: self.data é None")
             return
         mes_count = len(self.data)
         comp_count = sum(len(v.get('components', {})) for v in self.data.values())
         if MONGO_AVAILABLE:
             try:
-                MongoStore.set('component_consumption', {'data': self.data}, 'main')
+                MongoStore.set('component_consumption', {'data': self.data}, 'main', replace=True)
                 logger.debug(f"✅ Consumo salvo no MongoDB: {mes_count} mês(es), {comp_count} componente(s)")
             except Exception as e:
                 logger.error(f"Erro ao salvar consumo no MongoDB: {e}")
@@ -1625,17 +1665,16 @@ class ComponentConsumptionManager:
             logger.error(f"Erro ao salvar consumo em arquivo: {e}")
 
     def _ensure_current_month(self):
-        """Garante estrutura para o mês atual — só salva se houver dados pré-existentes."""
+        """Garante estrutura para o mês atual e persiste imediatamente."""
         key = self._current_month_key()
         if key not in self.data:
             self.data[key] = {
                 'components': {},
                 'checklist_logs': []
             }
-            # Só persiste se já tem outros meses (evita sobrescrever MongoDB com {} vazio)
-            # O save real acontece quando register_component for chamado
-            if len(self.data) > 1:
-                self._save()
+            # Persiste sempre que cria o mês — garante que o doc existe no MongoDB
+            # antes do primeiro register_component, eliminando race condition
+            self._save()
 
     def register_component(self, component_name: str, qty: float, unit: str, product_name: str):
         """Registra uso de um componente via checklist."""
