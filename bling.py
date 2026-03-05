@@ -177,7 +177,9 @@ class MongoStore:
 # ============================================================================
 # CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
 # ============================================================================
-DATA_DIR = Path(os.environ.get('DATA_DIR', '.'))
+# No Render o diretório de trabalho é read-only — usa /tmp para arquivos temporários
+_default_data_dir = '/tmp' if os.path.isdir('/tmp') and os.access('/tmp', os.W_OK) else '.'
+DATA_DIR = Path(os.environ.get('DATA_DIR', _default_data_dir))
 
 # ============================================================================ 
 # 0. RATE LIMITER GLOBAL (NÍVEL PRODUÇÃO)
@@ -356,16 +358,61 @@ def cleanup_kpi_callbacks():
         logger.debug(f"🔗 WebSocket KPI: {n} conexão(ões) ativa(s)")
 
 def start_cleanup_timer():
-    """Inicia timer para limpar callbacks órfãos — idempotente, roda no máximo 1 vez."""
+    """Inicia timer para limpar callbacks órfãos e fazer reset mensal — idempotente."""
     global _cleanup_timer_started
     if _cleanup_timer_started:
         return
     _cleanup_timer_started = True
 
+    def _monthly_reset():
+        """Limpa dados do mês anterior no MongoDB e reinicia contadores."""
+        try:
+            now = datetime.now()
+            mes_atual = now.strftime('%Y-%m')
+
+            # 1. Remove documentos de production_history de meses anteriores
+            if MONGO_AVAILABLE:
+                try:
+                    result = _mongo_db['production_history'].delete_many(
+                        {'_id': {'$ne': mes_atual}}
+                    )
+                    if result.deleted_count:
+                        logger.info(f"🗓️ Reset mensal: {result.deleted_count} mês(es) antigo(s) removido(s) do histórico de produção.")
+                except Exception as e:
+                    logger.error(f"Reset mensal production_history: {e}")
+
+            # 2. Remove meses antigos do component_consumption
+            if MONGO_AVAILABLE:
+                try:
+                    doc = MongoStore.get('component_consumption', 'main')
+                    data = doc.get('data', {})
+                    meses_antigos = [k for k in data if k != mes_atual]
+                    if meses_antigos:
+                        for k in meses_antigos:
+                            del data[k]
+                        MongoStore.set('component_consumption', {'data': data}, 'main', replace=True)
+                        logger.info(f"🗓️ Reset mensal: {len(meses_antigos)} mês(es) antigo(s) removido(s) do consumo de componentes.")
+                        # Atualiza o objeto em memória também
+                        component_consumption.data = data
+                except Exception as e:
+                    logger.error(f"Reset mensal component_consumption: {e}")
+
+            logger.info(f"✅ Reset mensal concluído para {mes_atual}.")
+        except Exception as e:
+            logger.error(f"Erro no reset mensal: {e}")
+
     def cleanup_loop():
+        last_reset_month = datetime.now().month
         while True:
-            time.sleep(300)
+            time.sleep(300)  # verifica a cada 5 minutos
             cleanup_kpi_callbacks()
+
+            # Verifica se virou o mês
+            now = datetime.now()
+            if now.month != last_reset_month:
+                logger.info(f"🗓️ Novo mês detectado ({now.strftime('%Y-%m')}) — iniciando reset mensal...")
+                _monthly_reset()
+                last_reset_month = now.month
 
     Thread(target=cleanup_loop, daemon=True, name="cleanup_timer").start()
 
@@ -1354,9 +1401,9 @@ class ProductionTimer:
 
     def _auto_pause_on_restart(self):
         """
-        Ao reiniciar: pausa timers 'running' E soma o tempo que estava rodando.
-        O background_saver salva a cada 30s, então perdemos no máximo 30s.
-        Garante que o tempo acumulado não seja perdido.
+        Ao reiniciar: soma o tempo que estava rodando desde o último checkpoint
+        e retoma automaticamente (start_ts = agora).
+        Assim o timer continua contando sem interrupção visível para o usuário.
         """
         changed = False
         now = time.time()
@@ -1364,14 +1411,15 @@ class ProductionTimer:
             if v.get('state') == 'running':
                 start_ts = v.get('start_ts', 0)
                 if start_ts and start_ts > 0:
-                    # Soma o tempo que estava rodando desde o último checkpoint
+                    # Soma o tempo decorrido desde o último checkpoint
                     v['accumulated'] = v.get('accumulated', 0) + (now - start_ts)
-                v['state'] = 'paused'
-                v['start_ts'] = 0
+                # Retoma imediatamente — timer continua rodando
+                v['start_ts'] = now
+                v['state'] = 'running'
                 changed = True
+                logger.info(f"▶️ Restart: timer '{k}' retomado automaticamente ({int(v['accumulated'])}s acumulados).")
         if changed:
             self._save()
-            logger.info(f"⏸ Restart: {sum(1 for v in self.timers.values() if v.get('state')=='paused')} timers pausados com tempo preservado.")
 
     def start(self, produto_nome):
         now = time.time()
@@ -3405,11 +3453,100 @@ class WebServer:
 
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
-            """Retorna status da conexão MongoDB."""
-            return jsonify({
+            """
+            Diagnóstico completo do MongoDB.
+            Testa conexão, leitura, escrita e mostra o que está salvo em cada coleção.
+            Acesse: /api/mongo-status
+            """
+            result = {
                 'mongodb_available': MONGO_AVAILABLE,
-                'storage_backend': 'MongoDB' if MONGO_AVAILABLE else 'Arquivo Local (efêmero)'
-            })
+                'storage_backend': 'MongoDB' if MONGO_AVAILABLE else '⚠️ Arquivo Local (EFÊMERO — dados somem no restart!)',
+                'env_vars': {
+                    'MONGODB_URI_set': bool(os.environ.get('MONGODB_URI')),
+                    'MONGO_URI_set':   bool(os.environ.get('MONGO_URI')),
+                },
+                'connection_test': None,
+                'write_test': None,
+                'collections': {},
+                'errors': []
+            }
+
+            if not MONGO_AVAILABLE:
+                uri_set = result['env_vars']['MONGODB_URI_set'] or result['env_vars']['MONGO_URI_set']
+                if not uri_set:
+                    result['errors'].append('❌ CRÍTICO: variável MONGODB_URI não está configurada no Render! '
+                                            'Vá em Environment > Add Environment Variable > MONGODB_URI')
+                else:
+                    result['errors'].append('❌ MONGODB_URI está configurada mas a conexão falhou na inicialização. '
+                                            'Verifique se o IP do Render está liberado no Atlas (Network Access > 0.0.0.0/0)')
+                return jsonify(result), 200
+
+            # Testa ping
+            try:
+                _mongo_client.admin.command('ping')
+                result['connection_test'] = '✅ ping OK'
+            except Exception as e:
+                result['connection_test'] = f'❌ ping falhou: {e}'
+                result['errors'].append(str(e))
+
+            # Testa escrita e leitura
+            try:
+                _mongo_db['_diag_test'].replace_one(
+                    {'_id': 'test'},
+                    {'_id': 'test', 'ts': time.time()},
+                    upsert=True
+                )
+                doc = _mongo_db['_diag_test'].find_one({'_id': 'test'})
+                result['write_test'] = '✅ escrita/leitura OK' if doc else '❌ escrita OK mas leitura falhou'
+            except Exception as e:
+                result['write_test'] = f'❌ falhou: {e}'
+                result['errors'].append(str(e))
+
+            # Inspeciona cada coleção relevante
+            collections_to_check = {
+                'auth_tokens':           ('tokens',  ['access_token', 'refresh_token', 'expires_at']),
+                'production_timers':     ('timers',  ['timers']),
+                'production_history':    (None,      ['registros']),
+                'component_consumption': ('main',    ['data']),
+                'pending_orders':        (None,      None),
+                'sales_stats':           ('stats',   ['daily', 'monthly']),
+                'sales_history':         ('history', ['orders']),
+                'products_cache':        ('cache',   ['products', 'kits']),
+            }
+
+            for col, (doc_id, fields) in collections_to_check.items():
+                try:
+                    count = _mongo_db[col].count_documents({})
+                    info = {'total_docs': count}
+                    if count == 0:
+                        info['status'] = '⚠️ vazio'
+                    else:
+                        info['status'] = '✅ tem dados'
+                        if doc_id:
+                            doc = _mongo_db[col].find_one({'_id': doc_id})
+                            if doc and fields:
+                                info['campos_presentes'] = [f for f in fields if f in doc]
+                                info['campos_ausentes']  = [f for f in fields if f not in doc]
+                                for f in fields:
+                                    val = doc.get(f)
+                                    if isinstance(val, list):
+                                        info[f'qtd_{f}'] = len(val)
+                                    elif isinstance(val, dict):
+                                        info[f'qtd_{f}_chaves'] = len(val)
+                        else:
+                            sample = list(_mongo_db[col].find({}, {'_id': 1}).limit(5))
+                            info['sample_ids'] = [str(d['_id']) for d in sample]
+                    result['collections'][col] = info
+                except Exception as e:
+                    result['collections'][col] = {'status': f'❌ erro: {e}'}
+                    result['errors'].append(f'{col}: {e}')
+
+            result['resumo'] = (
+                '✅ MongoDB OK — dados persistem entre restarts'
+                if not result['errors'] and result['write_test'] and 'OK' in result['write_test']
+                else '⚠️ MongoDB com problemas — veja errors acima'
+            )
+            return jsonify(result), 200
 
         @self.app.route('/_health')
         def health_check():
