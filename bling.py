@@ -2163,6 +2163,23 @@ class PendingOrdersManager:
                 if isinstance(contato, dict):
                     cliente = contato.get('nome', '') or contato.get('nomeFantasia', '')
 
+                # Extrai data estimada de entrega — suporte a múltiplos campos da API Bling
+                data_entrega_raw = (
+                    pedido.get('dataEntrega') or
+                    pedido.get('dataPrevista') or
+                    pedido.get('dataSaida') or
+                    item.get('dataEntrega') or
+                    item.get('dataPrevista') or
+                    ''
+                )
+                # Ordem de produção Bling (se vier no item ou pedido)
+                ordem_producao = (
+                    pedido.get('ordemProducao') or
+                    pedido.get('numeroPedido') or
+                    item.get('ordemProducao') or
+                    str(pedido.get('numero', order_id))
+                )
+
                 item_data = {
                     'nome': nome_produto,
                     'nome_original': nome_raw,
@@ -2173,6 +2190,9 @@ class PendingOrdersManager:
                     'pedido_data': pedido.get('data') or pedido.get('dataEmissao', ''),
                     'pedido_numero': pedido.get('numero', order_id),
                     'cliente': cliente,
+                    'data_entrega': data_entrega_raw,
+                    'ordem_producao': ordem_producao,
+                    'order_id_bling': order_id,
                 }
 
                 for unit in range(qtd):
@@ -2195,6 +2215,25 @@ class PendingOrdersManager:
                         existing_order_sku_idx.add((str(order_id), sku_raw, unit))
                         self._save_one(sub_key)
                         added += 1
+                        # ── Computa componentes automaticamente na hora da venda ──
+                        # Não precisa de checklist — já registra ao entrar na fila
+                        try:
+                            nome_upper = nome_produto.upper()
+                            if 'CADEIRA' in nome_upper:
+                                # Evita duplicação: checa se já foi registrado para este sub_key
+                                consumo_key = f"auto_{sub_key}"
+                                existing_consumo = component_consumption.get_current_month().get('checklist_logs', [])
+                                already_computed = any(
+                                    l.get('produto') == consumo_key for l in existing_consumo
+                                )
+                                if not already_computed:
+                                    for comp in RECIPE_CADEIRA:
+                                        component_consumption.register_component(
+                                            comp['nome'], comp['qtd'], comp['un'], consumo_key
+                                        )
+                                    logger.info(f"✅ Componentes computados automaticamente para pedido {sub_key} ({nome_produto})")
+                        except Exception as _ce:
+                            logger.warning(f"Erro ao computar componentes automáticos: {_ce}")
 
         if added > 0:
             if not MONGO_AVAILABLE:
@@ -2665,7 +2704,14 @@ class Orchestrator:
                     continue
                 detail = resp.get('data', resp)
                 # Mantém campos do pedido original e adiciona itens do detalhe
-                merged = {**pedido, 'itens': detail.get('itens', [])}
+                # Preserva campos de entrega e OP do detalhe individual
+                merged = {
+                    **pedido,
+                    'itens': detail.get('itens', []),
+                    'dataEntrega': detail.get('dataEntrega') or detail.get('dataPrevista') or pedido.get('dataEntrega', ''),
+                    'dataPrevista': detail.get('dataPrevista') or pedido.get('dataPrevista', ''),
+                    'ordemProducao': detail.get('ordemProducao') or pedido.get('ordemProducao', ''),
+                }
                 if merged['itens']:
                     enriched.append(merged)
                     self.logger.debug(f"  Pedido {order_id}: {len(merged['itens'])} itens encontrados")
@@ -2897,6 +2943,23 @@ class WebServer:
             return jsonify(list(self.orchestrator.sales._orders_cache.values()))
 
         # Novo Endpoint: Histórico de Vendas para Dashboard
+        @self.app.route("/api/sales/orders-summary")
+        @token_required
+        def api_sales_orders_summary(token):
+            """Retorna lista compacta dos pedidos reais do Bling (numero + data) para exibir nos KPI cards."""
+            orders = self.orchestrator.sales._sales_history or []
+            result = []
+            for o in orders:
+                data_str = o.get('data') or o.get('dataEmissao', '')
+                if data_str:
+                    result.append({
+                        'id': o.get('id'),
+                        'numero': o.get('numero') or o.get('id'),
+                        'data': data_str,
+                    })
+            return jsonify({'orders': result[-500:]})  # máx 500 mais recentes
+
+        # Novo Endpoint: Histórico de Vendas para Dashboard
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
@@ -3016,6 +3079,7 @@ class WebServer:
 
             # Enriquece in_production com dados do timer correto
             in_prod = []
+            hoje_ip = datetime.now().date()
             for item in pending_orders.get_in_production():
                 ikey = item.get('item_key', '')
                 nome = item.get('nome') or item.get('nome_original', '')
@@ -3029,6 +3093,19 @@ class WebServer:
                         base_r, cor_r = _extract_base_cor(nome_raw)
                     if base_r: enriched['base'] = base_r
                     if cor_r: enriched['cor'] = cor_r
+                # Prazo
+                data_entrega_str = enriched.get('data_entrega', '')
+                dias_restantes = None
+                urgencia = 'normal'
+                if data_entrega_str:
+                    dt_ent = _parse_order_date(data_entrega_str)
+                    if dt_ent:
+                        dias_restantes = (dt_ent.date() - hoje_ip).days
+                        if dias_restantes < 0: urgencia = 'atrasado'
+                        elif dias_restantes <= 2: urgencia = 'critico'
+                        elif dias_restantes <= 5: urgencia = 'atencao'
+                enriched['dias_restantes'] = dias_restantes
+                enriched['urgencia'] = urgencia
                 in_prod.append(enriched)
 
             # Timers sem pedido vinculado (iniciados via modal diretamente)
@@ -3058,6 +3135,7 @@ class WebServer:
                 })
 
             waiting_enriched = []
+            hoje = datetime.now().date()
             for item in pending_orders.get_waiting():
                 enriched = dict(item)
                 if not enriched.get('cor') and not enriched.get('base'):
@@ -3068,7 +3146,37 @@ class WebServer:
                         base_r, cor_r = _extract_base_cor(nome_raw)
                     if base_r: enriched['base'] = base_r
                     if cor_r: enriched['cor'] = cor_r
+
+                # ── Calcula prazo / urgência ──────────────────────────────
+                data_entrega_str = enriched.get('data_entrega', '')
+                dias_restantes = None
+                urgencia = 'normal'  # normal | atencao | critico | atrasado
+                if data_entrega_str:
+                    dt_ent = _parse_order_date(data_entrega_str)
+                    if dt_ent:
+                        dias_restantes = (dt_ent.date() - hoje).days
+                        if dias_restantes < 0:
+                            urgencia = 'atrasado'
+                        elif dias_restantes == 0:
+                            urgencia = 'critico'
+                        elif dias_restantes <= 2:
+                            urgencia = 'critico'
+                        elif dias_restantes <= 5:
+                            urgencia = 'atencao'
+                enriched['dias_restantes'] = dias_restantes
+                enriched['urgencia'] = urgencia
                 waiting_enriched.append(enriched)
+
+            # ── Ordena: atrasados/críticos primeiro; agrupa por produto; dentro do grupo: urgência primeiro ──
+            def _sort_key(item):
+                urg = item.get('urgencia', 'normal')
+                dias = item.get('dias_restantes')
+                urg_order = {'atrasado': 0, 'critico': 1, 'atencao': 2, 'normal': 3}[urg]
+                dias_val = dias if dias is not None else 9999
+                nome_grp = (item.get('nome') or item.get('nome_original') or '').upper()
+                return (nome_grp, urg_order, dias_val)
+
+            waiting_enriched.sort(key=_sort_key)
 
             # Enriquece done com tempo de produção
             # Prioridade: tempo salvo no item > tempo do histórico de produção (por nome)
@@ -3274,6 +3382,45 @@ class WebServer:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             pending_orders.dismiss(item_key)
             return jsonify({'success': True})
+
+        @self.app.route('/api/bling/ordens-producao')
+        @token_required
+        def api_bling_ordens_producao(token):
+            """
+            Busca ordens de produção do Bling para cada pedido na fila.
+            Retorna mapa order_id -> {numero_op, codigo_barras, situacao, previsao}
+            """
+            try:
+                ordens = {}
+                # Busca os order_ids únicos dos pedidos em espera/produção
+                order_ids = set()
+                for item in pending_orders.data.values():
+                    oid = item.get('order_id') or item.get('order_id_bling')
+                    if oid:
+                        order_ids.add(str(oid))
+
+                for oid in list(order_ids)[:50]:  # limite para não explodir rate limit
+                    try:
+                        resp = self.orchestrator.api.get(f'ordens/producao', params={'numeroPedidoVenda': oid})
+                        if resp and resp.get('data'):
+                            for op in (resp['data'] if isinstance(resp['data'], list) else [resp['data']]):
+                                numero_op = op.get('numero') or op.get('id', '')
+                                previsao = op.get('dataPrevisao') or op.get('dataPrevista') or ''
+                                codigo_barras = op.get('codigoBarras') or str(numero_op)
+                                ordens[oid] = {
+                                    'numero_op': numero_op,
+                                    'codigo_barras': codigo_barras,
+                                    'situacao': op.get('situacao', {}).get('nome', '') if isinstance(op.get('situacao'), dict) else str(op.get('situacao', '')),
+                                    'previsao': previsao,
+                                }
+                                break  # pega a primeira OP do pedido
+                    except Exception as e:
+                        logger.debug(f"OP para pedido {oid}: {e}")
+                        continue
+
+                return jsonify({'ordens': ordens, 'total': len(ordens)})
+            except Exception as e:
+                return jsonify({'ordens': {}, 'error': str(e)}), 500
 
         @self.app.route('/api/pending-orders/sync', methods=['POST'])
         @token_required
@@ -4402,6 +4549,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <h5>⚡ Pedidos Diários</h5>
                     <h3 id="kpi-daily" class="text-primary">0</h3>
                     <small class="text-muted">Últimas 24h</small>
+                    <div id="kpi-daily-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
                 </div>
             </div>
             <div class="col-md-4 mb-4">
@@ -4409,6 +4557,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <h5>📅 Pedidos Semanais</h5>
                     <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
                     <small class="text-muted">Últimos 7 dias</small>
+                    <div id="kpi-weekly-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
                 </div>
             </div>
             <div class="col-md-4 mb-4">
@@ -4416,6 +4565,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <h5>📊 Pedidos Mensais</h5>
                     <h3 id="kpi-historic" style="color: var(--success);">0</h3>
                     <small class="text-muted">Este Mês</small>
+                    <div id="kpi-monthly-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
                 </div>
             </div>
         </div>
@@ -4748,6 +4898,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             kpiHistoric.textContent = dSalesStats.monthly;
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
+            // Exibe números de pedidos reais do Bling abaixo dos contadores
+            _loadKpiOrderNumbers(dSalesStats);
+
             // Animação de atualização
             const cards = document.querySelectorAll('.kpi-card');
             cards.forEach(card => {
@@ -4756,6 +4909,39 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     card.classList.remove('updating');
                 }, 600);
             });
+        }
+
+        async function _loadKpiOrderNumbers(dSalesStats) {
+            try {
+                // Usa o histórico de pedidos do servidor para listar números reais do Bling
+                const res = await fetch('/api/sales/orders-summary');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                const today = new Date();
+                today.setHours(0,0,0,0);
+                const week = new Date(today); week.setDate(today.getDate() - 7);
+                const month = new Date(today.getFullYear(), today.getMonth(), 1);
+
+                const dailyNums = [], weeklyNums = [], monthlyNums = [];
+                (data.orders || []).forEach(o => {
+                    const d = new Date(o.data);
+                    const num = '#' + (o.numero || o.id);
+                    if (d >= today) dailyNums.push(num);
+                    if (d >= week) weeklyNums.push(num);
+                    if (d >= month) monthlyNums.push(num);
+                });
+
+                const fmt = (arr) => arr.length === 0 ? '' :
+                    arr.slice(-10).join(' · ');
+
+                const dEl = document.getElementById('kpi-daily-orders');
+                const wEl = document.getElementById('kpi-weekly-orders');
+                const mEl = document.getElementById('kpi-monthly-orders');
+                if (dEl) dEl.textContent = fmt(dailyNums);
+                if (wEl) wEl.textContent = fmt(weeklyNums);
+                if (mEl) mEl.textContent = fmt(monthlyNums);
+            } catch(e) { /* silencioso */ }
         }
 
         /* ✅ DESIGN: Lista Técnica Hardcoded (Engenharia) */
@@ -5220,45 +5406,142 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (ib) ib.textContent = inProd.length + orphans.length;
             if (db) db.textContent = done.length;
 
+            // Aviso de urgência: mostra toast se há pedidos atrasados/críticos
+            const atrasados = waiting.filter(i => i.urgencia === 'atrasado').length;
+            const criticos  = waiting.filter(i => i.urgencia === 'critico').length;
+            if (atrasados > 0 && !window._alertedAtrasados) {
+                window._alertedAtrasados = true;
+                showToast('🚨 ATENÇÃO', `${atrasados} pedido(s) em ATRASO!`, 'danger');
+            }
+
             // Para ticker anterior
             if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
             _boardTimerState = {};
 
             let html = '';
 
-            // ── Em Espera ───────────────────────────────────────────────
+            // ════════════════════════════════════════════════
+            // ── Em Espera — agrupado por produto, urgência ──
+            // ════════════════════════════════════════════════
             if (waiting.length === 0) {
                 html += `<div class="text-center py-3 text-muted"><small>Nenhum pedido em espera. Clique em 🔄 Sincronizar Bling.</small></div>`;
             } else {
-                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
-                    <thead style="background:#fef9c3;"><tr>
-                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
-                        <th>Pedido Nº</th><th>Cliente</th><th class="text-center">Ação</th>
-                    </tr></thead><tbody>`;
+                // Agrupa por nome de produto
+                const grupos = {};
                 waiting.forEach(item => {
-                    const rawNome = item.nome || item.nome_original || 'N/D';
-                    const nome = rawNome.replace(/'/g,"&#39;");
-                    // Só mostra imagem se for URL real (não placeholder /static/no-image.png)
-                    const imgUrl = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
-                    const imgTag = imgUrl
-                        ? '<img src="' + imgUrl + '" alt="" loading="lazy" style="width:44px;height:44px;object-fit:contain;border-radius:6px;border:1px solid #e2e8f0;margin-right:8px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">'
-                        : '';
-                    html += `<tr>
-                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
-                        <td class="text-muted small">${escapeHtml(item.base || '—')}</td>
-                        <td class="text-muted small">${escapeHtml(item.cor)}</td>
-                        <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
-                        <td class="text-muted small">${escapeHtml(item.cliente)}</td>
-                        <td class="text-center">
-                            <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
-                                data-ikey="${item.item_key}"
-                                data-pnome="${(item.nome || item.nome_original || '').replace(/"/g,'')}"
-                                onclick="startPendingOrder(this.dataset.ikey, this.dataset.pnome)">▶ Produzir</button>
-                            <button class="btn btn-xs btn-outline-secondary btn-sm"
-                                data-dkey="${item.item_key}"
-                                onclick="dismissPendingOrder(this.dataset.dkey, event)">✕</button>
+                    const key = (item.nome || item.nome_original || 'N/D').toUpperCase();
+                    if (!grupos[key]) grupos[key] = { nome: item.nome || item.nome_original || 'N/D', items: [] };
+                    grupos[key].items.push(item);
+                });
+
+                // Ordena grupos: grupos com itens urgentes/atrasados primeiro
+                const gruposOrdenados = Object.values(grupos).sort((a, b) => {
+                    const urgA = Math.min(...a.items.map(i => ({atrasado:0,critico:1,atencao:2,normal:3})[i.urgencia||'normal']));
+                    const urgB = Math.min(...b.items.map(i => ({atrasado:0,critico:1,atencao:2,normal:3})[i.urgencia||'normal']));
+                    if (urgA !== urgB) return urgA - urgB;
+                    return a.nome.localeCompare(b.nome);
+                });
+
+                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
+                    <thead style="background:#fef9c3;position:sticky;top:0;z-index:1;"><tr>
+                        <th class="ps-3" style="min-width:200px">Produto</th>
+                        <th>Base / Cor</th>
+                        <th>Pedido Nº</th>
+                        <th>Cliente</th>
+                        <th class="text-center">Prazo</th>
+                        <th class="text-center" title="Ordem de Produção Bling">OP Bling</th>
+                        <th class="text-center">Ação</th>
+                    </tr></thead><tbody>`;
+
+                gruposOrdenados.forEach(grupo => {
+                    const totalGrupo = grupo.items.length;
+                    const hasUrgent = grupo.items.some(i => ['atrasado','critico'].includes(i.urgencia));
+
+                    // Linha separadora de grupo
+                    html += `<tr style="background:${hasUrgent ? '#fff1f1' : '#fffde7'};border-top:2px solid ${hasUrgent ? '#ef4444' : '#e5c200'};">
+                        <td colspan="7" class="ps-3 py-1">
+                            <strong style="font-size:0.78rem;letter-spacing:0.04em;color:${hasUrgent ? '#b91c1c' : '#92400e'};">
+                                ${hasUrgent ? '🔴' : '🟡'} ${escapeHtml(grupo.nome)}
+                                <span class="badge ms-2" style="background:${hasUrgent ? '#ef4444' : '#ffb600'};color:${hasUrgent ? '#fff' : '#000'}">${totalGrupo} un.</span>
+                            </strong>
                         </td>
                     </tr>`;
+
+                    grupo.items.forEach(item => {
+                        const rawNome = item.nome || item.nome_original || 'N/D';
+                        const nome = rawNome.replace(/'/g,"&#39;");
+                        const imgUrl = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
+                        const imgTag = imgUrl
+                            ? `<img src="${imgUrl}" alt="" loading="lazy" style="width:36px;height:36px;object-fit:contain;border-radius:5px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">`
+                            : '';
+
+                        // Prazo badge
+                        const urg = item.urgencia || 'normal';
+                        const dias = item.dias_restantes;
+                        let prazoBadge = '';
+                        if (dias === null || dias === undefined) {
+                            prazoBadge = `<span class="badge bg-light text-muted border" title="Sem data de entrega cadastrada">—</span>`;
+                        } else if (urg === 'atrasado') {
+                            prazoBadge = `<span class="badge bg-danger" title="Pedido atrasado!" style="animation:pulse-animation 1s infinite;">
+                                ⚠️ ${Math.abs(dias)}d ATRASO</span>`;
+                        } else if (urg === 'critico') {
+                            prazoBadge = `<span class="badge bg-danger" title="Prazo crítico!">🔥 ${dias === 0 ? 'HOJE' : dias+'d'}</span>`;
+                        } else if (urg === 'atencao') {
+                            prazoBadge = `<span class="badge bg-warning text-dark" title="Atenção ao prazo">⏰ ${dias}d</span>`;
+                        } else {
+                            prazoBadge = `<span class="badge bg-light text-dark border">${dias}d</span>`;
+                        }
+
+                        // Data entrega formatada
+                        const dataEntFmt = item.data_entrega ? (() => {
+                            try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; }
+                        })() : '';
+                        const prazoCel = `<div class="text-center">${prazoBadge}${dataEntFmt ? `<div style="font-size:0.65rem;color:#888;margin-top:2px;">${dataEntFmt}</div>` : ''}</div>`;
+
+                        // Ordem de Produção + QR/barcode
+                        const op = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '');
+                        const opCell = op ? `
+                            <div class="text-center">
+                                <span class="badge bg-dark text-white font-monospace" style="font-size:0.7rem;" title="Ordem de Produção Bling">OP #${op}</span>
+                                <div style="margin-top:4px;">
+                                    <svg id="qr_${item.item_key ? item.item_key.replace(/[^a-z0-9]/gi,'_') : 'x'}" 
+                                         data-barcode="${op}" 
+                                         style="cursor:pointer;" 
+                                         title="Clique para abrir detalhes da OP"
+                                         onclick="openOPModal('${op}', '${escapeHtml(rawNome)}')">
+                                        <!-- barcode placeholder -->
+                                        <rect width="60" height="16" fill="#222" rx="2"/>
+                                    </svg>
+                                    <div style="font-size:0.6rem;font-family:monospace;color:#555;letter-spacing:0.08em;">${op}</div>
+                                </div>
+                            </div>` : `<span class="text-muted small">—</span>`;
+
+                        // Cor de fundo da linha baseada na urgência
+                        const rowBg = {
+                            'atrasado': 'background:rgba(239,68,68,0.08);border-left:3px solid #ef4444;',
+                            'critico':  'background:rgba(239,68,68,0.05);border-left:3px solid #f97316;',
+                            'atencao':  'background:rgba(255,182,0,0.06);border-left:3px solid #ffb600;',
+                            'normal':   ''
+                        }[urg] || '';
+
+                        html += `<tr style="${rowBg}">
+                            <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
+                            <td class="text-muted small">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||'')) || '—'}</td>
+                            <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
+                            <td class="text-muted small" style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(item.cliente||'')}">${escapeHtml(item.cliente||'—')}</td>
+                            <td>${prazoCel}</td>
+                            <td>${opCell}</td>
+                            <td class="text-center">
+                                <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
+                                    data-ikey="${item.item_key}"
+                                    data-pnome="${nome.replace(/"/g,'')}"
+                                    onclick="startPendingOrder(this.dataset.ikey, this.dataset.pnome)">▶ Produzir</button>
+                                <button class="btn btn-xs btn-outline-secondary btn-sm"
+                                    data-dkey="${item.item_key}"
+                                    onclick="dismissPendingOrder(this.dataset.dkey, event)">✕</button>
+                            </td>
+                        </tr>`;
+                    });
                 });
                 html += `</tbody></table></div>`;
             }
@@ -5273,9 +5556,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } else {
                 html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
                     <thead style="background:#f0fdf4;"><tr>
-                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
+                        <th class="ps-3">Produto</th><th>Base / Cor</th>
+                        <th>#Pedido / OP</th>
+                        <th class="text-center">Prazo</th>
                         <th class="text-center">⏱ Tempo</th><th class="text-center">Status</th>
-                        <th class="text-center">Checklist</th><th class="text-center">Ação</th>
+                        <th class="text-center">Ação</th>
                     </tr></thead><tbody>`;
                 allInProd.forEach(item => {
                     const nome    = item.nome || item.nome_original || item.produto || 'N/D';
@@ -5284,15 +5569,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const elapsed = item.tempo_decorrido || 0;
                     const estado  = item.estado || 'paused';
                     const itemKey  = item.item_key || null;
-                    const timerKey = item.timer_key || nome;  // chave real do timer (pode ser "nome||item_key")
-                    const base    = item.base || '—';
-                    const cor     = item.cor  || '—';
-                    // Checklist: só mostrar para produtos com receita (cadeiras)
-                    const isCadeira = nome.toUpperCase().includes('CADEIRA');
-                    const chkDone = isCadeira ? Object.values(item.checklist || {}).filter(Boolean).length : null;
-                    const chkTotal = isCadeira ? RECIPE_CADEIRA.length : null;
+                    const timerKey = item.timer_key || nome;
+                    const base    = item.base || '';
+                    const cor     = item.cor  || '';
+                    const baseCor = (base + (base && cor ? ' / ' : '') + cor) || '—';
 
-                    // Guarda estado para ticker local com a chave correta
+                    // Prazo badge
+                    const urg2 = item.urgencia || 'normal';
+                    const dias2 = item.dias_restantes;
+                    let prazoBadge2 = '';
+                    if (dias2 === null || dias2 === undefined) {
+                        prazoBadge2 = '';
+                    } else if (urg2 === 'atrasado') {
+                        prazoBadge2 = `<span class="badge bg-danger" style="animation:pulse-animation 1s infinite;">⚠️ ${Math.abs(dias2)}d ATRASO</span>`;
+                    } else if (urg2 === 'critico') {
+                        prazoBadge2 = `<span class="badge bg-danger">🔥 ${dias2===0?'HOJE':dias2+'d'}</span>`;
+                    } else if (urg2 === 'atencao') {
+                        prazoBadge2 = `<span class="badge bg-warning text-dark">⏰ ${dias2}d</span>`;
+                    } else if (dias2 !== null) {
+                        prazoBadge2 = `<span class="badge bg-light text-dark border">${dias2}d</span>`;
+                    }
+
+                    const op2 = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '');
+
                     _boardTimerState[timerKey] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
 
                     const timerKeySafe = timerKey ? encodeURIComponent(timerKey) : '';
@@ -5302,10 +5601,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                     const imgUrlProd = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
                     const imgTagProd = imgUrlProd ? `<img src="${imgUrlProd}" alt="" loading="lazy" style="width:38px;height:38px;object-fit:contain;border-radius:5px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">` : '';
-                    html += `<tr>
+
+                    const rowBg2 = {
+                        'atrasado': 'background:rgba(239,68,68,0.07);border-left:3px solid #ef4444;',
+                        'critico':  'background:rgba(239,68,68,0.04);border-left:3px solid #f97316;',
+                        'atencao':  'background:rgba(255,182,0,0.05);',
+                        'normal':   ''
+                    }[urg2] || '';
+
+                    html += `<tr style="${rowBg2}">
                         <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTagProd}<span style="vertical-align:middle;">${nomeSafe}</span></td>
-                        <td class="text-muted small">${base}</td>
-                        <td class="text-muted small">${cor}</td>
+                        <td class="text-muted small">${escapeHtml(baseCor)}</td>
+                        <td class="text-muted small">
+                            <div>#${item.pedido_numero || item.order_id}</div>
+                            ${op2 ? `<div style="font-size:0.65rem;font-family:monospace;color:#666;cursor:pointer;" onclick="openOPModal('${op2}','${nomeSafe}')" title="Ver Ordem de Produção">OP #${op2} 🔍</div>` : ''}
+                        </td>
+                        <td class="text-center">${prazoBadge2}</td>
                         <td class="text-center">
                             <span id="btimer_${safeId}" class="font-monospace fw-bold text-primary" style="font-size:1.1rem;">${formatSeconds(elapsed)}</span>
                         </td>
@@ -5314,11 +5625,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
                                 ${estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}
                             </span>
-                        </td>
-                        <td class="text-center">
-                            ${chkTotal !== null
-                                ? `<span class="badge ${chkDone===chkTotal ? 'bg-success' : 'bg-light text-dark border'}">${chkDone}/${chkTotal}</span>`
-                                : `<span class="text-muted small">—</span>`}
                         </td>
                         <td class="text-center">
                             <button class="btn btn-xs btn-outline-primary btn-sm"
@@ -5339,19 +5645,23 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 </div>
                 <div class="table-responsive"><table class="table table-sm align-middle mb-0">
                     <thead class="table-success"><tr>
-                        <th class="ps-3">Produto</th><th>Base</th><th>Cor</th>
-                        <th>#Pedido</th><th>Cliente</th><th class="text-center">Tempo</th><th class="text-center">Concluído em</th>
+                        <th class="ps-3">Produto</th><th>Base / Cor</th>
+                        <th>#Pedido / OP</th><th>Cliente</th><th class="text-center">Tempo</th><th class="text-center">Concluído em</th>
                     </tr></thead>
                     <tbody>`;
                 done.slice().reverse().forEach(item => {
                     const nome = escapeHtml(item.nome || item.nome_original || 'N/D');
                     const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
                     const tempo = item.tempo_producao ? `<span class="font-monospace text-primary fw-bold">${formatSeconds(item.tempo_producao)}</span>` : '<span class="text-muted">—</span>';
+                    const baseCor = escapeHtml(((item.base||'') + (item.base&&item.cor?' / ':'') + (item.cor||'')) || '—');
+                    const op3 = escapeHtml(item.ordem_producao || item.pedido_numero || '');
                     html += `<tr class="table-success">
                         <td class="ps-3 fw-bold text-success">${nome}</td>
-                        <td class="text-muted small">${escapeHtml(item.base || '—')}</td>
-                        <td class="text-muted small">${escapeHtml(item.cor || '—')}</td>
-                        <td class="text-muted small">#${escapeHtml(String(item.pedido_numero || item.order_id || '—'))}</td>
+                        <td class="text-muted small">${baseCor}</td>
+                        <td class="text-muted small">
+                            <div>#${escapeHtml(String(item.pedido_numero || item.order_id || '—'))}</div>
+                            ${op3 ? `<div style="font-size:0.65rem;font-family:monospace;">OP #${op3}</div>` : ''}
+                        </td>
                         <td class="text-muted small">${escapeHtml(item.cliente || '—')}</td>
                         <td class="text-center">${tempo}</td>
                         <td class="text-center"><small class="text-muted">${fin}</small></td>
@@ -5374,6 +5684,102 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     if (el) el.textContent = formatSeconds(Math.floor(elapsed));
                 });
             }, 1000);
+
+            // ── Renderiza barcodes SVG inline (simula barcode com traços) ──
+            _renderBarcodes();
+        }
+
+        /** Renderiza barcodes simples SVG nos elementos com data-barcode */
+        function _renderBarcodes() {
+            document.querySelectorAll('svg[data-barcode]').forEach(svg => {
+                const val = svg.getAttribute('data-barcode') || '';
+                svg.setAttribute('viewBox', '0 0 80 20');
+                svg.setAttribute('width', '80');
+                svg.setAttribute('height', '20');
+                svg.style.display = 'block';
+                svg.style.margin = '0 auto';
+                // Gera barras simples baseadas nos chars do valor
+                let bars = '';
+                const chars = (val + '0').split('');
+                let x = 1;
+                chars.forEach((c, i) => {
+                    const code = c.charCodeAt(0);
+                    const w = (code % 3) + 1;
+                    const gap = (i % 2 === 0) ? 1 : 2;
+                    bars += `<rect x="${x}" y="1" width="${w}" height="15" fill="#111"/>`;
+                    x += w + gap;
+                    if (x > 75) return;
+                });
+                svg.innerHTML = bars;
+            });
+        }
+
+        /** Modal para ver e imprimir a Ordem de Produção do Bling */
+        function openOPModal(numeroOP, nomeProduto) {
+            const existing = document.getElementById('opModal');
+            if (existing) existing.remove();
+
+            // URL do Power BI embed com o código de barras (adapte se necessário)
+            const barcodeVal = numeroOP;
+
+            const modalHtml = `
+            <div class="modal fade" id="opModal" tabindex="-1">
+                <div class="modal-dialog modal-dialog-centered">
+                    <div class="modal-content border-0 shadow">
+                        <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
+                            <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">
+                                📋 Ordem de Produção Bling
+                            </h5>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body text-center" style="background:#f9f9f7;">
+                            <p class="text-muted small mb-1">${escapeHtml(nomeProduto)}</p>
+                            <h3 class="fw-bold font-monospace mb-3" style="color:#01010d;">OP # ${escapeHtml(numeroOP)}</h3>
+
+                            <!-- Barcode grande para leitura -->
+                            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:16px;display:inline-block;margin-bottom:12px;">
+                                <svg id="opBarcodeSvg" width="200" height="50" viewBox="0 0 200 50" style="display:block;"></svg>
+                                <div style="font-family:monospace;font-size:0.85rem;letter-spacing:0.12em;margin-top:4px;color:#333;">
+                                    ${escapeHtml(numeroOP)}
+                                </div>
+                            </div>
+
+                            <p class="text-muted small mb-0">
+                                Aponte o leitor de código de barras ou use o Power BI para abrir esta OP.
+                            </p>
+                        </div>
+                        <div class="modal-footer bg-white justify-content-between">
+                            <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
+                            <button class="btn btn-primary btn-sm fw-bold" onclick="window.print()">🖨️ Imprimir OP</button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+
+            // Renderiza barcode grande no modal
+            setTimeout(() => {
+                const svg = document.getElementById('opBarcodeSvg');
+                if (svg) {
+                    const val = numeroOP;
+                    let bars = '';
+                    let x = 4;
+                    (val + '00').split('').forEach((c, i) => {
+                        const code = c.charCodeAt(0);
+                        const w = (code % 4) + 2;
+                        const gap = (i % 2 === 0) ? 2 : 3;
+                        bars += `<rect x="${x}" y="4" width="${w}" height="36" fill="#111"/>`;
+                        x += w + gap;
+                        if (x > 190) return;
+                    });
+                    svg.innerHTML = bars;
+                }
+            }, 80);
+
+            const modal = new bootstrap.Modal(document.getElementById('opModal'));
+            modal.show();
+        }
         }
 
         async function startPendingOrder(itemKey, produtoNome) {
