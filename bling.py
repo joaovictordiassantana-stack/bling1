@@ -2222,16 +2222,18 @@ class PendingOrdersManager:
                             if 'CADEIRA' in nome_upper:
                                 # Evita duplicação: checa se já foi registrado para este sub_key
                                 consumo_key = f"auto_{sub_key}"
-                                existing_consumo = component_consumption.get_current_month().get('checklist_logs', [])
-                                already_computed = any(
-                                    l.get('produto') == consumo_key for l in existing_consumo
-                                )
-                                if not already_computed:
-                                    for comp in RECIPE_CADEIRA:
-                                        component_consumption.register_component(
-                                            comp['nome'], comp['qtd'], comp['un'], consumo_key
-                                        )
-                                    logger.info(f"✅ Componentes computados automaticamente para pedido {sub_key} ({nome_produto})")
+                                _cc = globals().get('component_consumption')
+                                if _cc is not None:
+                                    existing_consumo = _cc.get_current_month().get('checklist_logs', [])
+                                    already_computed = any(
+                                        l.get('produto') == consumo_key for l in existing_consumo
+                                    )
+                                    if not already_computed:
+                                        for comp in RECIPE_CADEIRA:
+                                            _cc.register_component(
+                                                comp['nome'], comp['qtd'], comp['un'], consumo_key
+                                            )
+                                        logger.info(f"✅ Componentes computados automaticamente para pedido {sub_key} ({nome_produto})")
                         except Exception as _ce:
                             logger.warning(f"Erro ao computar componentes automáticos: {_ce}")
 
@@ -4898,8 +4900,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             kpiHistoric.textContent = dSalesStats.monthly;
             document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
 
-            // Exibe números de pedidos reais do Bling abaixo dos contadores
-            _loadKpiOrderNumbers(dSalesStats);
+            // Exibe números de pedidos reais do Bling abaixo dos contadores (só se autenticado)
+            if (isAuthenticated) _loadKpiOrderNumbers();
 
             // Animação de atualização
             const cards = document.querySelectorAll('.kpi-card');
@@ -4911,7 +4913,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        async function _loadKpiOrderNumbers(dSalesStats) {
+        async function _loadKpiOrderNumbers() {
             try {
                 // Usa o histórico de pedidos do servidor para listar números reais do Bling
                 const res = await fetch('/api/sales/orders-summary');
@@ -5779,7 +5781,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             const modal = new bootstrap.Modal(document.getElementById('opModal'));
             modal.show();
-        }
         }
 
         async function startPendingOrder(itemKey, produtoNome) {
