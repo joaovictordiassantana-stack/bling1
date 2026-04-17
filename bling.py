@@ -3320,6 +3320,104 @@ class WebServer:
                 }
             })
 
+        @self.app.route('/api/barcode/scan', methods=['POST'])
+        @token_required
+        def api_barcode_scan(token):
+            """
+            Processa leitura de código de barras do scanner físico.
+            Lógica:
+              - Se o pedido está em 'waiting' → move para 'in_production' (1ª leitura)
+              - Se o pedido está em 'in_production' → finaliza + registra componentes (2ª leitura)
+            O código de barras é o número do pedido (pedido_numero / order_id).
+            """
+            data = request.json or {}
+            codigo = str(data.get('codigo', '')).strip()
+            if not codigo:
+                return jsonify({'error': 'codigo obrigatório'}), 400
+
+            # Busca item pelo número do pedido ou order_id
+            found_key = None
+            found_item = None
+            for key, item in pending_orders.data.items():
+                pnum = str(item.get('pedido_numero', '') or item.get('order_id', '') or '')
+                op   = str(item.get('ordem_producao', '') or '')
+                if codigo in (pnum, op) and item.get('status') != 'done':
+                    found_key = key
+                    found_item = item
+                    break
+
+            if not found_item:
+                return jsonify({'acao': 'nao_encontrado', 'codigo': codigo,
+                                'mensagem': f'Nenhum pedido ativo encontrado para código {codigo}'}), 404
+
+            status_atual = found_item.get('status', 'waiting')
+            nome_produto = found_item.get('nome') or found_item.get('nome_original', '')
+            timer_key = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
+
+            if status_atual == 'waiting':
+                # 1ª leitura → INICIA produção
+                pending_orders.start_production(found_key)
+                production_timer.start(timer_key)
+                pending_orders.data[found_key]['timer_key'] = timer_key
+                pending_orders._save_one(found_key)
+
+                # Registra componentes automaticamente se for cadeira
+                try:
+                    _cc = globals().get('component_consumption')
+                    if _cc and 'CADEIRA' in nome_produto.upper():
+                        consumo_key = f"scan_{found_key}"
+                        existing_consumo = _cc.get_current_month().get('checklist_logs', [])
+                        already = any(l.get('produto') == consumo_key for l in existing_consumo)
+                        if not already:
+                            for comp in RECIPE_CADEIRA:
+                                _cc.register_component(comp['nome'], comp['qtd'], comp['un'], consumo_key)
+                except Exception as _e:
+                    logger.warning(f"Scan: erro ao registrar componentes: {_e}")
+
+                def _broadcast():
+                    try:
+                        usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = usage
+                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                    except Exception: pass
+                Thread(target=_broadcast, daemon=True).start()
+
+                return jsonify({
+                    'acao': 'iniciado',
+                    'codigo': codigo,
+                    'item_key': found_key,
+                    'nome': nome_produto,
+                    'mensagem': f'✅ Produção INICIADA: {nome_produto}',
+                    'timer_key': timer_key,
+                })
+
+            elif status_atual == 'in_production':
+                # 2ª leitura → FINALIZA produção
+                result = production_timer.stop_and_log(timer_key)
+                tempo = result.get('elapsed', 0)
+                pending_orders.finish_production(found_key, tempo_segundos=tempo)
+
+                def _broadcast2():
+                    try:
+                        usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = usage
+                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                    except Exception: pass
+                Thread(target=_broadcast2, daemon=True).start()
+
+                return jsonify({
+                    'acao': 'concluido',
+                    'codigo': codigo,
+                    'item_key': found_key,
+                    'nome': nome_produto,
+                    'tempo_producao': tempo,
+                    'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({int(tempo//3600):02d}:{int((tempo%3600)//60):02d}:{int(tempo%60):02d})',
+                })
+
+            else:
+                return jsonify({'acao': 'ja_concluido', 'codigo': codigo,
+                                'mensagem': f'Pedido {codigo} já foi concluído.'}), 200
+
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         @token_required
         def api_pending_orders_start(token):
@@ -3929,6 +4027,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
     <style>
         /* ══════════════════════════════════════════
            SW MÓVEIS MDF — DESIGN SYSTEM 2025
@@ -4503,6 +4602,30 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             border-top: 3px solid var(--sw-yellow);
         }
 
+        /* ══ SCANNER GLOBAL ══ */
+        #scanner-indicator {
+            position: fixed; top: 70px; right: 16px; z-index: 9999;
+            background: #01010d; color: #ffb600;
+            border: 2px solid #ffb600; border-radius: 50px;
+            padding: 6px 14px; font-size: 0.72rem; font-weight: 700;
+            letter-spacing: 0.06em; display: none;
+            box-shadow: 0 4px 20px rgba(255,182,0,0.4);
+            animation: pulse-badge 1s infinite;
+        }
+        #scanner-indicator.active { display: flex; align-items: center; gap: 6px; }
+
+        /* ══ IMPRESSÃO ══ */
+        @media print {
+            body > *:not(#print-area) { display: none !important; }
+            #print-area {
+                display: block !important;
+                position: fixed; inset: 0;
+                background: white; z-index: 99999;
+                padding: 20px; text-align: center;
+            }
+        }
+        #print-area { display: none; }
+
         /* ══ RESPONSIVO ══ */
         @media (max-width: 768px) {
             .kpi-card h3 { font-size: 2.2rem; }
@@ -4515,6 +4638,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
     <!-- PATTERN BAR TOP -->
     <div class="sw-pattern-bar"></div>
+
+    <!-- SCANNER GLOBAL INDICATOR -->
+    <div id="scanner-indicator">📡 Lendo código...</div>
+
+    <!-- ÁREA DE IMPRESSÃO (oculta; aparece apenas no print) -->
+    <div id="print-area"></div>
 
     <!-- NAVBAR -->
     <nav class="navbar navbar-expand-lg">
@@ -4915,27 +5044,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         async function _loadKpiOrderNumbers() {
             try {
-                // Usa o histórico de pedidos do servidor para listar números reais do Bling
                 const res = await fetch('/api/sales/orders-summary');
                 if (!res.ok) return;
                 const data = await res.json();
 
-                const today = new Date();
-                today.setHours(0,0,0,0);
-                const week = new Date(today); week.setDate(today.getDate() - 7);
-                const month = new Date(today.getFullYear(), today.getMonth(), 1);
+                // Usa data local (sem timezone offset) para comparar corretamente
+                const now = new Date();
+                const todayStr = now.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+                const weekAgo = new Date(now); weekAgo.setDate(now.getDate() - 7);
+                const weekAgoStr = weekAgo.toISOString().slice(0, 10);
+                const monthStr = now.toISOString().slice(0, 7); // 'YYYY-MM'
 
                 const dailyNums = [], weeklyNums = [], monthlyNums = [];
                 (data.orders || []).forEach(o => {
-                    const d = new Date(o.data);
+                    // data pode vir como 'YYYY-MM-DD' ou 'YYYY-MM-DD HH:MM'
+                    const dateStr = (o.data || '').slice(0, 10);
                     const num = '#' + (o.numero || o.id);
-                    if (d >= today) dailyNums.push(num);
-                    if (d >= week) weeklyNums.push(num);
-                    if (d >= month) monthlyNums.push(num);
+                    if (dateStr === todayStr) dailyNums.push(num);
+                    if (dateStr >= weekAgoStr) weeklyNums.push(num);
+                    if (dateStr.startsWith(monthStr)) monthlyNums.push(num);
                 });
 
-                const fmt = (arr) => arr.length === 0 ? '' :
-                    arr.slice(-10).join(' · ');
+                // Mostra todos (sem limite de 10) — scroll no div
+                const fmt = (arr) => arr.length === 0 ? '—' : arr.join(' · ');
 
                 const dEl = document.getElementById('kpi-daily-orders');
                 const wEl = document.getElementById('kpi-weekly-orders');
@@ -5502,19 +5633,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                         // Ordem de Produção + QR/barcode
                         const op = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '');
+                        const opSafeId = `bc_${(item.item_key||op).replace(/[^a-z0-9]/gi,'_')}`;
                         const opCell = op ? `
-                            <div class="text-center">
-                                <span class="badge bg-dark text-white font-monospace" style="font-size:0.7rem;" title="Ordem de Produção Bling">OP #${op}</span>
-                                <div style="margin-top:4px;">
-                                    <svg id="qr_${item.item_key ? item.item_key.replace(/[^a-z0-9]/gi,'_') : 'x'}" 
-                                         data-barcode="${op}" 
-                                         style="cursor:pointer;" 
-                                         title="Clique para abrir detalhes da OP"
-                                         onclick="openOPModal('${op}', '${escapeHtml(rawNome)}')">
-                                        <!-- barcode placeholder -->
-                                        <rect width="60" height="16" fill="#222" rx="2"/>
-                                    </svg>
-                                    <div style="font-size:0.6rem;font-family:monospace;color:#555;letter-spacing:0.08em;">${op}</div>
+                            <div class="text-center" onclick="openOPModal('${op}', '${escapeHtml(rawNome)}', '${item.item_key||''}')" style="cursor:pointer;" title="Clique para ver/imprimir OP">
+                                <span class="badge bg-dark text-white font-monospace" style="font-size:0.7rem;">OP #${op}</span>
+                                <div style="margin-top:4px;background:#fff;border:1px solid #ddd;border-radius:4px;padding:3px 6px;display:inline-block;">
+                                    <svg id="${opSafeId}" style="display:block;"></svg>
                                 </div>
                             </div>` : `<span class="text-muted small">—</span>`;
 
@@ -5691,97 +5815,272 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             _renderBarcodes();
         }
 
-        /** Renderiza barcodes simples SVG nos elementos com data-barcode */
+        /** Renderiza mini-barcodes reais (JsBarcode) nas células da tabela */
         function _renderBarcodes() {
-            document.querySelectorAll('svg[data-barcode]').forEach(svg => {
-                const val = svg.getAttribute('data-barcode') || '';
-                svg.setAttribute('viewBox', '0 0 80 20');
-                svg.setAttribute('width', '80');
-                svg.setAttribute('height', '20');
-                svg.style.display = 'block';
-                svg.style.margin = '0 auto';
-                // Gera barras simples baseadas nos chars do valor
-                let bars = '';
-                const chars = (val + '0').split('');
-                let x = 1;
-                chars.forEach((c, i) => {
-                    const code = c.charCodeAt(0);
-                    const w = (code % 3) + 1;
-                    const gap = (i % 2 === 0) ? 1 : 2;
-                    bars += `<rect x="${x}" y="1" width="${w}" height="15" fill="#111"/>`;
-                    x += w + gap;
-                    if (x > 75) return;
-                });
-                svg.innerHTML = bars;
+            // Busca todos os SVGs com id começando em 'bc_' que ainda não foram renderizados
+            document.querySelectorAll('svg[id^="bc_"]').forEach(svg => {
+                // Pega o valor do OP do elemento pai (data attribute ou texto do badge)
+                const wrap = svg.closest('[onclick]');
+                if (!wrap) return;
+                const onclk = wrap.getAttribute('onclick') || '';
+                const m = onclk.match(/openOPModal..([^']+)/);
+                if (!m) return;
+                const val = m[1];
+                if (!val || svg.children.length > 0) return; // já renderizado
+                try {
+                    JsBarcode(svg, val, {
+                        format: 'CODE128',
+                        width: 1.2,
+                        height: 24,
+                        displayValue: false,
+                        margin: 2,
+                        background: '#ffffff',
+                        lineColor: '#000000',
+                    });
+                } catch(e) {
+                    svg.innerHTML = `<text x="0" y="12" font-size="9" font-family="monospace">${val}</text>`;
+                }
             });
         }
 
-        /** Modal para ver e imprimir a Ordem de Produção do Bling */
-        function openOPModal(numeroOP, nomeProduto) {
+        /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
+        function openOPModal(numeroOP, nomeProduto, itemKey) {
             const existing = document.getElementById('opModal');
-            if (existing) existing.remove();
-
-            // URL do Power BI embed com o código de barras (adapte se necessário)
-            const barcodeVal = numeroOP;
+            if (existing) { bootstrap.Modal.getInstance(existing)?.hide(); existing.remove(); }
 
             const modalHtml = `
             <div class="modal fade" id="opModal" tabindex="-1">
-                <div class="modal-dialog modal-dialog-centered">
-                    <div class="modal-content border-0 shadow">
+                <div class="modal-dialog modal-dialog-centered" style="max-width:420px;">
+                    <div class="modal-content border-0 shadow-lg">
                         <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
                             <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">
-                                📋 Ordem de Produção Bling
+                                📋 Ordem de Produção
                             </h5>
                             <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                         </div>
-                        <div class="modal-body text-center" style="background:#f9f9f7;">
-                            <p class="text-muted small mb-1">${escapeHtml(nomeProduto)}</p>
-                            <h3 class="fw-bold font-monospace mb-3" style="color:#01010d;">OP # ${escapeHtml(numeroOP)}</h3>
+                        <div class="modal-body text-center" style="background:#f9f9f7;padding:24px;">
+                            <p class="text-muted small mb-1" style="font-size:0.78rem;">${escapeHtml(nomeProduto)}</p>
+                            <h4 class="fw-bold font-monospace mb-4" style="color:#01010d;letter-spacing:.06em;">
+                                OP # ${escapeHtml(numeroOP)}
+                            </h4>
 
-                            <!-- Barcode grande para leitura -->
-                            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:16px;display:inline-block;margin-bottom:12px;">
-                                <svg id="opBarcodeSvg" width="200" height="50" viewBox="0 0 200 50" style="display:block;"></svg>
-                                <div style="font-family:monospace;font-size:0.85rem;letter-spacing:0.12em;margin-top:4px;color:#333;">
-                                    ${escapeHtml(numeroOP)}
-                                </div>
+                            <!-- Barcode real via JsBarcode -->
+                            <div id="op-barcode-wrap" style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:20px 16px 12px;display:inline-block;margin-bottom:16px;min-width:280px;">
+                                <svg id="opBarcodeReal"></svg>
                             </div>
 
-                            <p class="text-muted small mb-0">
-                                Aponte o leitor de código de barras ou use o Power BI para abrir esta OP.
+                            <!-- Status do pedido -->
+                            <div id="op-status-box" class="mt-2 mb-1"></div>
+
+                            <p class="text-muted mb-0" style="font-size:0.72rem;">
+                                Scanner: aponte para o código acima.<br>
+                                <strong>1ª leitura</strong> = Iniciar · <strong>2ª leitura</strong> = Concluir
                             </p>
                         </div>
-                        <div class="modal-footer bg-white justify-content-between">
+                        <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
                             <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
-                            <button class="btn btn-primary btn-sm fw-bold" onclick="window.print()">🖨️ Imprimir OP</button>
+                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(numeroOP)}', '${escapeHtml(nomeProduto)}')">
+                                🖨️ Imprimir OP
+                            </button>
                         </div>
                     </div>
                 </div>
             </div>`;
 
             document.body.insertAdjacentHTML('beforeend', modalHtml);
-
-            // Renderiza barcode grande no modal
-            setTimeout(() => {
-                const svg = document.getElementById('opBarcodeSvg');
-                if (svg) {
-                    const val = numeroOP;
-                    let bars = '';
-                    let x = 4;
-                    (val + '00').split('').forEach((c, i) => {
-                        const code = c.charCodeAt(0);
-                        const w = (code % 4) + 2;
-                        const gap = (i % 2 === 0) ? 2 : 3;
-                        bars += `<rect x="${x}" y="4" width="${w}" height="36" fill="#111"/>`;
-                        x += w + gap;
-                        if (x > 190) return;
-                    });
-                    svg.innerHTML = bars;
-                }
-            }, 80);
-
             const modal = new bootstrap.Modal(document.getElementById('opModal'));
             modal.show();
+
+            // Renderiza barcode real com JsBarcode (Code128 — lido por qualquer scanner)
+            setTimeout(() => {
+                try {
+                    JsBarcode('#opBarcodeReal', String(numeroOP), {
+                        format: 'CODE128',
+                        width: 2.2,
+                        height: 70,
+                        displayValue: true,
+                        fontSize: 14,
+                        fontOptions: 'bold',
+                        margin: 6,
+                        background: '#ffffff',
+                        lineColor: '#000000',
+                        textMargin: 4,
+                    });
+                } catch(e) {
+                    document.getElementById('op-barcode-wrap').innerHTML =
+                        `<div class="font-monospace fw-bold" style="font-size:1.4rem;letter-spacing:.15em;">${escapeHtml(numeroOP)}</div>`;
+                }
+
+                // Mostra status atual do pedido
+                _updateOPStatusBox(numeroOP);
+            }, 60);
         }
+
+        async function _updateOPStatusBox(numeroOP) {
+            const box = document.getElementById('op-status-box');
+            if (!box) return;
+            try {
+                const res = await fetch('/api/production/board');
+                const data = await res.json();
+                const all = [...(data.waiting||[]), ...(data.in_production||[]), ...(data.done||[])];
+                const item = all.find(i => String(i.pedido_numero||i.order_id||i.ordem_producao||'') === String(numeroOP));
+                if (!item) {
+                    box.innerHTML = `<span class="badge bg-secondary">Status desconhecido</span>`;
+                    return;
+                }
+                const st = item.status || 'waiting';
+                const labels = {
+                    waiting:      `<span class="badge bg-warning text-dark">⏳ Aguardando</span>`,
+                    in_production:`<span class="badge bg-success" style="animation:pulse-animation 1.5s infinite;">⚙️ Em Produção</span>`,
+                    done:         `<span class="badge bg-primary">✅ Concluído</span>`,
+                };
+                box.innerHTML = labels[st] || `<span class="badge bg-secondary">${st}</span>`;
+            } catch { box.innerHTML = ''; }
+        }
+
+        /** Impressão da OP em página limpa (sem travar) */
+        function printOP(numeroOP, nomeProduto) {
+            // Gera SVG do barcode num canvas auxiliar
+            const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            tempSvg.id = '_printBcSvg';
+            tempSvg.style.display = 'none';
+            document.body.appendChild(tempSvg);
+
+            try {
+                JsBarcode('#_printBcSvg', String(numeroOP), {
+                    format: 'CODE128', width: 3, height: 90,
+                    displayValue: true, fontSize: 16, fontOptions: 'bold',
+                    margin: 8, background: '#ffffff', lineColor: '#000000'
+                });
+            } catch(e) {}
+
+            const svgHtml = tempSvg.outerHTML;
+            tempSvg.remove();
+
+            const printContent = `
+                <div style="font-family:Arial,sans-serif;text-align:center;padding:30px;">
+                    <h2 style="letter-spacing:.05em;margin-bottom:4px;">SW Móveis MDF</h2>
+                    <p style="color:#666;font-size:13px;margin-bottom:20px;">Ordem de Produção</p>
+                    <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;min-width:300px;">
+                        <div style="font-size:13px;color:#555;margin-bottom:8px;">${nomeProduto}</div>
+                        <div style="font-size:28px;font-weight:900;font-family:monospace;margin-bottom:16px;letter-spacing:.06em;">
+                            OP # ${numeroOP}
+                        </div>
+                        ${svgHtml}
+                    </div>
+                    <p style="color:#888;font-size:11px;margin-top:16px;">
+                        1ª leitura = Iniciar Produção &nbsp;|&nbsp; 2ª leitura = Concluir Produção
+                    </p>
+                    <script>window.onload=function(){window.print();window.onafterprint=function(){document.getElementById('print-area').style.display='none';}}</scr' + 'ipt>
+                </div>`;
+
+            const printArea = document.getElementById('print-area');
+            printArea.innerHTML = printContent;
+            printArea.style.display = 'block';
+            window.print();
+            // Limpa após impressão
+            window.onafterprint = () => {
+                printArea.innerHTML = '';
+                printArea.style.display = 'none';
+                window.onafterprint = null;
+            };
+        }
+
+        /** ════════════════════════════════════════════════════
+         *  LISTENER GLOBAL DE SCANNER DE CÓDIGO DE BARRAS
+         *  Scanners USB emulam teclado: digitam o código + Enter
+         *  ════════════════════════════════════════════════════ */
+        (function() {
+            let _scanBuffer = '';
+            let _scanTimer = null;
+            const _SCAN_TIMEOUT = 80;   // ms — scanners são rápidos (<50ms entre chars)
+            const _MIN_LEN = 3;         // tamanho mínimo para considerar como scan
+
+            const _indicator = document.getElementById('scanner-indicator');
+
+            function _showIndicator(msg, color) {
+                if (!_indicator) return;
+                _indicator.textContent = '📡 ' + msg;
+                _indicator.style.borderColor = color || '#ffb600';
+                _indicator.style.color = color || '#ffb600';
+                _indicator.classList.add('active');
+                clearTimeout(_indicator._hideTimer);
+                _indicator._hideTimer = setTimeout(() => _indicator.classList.remove('active'), 3000);
+            }
+
+            document.addEventListener('keydown', function(e) {
+                // Ignora quando o usuário está digitando em um input/textarea
+                const tag = document.activeElement?.tagName?.toLowerCase();
+                if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+                if (e.key === 'Enter') {
+                    const code = _scanBuffer.trim();
+                    _scanBuffer = '';
+                    clearTimeout(_scanTimer);
+                    if (code.length >= _MIN_LEN) {
+                        _processScan(code);
+                    }
+                    return;
+                }
+
+                // Acumula caracteres
+                if (e.key.length === 1) {
+                    _scanBuffer += e.key;
+                    clearTimeout(_scanTimer);
+                    // Timeout: se parar de digitar, limpa (evita acúmulo de teclas manuais)
+                    _scanTimer = setTimeout(() => { _scanBuffer = ''; }, 400);
+                }
+            });
+
+            async function _processScan(codigo) {
+                if (!isAuthenticated) {
+                    _showIndicator('Não autenticado', '#ef4444');
+                    return;
+                }
+                _showIndicator('Lendo: ' + codigo, '#ffb600');
+                try {
+                    const res = await fetch('/api/barcode/scan', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ codigo: codigo })
+                    });
+                    const result = await res.json();
+
+                    if (!res.ok && res.status === 404) {
+                        _showIndicator('Não encontrado: ' + codigo, '#ef4444');
+                        showToast('Scanner', result.mensagem || 'Código não encontrado', 'warning');
+                        return;
+                    }
+
+                    const acao = result.acao;
+                    if (acao === 'iniciado') {
+                        _showIndicator('✅ INICIADO', '#10b981');
+                        showToast('🚀 Produção Iniciada', result.nome + ' · OP #' + codigo, 'success');
+                        // Recarrega board para refletir mudança
+                        setTimeout(() => loadProductionBoard(), 600);
+
+                    } else if (acao === 'concluido') {
+                        _showIndicator('✅ CONCLUÍDO', '#6366f1');
+                        const tempoFmt = result.tempo_producao ? formatSeconds(result.tempo_producao) : '';
+                        showToast('✅ Produção Concluída', result.nome + (tempoFmt ? ' · ' + tempoFmt : ''), 'success');
+                        setTimeout(() => { loadProductionBoard(); refreshComponentTab(); }, 600);
+
+                    } else if (acao === 'ja_concluido') {
+                        _showIndicator('Já concluído', '#6b7280');
+                        showToast('Info', result.mensagem, 'info');
+
+                    } else {
+                        _showIndicator(result.mensagem || 'Processado', '#ffb600');
+                    }
+                } catch(e) {
+                    _showIndicator('Erro de comunicação', '#ef4444');
+                    showToast('Erro', 'Falha ao processar código de barras', 'danger');
+                }
+            }
+
+            // Expõe para debug/teste
+            window._testScan = _processScan;
+        })();
 
         async function startPendingOrder(itemKey, produtoNome) {
             if (!itemKey || !produtoNome) {
