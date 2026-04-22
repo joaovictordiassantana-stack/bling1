@@ -3324,18 +3324,17 @@ class WebServer:
         @token_required
         def api_barcode_scan(token):
             """
-            Processa leitura de código de barras do scanner físico.
-            Lógica:
-              - Se o pedido está em 'waiting' → move para 'in_production' (1ª leitura)
-              - Se o pedido está em 'in_production' → finaliza + registra componentes (2ª leitura)
-            O código de barras é o número do pedido (pedido_numero / order_id).
+            Processa leitura de código de barras.
+            Anti-duplicação persistente: cada item só avança UMA VEZ por etapa.
+            1ª leitura (waiting)      → in_production + registra componentes
+            2ª leitura (in_production)→ done + registra tempo
             """
             data = request.json or {}
             codigo = str(data.get('codigo', '')).strip()
             if not codigo:
                 return jsonify({'error': 'codigo obrigatório'}), 400
 
-            # Busca item pelo número do pedido ou order_id
+            # Busca pedido pelo número do pedido, ordem_producao ou order_id
             found_key = None
             found_item = None
             for key, item in pending_orders.data.items():
@@ -3347,76 +3346,109 @@ class WebServer:
                     break
 
             if not found_item:
-                return jsonify({'acao': 'nao_encontrado', 'codigo': codigo,
-                                'mensagem': f'Nenhum pedido ativo encontrado para código {codigo}'}), 404
+                return jsonify({
+                    'acao': 'nao_encontrado',
+                    'codigo': codigo,
+                    'mensagem': f'Nenhum pedido ativo encontrado para #{codigo}'
+                }), 404
 
             status_atual = found_item.get('status', 'waiting')
             nome_produto = found_item.get('nome') or found_item.get('nome_original', '')
-            timer_key = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
+            timer_key    = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
 
+            # ── Anti-duplicação persistente por etapa ──────────────────────
+            # Guarda flag no próprio item: "scan_iniciado" e "scan_concluido"
             if status_atual == 'waiting':
-                # 1ª leitura → INICIA produção
+                if found_item.get('scan_iniciado'):
+                    return jsonify({
+                        'acao': 'ja_lido_etapa',
+                        'codigo': codigo,
+                        'item_key': found_key,
+                        'nome': nome_produto,
+                        'mensagem': f'Pedido #{codigo} já foi iniciado. Veja a aba Produzindo.'
+                    })
+
+                # ── Inicia produção ─────────────────────────────────────────
                 pending_orders.start_production(found_key)
                 production_timer.start(timer_key)
-                pending_orders.data[found_key]['timer_key'] = timer_key
+                pending_orders.data[found_key]['timer_key']    = timer_key
+                pending_orders.data[found_key]['scan_iniciado'] = True
                 pending_orders._save_one(found_key)
 
-                # Registra componentes automaticamente se for cadeira
+                # Registra componentes automaticamente
                 try:
                     _cc = globals().get('component_consumption')
                     if _cc and 'CADEIRA' in nome_produto.upper():
                         consumo_key = f"scan_{found_key}"
-                        existing_consumo = _cc.get_current_month().get('checklist_logs', [])
-                        already = any(l.get('produto') == consumo_key for l in existing_consumo)
+                        existing_logs = _cc.get_current_month().get('checklist_logs', [])
+                        already = any(l.get('produto') == consumo_key for l in existing_logs)
                         if not already:
                             for comp in RECIPE_CADEIRA:
                                 _cc.register_component(comp['nome'], comp['qtd'], comp['un'], consumo_key)
-                except Exception as _e:
-                    logger.warning(f"Scan: erro ao registrar componentes: {_e}")
+                            logger.info(f"✅ Componentes registrados via scan para {nome_produto}")
+                except Exception as _ce:
+                    logger.warning(f"Scan: erro componentes: {_ce}")
 
-                def _broadcast():
+                def _bcast1():
                     try:
                         usage = self.orchestrator.calculate_component_usage()
                         self.orchestrator._component_usage_cache = usage
                         self.orchestrator.broadcast_kpi_update(component_usage=usage)
                     except Exception: pass
-                Thread(target=_broadcast, daemon=True).start()
+                Thread(target=_bcast1, daemon=True).start()
 
                 return jsonify({
                     'acao': 'iniciado',
                     'codigo': codigo,
                     'item_key': found_key,
                     'nome': nome_produto,
-                    'mensagem': f'✅ Produção INICIADA: {nome_produto}',
                     'timer_key': timer_key,
+                    'mensagem': f'✅ Produção INICIADA: {nome_produto}'
                 })
 
             elif status_atual == 'in_production':
-                # 2ª leitura → FINALIZA produção
-                result = production_timer.stop_and_log(timer_key)
-                tempo = result.get('elapsed', 0)
-                pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                if found_item.get('scan_concluido'):
+                    return jsonify({
+                        'acao': 'ja_lido_etapa',
+                        'codigo': codigo,
+                        'item_key': found_key,
+                        'nome': nome_produto,
+                        'mensagem': f'Pedido #{codigo} já foi concluído. Veja a aba Concluídos.'
+                    })
 
-                def _broadcast2():
+                # ── Conclui produção ────────────────────────────────────────
+                result = production_timer.stop_and_log(timer_key)
+                tempo  = result.get('elapsed', 0)
+                pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                pending_orders.data[found_key]['scan_concluido'] = True
+                pending_orders._save_one(found_key)
+
+                def _bcast2():
                     try:
                         usage = self.orchestrator.calculate_component_usage()
                         self.orchestrator._component_usage_cache = usage
                         self.orchestrator.broadcast_kpi_update(component_usage=usage)
                     except Exception: pass
-                Thread(target=_broadcast2, daemon=True).start()
+                Thread(target=_bcast2, daemon=True).start()
 
+                h = int(tempo // 3600)
+                m = int((tempo % 3600) // 60)
+                s = int(tempo % 60)
                 return jsonify({
                     'acao': 'concluido',
                     'codigo': codigo,
                     'item_key': found_key,
                     'nome': nome_produto,
                     'tempo_producao': tempo,
-                    'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({int(tempo//3600):02d}:{int((tempo%3600)//60):02d}:{int(tempo%60):02d})',
+                    'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
                 })
 
             else:
-                return jsonify({'acao': 'ja_concluido', 'codigo': codigo,
-                                'mensagem': f'Pedido {codigo} já foi concluído.'}), 200
+                return jsonify({
+                    'acao': 'ja_concluido',
+                    'codigo': codigo,
+                    'mensagem': f'Pedido #{codigo} já foi concluído anteriormente.'
+                })
 
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         @token_required
@@ -4614,6 +4646,36 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
         #scanner-indicator.active { display: flex; align-items: center; gap: 6px; }
 
+        /* ══ BOARD SUB-ABAS ══ */
+        .board-tab-btn { outline: none; }
+        .board-tab-btn:hover { opacity: 0.85; transform: translateY(-1px); }
+        .active-board-tab { opacity: 1 !important; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
+
+        /* ══ CARD DE BARCODE (Em Espera / Produzindo) ══ */
+        .bc-card {
+            border: 1.5px solid var(--border);
+            border-radius: var(--radius);
+            background: #fff;
+            padding: 18px 16px 14px;
+            transition: box-shadow .2s, border-color .2s, transform .2s;
+            position: relative;
+        }
+        .bc-card:hover { box-shadow: 0 6px 24px rgba(0,0,0,.09); border-color: var(--sw-yellow); transform: translateY(-2px); }
+        .bc-card.urgente { border-color: #ef4444; background: #fff5f5; }
+        .bc-card.atencao { border-color: #f59e0b; }
+        .bc-card.inprod  { border-color: #10b981; background: #f0fdf4; }
+        .bc-card .bc-num  { font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: .05em; color: var(--sw-black); }
+        .bc-card .bc-nome { font-size: 0.78rem; font-weight: 700; color: #374151; margin-bottom: 10px; line-height: 1.3; }
+        .bc-card .bc-meta { font-size: 0.68rem; color: #9ca3af; margin-top: 6px; }
+        .bc-card .bc-prazo { position: absolute; top: 10px; right: 10px; }
+        .bc-card .bc-svg-wrap { background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px 4px; display: inline-block; }
+        .bc-card .bc-lido-overlay {
+            position: absolute; inset: 0; background: rgba(16,185,129,.92); border-radius: var(--radius);
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            color: #fff; font-weight: 800; font-size: 1rem; letter-spacing: .04em;
+            animation: fadeIn .3s ease-out;
+        }
+
         /* ══ IMPRESSÃO ══ */
         @media print {
             body > *:not(#print-area) { display: none !important; }
@@ -4729,16 +4791,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             <div class="col-12">
                 <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
                     <li class="nav-item" role="presentation">
-                        <button class="nav-link active" id="search-tab" data-bs-toggle="tab" data-bs-target="#search" type="button">🔍 Busca</button>
+                        <button class="nav-link active" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
                     </li>
                     <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="kits-tab" data-bs-toggle="tab" data-bs-target="#kits" type="button">📦 Produtos</button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🔧 Insumos & Produção</button>
+                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🏭 Produção & Insumos</button>
                     </li>
                 </ul>
 
@@ -4750,30 +4806,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <!-- TAB CONTENT -->
                 <div id="content-tabs" class="tab-content hidden">
 
-                    <!-- TAB: BUSCA -->
-                    <div class="tab-pane fade show active" id="search" role="tabpanel">
-                        <div class="row mb-4">
-                            <div class="col-12">
-                                <div class="input-group">
-                                    <input type="text" class="form-control" id="search-input" placeholder="Digite SKU ou nome do produto..." style="padding: 0.75rem 1rem; font-weight: 500;">
-                                    <button class="btn btn-primary" id="btn-search" type="button">Buscar</button>
-                                </div>
-                            </div>
-                        </div>
-                        <div id="search-results"></div>
-                    </div>
-
-                    <!-- TAB: PRODUTOS -->
-                    <div class="tab-pane fade" id="kits" role="tabpanel">
-                        <div class="mb-4">
-                            <button class="btn btn-primary btn-sm" onclick="forceAndReloadKits(event)">🔄 Recarregar Lista</button>
-                            <small class="text-muted d-block mt-2">⚠️ Carregamento pode levar 2-5 minutos. Aguarde a notificação do WebSocket.</small>
-                        </div>
-                        <div id="kits-list"></div>
-                    </div>
-
                     <!-- TAB: DASHBOARD KPI -->
-                    <div class="tab-pane fade" id="kpi-chart" role="tabpanel">
+                    <div class="tab-pane fade show active" id="kpi-chart" role="tabpanel">
                         <div class="row">
                             <div class="col-lg-8 mb-4">
                                 <div class="card">
@@ -4809,24 +4843,48 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                     </div>
 
-                    <!-- TAB: INSUMOS & PRODUÇÃO -->
+                    <!-- TAB: PRODUÇÃO & INSUMOS -->
                     <div class="tab-pane fade" id="component-usage" role="tabpanel">
 
-                        <!-- PAINEL DE PRODUÇÃO -->
+                        <!-- PAINEL DE PRODUÇÃO PRINCIPAL -->
                         <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header d-flex justify-content-between align-items-center py-3" style="background: linear-gradient(135deg, #01010d 0%, #1e3a5f 100%) !important;">
-                                <div>
+                            <div class="card-header py-3" style="background: linear-gradient(135deg, #01010d 0%, #1e3a5f 100%) !important;">
+                                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
                                     <h5 class="mb-0 text-white">🏭 Painel de <span style="color:var(--sw-yellow)">Produção</span></h5>
-                                    <small class="text-white-50">
-                                        ⏳ Em Espera <span id="waiting-count-badge" class="badge bg-warning text-dark ms-1">0</span>
-                                        &nbsp; ⚙️ Produzindo <span id="inprod-count-badge" class="badge bg-success ms-1">0</span>
-                                        &nbsp; ✅ Concluídos <span id="done-count-badge" class="badge bg-secondary ms-1">0</span>
-                                    </small>
+                                    <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
                                 </div>
-                                <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+
+                                <!-- Sub-abas clicáveis -->
+                                <div class="d-flex gap-2 mt-3">
+                                    <button id="tab-waiting-btn" onclick="switchBoardTab('waiting')"
+                                        class="board-tab-btn active-board-tab"
+                                        style="background:rgba(255,182,0,0.18);border:2px solid #ffb600;color:#ffb600;border-radius:50px;padding:5px 18px;font-size:0.78rem;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .2s;">
+                                        ⏳ Em Espera <span id="waiting-count-badge" class="ms-1" style="background:#ffb600;color:#000;border-radius:50px;padding:1px 8px;font-size:.72rem;">0</span>
+                                    </button>
+                                    <button id="tab-inprod-btn" onclick="switchBoardTab('inprod')"
+                                        class="board-tab-btn"
+                                        style="background:rgba(16,185,129,0.12);border:2px solid rgba(16,185,129,0.4);color:#10b981;border-radius:50px;padding:5px 18px;font-size:0.78rem;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .2s;">
+                                        ⚙️ Produzindo <span id="inprod-count-badge" class="ms-1" style="background:#10b981;color:#fff;border-radius:50px;padding:1px 8px;font-size:.72rem;">0</span>
+                                    </button>
+                                    <button id="tab-done-btn" onclick="switchBoardTab('done')"
+                                        class="board-tab-btn"
+                                        style="background:rgba(99,102,241,0.12);border:2px solid rgba(99,102,241,0.3);color:#6366f1;border-radius:50px;padding:5px 18px;font-size:0.78rem;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .2s;">
+                                        ✅ Concluídos <span id="done-count-badge" class="ms-1" style="background:#6366f1;color:#fff;border-radius:50px;padding:1px 8px;font-size:.72rem;">0</span>
+                                    </button>
+                                </div>
                             </div>
-                            <div class="card-body p-0" id="production-board-section">
-                                <p class="text-center text-muted py-4">⏳ Carregando...</p>
+
+                            <!-- Painéis das 3 sub-abas -->
+                            <div class="card-body p-0">
+                                <div id="board-waiting" class="board-panel">
+                                    <p class="text-center text-muted py-4">⏳ Carregando...</p>
+                                </div>
+                                <div id="board-inprod" class="board-panel" style="display:none;">
+                                    <p class="text-center text-muted py-4">⏳ Carregando...</p>
+                                </div>
+                                <div id="board-done" class="board-panel" style="display:none;">
+                                    <p class="text-center text-muted py-4">⏳ Carregando...</p>
+                                </div>
                             </div>
                         </div>
 
@@ -5488,9 +5546,30 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
            - Em Espera + Em Produção + Concluídos numa única view
            ════════════════════════════════════════════════════════════ */
 
-        let _boardTick = null;      // setInterval do ticker de tempo
-        let _boardPoll = null;      // setInterval do polling de dados
-        let _boardTimerState = {};  // snapshot do servidor para ticker local
+        let _boardTick = null;
+        let _boardPoll = null;
+        let _boardTimerState = {};
+        let _currentBoardTab = 'waiting';   // aba activa
+        let _boardData = null;               // último snapshot
+        // Set de item_keys já lidos nesta sessão — anti-duplicação por aba
+        // Formato: "itemKey:etapa" onde etapa = 'waiting'|'inprod'
+        const _scannedThisSession = new Set();
+
+        /* Troca a sub-aba visível */
+        function switchBoardTab(tab) {
+            _currentBoardTab = tab;
+            ['waiting','inprod','done'].forEach(t => {
+                const panel = document.getElementById('board-' + t);
+                const btn   = document.getElementById('tab-' + t + '-btn');
+                if (!panel || !btn) return;
+                const isActive = t === tab;
+                panel.style.display = isActive ? 'block' : 'none';
+                btn.classList.toggle('active-board-tab', isActive);
+                btn.style.opacity = isActive ? '1' : '0.65';
+                btn.style.boxShadow = isActive ? '0 4px 14px rgba(0,0,0,.25)' : 'none';
+            });
+            if (_boardData) _renderCurrentTab();
+        }
 
         async function syncAndRefreshPending() {
             const btn = document.querySelector('[onclick="syncAndRefreshPending()"]');
@@ -5507,41 +5586,38 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             await loadProductionBoard();
         }
 
-        // Mantido como alias para compatibilidade com outros pontos do código
         async function loadPendingOrders() { await loadProductionBoard(); }
 
         async function loadProductionBoard() {
-            const div = document.getElementById('production-board-section');
-            if (!div) return;
             try {
                 const data = await fetch('/api/production/board').then(r => r.json());
+                _boardData = data;
                 renderProductionBoard(data);
             } catch(e) {
-                div.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar painel.</div>';
+                console.error('Erro ao carregar board:', e);
             }
         }
 
         function renderProductionBoard(data) {
-            const div = document.getElementById('production-board-section');
-            if (!div) return;
+            const waiting  = data.waiting       || [];
+            const inProd   = data.in_production  || [];
+            const orphans  = data.orphan_timers  || [];
+            const done     = data.done           || [];
+            const serverTime = data.server_time  || (Date.now() / 1000);
 
-            const waiting    = data.waiting      || [];
-            const inProd     = data.in_production || [];
-            const orphans    = data.orphan_timers || [];
-            const done       = data.done          || [];
-            const serverTime = data.server_time   || (Date.now() / 1000);
+            // Combina in_production + orphans
+            const allInProd = [...inProd, ...orphans];
 
-            // Atualiza badges
+            // Atualiza contadores nas badges
             const wb = document.getElementById('waiting-count-badge');
             const ib = document.getElementById('inprod-count-badge');
             const db = document.getElementById('done-count-badge');
             if (wb) wb.textContent = waiting.length;
-            if (ib) ib.textContent = inProd.length + orphans.length;
+            if (ib) ib.textContent = allInProd.length;
             if (db) db.textContent = done.length;
 
-            // Aviso de urgência: mostra toast se há pedidos atrasados/críticos
+            // Alerta de urgência
             const atrasados = waiting.filter(i => i.urgencia === 'atrasado').length;
-            const criticos  = waiting.filter(i => i.urgencia === 'critico').length;
             if (atrasados > 0 && !window._alertedAtrasados) {
                 window._alertedAtrasados = true;
                 showToast('🚨 ATENÇÃO', `${atrasados} pedido(s) em ATRASO!`, 'danger');
@@ -5551,269 +5627,367 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
             _boardTimerState = {};
 
-            let html = '';
+            // Salva para o ticker
+            allInProd.forEach(item => {
+                const tkey = item.timer_key || item.nome || item.nome_original || '';
+                if (tkey) {
+                    _boardTimerState[tkey] = {
+                        base: item.tempo_decorrido || 0,
+                        startedAt: Date.now() / 1000,
+                        estado: item.estado || 'paused',
+                        serverTime
+                    };
+                }
+            });
 
-            // ════════════════════════════════════════════════
-            // ── Em Espera — agrupado por produto, urgência ──
-            // ════════════════════════════════════════════════
-            if (waiting.length === 0) {
-                html += `<div class="text-center py-3 text-muted"><small>Nenhum pedido em espera. Clique em 🔄 Sincronizar Bling.</small></div>`;
-            } else {
-                // Agrupa por nome de produto
-                const grupos = {};
-                waiting.forEach(item => {
-                    const key = (item.nome || item.nome_original || 'N/D').toUpperCase();
-                    if (!grupos[key]) grupos[key] = { nome: item.nome || item.nome_original || 'N/D', items: [] };
-                    grupos[key].items.push(item);
-                });
+            _boardData = { waiting, allInProd, done, serverTime };
+            _renderCurrentTab();
 
-                // Ordena grupos: grupos com itens urgentes/atrasados primeiro
-                const gruposOrdenados = Object.values(grupos).sort((a, b) => {
-                    const urgA = Math.min(...a.items.map(i => ({atrasado:0,critico:1,atencao:2,normal:3})[i.urgencia||'normal']));
-                    const urgB = Math.min(...b.items.map(i => ({atrasado:0,critico:1,atencao:2,normal:3})[i.urgencia||'normal']));
-                    if (urgA !== urgB) return urgA - urgB;
-                    return a.nome.localeCompare(b.nome);
-                });
-
-                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
-                    <thead style="background:#fef9c3;position:sticky;top:0;z-index:1;"><tr>
-                        <th class="ps-3" style="min-width:200px">Produto</th>
-                        <th>Base / Cor</th>
-                        <th>Pedido Nº</th>
-                        <th>Cliente</th>
-                        <th class="text-center">Prazo</th>
-                        <th class="text-center" title="Ordem de Produção Bling">OP Bling</th>
-                        <th class="text-center">Ação</th>
-                    </tr></thead><tbody>`;
-
-                gruposOrdenados.forEach(grupo => {
-                    const totalGrupo = grupo.items.length;
-                    const hasUrgent = grupo.items.some(i => ['atrasado','critico'].includes(i.urgencia));
-
-                    // Linha separadora de grupo
-                    html += `<tr style="background:${hasUrgent ? '#fff1f1' : '#fffde7'};border-top:2px solid ${hasUrgent ? '#ef4444' : '#e5c200'};">
-                        <td colspan="7" class="ps-3 py-1">
-                            <strong style="font-size:0.78rem;letter-spacing:0.04em;color:${hasUrgent ? '#b91c1c' : '#92400e'};">
-                                ${hasUrgent ? '🔴' : '🟡'} ${escapeHtml(grupo.nome)}
-                                <span class="badge ms-2" style="background:${hasUrgent ? '#ef4444' : '#ffb600'};color:${hasUrgent ? '#fff' : '#000'}">${totalGrupo} un.</span>
-                            </strong>
-                        </td>
-                    </tr>`;
-
-                    grupo.items.forEach(item => {
-                        const rawNome = item.nome || item.nome_original || 'N/D';
-                        const nome = rawNome.replace(/'/g,"&#39;");
-                        const imgUrl = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
-                        const imgTag = imgUrl
-                            ? `<img src="${imgUrl}" alt="" loading="lazy" style="width:36px;height:36px;object-fit:contain;border-radius:5px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">`
-                            : '';
-
-                        // Prazo badge
-                        const urg = item.urgencia || 'normal';
-                        const dias = item.dias_restantes;
-                        let prazoBadge = '';
-                        if (dias === null || dias === undefined) {
-                            prazoBadge = `<span class="badge bg-light text-muted border" title="Sem data de entrega cadastrada">—</span>`;
-                        } else if (urg === 'atrasado') {
-                            prazoBadge = `<span class="badge bg-danger" title="Pedido atrasado!" style="animation:pulse-animation 1s infinite;">
-                                ⚠️ ${Math.abs(dias)}d ATRASO</span>`;
-                        } else if (urg === 'critico') {
-                            prazoBadge = `<span class="badge bg-danger" title="Prazo crítico!">🔥 ${dias === 0 ? 'HOJE' : dias+'d'}</span>`;
-                        } else if (urg === 'atencao') {
-                            prazoBadge = `<span class="badge bg-warning text-dark" title="Atenção ao prazo">⏰ ${dias}d</span>`;
-                        } else {
-                            prazoBadge = `<span class="badge bg-light text-dark border">${dias}d</span>`;
-                        }
-
-                        // Data entrega formatada
-                        const dataEntFmt = item.data_entrega ? (() => {
-                            try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; }
-                        })() : '';
-                        const prazoCel = `<div class="text-center">${prazoBadge}${dataEntFmt ? `<div style="font-size:0.65rem;color:#888;margin-top:2px;">${dataEntFmt}</div>` : ''}</div>`;
-
-                        // Ordem de Produção + QR/barcode
-                        const op = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '');
-                        const opSafeId = `bc_${(item.item_key||op).replace(/[^a-z0-9]/gi,'_')}`;
-                        const opCell = op ? `
-                            <div class="text-center" onclick="openOPModal('${op}', '${escapeHtml(rawNome)}', '${item.item_key||''}')" style="cursor:pointer;" title="Clique para ver/imprimir OP">
-                                <span class="badge bg-dark text-white font-monospace" style="font-size:0.7rem;">OP #${op}</span>
-                                <div style="margin-top:4px;background:#fff;border:1px solid #ddd;border-radius:4px;padding:3px 6px;display:inline-block;">
-                                    <svg id="${opSafeId}" style="display:block;"></svg>
-                                </div>
-                            </div>` : `<span class="text-muted small">—</span>`;
-
-                        // Cor de fundo da linha baseada na urgência
-                        const rowBg = {
-                            'atrasado': 'background:rgba(239,68,68,0.08);border-left:3px solid #ef4444;',
-                            'critico':  'background:rgba(239,68,68,0.05);border-left:3px solid #f97316;',
-                            'atencao':  'background:rgba(255,182,0,0.06);border-left:3px solid #ffb600;',
-                            'normal':   ''
-                        }[urg] || '';
-
-                        html += `<tr style="${rowBg}">
-                            <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTag}<span style="vertical-align:middle;">${nome}</span></td>
-                            <td class="text-muted small">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||'')) || '—'}</td>
-                            <td class="text-muted small">#${item.pedido_numero || item.order_id}</td>
-                            <td class="text-muted small" style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(item.cliente||'')}">${escapeHtml(item.cliente||'—')}</td>
-                            <td>${prazoCel}</td>
-                            <td>${opCell}</td>
-                            <td class="text-center">
-                                <button class="btn btn-xs btn-success btn-sm fw-bold me-1"
-                                    data-ikey="${item.item_key}"
-                                    data-pnome="${nome.replace(/"/g,'')}"
-                                    onclick="startPendingOrder(this.dataset.ikey, this.dataset.pnome)">▶ Produzir</button>
-                                <button class="btn btn-xs btn-outline-secondary btn-sm"
-                                    data-dkey="${item.item_key}"
-                                    onclick="dismissPendingOrder(this.dataset.dkey, event)">✕</button>
-                            </td>
-                        </tr>`;
-                    });
-                });
-                html += `</tbody></table></div>`;
-            }
-
-            // ── Em Produção ─────────────────────────────────────────────
-            const allInProd = [...inProd, ...orphans];
-            html += `<div class="border-bottom border-top px-3 py-2 mt-1" style="background:#dcfce7;">
-                <small class="fw-bold text-success">⚙️ EM PRODUÇÃO (${allInProd.length})</small>
-            </div>`;
-            if (allInProd.length === 0) {
-                html += `<div class="text-center py-3 text-muted"><small>Nenhuma produção em andamento.</small></div>`;
-            } else {
-                html += `<div class="table-responsive"><table class="table table-hover align-middle mb-0 table-sm">
-                    <thead style="background:#f0fdf4;"><tr>
-                        <th class="ps-3">Produto</th><th>Base / Cor</th>
-                        <th>#Pedido / OP</th>
-                        <th class="text-center">Prazo</th>
-                        <th class="text-center">⏱ Tempo</th><th class="text-center">Status</th>
-                        <th class="text-center">Ação</th>
-                    </tr></thead><tbody>`;
-                allInProd.forEach(item => {
-                    const nome    = item.nome || item.nome_original || item.produto || 'N/D';
-                    const nomeSafe = nome.replace(/'/g,"&#39;");
-                    const safeId  = nome.replace(/[^a-zA-Z0-9]/g,'_');
-                    const elapsed = item.tempo_decorrido || 0;
-                    const estado  = item.estado || 'paused';
-                    const itemKey  = item.item_key || null;
-                    const timerKey = item.timer_key || nome;
-                    const base    = item.base || '';
-                    const cor     = item.cor  || '';
-                    const baseCor = (base + (base && cor ? ' / ' : '') + cor) || '—';
-
-                    // Prazo badge
-                    const urg2 = item.urgencia || 'normal';
-                    const dias2 = item.dias_restantes;
-                    let prazoBadge2 = '';
-                    if (dias2 === null || dias2 === undefined) {
-                        prazoBadge2 = '';
-                    } else if (urg2 === 'atrasado') {
-                        prazoBadge2 = `<span class="badge bg-danger" style="animation:pulse-animation 1s infinite;">⚠️ ${Math.abs(dias2)}d ATRASO</span>`;
-                    } else if (urg2 === 'critico') {
-                        prazoBadge2 = `<span class="badge bg-danger">🔥 ${dias2===0?'HOJE':dias2+'d'}</span>`;
-                    } else if (urg2 === 'atencao') {
-                        prazoBadge2 = `<span class="badge bg-warning text-dark">⏰ ${dias2}d</span>`;
-                    } else if (dias2 !== null) {
-                        prazoBadge2 = `<span class="badge bg-light text-dark border">${dias2}d</span>`;
-                    }
-
-                    const op2 = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '');
-
-                    _boardTimerState[timerKey] = { base: elapsed, startedAt: Date.now() / 1000, estado, serverTime };
-
-                    const timerKeySafe = timerKey ? encodeURIComponent(timerKey) : '';
-                    const finishBtn = itemKey
-                        ? `<button class="btn btn-xs btn-success btn-sm ms-1" data-ikey="${itemKey}" data-pnome="${nomeSafe}" data-tkey="${timerKeySafe}" onclick="finishBoardItem(this.dataset.ikey, this.dataset.pnome, event, decodeURIComponent(this.dataset.tkey))">✅ Concluir</button>`
-                        : `<button class="btn btn-xs btn-success btn-sm ms-1" data-tkey="${timerKeySafe}" data-pnome="${nomeSafe}" onclick="controlTimer('finish', decodeURIComponent(this.dataset.tkey) || this.dataset.pnome)">✅ Concluir</button>`;
-
-                    const imgUrlProd = (item.imagem && item.imagem.startsWith('http') && !item.imagem.includes('no-image')) ? item.imagem : '';
-                    const imgTagProd = imgUrlProd ? `<img src="${imgUrlProd}" alt="" loading="lazy" style="width:38px;height:38px;object-fit:contain;border-radius:5px;border:1px solid #e2e8f0;margin-right:6px;vertical-align:middle;flex-shrink:0;" onerror="this.remove()">` : '';
-
-                    const rowBg2 = {
-                        'atrasado': 'background:rgba(239,68,68,0.07);border-left:3px solid #ef4444;',
-                        'critico':  'background:rgba(239,68,68,0.04);border-left:3px solid #f97316;',
-                        'atencao':  'background:rgba(255,182,0,0.05);',
-                        'normal':   ''
-                    }[urg2] || '';
-
-                    html += `<tr style="${rowBg2}">
-                        <td class="ps-3 fw-bold" style="vertical-align:middle;">${imgTagProd}<span style="vertical-align:middle;">${nomeSafe}</span></td>
-                        <td class="text-muted small">${escapeHtml(baseCor)}</td>
-                        <td class="text-muted small">
-                            <div>#${item.pedido_numero || item.order_id}</div>
-                            ${op2 ? `<div style="font-size:0.65rem;font-family:monospace;color:#666;cursor:pointer;" onclick="openOPModal('${op2}','${nomeSafe}')" title="Ver Ordem de Produção">OP #${op2} 🔍</div>` : ''}
-                        </td>
-                        <td class="text-center">${prazoBadge2}</td>
-                        <td class="text-center">
-                            <span id="btimer_${safeId}" class="font-monospace fw-bold text-primary" style="font-size:1.1rem;">${formatSeconds(elapsed)}</span>
-                        </td>
-                        <td class="text-center">
-                            <span class="badge ${estado === 'running' ? 'bg-success' : 'bg-warning text-dark'}"
-                                style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
-                                ${estado === 'running' ? '🟢 PRODUZINDO' : '⏸ PAUSADO'}
-                            </span>
-                        </td>
-                        <td class="text-center">
-                            <button class="btn btn-xs btn-outline-primary btn-sm"
-                                data-nome="${nomeSafe}"
-                                data-tkey="${encodeURIComponent(timerKey)}"
-                                onclick="openProductionChecklist(this.dataset.nome, decodeURIComponent(this.dataset.tkey))">🛠 Abrir</button>
-                            ${finishBtn}
-                        </td>
-                    </tr>`;
-                });
-                html += `</tbody></table></div>`;
-            }
-
-            // ── Concluídos ──────────────────────────────────────────────
-            if (done.length > 0) {
-                html += `<div class="border-top px-3 py-2 mt-1" style="background:#f0fdf4;">
-                    <small class="fw-bold text-success">✅ CONCLUÍDOS ESTE MÊS (${done.length})</small>
-                </div>
-                <div class="table-responsive"><table class="table table-sm align-middle mb-0">
-                    <thead class="table-success"><tr>
-                        <th class="ps-3">Produto</th><th>Base / Cor</th>
-                        <th>#Pedido / OP</th><th>Cliente</th><th class="text-center">Tempo</th><th class="text-center">Concluído em</th>
-                    </tr></thead>
-                    <tbody>`;
-                done.slice().reverse().forEach(item => {
-                    const nome = escapeHtml(item.nome || item.nome_original || 'N/D');
-                    const fin  = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
-                    const tempo = item.tempo_producao ? `<span class="font-monospace text-primary fw-bold">${formatSeconds(item.tempo_producao)}</span>` : '<span class="text-muted">—</span>';
-                    const baseCor = escapeHtml(((item.base||'') + (item.base&&item.cor?' / ':'') + (item.cor||'')) || '—');
-                    const op3 = escapeHtml(item.ordem_producao || item.pedido_numero || '');
-                    html += `<tr class="table-success">
-                        <td class="ps-3 fw-bold text-success">${nome}</td>
-                        <td class="text-muted small">${baseCor}</td>
-                        <td class="text-muted small">
-                            <div>#${escapeHtml(String(item.pedido_numero || item.order_id || '—'))}</div>
-                            ${op3 ? `<div style="font-size:0.65rem;font-family:monospace;">OP #${op3}</div>` : ''}
-                        </td>
-                        <td class="text-muted small">${escapeHtml(item.cliente || '—')}</td>
-                        <td class="text-center">${tempo}</td>
-                        <td class="text-center"><small class="text-muted">${fin}</small></td>
-                    </tr>`;
-                });
-                html += `</tbody></table></div>`;
-            }
-
-            div.innerHTML = html;
-
-            // ── Ticker local (1s) ────────────────────────────────────────
+            // Ticker ao vivo para produzindo
             _boardTick = setInterval(() => {
                 Object.entries(_boardTimerState).forEach(([tkey, s]) => {
                     if (s.estado !== 'running') return;
                     const elapsed = s.base + (Date.now() / 1000 - s.startedAt);
-                    // O safeId do elemento usa o nome do produto (parte antes do ||)
                     const displayNome = tkey.includes('||') ? tkey.split('||')[0] : tkey;
                     const safeId = displayNome.replace(/[^a-zA-Z0-9]/g, '_');
                     const el = document.getElementById('btimer_' + safeId);
                     if (el) el.textContent = formatSeconds(Math.floor(elapsed));
                 });
             }, 1000);
-
-            // ── Renderiza barcodes SVG inline (simula barcode com traços) ──
-            _renderBarcodes();
         }
+
+        function _renderCurrentTab() {
+            if (!_boardData) return;
+            const { waiting, allInProd, done } = _boardData;
+            switch (_currentBoardTab) {
+                case 'waiting': _renderWaiting(waiting); break;
+                case 'inprod':  _renderInProd(allInProd); break;
+                case 'done':    _renderDone(done); break;
+            }
+        }
+
+        /* ── ABA EM ESPERA: cards com barcode, leitura única por pedido ── */
+        function _renderWaiting(items) {
+            const div = document.getElementById('board-waiting');
+            if (!div) return;
+            if (items.length === 0) {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">📭</div>
+                    <p class="mt-2">Nenhum pedido em espera.</p>
+                    <button class="btn btn-sm btn-outline-primary mt-2" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                </div>`;
+                return;
+            }
+
+            // Agrupa por produto
+            const grupos = {};
+            items.forEach(item => {
+                const key = (item.nome || item.nome_original || 'N/D').toUpperCase();
+                if (!grupos[key]) grupos[key] = { nome: item.nome || item.nome_original || 'N/D', items: [] };
+                grupos[key].items.push(item);
+            });
+
+            // Ordena grupos: urgentes primeiro
+            const gruposArr = Object.values(grupos).sort((a, b) => {
+                const urgMap = {atrasado:0,critico:1,atencao:2,normal:3};
+                const urgA = Math.min(...a.items.map(i => urgMap[i.urgencia||'normal']));
+                const urgB = Math.min(...b.items.map(i => urgMap[i.urgencia||'normal']));
+                return urgA !== urgB ? urgA - urgB : a.nome.localeCompare(b.nome);
+            });
+
+            let html = '<div class="p-3">';
+            gruposArr.forEach(grupo => {
+                const hasUrgent = grupo.items.some(i => ['atrasado','critico'].includes(i.urgencia||'normal'));
+                html += `<div class="mb-4">
+                    <div class="d-flex align-items-center gap-2 mb-2">
+                        <span style="font-family:'Bebas Neue',sans-serif;font-size:1.1rem;letter-spacing:.04em;color:${hasUrgent?'#b91c1c':'#01010d'};">
+                            ${hasUrgent?'🔴':'🟡'} ${escapeHtml(grupo.nome)}
+                        </span>
+                        <span class="badge" style="background:${hasUrgent?'#ef4444':'#ffb600'};color:${hasUrgent?'#fff':'#000'};">${grupo.items.length} un.</span>
+                    </div>
+                    <div class="row g-3">`;
+
+                grupo.items.forEach(item => {
+                    const ikey = item.item_key || '';
+                    const op = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                    const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
+                    const urg = item.urgencia || 'normal';
+                    const dias = item.dias_restantes;
+                    const jaLido = _scannedThisSession.has(ikey + ':waiting');
+
+                    let prazoBadge = '';
+                    if (dias !== null && dias !== undefined) {
+                        if (urg==='atrasado') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">⚠️ ${Math.abs(dias)}d ATRASO</span>`;
+                        else if (urg==='critico') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">🔥 ${dias===0?'HOJE':dias+'d'}</span>`;
+                        else if (urg==='atencao') prazoBadge = `<span class="badge bg-warning text-dark" style="font-size:.65rem;">⏰ ${dias}d</span>`;
+                        else prazoBadge = `<span class="badge bg-light text-dark border" style="font-size:.65rem;">${dias}d</span>`;
+                    }
+
+                    html += `<div class="col-sm-6 col-lg-4 col-xl-3">
+                        <div class="bc-card ${urg==='atrasado'||urg==='critico'?'urgente':urg==='atencao'?'atencao':''}">
+                            ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
+                            <div class="bc-nome">${escapeHtml(item.nome||item.nome_original||'N/D')}</div>
+                            ${item.base||item.cor ? `<div style="font-size:.68rem;color:#6b7280;margin-bottom:8px;">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))}</div>` : ''}
+                            <div class="bc-num">#${escapeHtml(String(op))}</div>
+                            <div class="bc-svg-wrap my-2 text-center">
+                                <svg id="${svgId}"></svg>
+                            </div>
+                            <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data ? '· '+new Date(item.pedido_data).toLocaleDateString('pt-BR') : ''}</div>
+                            ${jaLido
+                                ? `<div class="bc-lido-overlay">✅ CÓDIGO LIDO<br><small style="font-weight:400;font-size:.72rem;">Indo para Produzindo...</small></div>`
+                                : `<div class="mt-2 d-flex gap-2">
+                                    <button class="btn btn-success btn-sm fw-bold flex-grow-1"
+                                        data-ikey="${ikey}" data-pnome="${escapeHtml(item.nome||item.nome_original||'')}" data-op="${escapeHtml(String(op))}"
+                                        onclick="scanOrStartWaiting(this)">
+                                        ▶ Iniciar Produção
+                                    </button>
+                                    <button class="btn btn-outline-secondary btn-sm" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
+                                   </div>`
+                            }
+                        </div>
+                    </div>`;
+                });
+
+                html += `</div></div>`;
+            });
+            html += '</div>';
+            div.innerHTML = html;
+
+            // Renderiza barcodes
+            items.forEach(item => {
+                const ikey = item.item_key || '';
+                const op = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
+                const svgEl = document.getElementById(svgId);
+                if (svgEl && op) {
+                    try {
+                        JsBarcode(svgEl, String(op), { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { if (svgEl) svgEl.innerHTML = `<text font-size="10">${op}</text>`; }
+                }
+            });
+        }
+
+        /* Botão "Iniciar" ou leitura via scanner — anti-duplicação */
+        async function scanOrStartWaiting(btn) {
+            const ikey  = btn.dataset.ikey;
+            const pnome = btn.dataset.pnome;
+            const op    = btn.dataset.op;
+            if (!ikey) return;
+            if (_scannedThisSession.has(ikey + ':waiting')) {
+                showToast('Aviso', 'Este pedido já foi iniciado nesta sessão.', 'warning');
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = '⏳...';
+            try {
+                const res = await fetch('/api/pending-orders/start', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome })
+                });
+                if (!res.ok) throw new Error('Erro servidor');
+                _scannedThisSession.add(ikey + ':waiting');
+                showToast('🚀 Iniciado', pnome, 'success');
+                // Registra componentes automaticamente
+                _autoRegisterComponents(pnome, ikey);
+                await loadProductionBoard();
+                switchBoardTab('inprod');
+            } catch(e) {
+                btn.disabled = false; btn.textContent = '▶ Iniciar Produção';
+                showToast('Erro', 'Falha ao iniciar produção', 'danger');
+            }
+        }
+
+        /* ── ABA PRODUZINDO: cards com barcode + timer, leitura única ── */
+        function _renderInProd(items) {
+            const div = document.getElementById('board-inprod');
+            if (!div) return;
+            if (items.length === 0) {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">⚙️</div>
+                    <p class="mt-2">Nenhum item em produção.</p>
+                </div>`;
+                return;
+            }
+
+            let html = '<div class="p-3 row g-3">';
+            items.forEach(item => {
+                const ikey  = item.item_key || '';
+                const nome  = item.nome || item.nome_original || item.produto || 'N/D';
+                const op    = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const tkey  = item.timer_key || nome;
+                const safeId = nome.replace(/[^a-zA-Z0-9]/g,'_');
+                const svgId  = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
+                const elapsed = item.tempo_decorrido || 0;
+                const estado  = item.estado || 'paused';
+                const jaLido  = _scannedThisSession.has(ikey + ':inprod');
+                const urg = item.urgencia || 'normal';
+                const dias = item.dias_restantes;
+
+                let prazoBadge = '';
+                if (dias !== null && dias !== undefined) {
+                    if (urg==='atrasado') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">⚠️ ${Math.abs(dias)}d ATRASO</span>`;
+                    else if (urg==='critico') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">🔥 ${dias===0?'HOJE':dias+'d'}</span>`;
+                    else if (urg==='atencao') prazoBadge = `<span class="badge bg-warning text-dark" style="font-size:.65rem;">⏰ ${dias}d</span>`;
+                }
+
+                html += `<div class="col-sm-6 col-lg-4 col-xl-3">
+                    <div class="bc-card inprod">
+                        ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
+                        <div class="bc-nome">${escapeHtml(nome)}</div>
+                        <div class="bc-num">#${escapeHtml(String(op))}</div>
+                        <div class="bc-svg-wrap my-2 text-center">
+                            <svg id="${svgId}"></svg>
+                        </div>
+                        <!-- Timer ao vivo -->
+                        <div class="text-center my-2">
+                            <span id="btimer_${safeId}" class="font-monospace fw-bold" style="font-size:1.6rem;color:#10b981;">${formatSeconds(elapsed)}</span>
+                            <div>
+                                <span class="badge ${estado==='running'?'bg-success':'bg-warning text-dark'}" style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
+                                    ${estado==='running'?'🟢 PRODUZINDO':'⏸ PAUSADO'}
+                                </span>
+                            </div>
+                        </div>
+                        <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data?'· '+new Date(item.pedido_data).toLocaleDateString('pt-BR'):''}</div>
+                        ${jaLido
+                            ? `<div class="bc-lido-overlay">✅ CONCLUÍDO!<br><small style="font-weight:400;font-size:.72rem;">Registrado com sucesso</small></div>`
+                            : `<div class="mt-2">
+                                <button class="btn btn-danger btn-sm fw-bold w-100"
+                                    data-ikey="${ikey}" data-pnome="${escapeHtml(nome)}" data-tkey="${encodeURIComponent(tkey)}"
+                                    onclick="scanOrFinishInProd(this)">
+                                    ✅ Concluir Produção
+                                </button>
+                               </div>`
+                        }
+                    </div>
+                </div>`;
+            });
+            html += '</div>';
+            div.innerHTML = html;
+
+            // Renderiza barcodes e reconecta ticker
+            items.forEach(item => {
+                const ikey = item.item_key || '';
+                const op   = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
+                const svgEl = document.getElementById(svgId);
+                if (svgEl && op) {
+                    try {
+                        JsBarcode(svgEl, String(op), { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { if (svgEl) svgEl.innerHTML = `<text font-size="10">${op}</text>`; }
+                }
+            });
+        }
+
+        /* Botão "Concluir" ou leitura via scanner — anti-duplicação */
+        async function scanOrFinishInProd(btn) {
+            const ikey  = btn.dataset.ikey;
+            const pnome = btn.dataset.pnome;
+            const tkey  = decodeURIComponent(btn.dataset.tkey || '');
+            if (!ikey) return;
+            if (_scannedThisSession.has(ikey + ':inprod')) {
+                showToast('Aviso', 'Este pedido já foi concluído nesta sessão.', 'warning');
+                return;
+            }
+            btn.disabled = true; btn.textContent = '⏳...';
+            try {
+                const res = await fetch('/api/pending-orders/finish', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome, timer_key: tkey||null })
+                });
+                if (!res.ok) throw new Error('Erro servidor');
+                const result = await res.json();
+                _scannedThisSession.add(ikey + ':inprod');
+                const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
+                showToast('✅ Concluído!', pnome + tempoFmt, 'success');
+                await loadProductionBoard();
+                await refreshComponentTab();
+                switchBoardTab('done');
+            } catch(e) {
+                btn.disabled = false; btn.textContent = '✅ Concluir Produção';
+                showToast('Erro', 'Falha ao concluir produção', 'danger');
+            }
+        }
+
+        /* ── ABA CONCLUÍDOS: tabela simples ── */
+        function _renderDone(items) {
+            const div = document.getElementById('board-done');
+            if (!div) return;
+            if (items.length === 0) {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">✅</div>
+                    <p class="mt-2">Nenhum item concluído este mês.</p>
+                </div>`;
+                return;
+            }
+            let html = `<div class="table-responsive">
+                <table class="table table-sm align-middle mb-0">
+                    <thead class="table-success">
+                        <tr>
+                            <th class="ps-3">Produto</th>
+                            <th>Base / Cor</th>
+                            <th>#Pedido / OP</th>
+                            <th>Cliente</th>
+                            <th class="text-center">Tempo</th>
+                            <th class="text-center">Concluído em</th>
+                        </tr>
+                    </thead>
+                    <tbody>`;
+            items.slice().reverse().forEach(item => {
+                const nome   = escapeHtml(item.nome || item.nome_original || 'N/D');
+                const baseCor = escapeHtml(((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))||'—');
+                const op     = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '—');
+                const fin    = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                const tempo  = item.tempo_producao
+                    ? `<span class="font-monospace fw-bold text-success">${formatSeconds(item.tempo_producao)}</span>`
+                    : '<span class="text-muted">—</span>';
+                html += `<tr class="table-success">
+                    <td class="ps-3 fw-bold text-success">${nome}</td>
+                    <td class="text-muted small">${baseCor}</td>
+                    <td class="text-muted small">#${op}</td>
+                    <td class="text-muted small">${escapeHtml(item.cliente||'—')}</td>
+                    <td class="text-center">${tempo}</td>
+                    <td class="text-center"><small class="text-muted">${fin}</small></td>
+                </tr>`;
+            });
+            html += `</tbody></table></div>`;
+            div.innerHTML = html;
+        }
+
+        /* Auto-registra componentes quando inicia produção via botão */
+        async function _autoRegisterComponents(nomeProduto, itemKey) {
+            if (!nomeProduto.toUpperCase().includes('CADEIRA')) return;
+            // O backend já registra via sync_from_orders — aqui é redundância
+            // para garantir no caso de pedidos antigos sem registro automático
+            const consumoKey = 'scan_btn_' + itemKey;
+            try {
+                for (const comp of RECIPE_CADEIRA) {
+                    await fetch('/api/consumption/register', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({ component_name: comp.nome, qty: comp.qtd, unit: comp.un, product_name: consumoKey, checked: true })
+                    });
+                    break; // faz só 1 para checar duplicação — o backend cuida do resto
+                }
+            } catch(e) { /* silencioso */ }
+        }
+
+        /** Renderiza mini-barcodes reais (JsBarcode) nas células da tabela */
+        function _renderBarcodes() {
+            document.querySelectorAll('svg[id^="bc_"]').forEach(svg => {
+                const wrap = svg.closest('[onclick]');
+                if (!wrap) return;
+                const onclk = wrap.getAttribute('onclick') || '';
+                const m = onclk.match(/openOPModal..([^']+)/);
+                if (!m) return;
+                const val = m[1];
+                if (!val || svg.children.length > 0) return;
+                try {
+                    JsBarcode(svg, val, { format:'CODE128', width:1.2, height:24, displayValue:false, margin:2, background:'#ffffff', lineColor:'#000000' });
+                } catch(e) {
+                    svg.innerHTML = `<text x="0" y="12" font-size="9" font-family="monospace">${val}</text>`;
+                }
+            });
+        }
+
 
         /** Renderiza mini-barcodes reais (JsBarcode) nas células da tabela */
         function _renderBarcodes() {
@@ -5989,12 +6163,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /** ════════════════════════════════════════════════════
          *  LISTENER GLOBAL DE SCANNER DE CÓDIGO DE BARRAS
          *  Scanners USB emulam teclado: digitam o código + Enter
+         *  1ª leitura (Em Espera)   → inicia produção
+         *  2ª leitura (Produzindo)  → conclui produção
+         *  Anti-duplicação: _scannedThisSession por item+etapa
          *  ════════════════════════════════════════════════════ */
         (function() {
             let _scanBuffer = '';
-            let _scanTimer = null;
-            const _SCAN_TIMEOUT = 80;   // ms — scanners são rápidos (<50ms entre chars)
-            const _MIN_LEN = 3;         // tamanho mínimo para considerar como scan
+            let _scanTimer  = null;
+            const _MIN_LEN  = 3;
 
             const _indicator = document.getElementById('scanner-indicator');
 
@@ -6005,11 +6181,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _indicator.style.color = color || '#ffb600';
                 _indicator.classList.add('active');
                 clearTimeout(_indicator._hideTimer);
-                _indicator._hideTimer = setTimeout(() => _indicator.classList.remove('active'), 3000);
+                _indicator._hideTimer = setTimeout(() => _indicator.classList.remove('active'), 3500);
             }
 
             document.addEventListener('keydown', function(e) {
-                // Ignora quando o usuário está digitando em um input/textarea
                 const tag = document.activeElement?.tagName?.toLowerCase();
                 if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
 
@@ -6017,17 +6192,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const code = _scanBuffer.trim();
                     _scanBuffer = '';
                     clearTimeout(_scanTimer);
-                    if (code.length >= _MIN_LEN) {
-                        _processScan(code);
-                    }
+                    if (code.length >= _MIN_LEN) _processScan(code);
                     return;
                 }
-
-                // Acumula caracteres
                 if (e.key.length === 1) {
                     _scanBuffer += e.key;
                     clearTimeout(_scanTimer);
-                    // Timeout: se parar de digitar, limpa (evita acúmulo de teclas manuais)
                     _scanTimer = setTimeout(() => { _scanBuffer = ''; }, 400);
                 }
             });
@@ -6046,24 +6216,39 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     });
                     const result = await res.json();
 
-                    if (!res.ok && res.status === 404) {
+                    if (res.status === 404) {
                         _showIndicator('Não encontrado: ' + codigo, '#ef4444');
                         showToast('Scanner', result.mensagem || 'Código não encontrado', 'warning');
                         return;
                     }
 
-                    const acao = result.acao;
+                    const acao   = result.acao;
+                    const ikey   = result.item_key || '';
+                    const nome   = result.nome || '';
+
+                    if (acao === 'ja_lido_etapa') {
+                        // Backend sinalizou que já foi processado nesta etapa
+                        _showIndicator('Já processado nesta etapa', '#6b7280');
+                        showToast('Aviso', result.mensagem, 'warning');
+                        return;
+                    }
+
                     if (acao === 'iniciado') {
-                        _showIndicator('✅ INICIADO', '#10b981');
-                        showToast('🚀 Produção Iniciada', result.nome + ' · OP #' + codigo, 'success');
-                        // Recarrega board para refletir mudança
-                        setTimeout(() => loadProductionBoard(), 600);
+                        // Marca no Set do front para bloquear botão visualmente
+                        if (ikey) _scannedThisSession.add(ikey + ':waiting');
+                        _showIndicator('✅ INICIADO — ' + nome, '#10b981');
+                        showToast('🚀 Produção Iniciada', nome + ' · #' + codigo, 'success');
+                        await loadProductionBoard();
+                        switchBoardTab('inprod');
 
                     } else if (acao === 'concluido') {
-                        _showIndicator('✅ CONCLUÍDO', '#6366f1');
-                        const tempoFmt = result.tempo_producao ? formatSeconds(result.tempo_producao) : '';
-                        showToast('✅ Produção Concluída', result.nome + (tempoFmt ? ' · ' + tempoFmt : ''), 'success');
-                        setTimeout(() => { loadProductionBoard(); refreshComponentTab(); }, 600);
+                        if (ikey) _scannedThisSession.add(ikey + ':inprod');
+                        _showIndicator('✅ CONCLUÍDO — ' + nome, '#6366f1');
+                        const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
+                        showToast('✅ Concluído!', nome + tempoFmt, 'success');
+                        await loadProductionBoard();
+                        await refreshComponentTab();
+                        switchBoardTab('done');
 
                     } else if (acao === 'ja_concluido') {
                         _showIndicator('Já concluído', '#6b7280');
@@ -6074,11 +6259,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     }
                 } catch(e) {
                     _showIndicator('Erro de comunicação', '#ef4444');
-                    showToast('Erro', 'Falha ao processar código de barras', 'danger');
+                    showToast('Erro', 'Falha ao processar leitura', 'danger');
                 }
             }
 
-            // Expõe para debug/teste
+            // Para testes no console: window._testScan('2781')
             window._testScan = _processScan;
         })();
 
@@ -6531,13 +6716,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        /* Inicialização — loadKits só após autenticação confirmada via WS */
-        let _kitsLoaded = false;
+        /* Inicialização após autenticação confirmada */
+        let _boardInitialized = false;
 
         function _onAuthConfirmed() {
-            if (!_kitsLoaded) {
-                _kitsLoaded = true;
-                loadKits();
+            if (!_boardInitialized) {
+                _boardInitialized = true;
+                // Ativa aba Produção & Insumos como padrão após login
+                const prodTab = document.querySelector('[data-bs-target="#component-usage"]');
+                if (prodTab) { try { new bootstrap.Tab(prodTab).show(); } catch(e) {} }
+                loadProductionBoard();
+                refreshComponentTab();
+                if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
             }
         }
 
@@ -6552,9 +6742,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 componentUsageTab.addEventListener('shown.bs.tab', () => {
                     refreshComponentTab();
                     loadProductionBoard();
-                    if (!_boardPoll) {
-                        _boardPoll = setInterval(loadProductionBoard, 10000);
-                    }
+                    if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
                 });
                 componentUsageTab.addEventListener('hidden.bs.tab', () => {
                     if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
