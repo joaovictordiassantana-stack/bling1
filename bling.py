@@ -4786,138 +4786,317 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- TABS -->
+        <!-- TABS PRINCIPAIS -->
         <div class="row">
             <div class="col-12">
-                <ul class="nav nav-tabs mb-4" id="myTab" role="tablist">
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link active" id="kpi-chart-tab" data-bs-toggle="tab" data-bs-target="#kpi-chart" type="button">📈 Dashboard</button>
-                    </li>
-                    <li class="nav-item" role="presentation">
-                        <button class="nav-link" id="component-tab" data-bs-toggle="tab" data-bs-target="#component-usage" type="button">🏭 Produção & Insumos</button>
-                    </li>
+                <ul class="nav nav-tabs mb-0" id="myTab" role="tablist" style="border-bottom:2px solid var(--border);flex-wrap:nowrap;overflow-x:auto;">
+                    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-dashboard">📊 Dashboard</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-producao">🏭 Produção</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-insumos">📦 Insumos</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-expedicao">🚚 Expedição</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-relatorio">📋 Relatório</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-ficha">🔧 Ficha Técnica</button></li>
                 </ul>
 
                 <!-- AUTH REQUIRED -->
-                <div id="auth-required-tabs" class="alert alert-warning hidden mb-4">
+                <div id="auth-required-tabs" class="alert alert-warning hidden mt-3">
                     🔐 É necessário autenticar com o SW Móveis para visualizar o conteúdo.
                 </div>
 
                 <!-- TAB CONTENT -->
-                <div id="content-tabs" class="tab-content hidden">
+                <div id="content-tabs" class="tab-content hidden mt-4">
 
-                    <!-- TAB: DASHBOARD KPI -->
-                    <div class="tab-pane fade show active" id="kpi-chart" role="tabpanel">
-                        <div class="row">
+                    <!-- ══════════════════════════════════════════════
+                         TAB 1: DASHBOARD
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade show active" id="tab-dashboard" role="tabpanel">
+
+                        <!-- Filtro de data unificado -->
+                        <div class="d-flex align-items-center gap-3 mb-4 flex-wrap">
+                            <div class="d-flex gap-2 align-items-center">
+                                <label class="text-muted small fw-bold mb-0">De:</label>
+                                <input type="date" id="filter-date-from" class="form-control form-control-sm" style="width:140px;">
+                                <label class="text-muted small fw-bold mb-0">Até:</label>
+                                <input type="date" id="filter-date-to" class="form-control form-control-sm" style="width:140px;">
+                                <button class="btn btn-primary btn-sm" onclick="applyDashboardFilter()">Filtrar</button>
+                                <button class="btn btn-outline-secondary btn-sm" onclick="resetDashboardFilter()">Limpar</button>
+                            </div>
+                            <button class="btn btn-outline-dark btn-sm ms-auto" onclick="printDashboard()">🖨️ Imprimir</button>
+                        </div>
+
+                        <!-- KPIs: 3 etapas de produção -->
+                        <div class="row mb-4" id="dash-kpi-row">
+                            <div class="col-md-4 mb-3">
+                                <div class="card p-4 kpi-card kpi-daily text-center h-100">
+                                    <h5>⏳ Em Espera</h5>
+                                    <h3 id="kpi-waiting" class="text-warning">0</h3>
+                                    <small class="text-muted">Pedidos na fila</small>
+                                    <div id="kpi-waiting-nums" class="mt-2" style="font-size:.68rem;color:#888;max-height:50px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <div class="card p-4 kpi-card kpi-weekly text-center h-100">
+                                    <h5>⚙️ Produzindo</h5>
+                                    <h3 id="kpi-inprod" style="color:#10b981;">0</h3>
+                                    <small class="text-muted">Em produção agora</small>
+                                    <div id="kpi-inprod-nums" class="mt-2" style="font-size:.68rem;color:#888;max-height:50px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <div class="card p-4 kpi-card kpi-historic text-center h-100">
+                                    <h5>✅ Concluídos</h5>
+                                    <h3 id="kpi-done" style="color:var(--success);">0</h3>
+                                    <small class="text-muted">Este mês</small>
+                                    <div id="kpi-done-nums" class="mt-2" style="font-size:.68rem;color:#888;max-height:50px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- KPIs: Pedidos -->
+                        <div class="row mb-4">
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#ffb600!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Pedidos Hoje</div>
+                                    <div class="fw-bold" id="kpi-daily" style="font-family:'Bebas Neue',sans-serif;font-size:2.5rem;color:#ffb600;">0</div>
+                                    <div id="kpi-daily-orders" style="font-size:.65rem;color:#aaa;max-height:40px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#f59e0b!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Esta Semana</div>
+                                    <div class="fw-bold" id="kpi-weekly" style="font-family:'Bebas Neue',sans-serif;font-size:2.5rem;color:#f59e0b;">0</div>
+                                    <div id="kpi-weekly-orders" style="font-size:.65rem;color:#aaa;max-height:40px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#10b981!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Este Mês</div>
+                                    <div class="fw-bold" id="kpi-historic" style="font-family:'Bebas Neue',sans-serif;font-size:2.5rem;color:#10b981;">0</div>
+                                    <div id="kpi-monthly-orders" style="font-size:.65rem;color:#aaa;max-height:40px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#6366f1!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Tendência</div>
+                                    <div class="fw-bold" id="trend-indicator" style="font-family:'Bebas Neue',sans-serif;font-size:1.6rem;color:#6366f1;">—</div>
+                                    <div id="growth-weekly" style="font-size:.8rem;color:#6366f1;font-weight:700;"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Gráfico principal: pedidos + produção -->
+                        <div class="row mb-4">
                             <div class="col-lg-8 mb-4">
                                 <div class="card">
-                                    <div class="card-header">
-                                        <h5 class="mb-0">📈 Evolução de Pedidos <span style="color:var(--sw-yellow)">(Últimos 30 dias)</span></h5>
+                                    <div class="card-header d-flex justify-content-between align-items-center">
+                                        <h5 class="mb-0">📈 Pedidos × Produção <span style="color:var(--sw-yellow)">(Últimos 30 dias)</span></h5>
+                                        <small id="last-recalculated" class="text-muted"></small>
                                     </div>
-                                    <div class="card-body" style="height: 400px;">
+                                    <div class="card-body" style="height:340px;">
                                         <canvas id="salesChart"></canvas>
                                     </div>
                                 </div>
                             </div>
-                            <div class="col-lg-4">
-                                <div class="card">
-                                    <div class="card-header">
-                                        <h5 class="mb-0">🎯 Métricas <span style="color:var(--sw-yellow)">Rápidas</span></h5>
-                                    </div>
-                                    <div class="card-body">
-                                        <div class="metric-box mb-3">
-                                            <div class="metric-label">Média Diária</div>
-                                            <div class="metric-value" id="avg-daily">0</div>
-                                        </div>
-                                        <div class="metric-box mb-3">
-                                            <div class="metric-label">Crescimento Semanal</div>
-                                            <div class="metric-value" id="growth-weekly">+0%</div>
-                                        </div>
-                                        <div class="metric-box">
-                                            <div class="metric-label">Tendência</div>
-                                            <div class="metric-value" id="trend-indicator" style="font-size:1.4rem;">📊 Estável</div>
-                                        </div>
+                            <div class="col-lg-4 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><h5 class="mb-0">⚡ Produção por Etapa</h5></div>
+                                    <div class="card-body" style="height:300px;">
+                                        <canvas id="stagesChart"></canvas>
                                     </div>
                                 </div>
                             </div>
                         </div>
+
+                        <!-- Gráfico barcode por produção + queda/subida -->
+                        <div class="row mb-4">
+                            <div class="col-lg-6 mb-4">
+                                <div class="card">
+                                    <div class="card-header"><h5 class="mb-0">📊 Produção por Dia (Barras)</h5></div>
+                                    <div class="card-body" style="height:260px;">
+                                        <canvas id="prodBarChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card">
+                                    <div class="card-header"><h5 class="mb-0">📉 Queda / 📈 Subida Diária</h5></div>
+                                    <div class="card-body" style="height:260px;">
+                                        <canvas id="deltaChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
                     </div>
 
-                    <!-- TAB: PRODUÇÃO & INSUMOS -->
-                    <div class="tab-pane fade" id="component-usage" role="tabpanel">
+                    <!-- ══════════════════════════════════════════════
+                         TAB 2: PRODUÇÃO
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-producao" role="tabpanel">
 
-                        <!-- PAINEL DE PRODUÇÃO PRINCIPAL -->
-                        <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header py-3" style="background: linear-gradient(135deg, #01010d 0%, #1e3a5f 100%) !important;">
-                                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
-                                    <h5 class="mb-0 text-white">🏭 Painel de <span style="color:var(--sw-yellow)">Produção</span></h5>
-                                    <button class="btn btn-sm btn-outline-light" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
-                                </div>
-
-                                <!-- Sub-abas clicáveis -->
-                                <div class="d-flex gap-2 mt-3">
-                                    <button id="tab-waiting-btn" onclick="switchBoardTab('waiting')"
-                                        class="board-tab-btn active-board-tab"
-                                        style="background:rgba(255,182,0,0.18);border:2px solid #ffb600;color:#ffb600;border-radius:50px;padding:5px 18px;font-size:0.78rem;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .2s;">
-                                        ⏳ Em Espera <span id="waiting-count-badge" class="ms-1" style="background:#ffb600;color:#000;border-radius:50px;padding:1px 8px;font-size:.72rem;">0</span>
-                                    </button>
-                                    <button id="tab-inprod-btn" onclick="switchBoardTab('inprod')"
-                                        class="board-tab-btn"
-                                        style="background:rgba(16,185,129,0.12);border:2px solid rgba(16,185,129,0.4);color:#10b981;border-radius:50px;padding:5px 18px;font-size:0.78rem;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .2s;">
-                                        ⚙️ Produzindo <span id="inprod-count-badge" class="ms-1" style="background:#10b981;color:#fff;border-radius:50px;padding:1px 8px;font-size:.72rem;">0</span>
-                                    </button>
-                                    <button id="tab-done-btn" onclick="switchBoardTab('done')"
-                                        class="board-tab-btn"
-                                        style="background:rgba(99,102,241,0.12);border:2px solid rgba(99,102,241,0.3);color:#6366f1;border-radius:50px;padding:5px 18px;font-size:0.78rem;font-weight:700;letter-spacing:.04em;cursor:pointer;transition:all .2s;">
-                                        ✅ Concluídos <span id="done-count-badge" class="ms-1" style="background:#6366f1;color:#fff;border-radius:50px;padding:1px 8px;font-size:.72rem;">0</span>
-                                    </button>
-                                </div>
+                        <!-- Header com sync + sub-abas -->
+                        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+                            <div class="d-flex gap-2 flex-wrap">
+                                <button id="tab-waiting-btn" onclick="switchBoardTab('waiting')" class="board-tab-btn active-board-tab"
+                                    style="background:rgba(255,182,0,0.18);border:2px solid #ffb600;color:#ffb600;border-radius:50px;padding:6px 20px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;">
+                                    ⏳ Em Espera <span id="waiting-count-badge" style="background:#ffb600;color:#000;border-radius:50px;padding:1px 9px;font-size:.72rem;margin-left:4px;">0</span>
+                                </button>
+                                <button id="tab-inprod-btn" onclick="switchBoardTab('inprod')" class="board-tab-btn"
+                                    style="background:rgba(16,185,129,0.12);border:2px solid rgba(16,185,129,0.4);color:#10b981;border-radius:50px;padding:6px 20px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;">
+                                    ⚙️ Produzindo <span id="inprod-count-badge" style="background:#10b981;color:#fff;border-radius:50px;padding:1px 9px;font-size:.72rem;margin-left:4px;">0</span>
+                                </button>
+                                <button id="tab-done-btn" onclick="switchBoardTab('done')" class="board-tab-btn"
+                                    style="background:rgba(99,102,241,0.12);border:2px solid rgba(99,102,241,0.3);color:#6366f1;border-radius:50px;padding:6px 20px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;">
+                                    ✅ Concluídos <span id="done-count-badge" style="background:#6366f1;color:#fff;border-radius:50px;padding:1px 9px;font-size:.72rem;margin-left:4px;">0</span>
+                                </button>
                             </div>
+                            <button class="btn btn-sm btn-outline-primary" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                        </div>
 
-                            <!-- Painéis das 3 sub-abas -->
-                            <div class="card-body p-0">
-                                <div id="board-waiting" class="board-panel">
-                                    <p class="text-center text-muted py-4">⏳ Carregando...</p>
-                                </div>
-                                <div id="board-inprod" class="board-panel" style="display:none;">
-                                    <p class="text-center text-muted py-4">⏳ Carregando...</p>
-                                </div>
-                                <div id="board-done" class="board-panel" style="display:none;">
-                                    <p class="text-center text-muted py-4">⏳ Carregando...</p>
-                                </div>
+                        <!-- Sub-abas Marcenaria / Tapeçaria (visível na aba Produzindo) -->
+                        <div id="setor-tabs-wrap" style="display:none;" class="mb-3">
+                            <div class="d-flex gap-2">
+                                <button onclick="switchSetor('todos')" id="setor-todos" class="btn btn-sm btn-dark active">Todos</button>
+                                <button onclick="switchSetor('marcenaria')" id="setor-marc" class="btn btn-sm btn-outline-secondary">🪚 Marcenaria</button>
+                                <button onclick="switchSetor('tapecaria')" id="setor-tape" class="btn btn-sm btn-outline-secondary">🧵 Tapeçaria</button>
+                                <button onclick="printSetor()" class="btn btn-sm btn-outline-dark ms-auto">🖨️ Imprimir Setor</button>
                             </div>
                         </div>
 
-                        <!-- CONSUMO MENSAL -->
+                        <!-- Buscador (visível na aba Produzindo) -->
+                        <div id="search-inprod-wrap" style="display:none;" class="mb-3">
+                            <input type="text" id="search-inprod" class="form-control form-control-sm" placeholder="🔍 Buscar por número do pedido ou cliente..."
+                                oninput="filterInProd(this.value)" style="max-width:360px;">
+                        </div>
+
+                        <!-- Painéis das 3 sub-abas -->
+                        <div id="board-waiting" class="board-panel"></div>
+                        <div id="board-inprod"   class="board-panel" style="display:none;"></div>
+                        <div id="board-done"     class="board-panel" style="display:none;"></div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 3: INSUMOS
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-insumos" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <div>
+                                <h5 class="mb-0">📦 Gestão de Insumos</h5>
+                                <small class="text-muted">Consumo real × necessidade por pedidos em espera</small>
+                            </div>
+                            <span class="badge bg-light text-dark border" id="consumption-total-badge">0 insumos</span>
+                        </div>
+
+                        <!-- Guia Compras (necessidade baseada em pedidos) -->
                         <div class="card mb-4 border-0 shadow-sm">
-                            <div class="card-header d-flex justify-content-between align-items-center" style="background: linear-gradient(135deg, #065f46 0%, #059669 100%) !important;">
+                            <div class="card-header" style="background:linear-gradient(135deg,#1e3a5f,#2563eb)!important;">
+                                <h5 class="mb-0">🛒 Guia de Compras — Baseado nos Pedidos em Espera</h5>
+                                <small class="text-white-50">Quantidade necessária para produzir todos os pedidos aguardando</small>
+                            </div>
+                            <div class="card-body p-0" id="purchase-guide-section">
+                                <div class="text-center py-4 text-muted">⏳ Calculando...</div>
+                            </div>
+                        </div>
+
+                        <!-- Consumo Mensal -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background:linear-gradient(135deg,#065f46,#059669)!important;">
                                 <div>
-                                    <h5 class="mb-0">📊 Consumo de Insumos & Componentes</h5>
-                                    <small class="text-white-50" id="consumption-month-label">Mês atual • Reinicia todo mês</small>
+                                    <h5 class="mb-0">📊 Consumo Real do Mês</h5>
+                                    <small class="text-white-50" id="consumption-month-label">Mês atual</small>
                                 </div>
-                                <span class="badge bg-light text-dark" id="consumption-total-badge">0 insumos</span>
                             </div>
                             <div class="card-body p-0" id="consumption-table-section">
-                                <div class="text-center py-4 text-muted">⏳ Carregando consumo...</div>
-                            </div>
-                        </div>
-
-                        <!-- HISTÓRICO DE FINALIZAÇÕES -->
-                        <div class="card border-0 shadow-sm">
-                            <div class="card-header" style="background: linear-gradient(135deg, #3b0764 0%, #7c3aed 100%) !important;">
-                                <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
-                                <small class="text-white-50">Registro de cada produto finalizado com tempo de produção</small>
-                            </div>
-                            <div class="card-body p-0" id="production-history-section">
-                                <div class="text-center py-4 text-muted">⏳ Carregando histórico...</div>
+                                <div class="text-center py-4 text-muted">⏳ Carregando...</div>
                             </div>
                         </div>
 
                     </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 4: EXPEDIÇÃO
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-expedicao" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <h5 class="mb-0">🚚 Expedição — Pedidos Prontos para Envio</h5>
+                            <button class="btn btn-outline-dark btn-sm" onclick="printExpedicao()">🖨️ Imprimir Lista</button>
+                        </div>
+
+                        <!-- Filtro de prazo por cor -->
+                        <div class="d-flex gap-2 mb-3 flex-wrap">
+                            <button onclick="filterExpedicao('all')" class="btn btn-sm btn-dark">Todos</button>
+                            <button onclick="filterExpedicao('atrasado')" class="btn btn-sm btn-danger">🔴 Atrasados</button>
+                            <button onclick="filterExpedicao('critico')" class="btn btn-sm btn-warning text-dark">🟡 Crítico (≤2d)</button>
+                            <button onclick="filterExpedicao('atencao')" class="btn btn-sm btn-info text-dark">🔵 Atenção (≤5d)</button>
+                            <button onclick="filterExpedicao('normal')" class="btn btn-sm btn-success">🟢 No prazo</button>
+                        </div>
+
+                        <div id="expedicao-section">
+                            <div class="text-center py-5 text-muted">⏳ Carregando...</div>
+                        </div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 5: RELATÓRIO
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-relatorio" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <h5 class="mb-0">📋 Relatório de Produção</h5>
+                            <div class="d-flex gap-2">
+                                <button onclick="loadRelatorio(7)"  class="btn btn-sm btn-outline-primary">7 dias</button>
+                                <button onclick="loadRelatorio(30)" class="btn btn-sm btn-outline-primary">30 dias</button>
+                                <button onclick="printRelatorio()"  class="btn btn-sm btn-outline-dark">🖨️ Imprimir</button>
+                            </div>
+                        </div>
+
+                        <div id="relatorio-section">
+                            <div class="text-center py-5 text-muted">⏳ Selecione o período acima.</div>
+                        </div>
+
+                        <!-- Histórico de Finalizações -->
+                        <div class="card border-0 shadow-sm mt-4">
+                            <div class="card-header" style="background:linear-gradient(135deg,#3b0764,#7c3aed)!important;">
+                                <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
+                            </div>
+                            <div class="card-body p-0" id="production-history-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando...</div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 6: FICHA TÉCNICA
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-ficha" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <h5 class="mb-0">🔧 Ficha Técnica de Produtos</h5>
+                            <button class="btn btn-sm btn-outline-dark" onclick="printFicha()">🖨️ Imprimir</button>
+                        </div>
+
+                        <div class="card border-0 shadow-sm">
+                            <div class="card-header" style="background:linear-gradient(135deg,#01010d,#374151)!important;">
+                                <h5 class="mb-0">📐 Cadeira SW — Lista Técnica de Insumos</h5>
+                                <small class="text-white-50">Componentes por unidade produzida</small>
+                            </div>
+                            <div class="card-body p-0" id="ficha-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando...</div>
+                            </div>
+                        </div>
+
+                    </div>
+
                 </div>
             </div>
         </div>
     </div>
+
 
     <!-- TOAST CONTAINER -->
     <div class="toast-container position-fixed bottom-0 end-0 p-4"></div>
@@ -4929,6 +5108,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         const API = '/api';
         let isAuthenticated = false;
         let salesChart = null;
+        let stagesChart = null;
+        let prodBarChart = null;
+        let deltaChart = null;
+        let _currentSetor = 'todos';
+        let _boardDataRaw = null;  // raw data for filtering
 
         /* ✅ DESIGN: Fetch API com Tratamento */
         async function fetchAPI(url, options = {}) {
@@ -5076,29 +5260,44 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (al && authUrl) al.href = authUrl;
         }
 
-        /* ✅ DESIGN: Atualizar KPIs com Animação */
+        /* Atualizar KPIs com Animação */
         function updateKpis(dSalesStats) {
-            const kpiDaily = document.getElementById('kpi-daily');
-            const kpiWeekly = document.getElementById('kpi-weekly');
-            const kpiHistoric = document.getElementById('kpi-historic');
-
-            kpiDaily.textContent = dSalesStats.daily;
-            kpiWeekly.textContent = dSalesStats.weekly;
-            kpiHistoric.textContent = dSalesStats.monthly;
-            document.getElementById('last-recalculated').textContent = formatDateTime(dSalesStats.last_update);
-
-            // Exibe números de pedidos reais do Bling abaixo dos contadores (só se autenticado)
+            const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+            set('kpi-daily',   dSalesStats.daily);
+            set('kpi-weekly',  dSalesStats.weekly);
+            set('kpi-historic',dSalesStats.monthly);
+            const lu = document.getElementById('last-recalculated');
+            if (lu) lu.textContent = '⏱ ' + formatDateTime(dSalesStats.last_update);
+            // Tendência: seta + percentual
+            const gr = dSalesStats.growth || 0;
+            set('trend-indicator', gr > 5 ? '📈 Subindo' : gr < -5 ? '📉 Caindo' : '📊 Estável');
+            set('growth-weekly', (gr > 0 ? '+' : '') + gr.toFixed(1) + '% sem.');
             if (isAuthenticated) _loadKpiOrderNumbers();
-
-            // Animação de atualização
-            const cards = document.querySelectorAll('.kpi-card');
-            cards.forEach(card => {
-                card.classList.add('updating');
-                setTimeout(() => {
-                    card.classList.remove('updating');
-                }, 600);
+            document.querySelectorAll('.kpi-card').forEach(c => {
+                c.classList.add('updating');
+                setTimeout(() => c.classList.remove('updating'), 600);
             });
         }
+
+        /* Atualiza KPIs de produção (3 etapas) */
+        function updateProductionKpis(boardData) {
+            const waiting = (boardData.waiting || []).length;
+            const inprod  = (boardData.in_production || []).length + (boardData.orphan_timers || []).length;
+            const done    = (boardData.done || []).length;
+            const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+            set('kpi-waiting', waiting);
+            set('kpi-inprod',  inprod);
+            set('kpi-done',    done);
+            // Números dos pedidos em cada etapa
+            const fmtNums = arr => arr.map(i => '#'+(i.pedido_numero||i.order_id||'')).filter(Boolean).join(' · ');
+            const dw = document.getElementById('kpi-waiting-nums');
+            const di = document.getElementById('kpi-inprod-nums');
+            const dd = document.getElementById('kpi-done-nums');
+            if (dw) dw.textContent = fmtNums(boardData.waiting||[]);
+            if (di) di.textContent = fmtNums([...(boardData.in_production||[]),...(boardData.orphan_timers||[])]);
+            if (dd) dd.textContent = fmtNums((boardData.done||[]).slice(-5));
+        }
+
 
         async function _loadKpiOrderNumbers() {
             try {
@@ -5357,7 +5556,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     body: JSON.stringify({ component_name: componentName, qty: qty, unit: unit, product_name: productName, checked: checked })
                 });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
-                const tab = document.getElementById('component-usage');
+                const tab = document.getElementById('tab-insumos');
                 if (tab && tab.classList.contains('active')) {
                     setTimeout(() => fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {}), 400);
                 }
@@ -5568,6 +5767,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 btn.style.opacity = isActive ? '1' : '0.65';
                 btn.style.boxShadow = isActive ? '0 4px 14px rgba(0,0,0,.25)' : 'none';
             });
+            // Mostra buscador e setor tabs só quando Produzindo está ativo
+            const sw = document.getElementById('setor-tabs-wrap');
+            const si = document.getElementById('search-inprod-wrap');
+            const isInprod = tab === 'inprod';
+            if (sw) sw.style.display = isInprod ? 'block' : 'none';
+            if (si) si.style.display = isInprod ? 'block' : 'none';
+            // Limpa busca ao trocar aba
+            if (!isInprod) {
+                const inp = document.getElementById('search-inprod');
+                if (inp) inp.value = '';
+                if (_boardDataRaw) _boardData = _boardDataRaw;
+            }
             if (_boardData) _renderCurrentTab();
         }
 
@@ -5591,8 +5802,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         async function loadProductionBoard() {
             try {
                 const data = await fetch('/api/production/board').then(r => r.json());
+                _boardDataRaw = data;
                 _boardData = data;
                 renderProductionBoard(data);
+                updateProductionKpis(data);
+                _updateDashboardStagesChart(data);
             } catch(e) {
                 console.error('Erro ao carregar board:', e);
             }
@@ -5801,16 +6015,32 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         function _renderInProd(items) {
             const div = document.getElementById('board-inprod');
             if (!div) return;
-            if (items.length === 0) {
+
+            // Filtra por setor
+            let filtered = items;
+            if (_currentSetor === 'marcenaria') {
+                // Marcenaria: produtos com MDF, madeira, compensado no nome
+                filtered = items.filter(i => {
+                    const n = (i.nome||i.nome_original||'').toUpperCase();
+                    return n.includes('MDF') || n.includes('MADEIRA') || n.includes('COMPENSADO') || n.includes('BASE');
+                });
+            } else if (_currentSetor === 'tapecaria') {
+                filtered = items.filter(i => {
+                    const n = (i.nome||i.nome_original||'').toUpperCase();
+                    return n.includes('CADEIRA') || n.includes('ESPUMA') || n.includes('TECIDO') || n.includes('COURVIM');
+                });
+            }
+
+            if (filtered.length === 0) {
                 div.innerHTML = `<div class="text-center py-5 text-muted">
                     <div style="font-size:3rem;opacity:.3;">⚙️</div>
-                    <p class="mt-2">Nenhum item em produção.</p>
+                    <p class="mt-2">${items.length === 0 ? 'Nenhum item em produção.' : 'Nenhum item para este setor.'}</p>
                 </div>`;
                 return;
             }
 
             let html = '<div class="p-3 row g-3">';
-            items.forEach(item => {
+            filtered.forEach(item => {
                 const ikey  = item.item_key || '';
                 const nome  = item.nome || item.nome_original || item.produto || 'N/D';
                 const op    = item.ordem_producao || item.pedido_numero || item.order_id || '';
@@ -5830,17 +6060,26 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     else if (urg==='atencao') prazoBadge = `<span class="badge bg-warning text-dark" style="font-size:.65rem;">⏰ ${dias}d</span>`;
                 }
 
+                // Tempo em dias/horas
+                const elapsedFmt = elapsed > 86400
+                    ? (elapsed/86400).toFixed(1)+'d'
+                    : formatSeconds(elapsed);
+
+                // Data prevista formatada
+                const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
+
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
                     <div class="bc-card inprod">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
                         <div class="bc-num">#${escapeHtml(String(op))}</div>
+                        ${dataEntFmt ? `<div style="font-size:.65rem;color:#6b7280;margin-bottom:4px;">📅 Previsto: ${dataEntFmt}</div>` : ''}
                         <div class="bc-svg-wrap my-2 text-center">
                             <svg id="${svgId}"></svg>
                         </div>
                         <!-- Timer ao vivo -->
                         <div class="text-center my-2">
-                            <span id="btimer_${safeId}" class="font-monospace fw-bold" style="font-size:1.6rem;color:#10b981;">${formatSeconds(elapsed)}</span>
+                            <span id="btimer_${safeId}" class="font-monospace fw-bold" style="font-size:1.5rem;color:#10b981;">${elapsedFmt}</span>
                             <div>
                                 <span class="badge ${estado==='running'?'bg-success':'bg-warning text-dark'}" style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
                                     ${estado==='running'?'🟢 PRODUZINDO':'⏸ PAUSADO'}
@@ -5864,8 +6103,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes e reconecta ticker
-            items.forEach(item => {
+            // Renderiza barcodes
+            filtered.forEach(item => {
                 const ikey = item.item_key || '';
                 const op   = item.ordem_producao || item.pedido_numero || item.order_id || '';
                 const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
@@ -5938,7 +6177,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const op     = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '—');
                 const fin    = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
                 const tempo  = item.tempo_producao
-                    ? `<span class="font-monospace fw-bold text-success">${formatSeconds(item.tempo_producao)}</span>`
+                    ? (() => {
+                        const tp = item.tempo_producao;
+                        const fmt = tp > 86400
+                            ? `<span class="fw-bold text-success">${(tp/86400).toFixed(2)}d</span>`
+                            : tp > 3600
+                                ? `<span class="font-monospace fw-bold text-success">${Math.floor(tp/3600)}h${Math.floor((tp%3600)/60)}m</span>`
+                                : `<span class="font-monospace fw-bold text-success">${Math.floor(tp/60)}m</span>`;
+                        return fmt;
+                    })()
                     : '<span class="text-muted">—</span>';
                 html += `<tr class="table-success">
                     <td class="ps-3 fw-bold text-success">${nome}</td>
@@ -5988,34 +6235,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-
-        /** Renderiza mini-barcodes reais (JsBarcode) nas células da tabela */
-        function _renderBarcodes() {
-            // Busca todos os SVGs com id começando em 'bc_' que ainda não foram renderizados
-            document.querySelectorAll('svg[id^="bc_"]').forEach(svg => {
-                // Pega o valor do OP do elemento pai (data attribute ou texto do badge)
-                const wrap = svg.closest('[onclick]');
-                if (!wrap) return;
-                const onclk = wrap.getAttribute('onclick') || '';
-                const m = onclk.match(/openOPModal..([^']+)/);
-                if (!m) return;
-                const val = m[1];
-                if (!val || svg.children.length > 0) return; // já renderizado
-                try {
-                    JsBarcode(svg, val, {
-                        format: 'CODE128',
-                        width: 1.2,
-                        height: 24,
-                        displayValue: false,
-                        margin: 2,
-                        background: '#ffffff',
-                        lineColor: '#000000',
-                    });
-                } catch(e) {
-                    svg.innerHTML = `<text x="0" y="12" font-size="9" font-family="monospace">${val}</text>`;
-                }
-            });
-        }
 
         /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
         function openOPModal(numeroOP, nomeProduto, itemKey) {
@@ -6267,93 +6486,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             window._testScan = _processScan;
         })();
 
-        async function startPendingOrder(itemKey, produtoNome) {
-            if (!itemKey || !produtoNome) {
-                showToast('Erro', 'Dados do pedido inválidos', 'danger');
-                return;
-            }
-            try {
-                const res = await fetch('/api/pending-orders/start', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome })
-                });
-                if (!res.ok) throw new Error('Servidor retornou erro');
-                const resData = await res.json();
-                // Passa o timer_key real (nome||item_key) para o modal
-                const timerKey = resData.timer_key || produtoNome;
-                await loadProductionBoard();
-                openProductionChecklist(produtoNome, timerKey);
-                showToast('✅ Iniciado', `Produção: ${produtoNome}`, 'success');
-            } catch(e) {
-                console.error('startPendingOrder:', e);
-                showToast('Erro', 'Falha ao iniciar produção', 'danger');
-            }
-        }
-
-        async function finishBoardItem(itemKey, produtoNome, evt, timerKey) {
-            // Confirmação inline sem confirm() bloqueante
-            const btn = (evt && evt.target) || (typeof event !== 'undefined' && event && event.target) || null;
-            if (btn && btn.dataset.confirming !== 'true') {
-                btn.dataset.confirming = 'true';
-                const orig = btn.textContent;
-                btn.textContent = '❓ Confirmar?';
-                btn.classList.replace('btn-success', 'btn-warning');
-                setTimeout(() => {
-                    if (btn.dataset.confirming === 'true') {
-                        btn.dataset.confirming = '';
-                        btn.textContent = orig;
-                        btn.classList.replace('btn-warning', 'btn-success');
-                    }
-                }, 3000);
-                return;
-            }
-            if (btn) { btn.dataset.confirming = ''; btn.disabled = true; }
-            try {
-                await fetch('/api/pending-orders/finish', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ item_key: itemKey, produto_nome: produtoNome, timer_key: timerKey || null })
-                });
-                showToast('✅ Concluído!', produtoNome, 'success');
-                await loadProductionBoard();
-                await refreshComponentTab();
-            } catch(e) {
-                showToast('Erro', 'Falha ao concluir', 'danger');
-                if (btn) { btn.disabled = false; }
-            }
-        }
-
-        async function dismissPendingOrder(itemKey, evt) {
-            const btn = (evt && evt.target) || (typeof event !== 'undefined' && event && event.target) || null;
-            if (btn && btn.dataset.confirming !== 'true') {
-                btn.dataset.confirming = 'true';
-                const orig = btn.textContent;
-                btn.textContent = '❓ Confirmar?';
-                btn.classList.replace('btn-outline-danger', 'btn-danger');
-                setTimeout(() => {
-                    if (btn.dataset.confirming === 'true') {
-                        btn.dataset.confirming = '';
-                        btn.textContent = orig;
-                        btn.classList.replace('btn-danger', 'btn-outline-danger');
-                    }
-                }, 3000);
-                return;
-            }
-            if (btn) { btn.dataset.confirming = ''; btn.disabled = true; }
-            try {
-                await fetch('/api/pending-orders/dismiss', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ item_key: itemKey })
-                });
-                await loadProductionBoard();
-            } catch(e) {
-                showToast('Erro', 'Falha ao remover pedido', 'danger');
-                if (btn) btn.disabled = false;
-            }
-        }
-
         function updateComponentUsage(usageData) {
             if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
         }
@@ -6453,18 +6585,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     if (data.authenticated && !_wsFirstAuthDone) {
                         _wsFirstAuthDone = true;
                         fetch('/api/pending-orders/sync', { method: 'POST' }).catch(() => {});
-                        const prodTab = document.getElementById('component-usage');
+                        const prodTab = document.getElementById('tab-producao');
                         if (prodTab && prodTab.classList.contains('active')) {
                             loadProductionBoard();
                         }
                     }
 
-                    const forceLoadButton = document.querySelector('#kits button.btn-primary');
-                    if (forceLoadButton && forceLoadButton.disabled && data.cache_updated) {
-                        forceLoadButton.disabled = false;
-                        forceLoadButton.textContent = '🔄 Recarregar Lista';
-                        loadKits();
-                        showToast('Sucesso', 'Cache de produtos/kits atualizado.', 'success');
+                    // Sincroniza cache: não há mais botão de recarregar na aba Produtos
+                    if (data.cache_updated) {
+                        showToast('Cache', 'Produtos atualizados no servidor.', 'info');
                     }
                 }
             };
@@ -6482,239 +6611,510 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         _connectKpiWs();
 
-        /* ✅ DESIGN: Busca de Produtos */
-        const btnSearch = document.getElementById('btn-search');
-        btnSearch.onclick = async () => {
-            if (!isAuthenticated) {
-                document.getElementById('search-results').innerHTML = '<div class="alert alert-warning">É necessário autenticar com o SW Móveis para realizar buscas.</div>';
-                return;
-            }
+        /* ══════════════════════════════════════════════════════════
+           DASHBOARD — Gráficos unificados
+        ══════════════════════════════════════════════════════════ */
 
-            const q = document.getElementById('search-input').value;
-            const div = document.getElementById('search-results');
-            div.innerHTML = '<div class="text-center"><div class="spinner-border spinner-border-sm text-primary" role="status"><span class="visually-hidden">Buscando...</span></div></div>';
+        let _dashFilter = { from: null, to: null };
 
-            try {
-                const data = await fetchAPI(`${API}/products/search?q=${encodeURIComponent(q)}`);
-
-                if(!data.length) {
-                    div.innerHTML = `<div class="alert alert-warning">
-                        <strong>Nenhum resultado encontrado.</strong><br>
-                        <small>Se o sistema acabou de reiniciar, o cache pode estar carregando (~2 min). Tente novamente em instantes ou vá em <b>Produtos → Recarregar Lista</b>.</small>
-                    </div>`;
-                    return;
-                }
-
-                let html = '<div class="list-group">';
-
-                data.forEach(p => {
-                    const imgHtml = p.imagemURL
-                        ? `<img src="${p.imagemURL}" style="width:60px;height:60px;object-fit:contain;margin-right:10px;border-radius:6px;background:#f1f1f1" onerror="this.style.display='none'">`
-                        : '<span class="text-muted">-</span>';
-
-                    html += `
-                        <div class="list-group-item list-group-item-action" onclick="openProductionChecklist('${p.nome || p.produto}')" style="cursor: pointer;">
-                            <div class="d-flex">
-                                ${imgHtml}
-
-                                <div class="flex-grow-1">
-                                    <div class="d-flex w-100 justify-content-between">
-                                        <h5 class="mb-1">${p.nome || p.produto || 'Sem nome'}</h5>
-                                        <small>${p.sku || 'N/D'}</small>
-                                    </div>
-
-                                    <p class="mb-1">${p.descricaoCurta || ''}</p>
-
-                                    <small class="text-muted d-block">
-                                        <b>Tipo:</b> ${p.tipo}
-                                    </small>
-
-                                    ${p.componentes && p.componentes.length > 0 ? `
-                                        <div class="componentes mt-2 p-2 bg-light rounded">
-                                            <small>Componentes:</small>
-                                            <ul>
-                                                ${p.componentes.map(c =>
-                                                    `<li>${c.nome || 'Sem nome'} (${c.quantidade}x)</li>`
-                                                ).join("")}
-                                            </ul>
-                                        </div>
-                                    ` : ""}
-
-                                    ${p.tipo === 'Produto' && p.usado_em && p.usado_em.length > 0 ? `
-                                        <div class="mt-2 p-2 bg-warning bg-opacity-10 rounded">
-                                            <b>📦 Este componente é usado em:</b><br>
-                                            ${p.usado_em.map(u =>
-                                                `• ${u.quantidade}x no kit <b>${u.kit_nome}</b> (${u.kit_sku})`
-                                            ).join("<br>")}
-                                        </div>
-                                    ` : ""}
-                                </div>
-                            </div>
-                        </div>
-                    `;
-                });
-
-                html += '</div>';
-                div.innerHTML = html;
-
-            } catch(e) {
-                div.innerHTML = `<div class="alert alert-danger">Erro: ${e.message}</div>`;
-            }
-        };
-
-        /* ✅ DESIGN: Carregar Kits */
-        async function loadKits() {
-            const div = document.getElementById('kits-list');
-            const authRequiredDiv = document.getElementById('auth-required-tabs');
-
-            if (!isAuthenticated) {
-                div.innerHTML = '';
-                authRequiredDiv.classList.remove('hidden');
-                return;
-            }
-
-            authRequiredDiv.classList.add('hidden');
-            div.innerHTML = '<div class="alert alert-info">⏳ Carregando dados. O worker em segundo plano atualiza o cache a cada 10 minutos. Se a lista estiver vazia, aguarde até 10 minutos e recarregue a página.</div>';
-
-            try {
-                const data = await fetchAPI(`${API}/kits`);
-
-                if (!data || data.length === 0) {
-                    div.innerHTML = '<div class="alert alert-warning">⚠️ Nenhum Produto/Kit encontrado no cache. O worker pode estar carregando dados. Aguarde 10 minutos e recarregue a página.</div>';
-                    return;
-                }
-
-                let html = `
-                <div class="table-responsive">
-                <table class="table table-sm">
-                <thead>
-                <tr>
-                    <th>IMG</th>
-                    <th>SKU</th>
-                    <th>Nome</th>
-                    <th>Componentes / Tipo</th>
-                </tr>
-                </thead>
-                <tbody>
-                `;
-
-                data.forEach(k => {
-                    const imgHtml = k.imagemURL
-                        ? `<img src="${k.imagemURL}" style="width:50px;height:50px;object-fit:contain;border-radius:4px;" onerror="this.style.display='none'">`
-                        : '<span class="text-muted">-</span>';
-
-                    let comps = '';
-                    if (k.tipo === 'K' && k.componentes && k.componentes.length > 0) {
-                        comps = `<b>KIT (${k.componentes.length} itens):</b><br>` + k.componentes
-                            .map(c => `<small>• ${c.quantidade}x ${c.nome || 'Sem nome'} (SKU: ${c.sku || 'N/D'})</small>`)
-                            .join('<br>');
-                    } else if (k.tipo === 'P') {
-                        comps = `<span class="badge bg-light text-dark border">Produto Cadastrado</span>`;
-                        if (k.pai_id) {
-                            comps += `<br><span class="badge bg-secondary">Variação</span>`;
-                        }
-                    } else {
-                        comps = '<span class="badge bg-secondary">Tipo Desconhecido</span>';
-                    }
-
-                    html += `
-                        <tr onclick="openProductionChecklist('${k.nome}')" style="cursor: pointer;">
-                            <td style="width:60px">${imgHtml}</td>
-                            <td style="width:120px; font-weight:bold;">${k.sku || ''}</td>
-                            <td>${k.nome || 'N/D'}</td>
-                            <td>${comps}</td>
-                        </tr>
-                    `;
-                });
-
-                html += '</tbody></table></div>';
-                div.innerHTML = html;
-
-            } catch(e) {
-                if (e.message === '401') {
-                    div.innerHTML = '<div class="alert alert-warning">🔐 Sessão expirada. <a href="/auth">Clique aqui para reautenticar</a>.</div>';
-                } else {
-                    div.innerHTML = '<div class="alert alert-danger">⚠️ Erro ao carregar lista. Verifique os logs do servidor.</div>';
-                }
+        function applyDashboardFilter() {
+            const f = document.getElementById('filter-date-from')?.value;
+            const t = document.getElementById('filter-date-to')?.value;
+            _dashFilter = { from: f || null, to: t || null };
+            loadKPIChart();
+        }
+        function resetDashboardFilter() {
+            _dashFilter = { from: null, to: null };
+            const f = document.getElementById('filter-date-from');
+            const t = document.getElementById('filter-date-to');
+            if (f) f.value = ''; if (t) t.value = '';
+            loadKPIChart();
+        }
+        function printDashboard() {
+            const area = document.getElementById('print-area');
+            const dash = document.getElementById('tab-dashboard');
+            if (area && dash) {
+                area.innerHTML = '<div style="padding:20px;">' + dash.innerHTML + '</div>';
+                area.style.display = 'block';
+                window.print();
+                window.onafterprint = () => { area.innerHTML = ''; area.style.display = 'none'; window.onafterprint = null; };
             }
         }
 
-        /* ✅ DESIGN: Forçar Recarregamento */
-        async function forceAndReloadKits(event) {
-            if (!isAuthenticated) {
-                showToast('Aviso', 'Faça login primeiro!', 'warning');
-                return;
-            }
-
-            const btn = event.target;
-            btn.disabled = true;
-            btn.innerHTML = '⏳ Carregando cache... (pode levar 2-5 minutos)';
-
-            try {
-                const data = await fetchAPI('/api/force-load', { method: 'POST' });
-                showToast('Info', 'Cache sendo atualizado. Aguarde a notificação do WebSocket.', 'info');
-            } catch(e) {
-                showToast('Erro', 'Erro: ' + e.message, 'danger');
-                btn.disabled = false;
-                btn.innerHTML = '🔄 Recarregar Lista';
-            }
-        }
-
-        /* ✅ DESIGN: Gráfico KPI */
         async function loadKPIChart() {
             try {
-                const data = await fetchAPI('/api/sales/history');
+                let url = '/api/sales/history';
+                const params = [];
+                if (_dashFilter.from) params.push('from=' + _dashFilter.from);
+                if (_dashFilter.to)   params.push('to='   + _dashFilter.to);
+                if (params.length) url += '?' + params.join('&');
 
-                const ctx = document.getElementById('salesChart').getContext('2d');
-
+                const data = await fetchAPI(url);
+                const ctx = document.getElementById('salesChart')?.getContext('2d');
+                if (!ctx) return;
                 if (salesChart) salesChart.destroy();
+
+                // Dados de produção concluída (do board)
+                const boardData = _boardDataRaw || {};
+                const doneItems = boardData.done || [];
+                // Conta concluídos por data
+                const doneByDate = {};
+                doneItems.forEach(d => {
+                    const ds = (d.finished_at||'').slice(0,10);
+                    if (ds) doneByDate[ds] = (doneByDate[ds]||0) + 1;
+                });
+                const prodCounts = (data.labels||[]).map(l => doneByDate[l]||0);
 
                 salesChart = new Chart(ctx, {
                     type: 'line',
                     data: {
-                        labels: data.labels,
-                        datasets: [{
-                            label: 'Pedidos Diários',
-                            data: data.daily,
-                            borderColor: '#6366f1',
-                            backgroundColor: 'rgba(99, 102, 241, 0.1)',
-                            tension: 0.4,
-                            fill: true,
-                            borderWidth: 2
-                        }, {
-                            label: 'Média Móvel (7 dias)',
-                            data: data.moving_avg,
-                            borderColor: '#f59e0b',
-                            borderDash: [5, 5],
-                            tension: 0.4,
-                            borderWidth: 2
-                        }]
+                        labels: data.labels || [],
+                        datasets: [
+                            {
+                                label: 'Pedidos Recebidos',
+                                data: data.daily || [],
+                                borderColor: '#ffb600',
+                                backgroundColor: 'rgba(255,182,0,0.1)',
+                                tension: 0.4, fill: true, borderWidth: 2,
+                                pointRadius: 3,
+                            },
+                            {
+                                label: 'Produção Concluída',
+                                data: prodCounts,
+                                borderColor: '#10b981',
+                                backgroundColor: 'rgba(16,185,129,0.08)',
+                                tension: 0.4, fill: true, borderWidth: 2,
+                                pointRadius: 3,
+                            },
+                            {
+                                label: 'Média Móvel (7d)',
+                                data: data.moving_avg || [],
+                                borderColor: '#6366f1',
+                                borderDash: [5,5],
+                                tension: 0.4, borderWidth: 1.5,
+                                pointRadius: 0,
+                            }
+                        ]
                     },
                     options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {
-                            legend: { position: 'top' },
-                            tooltip: {
-                                mode: 'index',
-                                intersect: false
-                            }
-                        },
-                        scales: {
-                            y: { beginAtZero: true }
-                        }
+                        responsive: true, maintainAspectRatio: false,
+                        plugins: { legend: { position: 'top' }, tooltip: { mode: 'index', intersect: false } },
+                        scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
                     }
                 });
 
-                document.getElementById('avg-daily').textContent = data.avg_daily.toFixed(1);
-                document.getElementById('growth-weekly').textContent =
-                    (data.growth > 0 ? '+' : '') + data.growth.toFixed(1) + '%';
-                document.getElementById('trend-indicator').textContent =
-                    data.growth > 10 ? '📈 Crescendo' : data.growth < -10 ? '📉 Caindo' : '📊 Estável';
+                // Gráfico de barras de produção por dia
+                _buildProdBarChart(data.labels||[], data.daily||[], prodCounts);
+                // Gráfico delta (queda/subida)
+                _buildDeltaChart(data.labels||[], data.daily||[]);
+
+                // Métricas
+                const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                set('avg-daily',    (data.avg_daily||0).toFixed(1));
+                const gr = data.growth||0;
+                set('growth-weekly', (gr>0?'+':'')+gr.toFixed(1)+'%');
+                set('trend-indicator', gr>5?'📈 Subindo':gr<-5?'📉 Caindo':'📊 Estável');
             } catch(e) {
-                console.error('Erro ao carregar gráfico KPI:', e);
+                console.error('Erro ao carregar KPI Chart:', e);
             }
         }
+
+        function _buildProdBarChart(labels, pedidos, producao) {
+            const ctx = document.getElementById('prodBarChart')?.getContext('2d');
+            if (!ctx) return;
+            if (prodBarChart) prodBarChart.destroy();
+            const last14 = -14;
+            prodBarChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels.slice(last14),
+                    datasets: [
+                        { label: 'Pedidos', data: pedidos.slice(last14), backgroundColor: 'rgba(255,182,0,0.7)', borderRadius: 4 },
+                        { label: 'Produzidos', data: producao.slice(last14), backgroundColor: 'rgba(16,185,129,0.7)', borderRadius: 4 }
+                    ]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { position: 'top' } },
+                    scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+                }
+            });
+        }
+
+        function _buildDeltaChart(labels, counts) {
+            const ctx = document.getElementById('deltaChart')?.getContext('2d');
+            if (!ctx) return;
+            if (deltaChart) deltaChart.destroy();
+            const last14 = -14;
+            const lbl = labels.slice(last14);
+            const cnt = counts.slice(last14);
+            const deltas = cnt.map((v,i) => i === 0 ? 0 : v - cnt[i-1]);
+            deltaChart = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: lbl,
+                    datasets: [{
+                        label: 'Variação Diária',
+                        data: deltas,
+                        backgroundColor: deltas.map(d => d >= 0 ? 'rgba(16,185,129,0.75)' : 'rgba(239,68,68,0.75)'),
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: { y: { ticks: { precision: 0 } } }
+                }
+            });
+        }
+
+        function _updateDashboardStagesChart(boardData) {
+            const ctx = document.getElementById('stagesChart')?.getContext('2d');
+            if (!ctx) return;
+            if (stagesChart) stagesChart.destroy();
+            const w = (boardData.waiting||[]).length;
+            const p = (boardData.in_production||[]).length + (boardData.orphan_timers||[]).length;
+            const d = (boardData.done||[]).length;
+            stagesChart = new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Em Espera', 'Produzindo', 'Concluídos'],
+                    datasets: [{
+                        data: [w, p, d],
+                        backgroundColor: ['#ffb600','#10b981','#6366f1'],
+                        borderWidth: 2,
+                        borderColor: '#fff',
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'bottom' },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} pedido(s)` } }
+                    }
+                }
+            });
+        }
+
+        /* ══════════════════════════════════════════════════════════
+           SETOR: Marcenaria / Tapeçaria + Buscador
+        ══════════════════════════════════════════════════════════ */
+
+        function switchSetor(setor) {
+            _currentSetor = setor;
+            ['todos','marc','tape'].forEach(s => {
+                const btn = document.getElementById('setor-'+s);
+                if (btn) { btn.className = btn.className.replace('btn-dark','btn-outline-secondary').replace('btn-outline-secondary','btn-outline-secondary'); }
+            });
+            const map = {todos:'setor-todos', marcenaria:'setor-marc', tapecaria:'setor-tape'};
+            const btn = document.getElementById(map[setor]);
+            if (btn) btn.className = btn.className.replace('btn-outline-secondary','btn-dark');
+            _renderCurrentTab();
+        }
+
+        function filterInProd(query) {
+            if (!_boardDataRaw) return;
+            const q = query.toLowerCase().trim();
+            if (!q) { _boardData = _boardDataRaw; }
+            else {
+                _boardData = {
+                    ..._boardDataRaw,
+                    in_production: (_boardDataRaw.in_production||[]).filter(i =>
+                        (i.pedido_numero||'').toLowerCase().includes(q) ||
+                        (i.order_id||'').toLowerCase().includes(q) ||
+                        (i.cliente||'').toLowerCase().includes(q) ||
+                        (i.nome||'').toLowerCase().includes(q)
+                    ),
+                    orphan_timers: (_boardDataRaw.orphan_timers||[]).filter(i =>
+                        (i.nome||'').toLowerCase().includes(q)
+                    )
+                };
+            }
+            _renderCurrentTab();
+        }
+
+        function printSetor() {
+            const area = document.getElementById('print-area');
+            const boardEl = document.getElementById('board-inprod');
+            if (!area || !boardEl) return;
+            const titulo = _currentSetor === 'todos' ? 'Todos os Setores' :
+                           _currentSetor === 'marcenaria' ? '🪚 Marcenaria' : '🧵 Tapeçaria';
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2 style="text-align:center;">SW Móveis MDF — Produção: ${titulo}</h2>
+                <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${boardEl.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+        }
+
+        /* ══════════════════════════════════════════════════════════
+           EXPEDIÇÃO
+        ══════════════════════════════════════════════════════════ */
+        let _expedicaoFilter = 'all';
+
+        async function loadExpedicao() {
+            const sec = document.getElementById('expedicao-section');
+            if (!sec) return;
+            try {
+                const data = await fetch('/api/production/board').then(r => r.json());
+                const done = data.done || [];
+                _renderExpedicao(done);
+            } catch(e) {
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar expedição.</div>';
+            }
+        }
+
+        function filterExpedicao(filter) {
+            _expedicaoFilter = filter;
+            loadExpedicao();
+        }
+
+        function _renderExpedicao(items) {
+            const sec = document.getElementById('expedicao-section');
+            if (!sec) return;
+            let filtered = items;
+            if (_expedicaoFilter !== 'all') {
+                filtered = items.filter(i => (i.urgencia||'normal') === _expedicaoFilter);
+            }
+            if (filtered.length === 0) {
+                sec.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3;">🚚</div><p class="mt-2">Nenhum item neste filtro.</p></div>';
+                return;
+            }
+            const urgColors = { atrasado:'#ef4444', critico:'#f97316', atencao:'#f59e0b', normal:'#10b981' };
+            let html = `<div class="table-responsive"><table class="table table-hover table-sm align-middle mb-0">
+                <thead><tr style="background:#f9f9f7;">
+                    <th class="ps-3">Produto</th><th>Base/Cor</th><th>#Pedido</th>
+                    <th>Cliente</th><th class="text-center">Prazo</th>
+                    <th class="text-center">Dias Rest.</th><th class="text-center">Tempo Prod.</th>
+                    <th class="text-center">Concluído em</th>
+                </tr></thead><tbody>`;
+            filtered.slice().sort((a,b) => {
+                const uo = {atrasado:0,critico:1,atencao:2,normal:3};
+                return (uo[a.urgencia||'normal']||3) - (uo[b.urgencia||'normal']||3);
+            }).forEach(item => {
+                const urg = item.urgencia || 'normal';
+                const dias = item.dias_restantes;
+                const rowBg = urg==='atrasado' ? 'background:rgba(239,68,68,.07);' : urg==='critico' ? 'background:rgba(249,115,22,.05);' : '';
+                const diasCell = dias === null || dias === undefined ? '—' :
+                    `<span class="badge" style="background:${urgColors[urg]};color:#fff;">${dias<0?'ATRASO '+Math.abs(dias)+'d':dias===0?'HOJE':dias+'d'}</span>`;
+                const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '—';
+                const finFmt = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                // Converte tempo de produção para dias/horas
+                const tp = item.tempo_producao || 0;
+                const tpFmt = tp > 86400 ? (tp/86400).toFixed(1)+'d' : tp > 3600 ? Math.floor(tp/3600)+'h'+Math.floor((tp%3600)/60)+'m' : tp > 0 ? Math.floor(tp/60)+'m' : '—';
+                html += `<tr style="${rowBg}">
+                    <td class="ps-3 fw-bold">${escapeHtml(item.nome||item.nome_original||'N/D')}</td>
+                    <td class="small text-muted">${escapeHtml(((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))||'—')}</td>
+                    <td class="small">#${escapeHtml(String(item.pedido_numero||item.order_id||'—'))}</td>
+                    <td class="small text-muted">${escapeHtml(item.cliente||'—')}</td>
+                    <td class="text-center small">${dataEntFmt}</td>
+                    <td class="text-center">${diasCell}</td>
+                    <td class="text-center small fw-bold text-success">${tpFmt}</td>
+                    <td class="text-center small text-muted">${finFmt}</td>
+                </tr>`;
+            });
+            html += '</tbody></table></div>';
+            sec.innerHTML = html;
+        }
+
+        function printExpedicao() {
+            const area = document.getElementById('print-area');
+            const sec  = document.getElementById('expedicao-section');
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2 style="text-align:center;">SW Móveis MDF — Lista de Expedição</h2>
+                <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${sec.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+        }
+
+        /* ══════════════════════════════════════════════════════════
+           RELATÓRIO DE PRODUÇÃO (7 / 30 dias)
+        ══════════════════════════════════════════════════════════ */
+
+        async function loadRelatorio(dias) {
+            const sec = document.getElementById('relatorio-section');
+            if (!sec) return;
+            sec.innerHTML = '<div class="text-center py-4 text-muted">⏳ Buscando dados do Bling...</div>';
+            try {
+                const [histData, boardData] = await Promise.all([
+                    fetchAPI('/api/sales/history'),
+                    fetch('/api/production/board').then(r => r.json())
+                ]);
+
+                const cutoff = new Date();
+                cutoff.setDate(cutoff.getDate() - dias);
+                const cutoffStr = cutoff.toISOString().slice(0,10);
+
+                // Filtra por período
+                const labels = histData.labels || [];
+                const daily  = histData.daily  || [];
+                const idxFrom = labels.findIndex(l => l >= cutoffStr);
+                const lblSlice = labels.slice(idxFrom);
+                const dlySlice = daily.slice(idxFrom);
+
+                const totalPedidos  = dlySlice.reduce((s,v) => s+v, 0);
+                const totalProduzidos = (boardData.done||[]).filter(i => {
+                    const d = (i.finished_at||'').slice(0,10);
+                    return d >= cutoffStr;
+                }).length;
+
+                // Crescimento: compara com período anterior
+                const prevLabels = labels.slice(Math.max(0, idxFrom - lblSlice.length), idxFrom);
+                const prevTotal  = daily.slice(Math.max(0, idxFrom - lblSlice.length), idxFrom).reduce((s,v)=>s+v,0);
+                const growth = prevTotal > 0 ? ((totalPedidos - prevTotal) / prevTotal * 100) : 0;
+
+                // Tempo médio de produção em dias
+                const tempos = (boardData.done||[])
+                    .filter(i => (i.finished_at||'').slice(0,10) >= cutoffStr && i.tempo_producao)
+                    .map(i => i.tempo_producao);
+                const avgTempoDias = tempos.length > 0 ? (tempos.reduce((s,v)=>s+v,0) / tempos.length / 86400).toFixed(2) : '—';
+
+                sec.innerHTML = `
+                <div class="row g-3 mb-4">
+                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid #ffb600;">
+                        <div class="text-muted small fw-bold text-uppercase">Pedidos Recebidos</div>
+                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:#ffb600;">${totalPedidos}</div>
+                        <small class="text-muted">Últimos ${dias} dias</small>
+                    </div></div>
+                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid #10b981;">
+                        <div class="text-muted small fw-bold text-uppercase">Produzidos</div>
+                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:#10b981;">${totalProduzidos}</div>
+                        <small class="text-muted">Concluídos no período</small>
+                    </div></div>
+                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid ${growth>=0?'#10b981':'#ef4444'};">
+                        <div class="text-muted small fw-bold text-uppercase">Crescimento</div>
+                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:${growth>=0?'#10b981':'#ef4444'};">${growth>=0?'+':''}${growth.toFixed(1)}%</div>
+                        <small class="text-muted">vs. período anterior</small>
+                    </div></div>
+                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid #6366f1;">
+                        <div class="text-muted small fw-bold text-uppercase">Tempo Médio</div>
+                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:#6366f1;">${avgTempoDias}</div>
+                        <small class="text-muted">dias por pedido</small>
+                    </div></div>
+                </div>
+                <div class="card p-3">
+                    <div style="height:220px;"><canvas id="relatorio-chart"></canvas></div>
+                </div>`;
+
+                setTimeout(() => {
+                    const ctx = document.getElementById('relatorio-chart')?.getContext('2d');
+                    if (!ctx) return;
+                    new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels: lblSlice,
+                            datasets: [{ label: 'Pedidos / dia', data: dlySlice, backgroundColor: 'rgba(255,182,0,0.7)', borderRadius: 4 }]
+                        },
+                        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+                    });
+                }, 100);
+
+            } catch(e) {
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar relatório.</div>';
+            }
+        }
+
+        function printRelatorio() {
+            const area = document.getElementById('print-area');
+            const sec  = document.getElementById('relatorio-section');
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2 style="text-align:center;">SW Móveis MDF — Relatório de Produção</h2>
+                <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${sec.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+        }
+
+        /* ══════════════════════════════════════════════════════════
+           FICHA TÉCNICA
+        ══════════════════════════════════════════════════════════ */
+
+        function loadFichaTecnica() {
+            const sec = document.getElementById('ficha-section');
+            if (!sec) return;
+            let html = `<div class="table-responsive"><table class="table table-sm align-middle mb-0">
+                <thead><tr style="background:#f1f5f9;">
+                    <th class="ps-3">#</th><th>Componente</th><th class="text-center">Qtd</th><th>Unidade</th>
+                </tr></thead><tbody>`;
+            RECIPE_CADEIRA.forEach((c, i) => {
+                html += `<tr>
+                    <td class="ps-3 text-muted small">${i+1}</td>
+                    <td class="fw-bold">${escapeHtml(c.nome)}</td>
+                    <td class="text-center">${c.qtd}</td>
+                    <td class="text-muted small">${escapeHtml(c.un)}</td>
+                </tr>`;
+            });
+            html += `</tbody></table></div>
+            <div class="p-3 border-top">
+                <small class="text-muted">Total: <strong>${RECIPE_CADEIRA.length} componentes</strong> por unidade · Computados automaticamente na venda</small>
+            </div>`;
+            sec.innerHTML = html;
+        }
+
+        function printFicha() {
+            const area = document.getElementById('print-area');
+            const sec  = document.getElementById('ficha-section');
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2>SW Móveis MDF — Ficha Técnica: Cadeira SW</h2>
+                <p style="color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${sec.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+        }
+
+        /* ══════════════════════════════════════════════════════════
+           GUIA DE COMPRAS (Insumos necessários pelos pedidos)
+        ══════════════════════════════════════════════════════════ */
+
+        async function loadPurchaseGuide() {
+            const sec = document.getElementById('purchase-guide-section');
+            if (!sec) return;
+            try {
+                const data = await fetch('/api/production/board').then(r => r.json());
+                const waiting = data.waiting || [];
+                // Conta quantas cadeiras estão em espera
+                const cadeiras = waiting.filter(i => (i.nome||i.nome_original||'').toUpperCase().includes('CADEIRA')).length;
+                if (cadeiras === 0) {
+                    sec.innerHTML = '<div class="text-center py-4 text-muted">Nenhuma cadeira em espera no momento.</div>';
+                    return;
+                }
+                let html = `<div class="p-3">
+                    <div class="alert alert-info border-0 mb-3">
+                        <strong>${cadeiras} cadeira(s)</strong> em espera · Calculando insumos necessários para produção completa
+                    </div>
+                    <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+                        <thead><tr style="background:#f0f9ff;">
+                            <th class="ps-3">Insumo</th><th class="text-center">Qtd/un</th>
+                            <th class="text-center fw-bold text-primary">Total Necessário</th><th>Unidade</th>
+                        </tr></thead><tbody>`;
+                RECIPE_CADEIRA.forEach(c => {
+                    const total = (c.qtd * cadeiras);
+                    html += `<tr>
+                        <td class="ps-3">${escapeHtml(c.nome)}</td>
+                        <td class="text-center text-muted">${c.qtd}</td>
+                        <td class="text-center fw-bold text-primary">${total % 1 === 0 ? total : total.toFixed(2)}</td>
+                        <td class="text-muted small">${escapeHtml(c.un)}</td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div></div>`;
+                sec.innerHTML = html;
+            } catch(e) {
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao calcular guia de compras.</div>';
+            }
+        }
+
 
         /* Inicialização após autenticação confirmada */
         let _boardInitialized = false;
@@ -6722,11 +7122,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         function _onAuthConfirmed() {
             if (!_boardInitialized) {
                 _boardInitialized = true;
-                // Ativa aba Produção & Insumos como padrão após login
-                const prodTab = document.querySelector('[data-bs-target="#component-usage"]');
-                if (prodTab) { try { new bootstrap.Tab(prodTab).show(); } catch(e) {} }
                 loadProductionBoard();
                 refreshComponentTab();
+                loadKPIChart();
                 if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
             }
         }
@@ -6734,21 +7132,48 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* Inicializa conexão WS após declarar todas as funções */
 
         document.addEventListener('DOMContentLoaded', () => {
-            const kpiTab = document.querySelector('[data-bs-target="#kpi-chart"]');
-            if (kpiTab) kpiTab.addEventListener('shown.bs.tab', loadKPIChart);
+            // Tab Dashboard
+            document.querySelector('[data-bs-target="#tab-dashboard"]')?.addEventListener('shown.bs.tab', () => {
+                loadKPIChart();
+            });
 
-            const componentUsageTab = document.querySelector('[data-bs-target="#component-usage"]');
-            if (componentUsageTab) {
-                componentUsageTab.addEventListener('shown.bs.tab', () => {
-                    refreshComponentTab();
+            // Tab Produção
+            const prodTab = document.querySelector('[data-bs-target="#tab-producao"]');
+            if (prodTab) {
+                prodTab.addEventListener('shown.bs.tab', () => {
                     loadProductionBoard();
                     if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
                 });
-                componentUsageTab.addEventListener('hidden.bs.tab', () => {
+                prodTab.addEventListener('hidden.bs.tab', () => {
                     if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
                     if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
+                    // Esconde buscador e setor tabs ao sair
+                    const sw = document.getElementById('setor-tabs-wrap');
+                    const si = document.getElementById('search-inprod-wrap');
+                    if (sw) sw.style.display = 'none';
+                    if (si) si.style.display = 'none';
                 });
             }
+
+            // Tab Insumos
+            document.querySelector('[data-bs-target="#tab-insumos"]')?.addEventListener('shown.bs.tab', () => {
+                refreshComponentTab();
+                loadPurchaseGuide();
+            });
+
+            // Tab Expedição
+            document.querySelector('[data-bs-target="#tab-expedicao"]')?.addEventListener('shown.bs.tab', loadExpedicao);
+
+            // Tab Relatório
+            document.querySelector('[data-bs-target="#tab-relatorio"]')?.addEventListener('shown.bs.tab', () => {
+                loadRelatorio(30);
+                // Carrega histórico de finalizações
+                try { fetchAPI('/api/components/usage').then(d => { if(d.history_production) renderProductionHistory(d.history_production); }).catch(()=>{}); } catch(e) {}
+            });
+
+            // Tab Ficha Técnica
+            document.querySelector('[data-bs-target="#tab-ficha"]')?.addEventListener('shown.bs.tab', loadFichaTecnica);
+
         });
     </script>
 
