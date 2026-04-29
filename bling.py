@@ -177,9 +177,17 @@ class MongoStore:
 # ============================================================================
 # CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
 # ============================================================================
-# No Render o diretório de trabalho é read-only — usa /tmp para arquivos temporários
-_default_data_dir = '/tmp' if os.path.isdir('/tmp') and os.access('/tmp', os.W_OK) else '.'
-DATA_DIR = Path(os.environ.get('DATA_DIR', _default_data_dir))
+# No Render o /tmp não persiste entre deploys — usa diretório local como fallback
+_default_data_dir = os.environ.get('DATA_DIR', '.')
+DATA_DIR = Path(_default_data_dir)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Testa escrita
+    _test = DATA_DIR / '.write_test'
+    _test.write_text('ok')
+    _test.unlink()
+except Exception:
+    DATA_DIR = Path('.')
 
 # ============================================================================ 
 # 0. RATE LIMITER GLOBAL (NÍVEL PRODUÇÃO)
@@ -1244,7 +1252,7 @@ class SalesManager:
         
         # Mantém KPIs de calendário (Hoje, Semana Atual, Mês Atual)
         hoje = now.date()
-        inicio_semana = hoje - timedelta(days=hoje.weekday())
+        inicio_semana = hoje - timedelta(days=6)   # últimos 7 dias corridos (não semana calendar)
         inicio_mes = hoje.replace(day=1)
         
         inicio_grafico = hoje - timedelta(days=29) # Últimos 30 dias
@@ -1313,9 +1321,18 @@ class SalesManager:
         for i in range(len(counts)):
             subset = counts[max(0, i-6):i+1]
             moving_avg.append(sum(subset) / len(subset) if subset else 0)
-        last_week = sum(counts[-7:])
-        prev_week = sum(counts[-14:-7])
-        growth = ((last_week - prev_week) / prev_week * 100) if prev_week else 0
+
+        # Crescimento: últimos 7 dias vs média mensal ÷ 20 dias úteis
+        # (conforme proposta V5.0: comparar semana atual vs ritmo mensal esperado)
+        last_7   = sum(counts[-7:])
+        monthly_total = len(monthly_orders)
+        # Ritmo esperado para 7 dias = (total_mês / 20 dias úteis) * 7
+        ritmo_mensal_7d = (monthly_total / 20) * 7 if monthly_total > 0 else 0
+        growth = round(((last_7 - ritmo_mensal_7d) / ritmo_mensal_7d * 100), 1) if ritmo_mensal_7d else 0
+
+        # Média diária de produção (pedidos/dia nos últimos 30d com pedidos)
+        dias_com_pedidos = sum(1 for c in counts if c > 0)
+        avg_daily = round(sum(counts) / max(dias_com_pedidos, 1), 1)
 
         pedidos_processados = len(daily_orders) + len(weekly_orders) + len(monthly_orders) + len(daily_counts_chart)
 
@@ -1334,11 +1351,17 @@ class SalesManager:
             self.history_data['yearly_monthly_report'] = dict(monthly_report)
 
             self.stats_history = {
-                'dates': [d.isoformat() for d in dates],
-                'daily': counts,
-                'moving_avg': [round(v, 2) for v in moving_avg],
-                'growth': round(growth, 1),
-                'avg_daily': round(sum(counts[-30:]) / 30, 1) if len(counts) >= 30 else 0
+                'dates':        [d.isoformat() for d in dates],
+                'daily':        counts,
+                'moving_avg':   [round(v, 2) for v in moving_avg],
+                'growth':       growth,
+                'avg_daily':    avg_daily,
+                'last_7':       last_7,
+                'ritmo_7d':     round(ritmo_mensal_7d, 1),
+                'monthly_total': monthly_total,
+                'weekly_count': len(weekly_orders),
+                'daily_count':  len(daily_orders),
+                'monthly_count': len(monthly_orders),
             }
             self.last_recalculated = now
             self._orders_cache = {o.get('id'): o for o in all_orders[-100:]}
@@ -1390,14 +1413,15 @@ class ProductionTimer:
                 MongoStore.set('production_timers', {'timers': self.timers}, 'timers', replace=True)
             except Exception as e:
                 logger.error(f"Erro ao salvar timers no MongoDB: {e}")
-        # Sempre salva no arquivo também (seguro contra falha do MongoDB)
-        temp_file = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.timers, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp_file), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"Erro ao salvar timers em arquivo: {e}")
+        # Salva em arquivo APENAS como fallback quando MongoDB não disponível
+        if not MONGO_AVAILABLE:
+            temp_file = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.timers, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp_file), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"Fallback arquivo timers falhou: {e}")
 
     def _auto_pause_on_restart(self):
         """
@@ -1607,10 +1631,11 @@ class ProductionTimer:
             if mes_chave not in history:
                 history[mes_chave] = []
             history[mes_chave].append(reg_clean)
-            temp = self.HISTORY_PATH.with_suffix('.tmp')
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(history, f, ensure_ascii=False)
-            shutil.move(str(temp), str(self.HISTORY_PATH))
+            if not MONGO_AVAILABLE:
+                temp = self.HISTORY_PATH.with_suffix('.tmp')
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, ensure_ascii=False)
+                shutil.move(str(temp), str(self.HISTORY_PATH))
             if not saved_mongo:
                 logger.info(f"✅ Histórico salvo em arquivo local (MongoDB indisponível).")
         except Exception as e:
@@ -1704,13 +1729,15 @@ class ComponentConsumptionManager:
                 logger.debug(f"✅ Consumo salvo no MongoDB: {mes_count} mês(es), {comp_count} componente(s)")
             except Exception as e:
                 logger.error(f"Erro ao salvar consumo no MongoDB: {e}")
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"Erro ao salvar consumo em arquivo: {e}")
+        # Arquivo apenas como fallback sem MongoDB
+        if not MONGO_AVAILABLE:
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"Fallback arquivo consumo falhou: {e}")
 
     def _ensure_current_month(self):
         """Garante estrutura para o mês atual e persiste imediatamente."""
@@ -1907,6 +1934,9 @@ class PendingOrdersManager:
     def __init__(self):
         self.data = self._load()
         self._restore_in_production_to_waiting()
+        self._op_cache     = {}   # oid -> {numero_op, situacao, previsao}
+        self._op_cache_ts  = 0.0  # timestamp do último refresh
+        self._op_cache_lock = __import__('threading').Lock()
 
     def _restore_in_production_to_waiting(self):
         """Ao reiniciar: itens in_production voltam para waiting.
@@ -1967,13 +1997,14 @@ class PendingOrdersManager:
                     MongoStore.upsert('pending_orders', key, val)
             except Exception as e:
                 logger.error(f"Erro ao salvar pending_orders no MongoDB: {e}")
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"Erro ao salvar pedidos pendentes em arquivo: {e}")
+        if not MONGO_AVAILABLE:
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"Fallback arquivo pending_orders falhou: {e}")
 
     def _save_one(self, key: str):
         """Salva apenas um item (mais eficiente que _save completo)."""
@@ -2030,13 +2061,14 @@ class PendingOrdersManager:
                 _mongo_db['pending_orders'].delete_one({'_id': item_key})
             except Exception as e:
                 logger.error(f"dismiss: erro MongoDB {item_key}: {e}")
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"dismiss: erro arquivo: {e}")
+        if not MONGO_AVAILABLE:
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"dismiss: fallback arquivo falhou: {e}")
 
     def get_waiting(self):
         """Retorna todos os itens aguardando produção."""
@@ -2858,7 +2890,20 @@ class Orchestrator:
             payload["component_usage"] = component_usage
             self.logger.debug("Uso de componentes incluído no broadcast.")
 
-        # 3.1 Adiciona lista de produtos se o cache foi atualizado
+        # 3.1 Adiciona snapshot de produção (contadores das 3 etapas)
+        try:
+            waiting_count  = len(pending_orders.get_waiting())
+            inprod_count   = len(pending_orders.get_in_production())
+            done_count     = len(pending_orders.get_done())
+            payload["production_snapshot"] = {
+                "waiting":       waiting_count,
+                "in_production": inprod_count,
+                "done":          done_count,
+            }
+        except Exception:
+            pass
+
+        # 3.2 Adiciona lista de produtos se o cache foi atualizado
         if cache_updated:
             payload["products"] = self.get_all_products()
             payload["kits"] = self.get_all_kits()
@@ -2965,18 +3010,123 @@ class WebServer:
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
+            # Suporta filtro por data via query params
+            date_from = request.args.get('from', '')
+            date_to   = request.args.get('to', '')
             stats = self.orchestrator.sales.stats_history
             if not stats or not stats.get('dates'):
                 if not self.orchestrator.sales.daily_count:
-                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
+                    Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
                 return jsonify({"labels": [], "daily": [], "moving_avg": [], "growth": 0, "avg_daily": 0})
+            labels = stats.get('dates', [])
+            daily  = stats.get('daily', [])
+            # Filtra por período se solicitado
+            if date_from or date_to:
+                filtered = [(l, d) for l, d in zip(labels, daily)
+                            if (not date_from or l >= date_from) and (not date_to or l <= date_to)]
+                labels = [x[0] for x in filtered]
+                daily  = [x[1] for x in filtered]
+                # Recalcula moving_avg (janela de 7 dias)
+                moving_avg = []
+                for i in range(len(daily)):
+                    window = daily[max(0, i-6):i+1]
+                    moving_avg.append(round(sum(window)/len(window), 1) if window else 0)
+                total = sum(daily)
+                n = max(len(daily), 1)
+                lw = sum(daily[-7:]) if len(daily) >= 7 else total
+                # Período anterior do mesmo tamanho
+                all_daily  = stats.get('daily', [])
+                all_labels = stats.get('dates', [])
+                prev = [(l2, d2) for l2, d2 in zip(all_labels, all_daily)
+                        if l2 < (labels[0] if labels else '')]
+                prev_total = sum(x[1] for x in prev[-len(daily):]) if prev else 0
+                growth     = round((total - prev_total) / prev_total * 100, 1) if prev_total else 0
+                avg_daily  = round(total / n, 1)
+            else:
+                moving_avg = stats.get('moving_avg', [])
+                growth     = stats.get('growth', 0)
+                avg_daily  = stats.get('avg_daily', 0)
             return jsonify({
-                "labels": stats.get('dates', []),
-                "daily": stats.get('daily', []),
-                "moving_avg": stats.get('moving_avg', []),
-                "growth": stats.get('growth', 0),
-                "avg_daily": stats.get('avg_daily', 0)
+                "labels": labels, "daily": daily, "moving_avg": moving_avg,
+                "growth": growth, "avg_daily": avg_daily
             })
+
+        @self.app.route("/api/production/report")
+        @token_required
+        def api_production_report(token):
+            """
+            Relatório de produção direto do Bling.
+            Parâmetros: dias=7|30 (padrão 30)
+            Retorna: pedidos recebidos, produzidos, crescimento, tempo médio, top produtos.
+            """
+            try:
+                dias = int(request.args.get('dias', 30))
+                hoje = datetime.now()
+                data_ini = (hoje - timedelta(days=dias)).strftime('%Y-%m-%d')
+
+                # Filtra history local (já baixado do Bling)
+                all_orders = self.orchestrator.sales._sales_history or []
+                pedidos_periodo = [
+                    o for o in all_orders
+                    if (o.get('data') or o.get('dataEmissao', ''))[:10] >= data_ini
+                ]
+
+                # Período anterior (para crescimento)
+                data_ant = (hoje - timedelta(days=dias*2)).strftime('%Y-%m-%d')
+                pedidos_anterior = [
+                    o for o in all_orders
+                    if data_ant <= (o.get('data') or o.get('dataEmissao', ''))[:10] < data_ini
+                ]
+
+                total_recebidos = len(pedidos_periodo)
+                total_anterior  = len(pedidos_anterior)
+                crescimento = round((total_recebidos - total_anterior) / total_anterior * 100, 1) if total_anterior else 0
+
+                # Produzidos no período (do board local)
+                done_items = [i for i in pending_orders.data.values()
+                              if i.get('status') == 'done'
+                              and (i.get('finished_at', '') or '')[:10] >= data_ini]
+                total_produzidos = len(done_items)
+
+                # Tempo médio de produção em dias
+                tempos = [i.get('tempo_producao', 0) for i in done_items if i.get('tempo_producao')]
+                avg_tempo_dias = round(sum(tempos) / len(tempos) / 86400, 2) if tempos else 0
+
+                # Top 10 produtos mais pedidos no período
+                from collections import Counter
+                produto_counter = Counter()
+                for o in pedidos_periodo:
+                    for item in (o.get('itens') or []):
+                        nome = item.get('descricao') or item.get('nome') or ''
+                        if nome:
+                            produto_counter[nome[:60]] += int(item.get('quantidade', 1))
+                top_produtos = [{'nome': k, 'qtd': v} for k, v in produto_counter.most_common(10)]
+
+                # Distribuição por dia
+                from collections import defaultdict
+                por_dia = defaultdict(int)
+                for o in pedidos_periodo:
+                    d = (o.get('data') or o.get('dataEmissao', ''))[:10]
+                    if d: por_dia[d] += 1
+                labels = sorted(por_dia.keys())
+                counts = [por_dia[l] for l in labels]
+
+                return jsonify({
+                    'dias': dias,
+                    'total_recebidos':  total_recebidos,
+                    'total_anterior':   total_anterior,
+                    'crescimento':      crescimento,
+                    'total_produzidos': total_produzidos,
+                    'avg_tempo_dias':   avg_tempo_dias,
+                    'top_produtos':     top_produtos,
+                    'labels':           labels,
+                    'counts':           counts,
+                })
+            except Exception as e:
+                logger.error(f"Erro no relatório de produção: {e}")
+                return jsonify({'error': str(e)}), 500
+
+
 
         @self.app.route('/api/recalculate', methods=['POST'])
         @token_required
@@ -3203,11 +3353,80 @@ class WebServer:
                     enriched_done['tempo_producao'] = tempos[-1] if tempos else 0
                 done_enriched.append(enriched_done)
 
+            # ── Busca OPs do Bling em cache (5min TTL, thread-safe) ───────────
+            with pending_orders._op_cache_lock:
+                _op_cache    = pending_orders._op_cache
+                _op_cache_ts = pending_orders._op_cache_ts
+                needs_refresh = time.time() - _op_cache_ts > 300
+
+            if needs_refresh:
+                new_op_cache = dict(_op_cache)  # cópia para não bloquear leituras
+                order_ids_to_fetch = set()
+                for it in list(pending_orders.data.values()):
+                    oid = (it.get('order_id_bling') or it.get('order_id') or
+                           it.get('pedido_numero'))
+                    if oid:
+                        order_ids_to_fetch.add(str(oid))
+                fetched = 0
+                for oid in list(order_ids_to_fetch):
+                    if fetched >= 25:   # máx 25 req por ciclo para não travar
+                        break
+                    if oid in new_op_cache:  # já cacheado
+                        continue
+                    try:
+                        resp = self.orchestrator.api.get(
+                            'ordens/producao',
+                            params={'numeroPedidoVenda': oid}
+                        )
+                        if resp and resp.get('data'):
+                            ops = resp['data'] if isinstance(resp['data'], list) else [resp['data']]
+                            for op in ops:
+                                numero_op = str(op.get('numero') or op.get('id') or '')
+                                previsao  = (op.get('dataPrevisao') or
+                                             op.get('dataPrevista') or '')
+                                situacao  = ''
+                                sit = op.get('situacao')
+                                if isinstance(sit, dict):
+                                    situacao = sit.get('nome', '')
+                                elif sit:
+                                    situacao = str(sit)
+                                if numero_op:
+                                    new_op_cache[oid] = {
+                                        'numero_op':    numero_op,
+                                        'codigo_barras': numero_op,
+                                        'situacao':     situacao,
+                                        'previsao':     previsao,
+                                    }
+                                    fetched += 1
+                                    break
+                    except Exception:
+                        pass
+                with pending_orders._op_cache_lock:
+                    pending_orders._op_cache    = new_op_cache
+                    pending_orders._op_cache_ts = time.time()
+                _op_cache = new_op_cache
+
+            def _inject_op(item):
+                """Injeta dados da OP do Bling no item se disponível."""
+                oid = str(item.get('order_id_bling') or item.get('order_id') or item.get('pedido_numero') or '')
+                op_data = _op_cache.get(oid, {})
+                if op_data.get('numero_op'):
+                    item['ordem_producao'] = op_data['numero_op']
+                    item['op_situacao']    = op_data.get('situacao', '')
+                    if op_data.get('previsao') and not item.get('data_entrega'):
+                        item['data_entrega'] = op_data['previsao']
+                return item
+
+            # Aplica enriquecimento de OP em todos os grupos
+            waiting_enriched  = [_inject_op(i) for i in waiting_enriched]
+            in_prod           = [_inject_op(i) for i in in_prod]
+            done_enriched_out = [_inject_op(i) for i in done_enriched]
+
             return jsonify({
                 'waiting': waiting_enriched,
                 'in_production': in_prod,
                 'orphan_timers': orphan,
-                'done': done_enriched,
+                'done': done_enriched_out,
                 'server_time': time.time(),
             })
 
@@ -3334,14 +3553,21 @@ class WebServer:
             if not codigo:
                 return jsonify({'error': 'codigo obrigatório'}), 400
 
-            # Busca pedido pelo número do pedido, ordem_producao ou order_id
+            # Busca pedido pelo número do pedido, ordem_producao, order_id ou OP do cache
             found_key = None
             found_item = None
             for key, item in pending_orders.data.items():
+                if item.get('status') == 'done':
+                    continue
                 pnum = str(item.get('pedido_numero', '') or item.get('order_id', '') or '')
                 op   = str(item.get('ordem_producao', '') or '')
-                if codigo in (pnum, op) and item.get('status') != 'done':
-                    found_key = key
+                # Verifica também no cache de OPs do Bling
+                oid  = str(item.get('order_id_bling') or item.get('order_id') or pnum or '')
+                op_cached = ''
+                with pending_orders._op_cache_lock:
+                    op_cached = pending_orders._op_cache.get(oid, {}).get('numero_op', '')
+                if codigo in (pnum, op, op_cached) or key == codigo:
+                    found_key  = key
                     found_item = item
                     break
 
@@ -3702,33 +3928,8 @@ class WebServer:
         @self.app.route('/api/kits')
         @token_required
         def api_kits(token):
-            """Retorna a lista de todos os kits e produtos simples em cache."""
-            kits = self.orchestrator.get_all_kits()
-            products = self.orchestrator.get_all_products()
-            
-            self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
-            
-            def normalize_for_api(item):
-                estoque_val = item.get("estoqueAtual", item.get("estoque", 0))
-                tipo = item.get("tipo", "P")
-                # Mapeia tipo textual para K/P (compatibilidade)
-                if tipo in ["COMPOSTO", "K"]: tipo_out = "K"
-                else: tipo_out = "P"
-
-                return {
-                    "id": item.get("id"),
-                    "nome": item.get("nome"),
-                    "sku": item.get("sku"),
-                    "estoque": estoque_val,
-                    "estoqueAtual": estoque_val,
-                    "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "tipo": tipo_out,
-                    "componentes": item.get("componentes", [])
-                }
-
-            all_list = [normalize_for_api(p) for p in kits + products]
-            return jsonify(all_list)
+            """Endpoint mantido por compatibilidade — aba Produtos foi removida."""
+            return jsonify([])
 
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
@@ -4060,6 +4261,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.18.6/umd/index.min.js"
+        onerror="console.warn('ZXing não carregado — câmera desativada. Scanner USB ainda funciona.')"></script>
     <style>
         /* ══════════════════════════════════════════
            SW MÓVEIS MDF — DESIGN SYSTEM 2025
@@ -4663,7 +4866,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .bc-card:hover { box-shadow: 0 6px 24px rgba(0,0,0,.09); border-color: var(--sw-yellow); transform: translateY(-2px); }
         .bc-card.urgente { border-color: #ef4444; background: #fff5f5; }
         .bc-card.atencao { border-color: #f59e0b; }
-        .bc-card.inprod  { border-color: #10b981; background: #f0fdf4; }
+        .bc-card.urgente  { border-color: #ef4444 !important; background: #fff5f5; }
+        .bc-card.critico  { border-color: #f97316 !important; background: #fff8f0; }
+        .bc-card.atencao  { border-color: #f59e0b !important; background: #fffbeb; }
+        .bc-card.normal   { border-color: var(--border); }
+        .bc-card.inprod   { border-color: #10b981 !important; background: #f0fdf4; }
+        /* Urgency pulse for overdue */
+        .bc-card.urgente .bc-num { animation: pulse-animation 1.2s infinite; color: #ef4444; }
+
         .bc-card .bc-num  { font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: .05em; color: var(--sw-black); }
         .bc-card .bc-nome { font-size: 0.78rem; font-weight: 700; color: #374151; margin-bottom: 10px; line-height: 1.3; }
         .bc-card .bc-meta { font-size: 0.68rem; color: #9ca3af; margin-top: 6px; }
@@ -4704,7 +4914,28 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <!-- SCANNER GLOBAL INDICATOR -->
     <div id="scanner-indicator">📡 Lendo código...</div>
 
-    <!-- ÁREA DE IMPRESSÃO (oculta; aparece apenas no print) -->
+    <!-- CÂMERA SCANNER MODAL -->
+    <div class="modal fade" id="cameraScanModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered" style="max-width:400px;">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
+                    <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">📷 Scanner de Câmera</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="stopCameraScanner()"></button>
+                </div>
+                <div class="modal-body p-0 bg-black text-center" style="min-height:280px;position:relative;">
+                    <video id="camera-preview" style="width:100%;max-height:280px;object-fit:cover;display:block;"></video>
+                    <div id="camera-scan-result" style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.7);color:#fff;padding:8px;font-size:.85rem;display:none;"></div>
+                    <div id="camera-aim" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:200px;height:80px;border:2px solid #ffb600;border-radius:4px;pointer-events:none;"></div>
+                </div>
+                <div class="modal-footer bg-dark justify-content-between">
+                    <small class="text-muted">Aponte para o código de barras da OP</small>
+                    <button class="btn btn-outline-light btn-sm" onclick="stopCameraScanner()" data-bs-dismiss="modal">Fechar</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ÁREA DE IMPRESSÃO -->
     <div id="print-area"></div>
 
     <!-- NAVBAR -->
@@ -4717,8 +4948,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <span class="navbar-brand-sub">Painel de Gestão</span>
                 </div>
             </a>
-            <div class="d-flex align-items-center gap-3">
+            <div class="d-flex align-items-center gap-2">
                 <span id="status-badge" class="badge bg-secondary" title="Aguardando WebSocket...">⏳ Conectando...</span>
+                <button class="btn btn-sm" onclick="openCameraScanner()"
+                    style="background:#ffb600;color:#000;font-weight:700;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
+                    title="Scanner por câmera do celular">📷 Câmera</button>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
             </div>
         </div>
@@ -4878,8 +5112,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             <div class="col-md-3 mb-3">
                                 <div class="card p-3 text-center border-start border-4" style="border-color:#6366f1!important;">
                                     <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Tendência</div>
-                                    <div class="fw-bold" id="trend-indicator" style="font-family:'Bebas Neue',sans-serif;font-size:1.6rem;color:#6366f1;">—</div>
-                                    <div id="growth-weekly" style="font-size:.8rem;color:#6366f1;font-weight:700;"></div>
+                                    <div class="fw-bold" id="trend-indicator" style="font-family:'Bebas Neue',sans-serif;font-size:1.4rem;color:#6366f1;">—</div>
+                                    <div id="growth-weekly" style="font-size:.9rem;font-weight:700;"></div>
+                                    <div id="growth-tooltip" style="font-size:.6rem;color:#aaa;margin-top:3px;line-height:1.3;"></div>
                                 </div>
                             </div>
                         </div>
@@ -5261,17 +5496,36 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /* Atualizar KPIs com Animação */
+        /* Atualizar KPIs — V5.0: crescimento vs média mensal ÷ 20 dias úteis */
         function updateKpis(dSalesStats) {
             const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-            set('kpi-daily',   dSalesStats.daily);
-            set('kpi-weekly',  dSalesStats.weekly);
-            set('kpi-historic',dSalesStats.monthly);
+            set('kpi-daily',    dSalesStats.daily_count   ?? dSalesStats.daily   ?? 0);
+            set('kpi-weekly',   dSalesStats.weekly_count  ?? dSalesStats.weekly  ?? 0);
+            set('kpi-historic', dSalesStats.monthly_count ?? dSalesStats.monthly ?? 0);
             const lu = document.getElementById('last-recalculated');
             if (lu) lu.textContent = '⏱ ' + formatDateTime(dSalesStats.last_update);
-            // Tendência: seta + percentual
-            const gr = dSalesStats.growth || 0;
-            set('trend-indicator', gr > 5 ? '📈 Subindo' : gr < -5 ? '📉 Caindo' : '📊 Estável');
-            set('growth-weekly', (gr > 0 ? '+' : '') + gr.toFixed(1) + '% sem.');
+
+            const gr    = dSalesStats.growth  || 0;
+            const last7 = dSalesStats.last_7  || 0;
+            const ritmo = dSalesStats.ritmo_7d || 0;
+
+            let trendIcon = '📊 Estável'; let trendColor = '#6366f1';
+            if (gr > 10)       { trendIcon = '📈 Acelerando'; trendColor = '#10b981'; }
+            else if (gr > 0)   { trendIcon = '📈 Subindo';    trendColor = '#10b981'; }
+            else if (gr < -10) { trendIcon = '📉 Caindo';     trendColor = '#ef4444'; }
+            else if (gr < 0)   { trendIcon = '📉 Abaixo';     trendColor = '#f59e0b'; }
+
+            set('trend-indicator', trendIcon);
+            set('growth-weekly', (gr > 0 ? '+' : '') + gr.toFixed(1) + '%');
+            const tEl = document.getElementById('trend-indicator');
+            const gEl = document.getElementById('growth-weekly');
+            if (tEl) tEl.style.color = trendColor;
+            if (gEl) gEl.style.color = trendColor;
+            const ttEl = document.getElementById('growth-tooltip');
+            if (ttEl) ttEl.textContent = ritmo > 0
+                ? `7d: ${last7} pedidos · Ritmo esperado: ${ritmo.toFixed(1)} (mês÷20×7)`
+                : '';
+
             if (isAuthenticated) _loadKpiOrderNumbers();
             document.querySelectorAll('.kpi-card').forEach(c => {
                 c.classList.add('updating');
@@ -5982,6 +6236,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /* Botão "Iniciar" ou leitura via scanner — anti-duplicação */
+        /* Remove pedido da fila (botão ✕) */
+        async function dismissPendingOrder(itemKey, evt) {
+            if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+            if (!itemKey) return;
+            if (!confirm('Remover este pedido da fila de produção?')) return;
+            try {
+                await fetch('/api/pending-orders/dismiss', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey })
+                });
+                showToast('Removido', 'Pedido removido da fila.', 'info');
+                await loadProductionBoard();
+            } catch(e) {
+                showToast('Erro', 'Falha ao remover pedido.', 'danger');
+            }
+        }
+
         async function scanOrStartWaiting(btn) {
             const ikey  = btn.dataset.ikey;
             const pnome = btn.dataset.pnome;
@@ -6016,19 +6288,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const div = document.getElementById('board-inprod');
             if (!div) return;
 
-            // Filtra por setor
+            // Filtra por setor usando classificação semântica
             let filtered = items;
             if (_currentSetor === 'marcenaria') {
-                // Marcenaria: produtos com MDF, madeira, compensado no nome
-                filtered = items.filter(i => {
-                    const n = (i.nome||i.nome_original||'').toUpperCase();
-                    return n.includes('MDF') || n.includes('MADEIRA') || n.includes('COMPENSADO') || n.includes('BASE');
-                });
+                filtered = items.filter(i => _classifySetor(i.nome||i.nome_original||'') === 'marcenaria');
             } else if (_currentSetor === 'tapecaria') {
-                filtered = items.filter(i => {
-                    const n = (i.nome||i.nome_original||'').toUpperCase();
-                    return n.includes('CADEIRA') || n.includes('ESPUMA') || n.includes('TECIDO') || n.includes('COURVIM');
-                });
+                filtered = items.filter(i => _classifySetor(i.nome||i.nome_original||'') === 'tapecaria');
             }
 
             if (filtered.length === 0) {
@@ -6491,18 +6756,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function refreshComponentTab() {
-            await loadProductionBoard();
             try {
                 const consumptionData = await fetchAPI('/api/consumption/summary');
                 renderConsumptionTable(consumptionData);
             } catch(e) {
-                document.getElementById('consumption-table-section').innerHTML =
-                    '<div class="alert alert-danger m-3">Erro ao carregar consumo.</div>';
+                const sec = document.getElementById('consumption-table-section');
+                if (sec) sec.innerHTML = '<div class="alert alert-warning m-3">⚠️ Erro ao carregar consumo.</div>';
             }
             try {
-                const usageData = await fetchAPI('/api/components/usage');
-                if (usageData.history_production) renderProductionHistory(usageData.history_production);
-            } catch(e) { console.error('Erro ao carregar histórico:', e); }
+                const histData = await fetchAPI('/api/components/usage');
+                if (histData && histData.history_production) {
+                    renderProductionHistory(histData.history_production);
+                }
+            } catch(e) { /* silencioso */ }
         }
 
         function renderActiveTimers(activeProduction) {}
@@ -6541,17 +6807,34 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado este mês.</div>';
                 return;
             }
-            div.innerHTML = `<div class="table-responsive" style="max-height:320px;overflow-y:auto;"><table class="table table-sm table-striped align-middle mb-0">
-                <thead class="table-dark sticky-top"><tr><th class="ps-3">Data/Hora</th><th>Produto</th><th class="text-center">Tempo de Produção</th></tr></thead>
+
+            function fmtTempo(secs) {
+                if (!secs || secs <= 0) return '—';
+                if (secs >= 86400) return (secs/86400).toFixed(2) + 'd';
+                if (secs >= 3600)  return Math.floor(secs/3600) + 'h' + Math.floor((secs%3600)/60) + 'm';
+                return Math.floor(secs/60) + 'min';
+            }
+
+            div.innerHTML = `<div class="table-responsive" style="max-height:340px;overflow-y:auto;">
+                <table class="table table-sm table-striped align-middle mb-0">
+                <thead class="table-dark sticky-top"><tr>
+                    <th class="ps-3">Data/Hora</th>
+                    <th>Produto</th>
+                    <th class="text-center">Tempo</th>
+                    <th>#Pedido</th>
+                </tr></thead>
                 <tbody>${reversed.map(h => {
                     const dt = h.data_conclusao ? new Date(h.data_conclusao) : null;
                     const dtStr = (dt && !isNaN(dt)) ? dt.toLocaleString('pt-BR') : (h.data_conclusao || '—');
-                    const nome = h.produto || h.nome || 'N/D';
+                    const nome  = escapeHtml(h.produto || h.nome || 'N/D');
+                    const pedNum = h.pedido_numero || h.order_id || '';
+                    const tempo  = fmtTempo(h.tempo_segundos || 0);
                     return `<tr>
-                    <td class="ps-3 small text-muted">${dtStr}</td>
-                    <td class="fw-bold">${escapeHtml(nome)}</td>
-                    <td class="text-center font-monospace fw-bold text-primary">${formatSeconds(h.tempo_segundos || 0)}</td>
-                </tr>`;
+                        <td class="ps-3 small text-muted">${dtStr}</td>
+                        <td class="fw-bold" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${nome}">${nome}</td>
+                        <td class="text-center fw-bold text-success font-monospace">${tempo}</td>
+                        <td class="small text-muted">${pedNum ? '#'+pedNum : '—'}</td>
+                    </tr>`;
                 }).join('')}</tbody></table></div>`;
         }
 
@@ -6580,6 +6863,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                     if (data.sales_stats) updateKpis(data.sales_stats);
                     if (data.component_usage) updateComponentUsage(data.component_usage);
+
+                    // Atualiza KPIs das 3 etapas de produção via broadcast (sem reload do board)
+                    if (data.production_snapshot) {
+                        const ps = data.production_snapshot;
+                        const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                        set('kpi-waiting', ps.waiting || 0);
+                        set('kpi-inprod',  ps.in_production || 0);
+                        set('kpi-done',    ps.done || 0);
+                        set('waiting-count-badge', ps.waiting || 0);
+                        set('inprod-count-badge',  ps.in_production || 0);
+                        set('done-count-badge',    ps.done || 0);
+                    }
 
                     // Primeira mensagem autenticada: sync pedidos + recarrega board
                     if (data.authenticated && !_wsFirstAuthDone) {
@@ -6800,11 +7095,30 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
            SETOR: Marcenaria / Tapeçaria + Buscador
         ══════════════════════════════════════════════════════════ */
 
+        function _classifySetor(nome) {
+            const n = (nome || '').toUpperCase();
+            // Tapeçaria: produtos com acabamento têxtil, estofamento
+            const tapecaria_kw = ['CADEIRA','POLTRONA','ESTOFADO','ESPUMA','TECIDO',
+                'COURVIM','COURO','VELUDO','LINHO','MATELASSÊ','MATELASSE',
+                'ASSENTO','ENCOSTO','BASE ESTOFADA','RECLINÁVEL','RECLINAVEL',
+                'HIDRÁULICA','HIDRAULICA','BERLIN','EVIDENCE','MADRID','LUNA'];
+            // Marcenaria: estrutura em madeira/MDF
+            const marcenaria_kw = ['MDF','COMPENSADO','MADEIRA','COMPENSAD','SARRAFO',
+                'ARMÁRIO','ARMARIO','BALCÃO','BALCAO','BANCADA','CARRINHO','GABINETE',
+                'LAVATÓRIO','LAVATORIO','ESPELHO','PRATELEIRA','NICHO','PAINEL'];
+            const isTape = tapecaria_kw.some(k => n.includes(k));
+            const isMarc = marcenaria_kw.some(k => n.includes(k));
+            if (isTape && isMarc) return 'tapecaria';  // prioriza tapeçaria em ambiguidade
+            if (isTape) return 'tapecaria';
+            if (isMarc) return 'marcenaria';
+            return 'outros';
+        }
+
         function switchSetor(setor) {
             _currentSetor = setor;
             ['todos','marc','tape'].forEach(s => {
                 const btn = document.getElementById('setor-'+s);
-                if (btn) { btn.className = btn.className.replace('btn-dark','btn-outline-secondary').replace('btn-outline-secondary','btn-outline-secondary'); }
+                if (btn) btn.className = btn.className.replace('btn-dark','btn-outline-secondary');
             });
             const map = {todos:'setor-todos', marcenaria:'setor-marc', tapecaria:'setor-tape'};
             const btn = document.getElementById(map[setor]);
@@ -6942,81 +7256,96 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             if (!sec) return;
             sec.innerHTML = '<div class="text-center py-4 text-muted">⏳ Buscando dados do Bling...</div>';
             try {
-                const [histData, boardData] = await Promise.all([
-                    fetchAPI('/api/sales/history'),
-                    fetch('/api/production/board').then(r => r.json())
-                ]);
+                const data = await fetchAPI('/api/production/report?dias=' + dias);
 
-                const cutoff = new Date();
-                cutoff.setDate(cutoff.getDate() - dias);
-                const cutoffStr = cutoff.toISOString().slice(0,10);
+                if (data.error) {
+                    sec.innerHTML = '<div class="alert alert-danger m-3">Erro: ' + escapeHtml(data.error) + '</div>';
+                    return;
+                }
 
-                // Filtra por período
-                const labels = histData.labels || [];
-                const daily  = histData.daily  || [];
-                const idxFrom = labels.findIndex(l => l >= cutoffStr);
-                const lblSlice = labels.slice(idxFrom);
-                const dlySlice = daily.slice(idxFrom);
-
-                const totalPedidos  = dlySlice.reduce((s,v) => s+v, 0);
-                const totalProduzidos = (boardData.done||[]).filter(i => {
-                    const d = (i.finished_at||'').slice(0,10);
-                    return d >= cutoffStr;
-                }).length;
-
-                // Crescimento: compara com período anterior
-                const prevLabels = labels.slice(Math.max(0, idxFrom - lblSlice.length), idxFrom);
-                const prevTotal  = daily.slice(Math.max(0, idxFrom - lblSlice.length), idxFrom).reduce((s,v)=>s+v,0);
-                const growth = prevTotal > 0 ? ((totalPedidos - prevTotal) / prevTotal * 100) : 0;
-
-                // Tempo médio de produção em dias
-                const tempos = (boardData.done||[])
-                    .filter(i => (i.finished_at||'').slice(0,10) >= cutoffStr && i.tempo_producao)
-                    .map(i => i.tempo_producao);
-                const avgTempoDias = tempos.length > 0 ? (tempos.reduce((s,v)=>s+v,0) / tempos.length / 86400).toFixed(2) : '—';
+                const growthColor = data.crescimento >= 0 ? '#10b981' : '#ef4444';
+                const growthSign  = data.crescimento >= 0 ? '+' : '';
 
                 sec.innerHTML = `
                 <div class="row g-3 mb-4">
-                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid #ffb600;">
-                        <div class="text-muted small fw-bold text-uppercase">Pedidos Recebidos</div>
-                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:#ffb600;">${totalPedidos}</div>
-                        <small class="text-muted">Últimos ${dias} dias</small>
-                    </div></div>
-                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid #10b981;">
-                        <div class="text-muted small fw-bold text-uppercase">Produzidos</div>
-                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:#10b981;">${totalProduzidos}</div>
-                        <small class="text-muted">Concluídos no período</small>
-                    </div></div>
-                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid ${growth>=0?'#10b981':'#ef4444'};">
-                        <div class="text-muted small fw-bold text-uppercase">Crescimento</div>
-                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:${growth>=0?'#10b981':'#ef4444'};">${growth>=0?'+':''}${growth.toFixed(1)}%</div>
-                        <small class="text-muted">vs. período anterior</small>
-                    </div></div>
-                    <div class="col-md-3"><div class="card p-3 text-center" style="border-left:4px solid #6366f1;">
-                        <div class="text-muted small fw-bold text-uppercase">Tempo Médio</div>
-                        <div style="font-size:2.5rem;font-family:'Bebas Neue',sans-serif;color:#6366f1;">${avgTempoDias}</div>
-                        <small class="text-muted">dias por pedido</small>
-                    </div></div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid #ffb600;">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Pedidos Recebidos</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:#ffb600;line-height:1;">${data.total_recebidos}</div>
+                            <small class="text-muted">Últimos ${dias} dias</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid #10b981;">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Produzidos</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:#10b981;line-height:1;">${data.total_produzidos}</div>
+                            <small class="text-muted">Concluídos no período</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid ${growthColor};">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Crescimento</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:${growthColor};line-height:1;">${growthSign}${data.crescimento}%</div>
+                            <small class="text-muted">vs. ${dias} dias anteriores</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid #6366f1;">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Tempo Médio</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:#6366f1;line-height:1;">${data.avg_tempo_dias || '—'}</div>
+                            <small class="text-muted">dias por pedido</small>
+                        </div>
+                    </div>
                 </div>
-                <div class="card p-3">
-                    <div style="height:220px;"><canvas id="relatorio-chart"></canvas></div>
+
+                <div class="row g-3 mb-4">
+                    <div class="col-lg-7">
+                        <div class="card p-3">
+                            <div class="fw-bold mb-2" style="font-size:.85rem;">📊 Pedidos por Dia (últimos ${dias}d)</div>
+                            <div style="height:220px;"><canvas id="relatorio-chart"></canvas></div>
+                        </div>
+                    </div>
+                    <div class="col-lg-5">
+                        <div class="card p-3 h-100">
+                            <div class="fw-bold mb-2" style="font-size:.85rem;">🏆 Top 10 Produtos Mais Vendidos</div>
+                            <div style="max-height:240px;overflow-y:auto;">
+                            ${(data.top_produtos||[]).map((p,i) => `
+                                <div class="d-flex justify-content-between align-items-center py-1 border-bottom">
+                                    <span style="font-size:.75rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(p.nome)}">
+                                        <span class="badge bg-light text-dark border me-1">${i+1}</span>${escapeHtml(p.nome)}
+                                    </span>
+                                    <span class="badge bg-warning text-dark ms-2">${p.qtd} un.</span>
+                                </div>`).join('')}
+                            </div>
+                        </div>
+                    </div>
                 </div>`;
 
+                // Renderiza gráfico de barras
                 setTimeout(() => {
                     const ctx = document.getElementById('relatorio-chart')?.getContext('2d');
                     if (!ctx) return;
                     new Chart(ctx, {
                         type: 'bar',
                         data: {
-                            labels: lblSlice,
-                            datasets: [{ label: 'Pedidos / dia', data: dlySlice, backgroundColor: 'rgba(255,182,0,0.7)', borderRadius: 4 }]
+                            labels: data.labels,
+                            datasets: [{
+                                label: 'Pedidos / dia',
+                                data: data.counts,
+                                backgroundColor: 'rgba(255,182,0,0.75)',
+                                borderRadius: 4
+                            }]
                         },
-                        options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } }
+                        options: {
+                            responsive: true, maintainAspectRatio: false,
+                            plugins: { legend: { display: false } },
+                            scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+                        }
                     });
-                }, 100);
+                }, 80);
 
             } catch(e) {
-                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar relatório.</div>';
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar relatório: ' + e.message + '</div>';
             }
         }
 
@@ -7038,26 +7367,71 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
            FICHA TÉCNICA
         ══════════════════════════════════════════════════════════ */
 
-        function loadFichaTecnica() {
+        async function loadFichaTecnica() {
             const sec = document.getElementById('ficha-section');
             if (!sec) return;
-            let html = `<div class="table-responsive"><table class="table table-sm align-middle mb-0">
-                <thead><tr style="background:#f1f5f9;">
-                    <th class="ps-3">#</th><th>Componente</th><th class="text-center">Qtd</th><th>Unidade</th>
-                </tr></thead><tbody>`;
-            RECIPE_CADEIRA.forEach((c, i) => {
-                html += `<tr>
-                    <td class="ps-3 text-muted small">${i+1}</td>
-                    <td class="fw-bold">${escapeHtml(c.nome)}</td>
-                    <td class="text-center">${c.qtd}</td>
-                    <td class="text-muted small">${escapeHtml(c.un)}</td>
-                </tr>`;
-            });
-            html += `</tbody></table></div>
-            <div class="p-3 border-top">
-                <small class="text-muted">Total: <strong>${RECIPE_CADEIRA.length} componentes</strong> por unidade · Computados automaticamente na venda</small>
+
+            // Contagem de quantas cadeiras estão em espera para contextualizar
+            let waitingCount = 0;
+            try {
+                const bd = await fetch('/api/production/board').then(r => r.json());
+                waitingCount = (bd.waiting || []).filter(i =>
+                    (i.nome||i.nome_original||'').toUpperCase().includes('CADEIRA') ||
+                    (i.nome||i.nome_original||'').toUpperCase().includes('POLTRONA')
+                ).length;
+            } catch(e) {}
+
+            let html = `
+            <div class="p-3">
+                ${waitingCount > 0 ? `<div class="alert alert-info border-0 py-2 mb-3">
+                    <strong>${waitingCount}</strong> cadeira(s)/poltrona(s) em espera — 
+                    <a href="#" onclick="switchTabTo('tab-insumos');return false;">ver guia de compras</a>
+                </div>` : ''}
+
+                <div class="table-responsive">
+                <table class="table table-sm align-middle mb-0 border">
+                    <thead><tr style="background:#01010d;color:#fff;">
+                        <th class="ps-3 py-2">#</th>
+                        <th>Componente / Insumo</th>
+                        <th class="text-center">Qtd/un</th>
+                        <th>Unidade</th>
+                        <th class="text-center">Para 10 un.</th>
+                        <th class="text-center">Para ${waitingCount > 0 ? waitingCount + ' em espera' : '20 un.'}</th>
+                    </tr></thead>
+                    <tbody>
+                    ${RECIPE_CADEIRA.map((c, i) => {
+                        const for10  = (c.qtd * 10);
+                        const forWait = (c.qtd * (waitingCount || 20));
+                        return `<tr class="${i%2===0?'':'table-light'}">
+                            <td class="ps-3 text-muted small">${i+1}</td>
+                            <td class="fw-bold">${escapeHtml(c.nome)}</td>
+                            <td class="text-center">${c.qtd}</td>
+                            <td class="text-muted small">${escapeHtml(c.un)}</td>
+                            <td class="text-center text-primary fw-bold">${for10 % 1 === 0 ? for10 : for10.toFixed(2)}</td>
+                            <td class="text-center fw-bold" style="color:${waitingCount>0?'#10b981':'#6366f1'};">
+                                ${forWait % 1 === 0 ? forWait : forWait.toFixed(2)}
+                            </td>
+                        </tr>`;
+                    }).join('')}
+                    </tbody>
+                </table>
+                </div>
+
+                <div class="mt-3 p-3 border-top d-flex gap-3 flex-wrap align-items-center">
+                    <small class="text-muted">
+                        <strong>${RECIPE_CADEIRA.length}</strong> componentes cadastrados · 
+                        Computados automaticamente na venda · 
+                        Categoria: <strong>Cadeiras / Poltronas</strong>
+                    </small>
+                    <button class="btn btn-sm btn-outline-dark ms-auto" onclick="printFicha()">🖨️ Imprimir Ficha</button>
+                </div>
             </div>`;
             sec.innerHTML = html;
+        }
+
+        function switchTabTo(tabId) {
+            const btn = document.querySelector('[data-bs-target="#'+tabId+'"]');
+            if (btn) { try { new bootstrap.Tab(btn).show(); } catch(e) {} }
         }
 
         function printFicha() {
@@ -7116,8 +7490,157 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
 
-        /* Inicialização após autenticação confirmada */
-        let _boardInitialized = false;
+        /* ══════════════════════════════════════════════════════════
+           CÂMERA SCANNER — ZXing (celular / webcam)
+        ══════════════════════════════════════════════════════════ */
+        let _codeReader = null;
+        let _cameraActive = false;
+
+        function openCameraScanner() {
+            if (!isAuthenticated) {
+                showToast('Aviso', 'Autentique-se antes de usar o scanner.', 'warning');
+                return;
+            }
+            // Verifica suporte a câmera
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showToast('Aviso', 'Câmera não suportada neste dispositivo/browser.', 'warning');
+                return;
+            }
+            if (typeof ZXing === 'undefined') {
+                showToast('Aviso', 'Biblioteca ZXing não carregada. Use o scanner USB ou recarregue a página.', 'warning');
+                return;
+            }
+            const modal = new bootstrap.Modal(document.getElementById('cameraScanModal'));
+            modal.show();
+            setTimeout(_startCameraScanner, 400);
+        }
+
+        async function _startCameraScanner() {
+            const video = document.getElementById('camera-preview');
+            const resultBox = document.getElementById('camera-scan-result');
+            if (!video) return;
+
+            // Verifica se ZXing está disponível
+            if (typeof ZXing === 'undefined') {
+                if (resultBox) {
+                    resultBox.style.display = 'block';
+                    resultBox.textContent = '⚠️ Biblioteca de scanner não carregada. Usando scanner USB.';
+                }
+                return;
+            }
+
+            try {
+                _codeReader = new ZXing.BrowserMultiFormatReader();
+                _cameraActive = true;
+
+                // Lista câmeras disponíveis e prefere a traseira
+                const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+                const backCam = devices.find(d =>
+                    d.label.toLowerCase().includes('back') ||
+                    d.label.toLowerCase().includes('tras') ||
+                    d.label.toLowerCase().includes('rear') ||
+                    d.label.toLowerCase().includes('environment')
+                ) || devices[devices.length - 1] || devices[0];
+
+                if (!backCam) {
+                    if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Nenhuma câmera encontrada.'; }
+                    return;
+                }
+
+                await _codeReader.decodeFromVideoDevice(backCam.deviceId, video, async (result, err) => {
+                    if (result && _cameraActive) {
+                        const codigo = result.getText();
+                        _cameraActive = false; // Para de ler após 1 leitura
+                        if (resultBox) {
+                            resultBox.style.display = 'block';
+                            resultBox.textContent = '⏳ Processando: ' + codigo;
+                            resultBox.style.background = 'rgba(255,182,0,.85)';
+                            resultBox.style.color = '#000';
+                        }
+                        // Envia para o backend (mesma lógica do scanner USB)
+                        try {
+                            const res = await fetch('/api/barcode/scan', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ codigo })
+                            });
+                            const data = await res.json();
+                            const acao = data.acao || '';
+
+                            if (resultBox) {
+                                if (acao === 'iniciado') {
+                                    resultBox.style.background = 'rgba(16,185,129,.9)';
+                                    resultBox.style.color = '#fff';
+                                    resultBox.textContent = '✅ INICIADO: ' + (data.nome || codigo);
+                                    showToast('🚀 Iniciado!', data.nome + ' · #' + codigo, 'success');
+                                    setTimeout(() => { loadProductionBoard(); switchBoardTab('inprod'); }, 800);
+                                } else if (acao === 'concluido') {
+                                    resultBox.style.background = 'rgba(99,102,241,.9)';
+                                    resultBox.style.color = '#fff';
+                                    const tf = data.tempo_producao ? ' · ' + formatSeconds(data.tempo_producao) : '';
+                                    resultBox.textContent = '✅ CONCLUÍDO: ' + (data.nome || codigo) + tf;
+                                    showToast('✅ Concluído!', data.nome + tf, 'success');
+                                    setTimeout(() => { loadProductionBoard(); refreshComponentTab(); switchBoardTab('done'); }, 800);
+                                } else if (acao === 'ja_lido_etapa') {
+                                    resultBox.style.background = 'rgba(107,114,128,.85)';
+                                    resultBox.style.color = '#fff';
+                                    resultBox.textContent = '⚠️ ' + (data.mensagem || 'Já processado nesta etapa');
+                                    showToast('Aviso', data.mensagem, 'warning');
+                                } else if (acao === 'nao_encontrado') {
+                                    resultBox.style.background = 'rgba(239,68,68,.85)';
+                                    resultBox.style.color = '#fff';
+                                    resultBox.textContent = '❌ Não encontrado: ' + codigo;
+                                    showToast('Não encontrado', 'Pedido #' + codigo + ' não está na fila.', 'warning');
+                                } else {
+                                    resultBox.textContent = data.mensagem || 'Código: ' + codigo;
+                                }
+                            }
+
+                            // Re-habilita leitura após 3s (para ler próximo pedido)
+                            setTimeout(() => {
+                                _cameraActive = true;
+                                if (resultBox) {
+                                    resultBox.style.display = 'none';
+                                    resultBox.style.background = 'rgba(0,0,0,.7)';
+                                    resultBox.style.color = '#fff';
+                                }
+                            }, 3000);
+
+                        } catch(e) {
+                            if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Erro de comunicação'; }
+                            setTimeout(() => { _cameraActive = true; }, 2000);
+                        }
+                    }
+                });
+            } catch(e) {
+                console.error('Erro câmera:', e);
+                if (resultBox) {
+                    resultBox.style.display = 'block';
+                    resultBox.textContent = '❌ Erro ao acessar câmera: ' + (e.message || 'Permissão negada');
+                }
+            }
+        }
+
+        function stopCameraScanner() {
+            _cameraActive = false;
+            if (_codeReader) {
+                try { _codeReader.reset(); } catch(e) {}
+                _codeReader = null;
+            }
+            const video = document.getElementById('camera-preview');
+            if (video && video.srcObject) {
+                video.srcObject.getTracks().forEach(t => t.stop());
+                video.srcObject = null;
+            }
+        }
+
+        // Para câmera quando modal fecha
+        document.addEventListener('DOMContentLoaded', () => {
+            const camModal = document.getElementById('cameraScanModal');
+            if (camModal) camModal.addEventListener('hidden.bs.modal', stopCameraScanner);
+        });
+
+
 
         function _onAuthConfirmed() {
             if (!_boardInitialized) {
