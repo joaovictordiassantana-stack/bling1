@@ -89,7 +89,15 @@ try:
     from pymongo.errors import PyMongoError
     _MONGO_URI = os.environ.get('MONGODB_URI', '') or os.environ.get('MONGO_URI', '')
     if _MONGO_URI:
-        _mongo_client = MongoClient(_MONGO_URI, serverSelectionTimeoutMS=5000)
+        _mongo_client = MongoClient(
+            _MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+            connect=False,          # lazy connect — evita KeyError do gevent
+            maxPoolSize=10,
+            minPoolSize=0,
+        )
         _mongo_db = _mongo_client.get_database('sw_moveis')
         _mongo_client.admin.command('ping')  # testa conexão na inicialização
         MONGO_AVAILABLE = True
@@ -631,6 +639,29 @@ def safe_iter(data):
     if isinstance(data, (list, tuple)):
         return data
     return []
+
+_TAPECARIA_KW = frozenset([
+    'CADEIRA','POLTRONA','ESTOFADO','ESPUMA','TECIDO','COURVIM','COURO',
+    'VELUDO','LINHO','MATELASSÊ','MATELASSE','ASSENTO','ENCOSTO',
+    'BASE ESTOFADA','RECLINÁVEL','RECLINAVEL','HIDRÁULICA','HIDRAULICA',
+    'BERLIN','EVIDENCE','MADRID','LUNA','DIAMANTE',
+])
+_MARCENARIA_KW = frozenset([
+    'MDF','COMPENSADO','MADEIRA','SARRAFO','ARMÁRIO','ARMARIO',
+    'BALCÃO','BALCAO','BANCADA','CARRINHO','GABINETE',
+    'LAVATÓRIO','LAVATORIO','ESPELHO','PRATELEIRA','NICHO','PAINEL',
+    'LAVATÓRIO','ROUPEIRO',
+])
+
+def _classify_setor_py(nome_upper: str) -> str:
+    """Classifica o setor de produção com base no nome do produto (Python)."""
+    is_tape = any(k in nome_upper for k in _TAPECARIA_KW)
+    is_marc = any(k in nome_upper for k in _MARCENARIA_KW)
+    if is_tape:
+        return 'tapecaria'
+    if is_marc:
+        return 'marcenaria'
+    return 'tapecaria'   # default
 
 def _parse_order_date(date_str) -> Optional[datetime]:
     """
@@ -1195,16 +1226,26 @@ class SalesManager:
 
     def _get_state_for_save(self) -> Dict[str, Any]:
         with self.lock:
+            sh = self.stats_history or {}
             return {
-                "daily": self.daily_count,
-                "weekly": self.weekly_count,
-                "monthly": self.monthly_count,
+                "daily":    self.daily_count,
+                "weekly":   self.weekly_count,
+                "monthly":  self.monthly_count,
                 "historic": self.historic_count,
-                "history_data": self.history_data,
-                "stats_history": self.stats_history,
-                # sales_history salvo separadamente (evita doc > 16MB no MongoDB)
-                # orders_cache é derivado e não precisa persistir
+                # V5.0 KPI fields — used by broadcast and updateKpis JS
+                "daily_count":   sh.get('daily_count',   self.daily_count),
+                "weekly_count":  sh.get('weekly_count',  self.weekly_count),
+                "monthly_count": sh.get('monthly_count', self.monthly_count),
+                "growth":        sh.get('growth',  0),
+                "avg_daily":     sh.get('avg_daily', 0),
+                "last_7":        sh.get('last_7',  0),
+                "ritmo_7d":      sh.get('ritmo_7d', 0),
+                "monthly_total": sh.get('monthly_total', 0),
+                "history_data":  self.history_data,
+                "stats_history": self.stats_history,  # kept for persistence
                 "last_recalculated": self.last_recalculated.isoformat()
+                    if hasattr(self.last_recalculated, 'isoformat')
+                    else str(self.last_recalculated),
             }
 
     def _save_sales_history(self):
@@ -1431,17 +1472,34 @@ class ProductionTimer:
         """
         changed = False
         now = time.time()
+        MAX_TIMER_SECONDS = 30 * 24 * 3600  # 30 dias — máximo razoável
+
+        stale_keys = []
         for k, v in self.timers.items():
             if v.get('state') == 'running':
                 start_ts = v.get('start_ts', 0)
                 if start_ts and start_ts > 0:
-                    # Soma o tempo decorrido desde o último checkpoint
                     v['accumulated'] = v.get('accumulated', 0) + (now - start_ts)
-                # Retoma imediatamente — timer continua rodando
-                v['start_ts'] = now
-                v['state'] = 'running'
+                # Cap máximo — timer não pode acumular mais de 30 dias
+                if v.get('accumulated', 0) > MAX_TIMER_SECONDS:
+                    logger.warning(f"⏰ Timer '{k}' excedeu {MAX_TIMER_SECONDS//86400}d — pausado automaticamente.")
+                    v['state'] = 'paused'
+                    stale_keys.append(k)
+                else:
+                    v['start_ts'] = now
+                    v['state'] = 'running'
+                    changed = True
+                    logger.info(f"▶️ Restart: timer '{k}' retomado automaticamente ({int(v['accumulated'])}s acumulados).")
+
+        # Remove timers stale (> 60 dias, nunca finalizados) — evita acumulação infinita
+        CLEANUP_AFTER = 60 * 24 * 3600
+        for k in list(self.timers.keys()):
+            acc = self.timers[k].get('accumulated', 0)
+            if acc > CLEANUP_AFTER:
+                logger.info(f"🗑️ Timer '{k[:40]}' removido (>60d sem conclusão).")
+                del self.timers[k]
                 changed = True
-                logger.info(f"▶️ Restart: timer '{k}' retomado automaticamente ({int(v['accumulated'])}s acumulados).")
+
         if changed:
             self._save()
 
@@ -1926,10 +1984,28 @@ def _extract_base_cor(nome: str):
 
 class PendingOrdersManager:
     """
-    Gerencia pedidos do Bling que chegaram e estão aguardando produção.
-    Persiste no MongoDB (principal) ou arquivo (fallback).
+    Gerencia pedidos do Bling com Máquina de Estados Finita (FSM).
+
+    Estados válidos e transições permitidas:
+        waiting → in_production → done
+        in_production → waiting  (apenas se barcode NÃO foi lido ainda)
+
+    Um pedido NUNCA ocupa dois estados simultaneamente.
+    A transição requer leitura de barcode (enforced pelo backend).
     """
     FILE_PATH = DATA_DIR / 'pending_orders.json'
+
+    # FSM: transições válidas
+    VALID_TRANSITIONS = {
+        'waiting':       {'in_production'},
+        'in_production': {'done', 'waiting'},   # waiting = rollback
+        'done':          set(),                  # terminal
+    }
+
+    @staticmethod
+    def _validate_transition(current: str, target: str) -> bool:
+        allowed = PendingOrdersManager.VALID_TRANSITIONS.get(current, set())
+        return target in allowed
 
     def __init__(self):
         self.data = self._load()
@@ -2033,24 +2109,51 @@ class PendingOrdersManager:
             self._save_one(key)
         return self.data[key]
 
-    def start_production(self, item_key: str):
-        """Move item para status 'in_production'."""
-        if item_key in self.data:
-            self.data[item_key]['status'] = 'in_production'
-            self.data[item_key]['started_at'] = datetime.now().isoformat()
-            self._save_one(item_key)
-        return self.data.get(item_key)
+    def start_production(self, item_key: str, setor: str = 'tapecaria') -> Optional[Dict]:
+        """
+        FSM: waiting → in_production.
+        Rejeita transição se item não estiver em 'waiting'.
+        Define o setor (marcenaria/tapecaria) para separação de ordens.
+        """
+        item = self.data.get(item_key)
+        if not item:
+            logger.warning(f"start_production: item_key '{item_key}' não encontrado.")
+            return None
+        current = item.get('status', 'waiting')
+        if not self._validate_transition(current, 'in_production'):
+            logger.warning(f"FSM: transição inválida {current}→in_production para {item_key}")
+            return None
+        now_iso = datetime.now().isoformat()
+        item['status']     = 'in_production'
+        item['started_at'] = now_iso
+        item['setor']      = setor
+        # Garante que o item NÃO aparece em nenhum outro estado
+        item.pop('finished_at', None)
+        item.pop('mes_conclusao', None)
+        self._save_one(item_key)
+        return item
 
-    def finish_production(self, item_key: str, tempo_segundos: int = None):
-        """Move item para status 'done' — persiste no MongoDB para não sumir ao reiniciar."""
-        if item_key in self.data:
-            self.data[item_key]['status'] = 'done'
-            self.data[item_key]['finished_at'] = datetime.now().isoformat()
-            self.data[item_key]['mes_conclusao'] = datetime.now().strftime('%Y-%m')
-            if tempo_segundos is not None:
-                self.data[item_key]['tempo_producao'] = tempo_segundos
-            self._save_one(item_key)
-        return self.data.get(item_key)
+    def finish_production(self, item_key: str, tempo_segundos: int = None) -> Optional[Dict]:
+        """
+        FSM: in_production → done.
+        Rejeita se item não estiver em 'in_production'.
+        """
+        item = self.data.get(item_key)
+        if not item:
+            logger.warning(f"finish_production: item_key '{item_key}' não encontrado.")
+            return None
+        current = item.get('status', 'waiting')
+        if not self._validate_transition(current, 'done'):
+            logger.warning(f"FSM: transição inválida {current}→done para {item_key}")
+            return None
+        now = datetime.now()
+        item['status']        = 'done'
+        item['finished_at']   = now.isoformat()
+        item['mes_conclusao'] = now.strftime('%Y-%m')
+        if tempo_segundos is not None:
+            item['tempo_producao'] = int(tempo_segundos)
+        self._save_one(item_key)
+        return item
 
     def dismiss(self, item_key: str):
         """Remove item da fila — sincroniza MongoDB E arquivo."""
@@ -2878,7 +2981,11 @@ class Orchestrator:
                     
                 if 'last_recalculated' in stats_data:
                     stats_data.pop('last_recalculated')
-                    
+                # Remove heavy array fields — não precisam ser enviados via WS
+                # (só são usados para persistência e para o gráfico via /api/sales/history)
+                for heavy_key in ('stats_history', 'history_data'):
+                    stats_data.pop(heavy_key, None)
+
                 payload["sales_stats"] = stats_data
             except Exception as e:
                 self.logger.error(f"Erro ao processar sales_stats para broadcast: {e}")
@@ -3093,13 +3200,36 @@ class WebServer:
                 avg_tempo_dias = round(sum(tempos) / len(tempos) / 86400, 2) if tempos else 0
 
                 # Top 10 produtos mais pedidos no período
+                # Fonte primária: itens dos pedidos do Bling (se disponíveis)
+                # Fonte secundária: pending_orders (sempre tem nome do produto)
                 from collections import Counter
                 produto_counter = Counter()
+                # Tenta itens detalhados dos pedidos
                 for o in pedidos_periodo:
                     for item in (o.get('itens') or []):
-                        nome = item.get('descricao') or item.get('nome') or ''
+                        nome = (item.get('descricao') or item.get('nome') or '').strip()
                         if nome:
-                            produto_counter[nome[:60]] += int(item.get('quantidade', 1))
+                            produto_counter[nome[:60]] += max(1, int(item.get('quantidade', 1)))
+                # Complementa com dados do pending_orders (mais confiável)
+                if not produto_counter:
+                    order_ids_periodo = {
+                        str(o.get('id') or o.get('numero', ''))
+                        for o in pedidos_periodo
+                    }
+                    for po_item in pending_orders.data.values():
+                        oid = str(po_item.get('order_id_bling') or po_item.get('order_id') or po_item.get('pedido_numero') or '')
+                        if not order_ids_periodo or oid in order_ids_periodo:
+                            nome = (po_item.get('nome') or po_item.get('nome_original') or '').strip()
+                            if nome:
+                                produto_counter[nome[:60]] += 1
+                # Se ainda vazio, conta todos do pending_orders no mês
+                if not produto_counter:
+                    for po_item in pending_orders.data.values():
+                        data_item = (po_item.get('pedido_data') or '')[:10]
+                        if data_item >= data_ini:
+                            nome = (po_item.get('nome') or po_item.get('nome_original') or '').strip()
+                            if nome:
+                                produto_counter[nome[:60]] += 1
                 top_produtos = [{'nome': k, 'qtd': v} for k, v in produto_counter.most_common(10)]
 
                 # Distribuição por dia
@@ -3407,7 +3537,12 @@ class WebServer:
                 _op_cache = new_op_cache
 
             def _inject_op(item):
-                """Injeta dados da OP do Bling no item se disponível."""
+                """Injeta dados da OP do Bling no item + setor fallback para itens antigos."""
+                # Setor fallback: itens do MongoDB sem campo setor
+                if not item.get('setor'):
+                    nome_up = (item.get('nome') or item.get('nome_original') or '').upper()
+                    item['setor'] = _classify_setor_py(nome_up)
+
                 oid = str(item.get('order_id_bling') or item.get('order_id') or item.get('pedido_numero') or '')
                 op_data = _op_cache.get(oid, {})
                 if op_data.get('numero_op'):
@@ -3420,7 +3555,7 @@ class WebServer:
             # Aplica enriquecimento de OP em todos os grupos
             waiting_enriched  = [_inject_op(i) for i in waiting_enriched]
             in_prod           = [_inject_op(i) for i in in_prod]
-            done_enriched_out = [_inject_op(i) for i in done_enriched]
+            done_enriched_out = [_inject_op(i) for i in done_enriched[-200:]]  # últimos 200
 
             return jsonify({
                 'waiting': waiting_enriched,
@@ -3429,38 +3564,6 @@ class WebServer:
                 'done': done_enriched_out,
                 'server_time': time.time(),
             })
-
-        @self.app.route('/api/checklist/state/<path:produto>', methods=['GET'])
-        @token_required
-        def api_checklist_get(token, produto):
-            """Retorna estado salvo da checklist de um produto em produção."""
-            t = production_timer.timers.get(produto, {})
-            return jsonify({'checklist': t.get('checklist', {})})
-
-        @self.app.route('/api/checklist/state', methods=['POST'])
-        @token_required
-        def api_checklist_set(token):
-            """Salva estado de um item da checklist no servidor (persiste)."""
-            data = request.json
-            produto = data.get('produto', '')
-            componente = data.get('componente', '')
-            checked = data.get('checked', False)
-            if produto and componente:
-                # Antes bloqueava silenciosamente, causando 0 registros de consumo
-                if produto not in production_timer.timers:
-                    production_timer.timers[produto] = {
-                        'start_ts': 0,
-                        'accumulated': 0,
-                        'state': 'paused',
-                        'created_at': datetime.now().isoformat(),
-                        'checklist': {}
-                    }
-                if 'checklist' not in production_timer.timers[produto]:
-                    production_timer.timers[produto]['checklist'] = {}
-                production_timer.timers[produto]['checklist'][componente] = checked
-                production_timer._save()
-                logger.debug(f"Checklist salvo: produto={produto} comp={componente} checked={checked}")
-            return jsonify({'ok': True})
 
         @self.app.route('/api/consumption/register', methods=['POST'])
         @token_required
@@ -3679,21 +3782,54 @@ class WebServer:
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         @token_required
         def api_pending_orders_start(token):
-            """Move pedido de 'Em Espera' para 'Em Produção' e inicia timer."""
-            data = request.json
-            item_key = data.get('item_key', '')
-            produto_nome = data.get('produto_nome', '')
+            """
+            Move pedido de 'Em Espera' → 'Em Produção'.
+            FSM: só aceita se status == 'waiting'.
+            Detecta setor automaticamente pelo nome do produto.
+            """
+            data = request.json or {}
+            item_key    = data.get('item_key', '').strip()
+            produto_nome = data.get('produto_nome', '').strip()
             if not item_key:
                 return jsonify({'error': 'item_key obrigatório'}), 400
-            item = pending_orders.start_production(item_key)
+
+            # Verifica FSM antes de qualquer coisa
+            item_data = pending_orders.data.get(item_key)
+            if not item_data:
+                return jsonify({'error': f'Pedido {item_key} não encontrado'}), 404
+            if item_data.get('status') != 'waiting':
+                return jsonify({
+                    'error': f"Pedido já está em '{item_data.get('status')}'. FSM bloqueou transição."
+                }), 409
+
+            # Detecta setor pelo nome do produto
+            nome_upper = (produto_nome or item_data.get('nome', '')).upper()
+            setor = _classify_setor_py(nome_upper)
+
+            item = pending_orders.start_production(item_key, setor=setor)
+            if not item:
+                return jsonify({'error': 'FSM: transição recusada'}), 409
+
             timer_key = None
             if produto_nome:
                 timer_key = f"{produto_nome}||{item_key}"
                 production_timer.start(timer_key)
-                if item_key in pending_orders.data:
-                    pending_orders.data[item_key]['timer_key'] = timer_key
-                    pending_orders._save_one(item_key)
-            return jsonify({'success': True, 'item': item, 'timer_key': timer_key})
+                pending_orders.data[item_key]['timer_key'] = timer_key
+                pending_orders._save_one(item_key)
+
+            # Broadcast instantâneo
+            def _bc():
+                try:
+                    self.orchestrator.broadcast_kpi_update()
+                except Exception: pass
+            Thread(target=_bc, daemon=True).start()
+
+            return jsonify({
+                'success': True,
+                'item_key': item_key,
+                'setor': setor,
+                'timer_key': timer_key,
+            })
 
         @self.app.route('/api/pending-orders/finish', methods=['POST'])
         @token_required
@@ -3740,6 +3876,172 @@ class WebServer:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             pending_orders.dismiss(item_key)
             return jsonify({'success': True})
+
+        @self.app.route('/api/production/print-op/<item_key>')
+        @token_required
+        def api_print_op(token, item_key):
+            """
+            Retorna HTML de impressão da Ordem de Produção.
+            Inclui dados completos do item + barcode Code128 em SVG.
+            """
+            item = pending_orders.data.get(item_key)
+            if not item:
+                return "Pedido não encontrado", 404
+
+            nome      = item.get('nome') or item.get('nome_original', 'N/D')
+            op_num    = item.get('ordem_producao') or item.get('pedido_numero') or item.get('order_id', '')
+            cliente   = item.get('cliente', '—')
+            setor     = item.get('setor', '—').title()
+            data_ent  = item.get('data_entrega', '')
+            data_ped  = item.get('pedido_data', '')
+            base      = item.get('base', '')
+            cor       = item.get('cor', '')
+            status    = item.get('status', 'waiting')
+
+            def fmt_date(ds):
+                if not ds: return '—'
+                try:
+                    from datetime import datetime as _dt
+                    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d', '%d/%m/%Y'):
+                        try: return _dt.strptime(ds[:10], fmt[:len(ds[:10])]).strftime('%d/%m/%Y')
+                        except: continue
+                except: pass
+                return ds[:10] if ds else '—'
+
+            status_label = {'waiting':'Aguardando','in_production':'Em Produção','done':'Concluído'}.get(status, status)
+
+            html = f"""<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="utf-8">
+<title>OP #{op_num} — {nome[:40]}</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:Arial,sans-serif;padding:24px;color:#111}}
+  .header{{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #000;padding-bottom:12px;margin-bottom:16px}}
+  .empresa{{font-size:22px;font-weight:900;letter-spacing:0.04em}}
+  .op-num{{font-size:32px;font-weight:900;font-family:monospace;color:#000}}
+  .grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}}
+  .field{{border:1px solid #ccc;border-radius:4px;padding:8px 10px}}
+  .field label{{font-size:10px;font-weight:700;text-transform:uppercase;color:#666;display:block;margin-bottom:2px}}
+  .field span{{font-size:14px;font-weight:700}}
+  .barcode-section{{text-align:center;border:2px solid #000;border-radius:6px;padding:16px;margin-bottom:16px}}
+  .status-badge{{display:inline-block;padding:4px 16px;border-radius:50px;font-size:12px;font-weight:700;background:#ffb600;color:#000}}
+  .instructions{{font-size:11px;color:#555;margin-top:8px}}
+  .footer{{border-top:1px solid #ccc;padding-top:10px;font-size:10px;color:#888;text-align:center}}
+  @media print{{body{{padding:10px}}button{{display:none}}}}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+</head>
+<body>
+<div class="header">
+  <div>
+    <div class="empresa">SW MÓVEIS MDF</div>
+    <div style="font-size:12px;color:#555">Ordem de Produção</div>
+  </div>
+  <div style="text-align:right">
+    <div class="op-num">OP #{op_num}</div>
+    <span class="status-badge">{status_label}</span>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="field"><label>Produto</label><span>{nome}</span></div>
+  <div class="field"><label>Setor</label><span>{setor}</span></div>
+  <div class="field"><label>Cliente</label><span>{cliente}</span></div>
+  <div class="field"><label>Pedido Nº</label><span>#{op_num}</span></div>
+  <div class="field"><label>Base / Cor</label><span>{base}{' / '+cor if cor else ''}</span></div>
+  <div class="field"><label>Data Pedido</label><span>{fmt_date(data_ped)}</span></div>
+  <div class="field" style="grid-column:1/-1"><label>Data Prevista de Entrega</label><span style="color:{'#ef4444' if data_ent else '#111'};font-size:18px">{fmt_date(data_ent) if data_ent else 'Não informada'}</span></div>
+</div>
+
+<div class="barcode-section">
+  <svg id="op-barcode"></svg>
+  <div style="font-family:monospace;font-size:14px;letter-spacing:0.1em;margin-top:4px;font-weight:700">{op_num}</div>
+  <div class="instructions">
+    1ª leitura = Iniciar Produção &nbsp;|&nbsp; 2ª leitura = Concluir Produção
+  </div>
+</div>
+
+<div class="footer">
+  SW Móveis MDF &nbsp;·&nbsp; Gerado em {datetime.now().strftime('%d/%m/%Y %H:%M')} &nbsp;·&nbsp; OP #{op_num}
+</div>
+
+<div style="text-align:center;margin-top:16px">
+  <button onclick="window.print()" style="padding:10px 24px;font-size:14px;background:#000;color:#fff;border:none;border-radius:6px;cursor:pointer">🖨️ Imprimir</button>
+</div>
+
+<script>
+  JsBarcode('#op-barcode', '{op_num}', {{
+    format: 'CODE128',
+    width: 2.5, height: 80,
+    displayValue: false,
+    margin: 8,
+    background: '#ffffff',
+    lineColor: '#000000',
+  }});
+</script>
+</body></html>"""
+
+            return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+        @self.app.route('/api/expedicao')
+        @token_required
+        def api_expedicao(token):
+            """
+            Expedição: pedidos concluídos prontos para envio.
+            Inclui dados do Bling (cliente, endereço) e calcula urgência de prazo.
+            Suporta paginação: ?page=1&per_page=50&urgencia=all
+            """
+            try:
+                page     = int(request.args.get('page', 1))
+                per_page = min(int(request.args.get('per_page', 50)), 200)
+                urgencia_filter = request.args.get('urgencia', 'all')
+                hoje = datetime.now().date()
+
+                # Coleta apenas itens concluídos
+                done_items = []
+                for item in pending_orders.data.values():
+                    if item.get('status') != 'done':
+                        continue
+                    # Calcular urgência do prazo
+                    data_ent_str = item.get('data_entrega', '')
+                    dias_rest    = None
+                    urg          = 'normal'
+                    if data_ent_str:
+                        dt_ent = _parse_order_date(data_ent_str)
+                        if dt_ent:
+                            dias_rest = (dt_ent.date() - hoje).days
+                            if dias_rest < 0:   urg = 'atrasado'
+                            elif dias_rest <= 2: urg = 'critico'
+                            elif dias_rest <= 5: urg = 'atencao'
+                    done_items.append({**item, 'dias_restantes': dias_rest, 'urgencia': urg})
+
+                # Filtra por urgência
+                if urgencia_filter != 'all':
+                    done_items = [i for i in done_items if i.get('urgencia') == urgencia_filter]
+
+                # Ordena: atrasados primeiro, depois por prazo
+                urg_order = {'atrasado': 0, 'critico': 1, 'atencao': 2, 'normal': 3}
+                done_items.sort(key=lambda i: (
+                    urg_order.get(i.get('urgencia', 'normal'), 3),
+                    i.get('dias_restantes') if i.get('dias_restantes') is not None else 9999
+                ))
+
+                total  = len(done_items)
+                offset = (page - 1) * per_page
+                page_items = done_items[offset:offset + per_page]
+
+                return jsonify({
+                    'items':      page_items,
+                    'total':      total,
+                    'page':       page,
+                    'per_page':   per_page,
+                    'pages':      max(1, (total + per_page - 1) // per_page),
+                })
+            except Exception as e:
+                logger.error(f"api_expedicao: {e}")
+                return jsonify({'error': str(e), 'items': [], 'total': 0}), 500
 
         @self.app.route('/api/bling/ordens-producao')
         @token_required
@@ -5418,6 +5720,28 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             return `<div class="log-entry ${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
         }
 
+        /* ── Date helpers — guard contra Invalid Date ─────────────────── */
+        function safeDate(raw) {
+            if (!raw || raw === 'null' || raw === 'undefined' || raw === 'N/D') return null;
+            raw = String(raw).trim();
+            // Normaliza formato BR dd/mm/yyyy para ISO yyyy-mm-dd
+            if (raw.length >= 8 && raw[2] === '/' && raw[5] === '/') {
+                raw = raw.slice(6,10) + '-' + raw.slice(3,5) + '-' + raw.slice(0,2);
+            }
+            // Garante separador ISO entre data e hora
+            if (raw.length > 10 && raw[10] === ' ') raw = raw.slice(0,10) + 'T' + raw.slice(11);
+            const dt = new Date(raw);
+            return isNaN(dt.getTime()) ? null : dt;
+        }
+        function safeDateStr(raw, opts) {
+            const d = safeDate(raw);
+            return d ? d.toLocaleDateString('pt-BR', opts||{}) : '—';
+        }
+        function safeDateTimeStr(raw) {
+            const d = safeDate(raw);
+            return d ? d.toLocaleString('pt-BR') : '—';
+        }
+
         /* ✅ DESIGN: Formatação de Data/Hora */
         function formatDateTime(isoString) {
             if (!isoString || isoString === 'N/D') return 'N/D';
@@ -5628,199 +5952,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
         let timerInterval = null;
 
-        function openProductionChecklist(productName, timerKey) {
-            // timerKey é o identificador único do timer (pode ser "nome||item_key" ou apenas "nome")
-            const _timerKey = timerKey || productName;
-            const isCadeira = productName.toUpperCase().includes('CADEIRA');
-            let checklistHtml = '';
-
-            if (isCadeira) {
-                // encodedTimerKey: identifica o timer no servidor (pode ser "nome||item_key")
-                // encodedProductName: nome legível para registro de consumo
-                const encodedTimerKey   = encodeURIComponent(_timerKey);
-                const encodedProductName = encodeURIComponent(productName);
-                checklistHtml = `
-                    <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
-                    <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
-                        ${RECIPE_CADEIRA.map((item, i) => `
-                            <div class="col-md-6">
-                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
-                                     id="checklist-row-${i}"
-                                     style="cursor:pointer; transition: background 0.2s, border-color 0.2s;">
-                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}"
-                                        onchange="handleChecklistChange(this, ${i}, '${encodedTimerKey}', '${encodedProductName}')">
-                                    <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
-                                        ${item.nome} 
-                                        <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
-                                    </label>
-                                </div>
-                            </div>
-                        `).join('')}
-                    </div>
-                    <div id="checklist-progress" class="alert alert-info py-2 small mb-0">
-                        <strong>0 / ${RECIPE_CADEIRA.length}</strong> itens marcados como usados
-                    </div>
-                `;
-            } else {
-                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática de insumos.</div>`;
-            }
-
-            const modalHtml = `
-                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
-                    <div class="modal-dialog modal-lg modal-dialog-centered">
-                        <div class="modal-content border-0 shadow-2xl">
-                            <div class="modal-header text-white" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
-                                <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
-                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
-                            </div>
-                            <div class="modal-body" style="background: #f8fafc;">
-                                <!-- Timer Section -->
-                                <div class="card mb-4 border-0" style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white;">
-                                    <div class="card-body text-center py-4">
-                                        <div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em; opacity:.7;">⏱ Tempo de Produção</div>
-                                        <div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size: 3.5rem; letter-spacing:.05em; text-shadow: 0 0 20px rgba(99,102,241,.6);">
-                                            00:00:00
-                                        </div>
-                                        <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
-                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group"
-                                             data-produto="${encodeURIComponent(_timerKey)}"
-                                             data-display="${encodeURIComponent(productName)}">
-                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                                ▶ Iniciar
-                                            </button>
-                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                                ⏸ Pausar
-                                            </button>
-                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                                ↺ Zerar
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Checklist -->
-                                ${checklistHtml}
-                            </div>
-                            <div class="modal-footer bg-white d-flex justify-content-between">
-                                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
-                                    Fechar
-                                </button>
-                                <button type="button" class="btn btn-success px-4 fw-bold"
-                                    onclick="controlTimer('finish', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                    ✅ CONCLUIR & SALVAR
-                                </button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            `;
-
-            const oldModal = document.getElementById('productionModal');
-            if (oldModal) oldModal.remove();
-            document.body.insertAdjacentHTML('beforeend', modalHtml);
-            
-            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
-            modal.show();
-
-            // Carrega estado do timer (usa timer_key) e checklist (usa timer_key para encontrar o estado correto)
-            controlTimer('get', _timerKey);
-            _loadChecklistState(productName, _timerKey);
-        }
-
-        const checklistState = {};
-
-        async function _loadChecklistState(productName, timerKey) {
-            // Usa timerKey se disponível (para encontrar checklist salvo no timer correto)
-            const keyToLoad = timerKey || productName;
-            try {
-                const safe = encodeURIComponent(keyToLoad);
-                const res = await fetch(`/api/checklist/state/${safe}`);
-                const data = await res.json();
-                const saved = data.checklist || {};
-                // Restaura checkboxes marcados
-                RECIPE_CADEIRA.forEach((item, i) => {
-                    if (saved[item.nome]) {
-                        const cb = document.getElementById(`check${i}`);
-                        const row = document.getElementById(`checklist-row-${i}`);
-                        if (cb) {
-                            cb.checked = true;
-                            if (row) {
-                                row.style.background = '#d1fae5';
-                                row.style.borderColor = '#10b981';
-                            }
-                        }
-                    }
-                });
-                _updateChecklistProgress();
-            } catch(e) { console.error('Erro ao carregar checklist:', e); }
-        }
-
-        function _updateChecklistProgress() {
-            const total = RECIPE_CADEIRA.length;
-            const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
-            const progressDiv = document.getElementById('checklist-progress');
-            if (progressDiv) {
-                progressDiv.innerHTML = '<strong>' + checked + ' / ' + total + '</strong> itens marcados' + (checked === total ? ' ✅ Tudo marcado!' : '');
-                progressDiv.className = 'alert py-2 small mb-0 ' + (checked === total ? 'alert-success' : 'alert-info');
-            }
-        }
-
-        function handleChecklistChange(cb, idx, encodedTimerKey, encodedProductName) {
-            // encodedTimerKey: chave do timer no servidor (para salvar estado do checklist)
-            // encodedProductName: nome legível (para registrar consumo)
-            const timerKey   = decodeURIComponent(encodedTimerKey);
-            const productName = encodedProductName ? decodeURIComponent(encodedProductName) : timerKey.split('||')[0];
-            const isChecked = cb.checked;
-            const item = RECIPE_CADEIRA[idx];
-            const row = document.getElementById('checklist-row-' + idx);
-
-            if (row) {
-                if (isChecked) {
-                    row.style.background = '#d1fae5';
-                    row.style.borderColor = '#10b981';
-                } else {
-                    row.style.background = '';
-                    row.style.borderColor = '';
-                }
-            }
-
-            // Salva estado da checklist no servidor usando o timerKey correto
-            fetch('/api/checklist/state', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ produto: timerKey, componente: item.nome, checked: isChecked })
-            }).catch(e => console.error('Erro ao salvar checklist:', e));
-
-            // Registra consumo usando o nome legível do produto
-            registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
-            _updateChecklistProgress();
-        }
-
-        function toggleChecklist(container, idx, productName, timerKey) {
-            const cb = container.querySelector('input[type=checkbox]');
-            const tkey = timerKey || productName;
-            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(tkey), encodeURIComponent(productName));
-        }
-
-        async function registerConsumption(componentName, qty, unit, productName, checked) {
-            try {
-                const res = await fetch('/api/consumption/register', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ component_name: componentName, qty: qty, unit: unit, product_name: productName, checked: checked })
-                });
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                const tab = document.getElementById('tab-insumos');
-                if (tab && tab.classList.contains('active')) {
-                    setTimeout(() => fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {}), 400);
-                }
-            } catch(e) {
-                console.error('Erro ao registrar consumo:', e);
-                showToast('Aviso', 'Falha ao registrar insumo', 'warning');
-            }
-        }
-
-        /* Lógica do Timer Conectada ao Backend */
         async function controlTimer(action, produto) {
             try {
                 const res = await fetch('/api/timer/action', {
@@ -6021,14 +6152,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 btn.style.opacity = isActive ? '1' : '0.65';
                 btn.style.boxShadow = isActive ? '0 4px 14px rgba(0,0,0,.25)' : 'none';
             });
-            // Mostra buscador e setor tabs só quando Produzindo está ativo
+            // Mostra setor tabs nas abas Espera e Produzindo; buscador só em Produzindo
             const sw = document.getElementById('setor-tabs-wrap');
             const si = document.getElementById('search-inprod-wrap');
-            const isInprod = tab === 'inprod';
-            if (sw) sw.style.display = isInprod ? 'block' : 'none';
-            if (si) si.style.display = isInprod ? 'block' : 'none';
+            const showSetor  = tab === 'waiting' || tab === 'inprod';
+            const showSearch = tab === 'inprod';
+            if (sw) sw.style.display = showSetor  ? 'block' : 'none';
+            if (si) si.style.display = showSearch ? 'block' : 'none';
             // Limpa busca ao trocar aba
-            if (!isInprod) {
+            if (!showSearch) {
                 const inp = document.getElementById('search-inprod');
                 if (inp) inp.value = '';
                 if (_boardDataRaw) _boardData = _boardDataRaw;
@@ -6147,9 +6279,26 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
+            // Filtra por setor se necessário (Marcenaria/Tapeçaria)
+            let itemsParaRender = items;
+            if (_currentSetor === 'marcenaria') {
+                itemsParaRender = items.filter(i => _classifySetor(i.nome||i.nome_original||'') === 'marcenaria');
+            } else if (_currentSetor === 'tapecaria') {
+                itemsParaRender = items.filter(i => _classifySetor(i.nome||i.nome_original||'') === 'tapecaria');
+            }
+
+            if (itemsParaRender.length === 0 && _currentSetor !== 'todos') {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:2.5rem;opacity:.3;">🔍</div>
+                    <p class="mt-2">Nenhum pedido para o setor <strong>${_currentSetor}</strong>.</p>
+                    <button class="btn btn-sm btn-outline-secondary mt-2" onclick="switchSetor('todos')">Ver todos</button>
+                </div>`;
+                return;
+            }
+
             // Agrupa por produto
             const grupos = {};
-            items.forEach(item => {
+            itemsParaRender.forEach(item => {
                 const key = (item.nome || item.nome_original || 'N/D').toUpperCase();
                 if (!grupos[key]) grupos[key] = { nome: item.nome || item.nome_original || 'N/D', items: [] };
                 grupos[key].items.push(item);
@@ -6200,7 +6349,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             <div class="bc-svg-wrap my-2 text-center">
                                 <svg id="${svgId}"></svg>
                             </div>
-                            <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data ? '· '+new Date(item.pedido_data).toLocaleDateString('pt-BR') : ''}</div>
+                            <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data ? '· '+safeDateStr(item.pedido_data) : ''}</div>
                             ${jaLido
                                 ? `<div class="bc-lido-overlay">✅ CÓDIGO LIDO<br><small style="font-weight:400;font-size:.72rem;">Indo para Produzindo...</small></div>`
                                 : `<div class="mt-2 d-flex gap-2">
@@ -6331,7 +6480,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     : formatSeconds(elapsed);
 
                 // Data prevista formatada
-                const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
+                const dataEntFmt = item.data_entrega ? (() => { try { return safeDateStr(item.data_entrega); } catch { return item.data_entrega; } })() : '';
 
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
                     <div class="bc-card inprod">
@@ -6351,7 +6500,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 </span>
                             </div>
                         </div>
-                        <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data?'· '+new Date(item.pedido_data).toLocaleDateString('pt-BR'):''}</div>
+                        <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data?'· '+safeDateStr(item.pedido_data):''}</div>
                         ${jaLido
                             ? `<div class="bc-lido-overlay">✅ CONCLUÍDO!<br><small style="font-weight:400;font-size:.72rem;">Registrado com sucesso</small></div>`
                             : `<div class="mt-2">
@@ -6440,7 +6589,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const nome   = escapeHtml(item.nome || item.nome_original || 'N/D');
                 const baseCor = escapeHtml(((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))||'—');
                 const op     = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '—');
-                const fin    = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                const fin    = item.finished_at ? safeDateTimeStr(item.finished_at) : '—';
                 const tempo  = item.tempo_producao
                     ? (() => {
                         const tp = item.tempo_producao;
@@ -6483,22 +6632,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /** Renderiza mini-barcodes reais (JsBarcode) nas células da tabela */
-        function _renderBarcodes() {
-            document.querySelectorAll('svg[id^="bc_"]').forEach(svg => {
-                const wrap = svg.closest('[onclick]');
-                if (!wrap) return;
-                const onclk = wrap.getAttribute('onclick') || '';
-                const m = onclk.match(/openOPModal..([^']+)/);
-                if (!m) return;
-                const val = m[1];
-                if (!val || svg.children.length > 0) return;
-                try {
-                    JsBarcode(svg, val, { format:'CODE128', width:1.2, height:24, displayValue:false, margin:2, background:'#ffffff', lineColor:'#000000' });
-                } catch(e) {
-                    svg.innerHTML = `<text x="0" y="12" font-size="9" font-family="monospace">${val}</text>`;
-                }
-            });
-        }
 
 
         /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
@@ -6537,7 +6670,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                         <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
                             <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
-                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(numeroOP)}', '${escapeHtml(nomeProduto)}')">
+                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(numeroOP)}', '${escapeHtml(nomeProduto)}', '${escapeHtml(itemKey||'')}')">🖨️ Imprimir OP
                                 🖨️ Imprimir OP
                             </button>
                         </div>
@@ -6596,65 +6729,47 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch { box.innerHTML = ''; }
         }
 
-        /** Impressão da OP em página limpa (sem travar) */
-        function printOP(numeroOP, nomeProduto) {
-            // Gera SVG do barcode num canvas auxiliar
+        /** Impressão da OP — abre rota dedicada no backend com barcode de alta qualidade */
+        function printOP(numeroOP, nomeProduto, itemKey) {
+            if (itemKey) {
+                // Rota backend gera HTML completo com JsBarcode + dados do Bling
+                const url = '/api/production/print-op/' + encodeURIComponent(itemKey);
+                const win = window.open(url, '_blank', 'width=800,height=650,toolbar=yes,menubar=yes');
+                if (!win) showToast('Pop-up bloqueado', 'Permita pop-ups para imprimir a OP.', 'warning');
+                return;
+            }
+            // Fallback sem itemKey: gera localmente
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            tempSvg.id = '_printBcSvg';
-            tempSvg.style.display = 'none';
+            tempSvg.id = '_printBcSvg'; tempSvg.style.display = 'none';
             document.body.appendChild(tempSvg);
-
-            try {
-                JsBarcode('#_printBcSvg', String(numeroOP), {
-                    format: 'CODE128', width: 3, height: 90,
-                    displayValue: true, fontSize: 16, fontOptions: 'bold',
-                    margin: 8, background: '#ffffff', lineColor: '#000000'
-                });
-            } catch(e) {}
-
-            const svgHtml = tempSvg.outerHTML;
-            tempSvg.remove();
-
-            const printContent = `
-                <div style="font-family:Arial,sans-serif;text-align:center;padding:30px;">
-                    <h2 style="letter-spacing:.05em;margin-bottom:4px;">SW Móveis MDF</h2>
-                    <p style="color:#666;font-size:13px;margin-bottom:20px;">Ordem de Produção</p>
-                    <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;min-width:300px;">
-                        <div style="font-size:13px;color:#555;margin-bottom:8px;">${nomeProduto}</div>
-                        <div style="font-size:28px;font-weight:900;font-family:monospace;margin-bottom:16px;letter-spacing:.06em;">
-                            OP # ${numeroOP}
-                        </div>
-                        ${svgHtml}
-                    </div>
-                    <p style="color:#888;font-size:11px;margin-top:16px;">
-                        1ª leitura = Iniciar Produção &nbsp;|&nbsp; 2ª leitura = Concluir Produção
-                    </p>
-                    <script>window.onload=function(){window.print();window.onafterprint=function(){document.getElementById('print-area').style.display='none';}}</scr' + 'ipt>
-                </div>`;
-
-            const printArea = document.getElementById('print-area');
-            printArea.innerHTML = printContent;
-            printArea.style.display = 'block';
+            try { JsBarcode('#_printBcSvg', String(numeroOP), {format:'CODE128',width:3,height:90,displayValue:true,fontSize:16,margin:8}); } catch(e) {}
+            const svgHtml = tempSvg.outerHTML; tempSvg.remove();
+            const area = document.getElementById('print-area');
+            area.innerHTML = `<div style="font-family:Arial,sans-serif;text-align:center;padding:30px;">
+                <h2>SW Móveis MDF — Ordem de Produção</h2>
+                <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;margin-top:12px;">
+                    <p style="font-size:13px;color:#555;">${escapeHtml(nomeProduto||'')}</p>
+                    <p style="font-size:28px;font-weight:900;font-family:monospace;margin:12px 0;">OP #${escapeHtml(String(numeroOP))}</p>
+                    ${svgHtml}
+                    <p style="font-size:11px;color:#666;margin-top:10px;">1ª leitura = Iniciar · 2ª leitura = Concluir</p>
+                </div></div>`;
+            area.style.display = 'block';
             window.print();
-            // Limpa após impressão
-            window.onafterprint = () => {
-                printArea.innerHTML = '';
-                printArea.style.display = 'none';
-                window.onafterprint = null;
-            };
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /** ════════════════════════════════════════════════════
          *  LISTENER GLOBAL DE SCANNER DE CÓDIGO DE BARRAS
-         *  Scanners USB emulam teclado: digitam o código + Enter
-         *  1ª leitura (Em Espera)   → inicia produção
-         *  2ª leitura (Produzindo)  → conclui produção
-         *  Anti-duplicação: _scannedThisSession por item+etapa
+         *  Scanners USB emulam teclado: chars em <80ms + Enter
+         *  Buffer inteligente: distingue scanner vs digitação manual
          *  ════════════════════════════════════════════════════ */
         (function() {
-            let _scanBuffer = '';
-            let _scanTimer  = null;
-            const _MIN_LEN  = 3;
+            let _scanBuffer  = '';
+            let _scanTimer   = null;
+            let _lastKeyAt   = 0;
+            let _isScanning  = false;  // true quando chars chegam muito rápido (scanner)
+            const _MIN_LEN   = 4;      // mínimo para ser considerado scan válido
+            const _SCAN_GAP  = 100;    // ms: gap máximo entre chars de scanner
 
             const _indicator = document.getElementById('scanner-indicator');
 
@@ -6672,17 +6787,38 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const tag = document.activeElement?.tagName?.toLowerCase();
                 if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
 
+                const now = Date.now();
+                const gap = now - _lastKeyAt;
+                _lastKeyAt = now;
+
                 if (e.key === 'Enter') {
-                    const code = _scanBuffer.trim();
+                    const code = _scanBuffer.trim().split(/[ \t]+/).join('');
                     _scanBuffer = '';
+                    _isScanning = false;
                     clearTimeout(_scanTimer);
-                    if (code.length >= _MIN_LEN) _processScan(code);
+                    // Só processa se o código foi digitado em velocidade de scanner
+                    if (code.length >= _MIN_LEN) {
+                        _processScan(code);
+                    }
                     return;
                 }
+
                 if (e.key.length === 1) {
+                    // Detecta se é scanner (chars chegam muito rápido) ou humano
+                    if (_scanBuffer.length === 0 || gap < _SCAN_GAP) {
+                        _isScanning = true;
+                    } else if (gap > 300) {
+                        // Gap muito grande → reinicia buffer (provavelmente digitação manual)
+                        _scanBuffer = '';
+                        _isScanning = false;
+                    }
                     _scanBuffer += e.key;
                     clearTimeout(_scanTimer);
-                    _scanTimer = setTimeout(() => { _scanBuffer = ''; }, 400);
+                    // Auto-limpa buffer após 500ms sem atividade
+                    _scanTimer = setTimeout(() => {
+                        _scanBuffer = '';
+                        _isScanning = false;
+                    }, 500);
                 }
             });
 
@@ -6771,7 +6907,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             } catch(e) { /* silencioso */ }
         }
 
-        function renderActiveTimers(activeProduction) {}
 
         function renderConsumptionTable(data) {
             const tableSection = document.getElementById('consumption-table-section');
@@ -6824,8 +6959,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <th>#Pedido</th>
                 </tr></thead>
                 <tbody>${reversed.map(h => {
-                    const dt = h.data_conclusao ? new Date(h.data_conclusao) : null;
-                    const dtStr = (dt && !isNaN(dt)) ? dt.toLocaleString('pt-BR') : (h.data_conclusao || '—');
+                    const dtStr = safeDateTimeStr(h.data_conclusao || h.finished_at || '');
                     const nome  = escapeHtml(h.produto || h.nome || 'N/D');
                     const pedNum = h.pedido_numero || h.order_id || '';
                     const tempo  = fmtTempo(h.tempo_segundos || 0);
@@ -7166,72 +7300,81 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ══════════════════════════════════════════════════════════
            EXPEDIÇÃO
         ══════════════════════════════════════════════════════════ */
+        let _expedicaoPage = 1;
         let _expedicaoFilter = 'all';
 
-        async function loadExpedicao() {
+        async function loadExpedicao(page) {
             const sec = document.getElementById('expedicao-section');
             if (!sec) return;
+            _expedicaoPage = page || 1;
+            sec.innerHTML = '<div class="text-center py-4 text-muted">⏳ Carregando expedição...</div>';
             try {
-                const data = await fetch('/api/production/board').then(r => r.json());
-                const done = data.done || [];
-                _renderExpedicao(done);
+                const url = `/api/expedicao?page=${_expedicaoPage}&per_page=50&urgencia=${_expedicaoFilter}`;
+                const data = await fetchAPI(url);
+                _renderExpedicao(data.items || [], data.total || 0, data.pages || 1);
             } catch(e) {
-                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar expedição.</div>';
+                if (sec) sec.innerHTML = `<div class="alert alert-danger m-3">Erro ao carregar expedição: ${escapeHtml(e.message||'')}</div>`;
             }
         }
 
         function filterExpedicao(filter) {
             _expedicaoFilter = filter;
-            loadExpedicao();
+            _expedicaoPage = 1;
+            loadExpedicao(1);
         }
 
-        function _renderExpedicao(items) {
+        function _renderExpedicao(items, total, totalPages) {
             const sec = document.getElementById('expedicao-section');
             if (!sec) return;
-            let filtered = items;
-            if (_expedicaoFilter !== 'all') {
-                filtered = items.filter(i => (i.urgencia||'normal') === _expedicaoFilter);
-            }
-            if (filtered.length === 0) {
-                sec.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3;">🚚</div><p class="mt-2">Nenhum item neste filtro.</p></div>';
+            if (items.length === 0) {
+                sec.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">🚚</div>
+                    <p class="mt-2">Nenhum item neste filtro.</p>
+                </div>`;
                 return;
             }
-            const urgColors = { atrasado:'#ef4444', critico:'#f97316', atencao:'#f59e0b', normal:'#10b981' };
-            let html = `<div class="table-responsive"><table class="table table-hover table-sm align-middle mb-0">
+            const urgColors = {atrasado:'#ef4444',critico:'#f97316',atencao:'#f59e0b',normal:'#10b981'};
+            const paginacao = (totalPages > 1) ? `<div class="d-flex gap-1 align-items-center">
+                ${_expedicaoPage > 1 ? `<button class="btn btn-sm btn-outline-secondary" onclick="loadExpedicao(${_expedicaoPage-1})">‹</button>` : ''}
+                <small class="text-muted px-2">${_expedicaoPage}/${totalPages}</small>
+                ${_expedicaoPage < totalPages ? `<button class="btn btn-sm btn-outline-secondary" onclick="loadExpedicao(${_expedicaoPage+1})">›</button>` : ''}
+            </div>` : '';
+            let html = `<div class="d-flex justify-content-between align-items-center px-3 py-2 border-bottom">
+                <small class="text-muted">${total} item(s)</small>${paginacao}
+            </div>
+            <div class="table-responsive"><table class="table table-hover table-sm align-middle mb-0">
                 <thead><tr style="background:#f9f9f7;">
                     <th class="ps-3">Produto</th><th>Base/Cor</th><th>#Pedido</th>
                     <th>Cliente</th><th class="text-center">Prazo</th>
                     <th class="text-center">Dias Rest.</th><th class="text-center">Tempo Prod.</th>
-                    <th class="text-center">Concluído em</th>
+                    <th class="text-center">Concluído</th>
                 </tr></thead><tbody>`;
-            filtered.slice().sort((a,b) => {
-                const uo = {atrasado:0,critico:1,atencao:2,normal:3};
-                return (uo[a.urgencia||'normal']||3) - (uo[b.urgencia||'normal']||3);
-            }).forEach(item => {
-                const urg = item.urgencia || 'normal';
+            items.forEach(item => {
+                const urg  = item.urgencia || 'normal';
                 const dias = item.dias_restantes;
-                const rowBg = urg==='atrasado' ? 'background:rgba(239,68,68,.07);' : urg==='critico' ? 'background:rgba(249,115,22,.05);' : '';
-                const diasCell = dias === null || dias === undefined ? '—' :
-                    `<span class="badge" style="background:${urgColors[urg]};color:#fff;">${dias<0?'ATRASO '+Math.abs(dias)+'d':dias===0?'HOJE':dias+'d'}</span>`;
-                const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '—';
-                const finFmt = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
-                // Converte tempo de produção para dias/horas
-                const tp = item.tempo_producao || 0;
-                const tpFmt = tp > 86400 ? (tp/86400).toFixed(1)+'d' : tp > 3600 ? Math.floor(tp/3600)+'h'+Math.floor((tp%3600)/60)+'m' : tp > 0 ? Math.floor(tp/60)+'m' : '—';
+                const rowBg = urg==='atrasado' ? 'background:rgba(239,68,68,.07);' :
+                              urg==='critico'  ? 'background:rgba(249,115,22,.05);' : '';
+                const diasCell = (dias===null||dias===undefined) ? '—' :
+                    `<span class="badge" style="background:${urgColors[urg]};color:#fff;">
+                        ${dias<0?'⚠️ '+Math.abs(dias)+'d':dias===0?'HOJE':dias+'d'}</span>`;
+                const tp = item.tempo_producao||0;
+                const tpFmt = tp>86400?(tp/86400).toFixed(2)+'d':tp>3600?Math.floor(tp/3600)+'h'+Math.floor((tp%3600)/60)+'m':tp>0?Math.floor(tp/60)+'m':'—';
                 html += `<tr style="${rowBg}">
-                    <td class="ps-3 fw-bold">${escapeHtml(item.nome||item.nome_original||'N/D')}</td>
+                    <td class="ps-3 fw-bold" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                        title="${escapeHtml(item.nome||item.nome_original||'')}">${escapeHtml(item.nome||item.nome_original||'N/D')}</td>
                     <td class="small text-muted">${escapeHtml(((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))||'—')}</td>
                     <td class="small">#${escapeHtml(String(item.pedido_numero||item.order_id||'—'))}</td>
-                    <td class="small text-muted">${escapeHtml(item.cliente||'—')}</td>
-                    <td class="text-center small">${dataEntFmt}</td>
+                    <td class="small text-muted" style="max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(item.cliente||'—')}</td>
+                    <td class="text-center small">${safeDateStr(item.data_entrega)}</td>
                     <td class="text-center">${diasCell}</td>
                     <td class="text-center small fw-bold text-success">${tpFmt}</td>
-                    <td class="text-center small text-muted">${finFmt}</td>
+                    <td class="text-center small text-muted">${safeDateTimeStr(item.finished_at)}</td>
                 </tr>`;
             });
             html += '</tbody></table></div>';
             sec.innerHTML = html;
         }
+
 
         function printExpedicao() {
             const area = document.getElementById('print-area');
@@ -7799,15 +7942,11 @@ def create_app() -> Flask:
 app = create_app()
 
 if __name__ == '__main__':
-    # Apenas para testes locais
-
-    # Lógica de worker para ambiente local (apenas 1 processo)
-    # Garante que o worker inicie no ambiente local
-    _orchestrator = app.orchestrator  # atribuído em WebServer.__init__ via flask_app.orchestrator
+    # Apenas para testes locais (gunicorn NÃO executa este bloco)
+    _orchestrator = app.orchestrator
     if not _orchestrator.is_running():
         _orchestrator.start_worker()
         start_cleanup_timer()
         logger.info("✅ Worker de fundo iniciado em modo local.")
-
     logger.info("Iniciando servidor Flask em modo local...")
     app.run(host='0.0.0.0', port=5000, debug=False)
