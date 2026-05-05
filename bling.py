@@ -89,18 +89,22 @@ try:
     from pymongo.errors import PyMongoError
     _MONGO_URI = os.environ.get('MONGODB_URI', '') or os.environ.get('MONGO_URI', '')
     if _MONGO_URI:
+        # connect=False + directConnection=False: conexão 100% lazy
+        # NÃO fazemos ping aqui — gevent ainda não patcheou as threads do pymongo
+        # A conexão real só ocorre na primeira operação de dados (dentro do worker)
         _mongo_client = MongoClient(
             _MONGO_URI,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
-            socketTimeoutMS=10000,
-            connect=False,          # lazy connect — evita KeyError do gevent
-            maxPoolSize=10,
+            serverSelectionTimeoutMS=8000,
+            connectTimeoutMS=8000,
+            socketTimeoutMS=15000,
+            connect=False,        # lazy — não conecta no import
+            maxPoolSize=5,
             minPoolSize=0,
+            maxIdleTimeMS=30000,
         )
         _mongo_db = _mongo_client.get_database('sw_moveis')
-        _mongo_client.admin.command('ping')  # testa conexão na inicialização
         MONGO_AVAILABLE = True
+        # Ping adiado — será feito na primeira chamada real dentro do worker gevent
     else:
         MONGO_AVAILABLE = False
         _mongo_db = None
@@ -2497,6 +2501,15 @@ class Orchestrator:
     def _worker_loop(self):
         cycle_count = 0
         logger.info("🔄 Worker loop iniciado.")
+
+        # Teste de conectividade MongoDB — feito aqui dentro do worker,
+        # DEPOIS que o gevent já patcheou as threads, evitando o KeyError
+        if MONGO_AVAILABLE and _mongo_client is not None:
+            try:
+                _mongo_client.admin.command('ping')
+                logger.info("✅ MongoDB conectado com sucesso (ping OK).")
+            except Exception as _pe:
+                logger.warning(f"⚠️  MongoDB ping falhou: {_pe} — operações usarão fallback.")
 
         while not self._stop_event.is_set():
             cycle_count += 1
@@ -6972,22 +6985,55 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }).join('')}</tbody></table></div>`;
         }
 
-        /* WebSocket KPI com reconexão e backoff */
+        /* WebSocket KPI com reconexão automática e backoff exponencial */
         let wsKpi = null;
-        let _kpiReconnectDelay = 3000; // declarado fora para persistir entre reconexões
+        let _kpiReconnectDelay = 2000;
+        let _kpiReconnectTimer = null;
+        let _wsFirstAuthDone   = false;
+        let _wsConnected       = false;
 
         function _connectKpiWs() {
+            if (_kpiReconnectTimer) { clearTimeout(_kpiReconnectTimer); _kpiReconnectTimer = null; }
+            // Fecha conexão anterior se existir
+            if (wsKpi && wsKpi.readyState !== WebSocket.CLOSED) {
+                try { wsKpi.close(); } catch(e) {}
+            }
             const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
-            setupKpiWebSocket();
+            try {
+                wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
+                setupKpiWebSocket();
+            } catch(e) {
+                console.error('WS connect error:', e);
+                _scheduleReconnect();
+            }
+        }
+
+        function _scheduleReconnect() {
+            _wsConnected = false;
+            _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000); // max 30s
+            console.log(`WS: reconectando em ${Math.round(_kpiReconnectDelay/1000)}s...`);
+            _kpiReconnectTimer = setTimeout(_connectKpiWs, _kpiReconnectDelay);
         }
 
         function setupKpiWebSocket() {
             wsKpi.onopen = () => {
-                _kpiReconnectDelay = 3000; // reset ao conectar com sucesso
+                _wsConnected = true;
+                _kpiReconnectDelay = 2000; // reset backoff
+                console.log('✅ WS KPI conectado');
             };
 
-            let _wsFirstAuthDone = false;
+            wsKpi.onclose = (e) => {
+                _wsConnected = false;
+                console.log(`WS KPI fechado (code=${e.code}). Reconectando...`);
+                _scheduleReconnect();
+            };
+
+            wsKpi.onerror = (e) => {
+                _wsConnected = false;
+                console.warn('WS KPI erro:', e);
+                // onclose será chamado logo após — não duplicar a reconexão
+            };
+
             wsKpi.onmessage = (e) => {
                 let data;
                 try { data = JSON.parse(e.data); } catch { return; }
@@ -6998,7 +7044,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     if (data.sales_stats) updateKpis(data.sales_stats);
                     if (data.component_usage) updateComponentUsage(data.component_usage);
 
-                    // Atualiza KPIs das 3 etapas de produção via broadcast (sem reload do board)
+                    // Atualiza badges das 3 etapas via broadcast (sem reload do board)
                     if (data.production_snapshot) {
                         const ps = data.production_snapshot;
                         const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
@@ -7010,35 +7056,42 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         set('done-count-badge',    ps.done || 0);
                     }
 
-                    // Primeira mensagem autenticada: sync pedidos + recarrega board
+                    // Primeira mensagem autenticada: inicia o painel
                     if (data.authenticated && !_wsFirstAuthDone) {
                         _wsFirstAuthDone = true;
+                        _onAuthConfirmed();
+                        // Sync silencioso de pedidos
                         fetch('/api/pending-orders/sync', { method: 'POST' }).catch(() => {});
-                        const prodTab = document.getElementById('tab-producao');
-                        if (prodTab && prodTab.classList.contains('active')) {
-                            loadProductionBoard();
-                        }
                     }
 
-                    // Sincroniza cache: não há mais botão de recarregar na aba Produtos
+                    // Se auth mudou (reconexão após queda), recarrega board
+                    if (data.authenticated && _boardInitialized && !_wsConnected) {
+                        loadProductionBoard();
+                    }
+
                     if (data.cache_updated) {
-                        showToast('Cache', 'Produtos atualizados no servidor.', 'info');
+                        showToast('Cache', 'Produtos atualizados.', 'info');
                     }
                 }
             };
-
-            wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
-
-            wsKpi.onclose = () => {
-                _wsFirstAuthDone = false;
-                setTimeout(() => {
-                    _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
-                    _connectKpiWs();
-                }, _kpiReconnectDelay);
-            };
         }
 
-        _connectKpiWs();
+        // Reativa WS quando a aba volta ao foco (tab hidden/visible)
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                if (!wsKpi || wsKpi.readyState === WebSocket.CLOSED || wsKpi.readyState === WebSocket.CLOSING) {
+                    console.log('Tab voltou ao foco — reconectando WS...');
+                    _kpiReconnectDelay = 2000;
+                    _connectKpiWs();
+                }
+                // Também recarrega o board se autenticado
+                if (isAuthenticated && _boardInitialized) {
+                    loadProductionBoard();
+                }
+            }
+        });
+
+
 
         /* ══════════════════════════════════════════════════════════
            DASHBOARD — Gráficos unificados
@@ -7786,13 +7839,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 
         function _onAuthConfirmed() {
-            if (!_boardInitialized) {
-                _boardInitialized = true;
-                loadProductionBoard();
-                refreshComponentTab();
-                loadKPIChart();
-                if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
-            }
+            // Carrega dados ao confirmar auth — inclusive em reconexões após re-abertura da aba
+            _boardInitialized = true;
+            loadProductionBoard();
+            refreshComponentTab();
+            loadKPIChart();
+            if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
         }
 
         /* Inicializa conexão WS após declarar todas as funções */
