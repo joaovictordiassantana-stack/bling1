@@ -3851,6 +3851,22 @@ class WebServer:
             all_list = [normalize_for_api(p) for p in kits + products]
             return jsonify(all_list)
 
+        @self.app.route('/api/status')
+        def api_status():
+            """HTTP status endpoint — used by frontend as fallback when WS is slow."""
+            auth_ok = (self.orchestrator.auth._access_token and
+                       self.orchestrator.auth._expires_at > __import__('time').time() + 60)
+            ps = pending_orders.get_production_snapshot() if hasattr(pending_orders, 'get_production_snapshot') else {}
+            return jsonify({
+                'authenticated': bool(auth_ok),
+                'auth_url':      self.orchestrator.auth.get_auth_url(),
+                'production': {
+                    'waiting':       len(pending_orders.get_waiting()),
+                    'in_production': len(pending_orders.get_in_production()),
+                    'done':          len(pending_orders.get_done()),
+                }
+            })
+
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
             """
@@ -5468,6 +5484,36 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             // Default board tab = Em Espera
             switchBoardTab('waiting');
 
+            // HTTP fallback: check auth status immediately (don't wait for WS)
+            // This ensures the page shows content even if WS is slow to connect
+            (async () => {
+                try {
+                    const r = await fetch('/api/status');
+                    if (r.ok) {
+                        const d = await r.json();
+                        updateAuthStatus(d.authenticated, d.auth_url);
+                        if (d.authenticated && !_wsFirstAuthDone) {
+                            _wsFirstAuthDone = true;
+                            _onAuthConfirmed();
+                        }
+                        // Update production KPI badges from HTTP
+                        if (d.production) {
+                            const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
+                            set('kpi-waiting', d.production.waiting||0);
+                            set('kpi-inprod',  d.production.in_production||0);
+                            set('kpi-done',    d.production.done||0);
+                            set('waiting-count-badge', d.production.waiting||0);
+                            set('inprod-count-badge',  d.production.in_production||0);
+                            set('done-count-badge',    d.production.done||0);
+                        }
+                    }
+                } catch(e) {
+                    console.warn('HTTP status check failed, waiting for WS:', e);
+                }
+                // Always connect WS regardless of HTTP check result
+                _connectKpiWs();
+            })();
+
             document.querySelector('[data-bs-target="#tab-dashboard"]')?.addEventListener('shown.bs.tab', loadKPIChart);
             document.querySelector('[data-bs-target="#tab-producao"]')?.addEventListener('shown.bs.tab', () => {
                 loadProductionBoard();
@@ -5506,7 +5552,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _wsLogs.onerror = () => _wsLogs.close();
             }
             _connectWsLogs();
-            _connectKpiWs();
         });
     </script>
 </body>
