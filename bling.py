@@ -4286,6 +4286,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .sw-toast.info    { border-left-color: #6366f1; }
 
         .hidden { display: none !important; }
+        /* Auth-required visible by default until JS confirms auth */
+        #content-tabs { display: none; }
+        #auth-required-tabs { display: block; }
         .sw-pattern-bar { height: 4px; background: linear-gradient(90deg, var(--sw-yellow) 0%, #fff 50%, var(--sw-yellow) 100%); }
 
         /* Setor badge */
@@ -4307,8 +4310,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <div class="container-fluid px-4 py-4">
 
         <!-- AUTH REQUIRED -->
-        <div id="auth-required-tabs" class="alert alert-warning hidden mt-3">
-            🔐 Autentique-se para acessar o painel.
+        <!-- AUTH REQUIRED — sempre visível até autenticação confirmada -->
+        <div id="auth-required-tabs" class="mt-4" style="display:block">
+            <div class="text-center py-5">
+                <div style="font-size:4rem;margin-bottom:16px">🔐</div>
+                <h3 class="fw-bold mb-2">Autenticação necessária</h3>
+                <p class="text-muted mb-4">Conecte sua conta Bling para acessar o painel de produção SW Móveis MDF.</p>
+                <a id="auth-link-main" href="/auth" class="btn btn-warning btn-lg fw-bold px-5" style="border-radius:50px;font-size:1.1rem">
+                    🔗 Autenticar com Bling
+                </a>
+                <div class="mt-3" id="connect-status" style="font-size:.82rem;color:#888">
+                    ⏳ Verificando conexão...
+                </div>
+            </div>
         </div>
 
         <!-- TABS PRINCIPAIS -->
@@ -4628,12 +4642,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const tabs   = document.getElementById('content-tabs');
             const authEl = document.getElementById('auth-required-tabs');
             if (badge) {
-                badge.textContent = authenticated ? '✅ Autenticado' : '⚠️ Não autenticado';
+                badge.textContent = authenticated ? '✅ Autenticado' : '⚠️ Não autenticado — clique em Autenticar';
                 badge.className   = 'badge ' + (authenticated ? 'bg-success' : 'bg-warning text-dark');
             }
-            if (link)   link.style.display   = authenticated ? 'none' : '';
+            if (authUrl) {
+                const lnk = document.getElementById('auth-link');
+                if (lnk) lnk.href = authUrl;
+            }
+            if (link)   link.style.display = authenticated ? 'none' : 'inline-block';
             if (tabs)   tabs.classList.toggle('hidden', !authenticated);
-            if (authEl) authEl.classList.toggle('hidden', !!authenticated);
+            // Always show auth-required section when NOT authenticated
+            // Show/hide auth-required section
+            if (authEl) {
+                authEl.style.display = authenticated ? 'none' : 'block';
+            }
+            // Show/hide main content tabs
+            if (tabs) {
+                tabs.style.display = authenticated ? 'block' : 'none';
+            }
         }
 
         /* ── Setor classifier ── */
@@ -5492,6 +5518,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     if (r.ok) {
                         const d = await r.json();
                         updateAuthStatus(d.authenticated, d.auth_url);
+                        // Update connect status message
+                        const cs = document.getElementById('connect-status');
+                        if (cs) cs.textContent = d.authenticated ? '✅ Autenticado' : '⚠️ Token expirado — clique em Autenticar';
+                        // Update main auth link href
+                        const aml = document.getElementById('auth-link-main');
+                        if (aml && d.auth_url) aml.href = d.auth_url;
+
                         if (d.authenticated && !_wsFirstAuthDone) {
                             _wsFirstAuthDone = true;
                             _onAuthConfirmed();
@@ -5508,7 +5541,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         }
                     }
                 } catch(e) {
-                    console.warn('HTTP status check failed, waiting for WS:', e);
+                    console.warn('HTTP status check failed:', e);
+                    const cs = document.getElementById('connect-status');
+                    if (cs) cs.textContent = '⚠️ Erro de conexão — tente recarregar a página';
                 }
                 // Always connect WS regardless of HTTP check result
                 _connectKpiWs();
