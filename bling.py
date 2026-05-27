@@ -830,12 +830,26 @@ class BlingAPIClient:
                 self.logger.warning(f"⚠️ Token expirado/inválido ({e.response.status_code}) em {endpoint} — tentando refresh automático...")
                 try:
                     if self.auth.refresh_token():
-                        self.logger.info("✅ Token renovado automaticamente — repetindo requisição.")
-                        # Retry once after refresh
-                        self._access_token = self.auth._access_token
-                        return None  # Caller will retry on next cycle
+                        self.logger.info("✅ Token renovado — re-tentando requisição imediatamente.")
+                        # Real retry with new token
+                        try:
+                            new_token = self.auth._access_token
+                            retry_resp = self._session.get(
+                                url, params=params,
+                                headers={
+                                    'Authorization': f'Bearer {new_token}',
+                                    'Accept': 'application/json',
+                                    'User-Agent': 'SWMoveis/4.6',
+                                },
+                                timeout=30
+                            )
+                            retry_resp.raise_for_status()
+                            return retry_resp.json()
+                        except Exception as _re:
+                            self.logger.error(f"Re-tentativa após refresh falhou: {_re}")
+                            return None
                     else:
-                        self.logger.error("❌ Refresh de token falhou — re-autenticação necessária.")
+                        self.logger.error("❌ Refresh falhou — re-autenticação necessária.")
                 except Exception as _re:
                     self.logger.error(f"Erro no auto-refresh: {_re}")
             self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
@@ -3853,13 +3867,28 @@ class WebServer:
 
         @self.app.route('/api/status')
         def api_status():
-            """HTTP status endpoint — used by frontend as fallback when WS is slow."""
-            auth_ok = (self.orchestrator.auth._access_token and
-                       self.orchestrator.auth._expires_at > __import__('time').time() + 60)
-            ps = pending_orders.get_production_snapshot() if hasattr(pending_orders, 'get_production_snapshot') else {}
+            """HTTP status — also tries to reload token from disk if memory token expired."""
+            import time as _t
+            auth = self.orchestrator.auth
+            # Try memory token first
+            auth_ok = bool(auth._access_token and auth._expires_at > _t.time() + 30)
+            # If not OK, try loading from disk (handles restart without re-auth)
+            if not auth_ok:
+                try:
+                    auth.reload_tokens_from_disk()
+                    auth_ok = bool(auth._access_token and auth._expires_at > _t.time() + 30)
+                except Exception:
+                    pass
+            # If still not OK, try refresh
+            if not auth_ok and auth._refresh_token:
+                try:
+                    if auth.refresh_token():
+                        auth_ok = True
+                except Exception:
+                    pass
             return jsonify({
-                'authenticated': bool(auth_ok),
-                'auth_url':      self.orchestrator.auth.get_auth_url(),
+                'authenticated': auth_ok,
+                'auth_url':      auth.get_auth_url(),
                 'production': {
                     'waiting':       len(pending_orders.get_waiting()),
                     'in_production': len(pending_orders.get_in_production()),
@@ -5624,11 +5653,15 @@ def create_app() -> Flask:
     # CRÍTICO: Sempre configure FLASK_SECRET_KEY como variável de ambiente em produção.
     _secret = os.environ.get('FLASK_SECRET_KEY')
     if not _secret:
+        # Derive stable key from MongoDB URI (persistent across restarts)
+        # This prevents OAuth state cookie invalidation
+        import hashlib as _hl
+        _seed = (os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URI') or 'sw-moveis-mdf-fallback-2026')
+        _secret = _hl.sha256(_seed.encode()).hexdigest()
         logger.warning(
-            "⚠️  FLASK_SECRET_KEY não configurada! Usando chave temporária gerada aleatoriamente. "
-            "Configure essa variável em produção para evitar invalidação de sessões ao reiniciar."
+            "⚠️  FLASK_SECRET_KEY não configurada! Usando chave estável derivada do MongoDB URI. "
+            "Configure FLASK_SECRET_KEY no Render para máxima segurança."
         )
-        _secret = secrets.token_hex(32)
     flask_app.config['SECRET_KEY'] = _secret
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
