@@ -455,8 +455,8 @@ class Config:
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', '')
     
     # API
-    BLING_API_URL: str = 'https://www.bling.com.br/Api/v3'
-    TOKEN_URL: str = 'https://www.bling.com.br/Api/v3/oauth/token'
+    BLING_API_URL: str = 'https://api.bling.com.br/Api/v3'
+    TOKEN_URL: str = 'https://api.bling.com.br/api/v3/oauth/token'
     
     # Retry e Timeout
     REQUEST_TIMEOUT: int = 30
