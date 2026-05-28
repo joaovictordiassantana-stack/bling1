@@ -831,18 +831,11 @@ class BlingAPIClient:
                 try:
                     if self.auth.refresh_token():
                         self.logger.info("✅ Token renovado — re-tentando requisição imediatamente.")
-                        # Real retry with new token
                         try:
                             new_token = self.auth._access_token
-                            retry_resp = self.session.get(
-                                url, params=params,
-                                headers={
-                                    'Authorization': f'Bearer {new_token}',
-                                    'Accept': 'application/json',
-                                    'User-Agent': 'SWMoveis/4.6',
-                                },
-                                timeout=30
-                            )
+                            # Atualiza o header de autorização no kwargs original e re-tenta
+                            kwargs['headers']['Authorization'] = f'Bearer {new_token}'
+                            retry_resp = self.session.request(method, url, timeout=45, **kwargs)
                             retry_resp.raise_for_status()
                             return retry_resp.json()
                         except Exception as _re:
