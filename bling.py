@@ -840,9 +840,16 @@ class BlingAPIClient:
                             return retry_resp.json()
                         except Exception as _re:
                             self.logger.error(f"Re-tentativa após refresh falhou: {_re}")
+                            # Se o retry também falhou com 403, o refresh_token expirou
+                            # Força limpeza dos tokens para obrigar re-autenticação
+                            if '403' in str(_re) or 'Forbidden' in str(_re):
+                                self.logger.error("🔐 Refresh token expirado. AÇÃO NECESSÁRIA: Acesse /auth para re-autenticar com o Bling.")
+                                self.auth._access_token  = None
+                                self.auth._refresh_token = None
+                                self.auth._expires_at    = 0
                             return None
                     else:
-                        self.logger.error("❌ Refresh falhou — re-autenticação necessária.")
+                        self.logger.error("❌ Refresh falhou — acesse /auth para re-autenticar.")
                 except Exception as _re:
                     self.logger.error(f"Erro no auto-refresh: {_re}")
             self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
@@ -1474,17 +1481,41 @@ class ProductionTimer:
         """
         changed = False
         now = time.time()
-        for k, v in self.timers.items():
+        MAX_TIMER_SECONDS = 30 * 24 * 3600   # 30 dias — cap máximo razoável
+        CLEANUP_AFTER     = 60 * 24 * 3600   # 60 dias — remove timers abandonados
+
+        stale_keys = []
+        for k, v in list(self.timers.items()):
+            acc = v.get('accumulated', 0)
+
+            # Remove timers muito antigos (>60 dias abandonados)
+            if acc > CLEANUP_AFTER:
+                logger.info(f"🗑️ Timer '{k[:40]}' removido (>60d sem conclusao).")
+                stale_keys.append(k)
+                changed = True
+                continue
+
             if v.get('state') == 'running':
                 start_ts = v.get('start_ts', 0)
                 if start_ts and start_ts > 0:
-                    # Soma o tempo decorrido desde o último checkpoint
-                    v['accumulated'] = v.get('accumulated', 0) + (now - start_ts)
-                # Retoma imediatamente — timer continua rodando
+                    v['accumulated'] = acc + (now - start_ts)
+
+                # Cap: pausa timers que excedem 30 dias
+                if v['accumulated'] > MAX_TIMER_SECONDS:
+                    logger.warning(f"⏰ Timer '{k[:50]}' excedeu 30d — pausado automaticamente.")
+                    v['state']    = 'paused'
+                    v['start_ts'] = 0
+                    changed = True
+                    continue
+
                 v['start_ts'] = now
-                v['state'] = 'running'
+                v['state']    = 'running'
                 changed = True
                 logger.info(f"▶️ Restart: timer '{k}' retomado automaticamente ({int(v['accumulated'])}s acumulados).")
+
+        for k in stale_keys:
+            del self.timers[k]
+
         if changed:
             self._save()
 
