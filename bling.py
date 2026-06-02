@@ -17,19 +17,6 @@ try:
     except RuntimeError:
         _aio.set_event_loop(_aio.new_event_loop())
     del _gm, _aio
-
-    # Suppress cosmetic KeyError from pymongo monitor threads under gevent/Python 3.13
-    # These errors are harmless — pymongo threads cleanup fails because gevent already
-    # owns the thread registry. Does NOT affect functionality.
-    import gevent.hub as _gh
-    _orig_handle = _gh.Hub.handle_error
-    def _patched_handle_error(self, context, type, value, tb):
-        if type is KeyError and 'pymongo' in str(context).lower():
-            return  # suppress pymongo thread cleanup KeyError
-        _orig_handle(self, context, type, value, tb)
-    _gh.Hub.handle_error = _patched_handle_error
-    del _gh, _orig_handle, _patched_handle_error
-
 except ImportError:
     pass  # Sem gevent instalado — modo local com threads puras
 
@@ -102,21 +89,9 @@ try:
     from pymongo.errors import PyMongoError
     _MONGO_URI = os.environ.get('MONGODB_URI', '') or os.environ.get('MONGO_URI', '')
     if _MONGO_URI:
-        # Python 3.13 + gevent + pymongo: usar options que minimizam threads background
-        # directConnection=False + heartbeatFrequencyMS alto reduz monitor threads
-        _mongo_client = MongoClient(
-            _MONGO_URI,
-            serverSelectionTimeoutMS=8000,
-            connectTimeoutMS=8000,
-            socketTimeoutMS=15000,
-            connect=False,           # lazy — não conecta no import
-            maxPoolSize=3,           # pool mínimo
-            minPoolSize=0,
-            maxIdleTimeMS=45000,
-            heartbeatFrequencyMS=60000,  # reduz frequência do monitor thread (padrão=10s)
-            serverMonitoringMode='stream',  # pymongo >=4.3 — desativa polling agressivo
-        )
+        _mongo_client = MongoClient(_MONGO_URI, serverSelectionTimeoutMS=5000)
         _mongo_db = _mongo_client.get_database('sw_moveis')
+        _mongo_client.admin.command('ping')  # testa conexão na inicialização
         MONGO_AVAILABLE = True
     else:
         MONGO_AVAILABLE = False
@@ -202,9 +177,17 @@ class MongoStore:
 # ============================================================================
 # CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
 # ============================================================================
-# No Render o diretório de trabalho é read-only — usa /tmp para arquivos temporários
-_default_data_dir = '/tmp' if os.path.isdir('/tmp') and os.access('/tmp', os.W_OK) else '.'
-DATA_DIR = Path(os.environ.get('DATA_DIR', _default_data_dir))
+# No Render o /tmp não persiste entre deploys — usa diretório local como fallback
+_default_data_dir = os.environ.get('DATA_DIR', '.')
+DATA_DIR = Path(_default_data_dir)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    # Testa escrita
+    _test = DATA_DIR / '.write_test'
+    _test.write_text('ok')
+    _test.unlink()
+except Exception:
+    DATA_DIR = Path('.')
 
 # ============================================================================ 
 # 0. RATE LIMITER GLOBAL (NÍVEL PRODUÇÃO)
@@ -825,19 +808,8 @@ class BlingAPIClient:
             
         except requests.exceptions.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
+                # Silencioso para 404, deixa o chamador decidir
                 raise e
-            if e.response is not None and e.response.status_code in (401, 403):
-                self.logger.warning(f"⚠️ Token expirado/inválido ({e.response.status_code}) em {endpoint} — tentando refresh automático...")
-                try:
-                    if self.auth.refresh_token():
-                        self.logger.info("✅ Token renovado automaticamente — repetindo requisição.")
-                        # Retry once after refresh
-                        self._access_token = self.auth._access_token
-                        return None  # Caller will retry on next cycle
-                    else:
-                        self.logger.error("❌ Refresh de token falhou — re-autenticação necessária.")
-                except Exception as _re:
-                    self.logger.error(f"Erro no auto-refresh: {_re}")
             self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
             return None
         except Exception as e:
@@ -1223,22 +1195,15 @@ class SalesManager:
 
     def _get_state_for_save(self) -> Dict[str, Any]:
         with self.lock:
-            sh = self.stats_history or {}
             return {
-                "daily":         self.daily_count,
-                "weekly":        self.weekly_count,
-                "monthly":       self.monthly_count,
-                "historic":      self.historic_count,
-                # V5.0 fields for KPI display
-                "daily_count":   sh.get("daily_count",   self.daily_count),
-                "weekly_count":  sh.get("weekly_count",  self.weekly_count),
-                "monthly_count": sh.get("monthly_count", self.monthly_count),
-                "growth":        sh.get("growth",  0),
-                "avg_daily":     sh.get("avg_daily", 0),
-                "last_7":        sh.get("last_7",  0),
-                "ritmo_7d":      sh.get("ritmo_7d", 0),
-                "history_data":  self.history_data,
+                "daily": self.daily_count,
+                "weekly": self.weekly_count,
+                "monthly": self.monthly_count,
+                "historic": self.historic_count,
+                "history_data": self.history_data,
                 "stats_history": self.stats_history,
+                # sales_history salvo separadamente (evita doc > 16MB no MongoDB)
+                # orders_cache é derivado e não precisa persistir
                 "last_recalculated": self.last_recalculated.isoformat()
             }
 
@@ -1287,7 +1252,7 @@ class SalesManager:
         
         # Mantém KPIs de calendário (Hoje, Semana Atual, Mês Atual)
         hoje = now.date()
-        inicio_semana = hoje - timedelta(days=6)  # rolling 7 days
+        inicio_semana = hoje - timedelta(days=6)   # últimos 7 dias corridos (não semana calendar)
         inicio_mes = hoje.replace(day=1)
         
         inicio_grafico = hoje - timedelta(days=29) # Últimos 30 dias
@@ -1356,9 +1321,18 @@ class SalesManager:
         for i in range(len(counts)):
             subset = counts[max(0, i-6):i+1]
             moving_avg.append(sum(subset) / len(subset) if subset else 0)
-        last_week = sum(counts[-7:])
-        prev_week = sum(counts[-14:-7])
-        growth = ((last_week - prev_week) / prev_week * 100) if prev_week else 0
+
+        # Crescimento: últimos 7 dias vs média mensal ÷ 20 dias úteis
+        # (conforme proposta V5.0: comparar semana atual vs ritmo mensal esperado)
+        last_7   = sum(counts[-7:])
+        monthly_total = len(monthly_orders)
+        # Ritmo esperado para 7 dias = (total_mês / 20 dias úteis) * 7
+        ritmo_mensal_7d = (monthly_total / 20) * 7 if monthly_total > 0 else 0
+        growth = round(((last_7 - ritmo_mensal_7d) / ritmo_mensal_7d * 100), 1) if ritmo_mensal_7d else 0
+
+        # Média diária de produção (pedidos/dia nos últimos 30d com pedidos)
+        dias_com_pedidos = sum(1 for c in counts if c > 0)
+        avg_daily = round(sum(counts) / max(dias_com_pedidos, 1), 1)
 
         pedidos_processados = len(daily_orders) + len(weekly_orders) + len(monthly_orders) + len(daily_counts_chart)
 
@@ -1376,24 +1350,17 @@ class SalesManager:
 
             self.history_data['yearly_monthly_report'] = dict(monthly_report)
 
-            # Crescimento V5.0: últimos 7d vs média mensal ÷ 20 dias úteis
-            last_7_val = sum(counts[-7:])
-            monthly_total_val = len(monthly_orders)
-            ritmo_7d_val = (monthly_total_val / 20) * 7 if monthly_total_val > 0 else 0
-            growth_v5 = round(((last_7_val - ritmo_7d_val) / ritmo_7d_val * 100), 1) if ritmo_7d_val else 0
-            dias_com = sum(1 for c in counts if c > 0)
-            avg_d = round(sum(counts) / max(dias_com, 1), 1)
             self.stats_history = {
-                'dates':         [d.isoformat() for d in dates],
-                'daily':         counts,
-                'moving_avg':    [round(v, 2) for v in moving_avg],
-                'growth':        growth_v5,
-                'avg_daily':     avg_d,
-                'last_7':        last_7_val,
-                'ritmo_7d':      round(ritmo_7d_val, 1),
-                'monthly_total': monthly_total_val,
-                'weekly_count':  len(weekly_orders),
-                'daily_count':   len(daily_orders),
+                'dates':        [d.isoformat() for d in dates],
+                'daily':        counts,
+                'moving_avg':   [round(v, 2) for v in moving_avg],
+                'growth':       growth,
+                'avg_daily':    avg_daily,
+                'last_7':       last_7,
+                'ritmo_7d':     round(ritmo_mensal_7d, 1),
+                'monthly_total': monthly_total,
+                'weekly_count': len(weekly_orders),
+                'daily_count':  len(daily_orders),
                 'monthly_count': len(monthly_orders),
             }
             self.last_recalculated = now
@@ -1446,14 +1413,15 @@ class ProductionTimer:
                 MongoStore.set('production_timers', {'timers': self.timers}, 'timers', replace=True)
             except Exception as e:
                 logger.error(f"Erro ao salvar timers no MongoDB: {e}")
-        # Sempre salva no arquivo também (seguro contra falha do MongoDB)
-        temp_file = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(self.timers, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp_file), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"Erro ao salvar timers em arquivo: {e}")
+        # Salva em arquivo APENAS como fallback quando MongoDB não disponível
+        if not MONGO_AVAILABLE:
+            temp_file = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.timers, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp_file), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"Fallback arquivo timers falhou: {e}")
 
     def _auto_pause_on_restart(self):
         """
@@ -1663,10 +1631,11 @@ class ProductionTimer:
             if mes_chave not in history:
                 history[mes_chave] = []
             history[mes_chave].append(reg_clean)
-            temp = self.HISTORY_PATH.with_suffix('.tmp')
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(history, f, ensure_ascii=False)
-            shutil.move(str(temp), str(self.HISTORY_PATH))
+            if not MONGO_AVAILABLE:
+                temp = self.HISTORY_PATH.with_suffix('.tmp')
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, ensure_ascii=False)
+                shutil.move(str(temp), str(self.HISTORY_PATH))
             if not saved_mongo:
                 logger.info(f"✅ Histórico salvo em arquivo local (MongoDB indisponível).")
         except Exception as e:
@@ -1760,13 +1729,15 @@ class ComponentConsumptionManager:
                 logger.debug(f"✅ Consumo salvo no MongoDB: {mes_count} mês(es), {comp_count} componente(s)")
             except Exception as e:
                 logger.error(f"Erro ao salvar consumo no MongoDB: {e}")
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"Erro ao salvar consumo em arquivo: {e}")
+        # Arquivo apenas como fallback sem MongoDB
+        if not MONGO_AVAILABLE:
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"Fallback arquivo consumo falhou: {e}")
 
     def _ensure_current_month(self):
         """Garante estrutura para o mês atual e persiste imediatamente."""
@@ -1955,35 +1926,17 @@ def _extract_base_cor(nome: str):
 
 class PendingOrdersManager:
     """
-    FSM de produção com esteira por tipo de produto.
-    CADEIRAS: waiting→marcenaria→tapecaria→done (3 leituras de barcode)
-    MDF/OUTROS: waiting→in_production→done (2 leituras de barcode)
+    Gerencia pedidos do Bling que chegaram e estão aguardando produção.
+    Persiste no MongoDB (principal) ou arquivo (fallback).
     """
     FILE_PATH = DATA_DIR / 'pending_orders.json'
 
-    ESTEIRA_KW = frozenset([
-        'CADEIRA','POLTRONA','EVIDENCE','BERLIN','MADRID','DIAMANTE',
-        'HIDRÁULICA','HIDRAULICA','RECLINÁVEL','RECLINAVEL',
-    ])
-    ESTEIRA_TRANSITIONS = {'waiting': 'marcenaria', 'marcenaria': 'tapecaria', 'tapecaria': 'done'}
-    SIMPLES_TRANSITIONS = {'waiting': 'in_production', 'in_production': 'done'}
-    ACTIVE_STATES       = {'waiting', 'in_production', 'marcenaria', 'tapecaria'}
-
-    @classmethod
-    def _is_esteira(cls, nome: str) -> bool:
-        return any(k in nome.upper() for k in cls.ESTEIRA_KW)
-
-    @classmethod
-    def _next_state(cls, current: str, nome: str) -> Optional[str]:
-        if cls._is_esteira(nome): return cls.ESTEIRA_TRANSITIONS.get(current)
-        return cls.SIMPLES_TRANSITIONS.get(current)
-
     def __init__(self):
         self.data = self._load()
-        self._op_cache     = {}
-        self._op_cache_ts  = 0.0
-        self._op_cache_lock = __import__('threading').Lock()
         self._restore_in_production_to_waiting()
+        self._op_cache     = {}   # oid -> {numero_op, situacao, previsao}
+        self._op_cache_ts  = 0.0  # timestamp do último refresh
+        self._op_cache_lock = __import__('threading').Lock()
 
     def _restore_in_production_to_waiting(self):
         """Ao reiniciar: itens in_production voltam para waiting.
@@ -2044,13 +1997,14 @@ class PendingOrdersManager:
                     MongoStore.upsert('pending_orders', key, val)
             except Exception as e:
                 logger.error(f"Erro ao salvar pending_orders no MongoDB: {e}")
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"Erro ao salvar pedidos pendentes em arquivo: {e}")
+        if not MONGO_AVAILABLE:
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"Fallback arquivo pending_orders falhou: {e}")
 
     def _save_one(self, key: str):
         """Salva apenas um item (mais eficiente que _save completo)."""
@@ -2079,44 +2033,24 @@ class PendingOrdersManager:
             self._save_one(key)
         return self.data[key]
 
-    def advance_production(self, item_key: str, tempo_segundos: int = None) -> Optional[Dict]:
-        """
-        FSM: avança exatamente UMA etapa.
-        Cadeiras: waiting→marcenaria→tapecaria→done
-        MDF:      waiting→in_production→done
-        """
-        item = self.data.get(item_key)
-        if not item:
-            logger.warning(f"advance_production: '{item_key}' não encontrado.")
-            return None
-        current = item.get('status', 'waiting')
-        nome    = item.get('nome') or item.get('nome_original', '')
-        target  = self._next_state(current, nome)
-        if not target:
-            logger.warning(f"FSM: sem transição para status='{current}' nome='{nome[:30]}'")
-            return None
-        now = datetime.now()
-        item['status']       = target
-        item[f'ts_{target}'] = now.isoformat()
-        if current == 'waiting':
-            item['started_at'] = now.isoformat()
-            item.pop('finished_at', None)
-            item.pop('mes_conclusao', None)
-        item['setor'] = target if target not in ('done',) else item.get('setor', 'tapecaria')
-        if target == 'done':
-            item['finished_at']   = now.isoformat()
-            item['mes_conclusao'] = now.strftime('%Y-%m')
-            if tempo_segundos:
-                item['tempo_producao'] = int(tempo_segundos)
-        self._save_one(item_key)
-        logger.info(f"FSM ✅ '{nome[:35]}' {current}→{target}")
-        return item
+    def start_production(self, item_key: str):
+        """Move item para status 'in_production'."""
+        if item_key in self.data:
+            self.data[item_key]['status'] = 'in_production'
+            self.data[item_key]['started_at'] = datetime.now().isoformat()
+            self._save_one(item_key)
+        return self.data.get(item_key)
 
-    def start_production(self, item_key: str, setor: str = 'tapecaria') -> Optional[Dict]:
-        return self.advance_production(item_key)
-
-    def finish_production(self, item_key: str, tempo_segundos: int = None) -> Optional[Dict]:
-        return self.advance_production(item_key, tempo_segundos=tempo_segundos)
+    def finish_production(self, item_key: str, tempo_segundos: int = None):
+        """Move item para status 'done' — persiste no MongoDB para não sumir ao reiniciar."""
+        if item_key in self.data:
+            self.data[item_key]['status'] = 'done'
+            self.data[item_key]['finished_at'] = datetime.now().isoformat()
+            self.data[item_key]['mes_conclusao'] = datetime.now().strftime('%Y-%m')
+            if tempo_segundos is not None:
+                self.data[item_key]['tempo_producao'] = tempo_segundos
+            self._save_one(item_key)
+        return self.data.get(item_key)
 
     def dismiss(self, item_key: str):
         """Remove item da fila — sincroniza MongoDB E arquivo."""
@@ -2127,13 +2061,14 @@ class PendingOrdersManager:
                 _mongo_db['pending_orders'].delete_one({'_id': item_key})
             except Exception as e:
                 logger.error(f"dismiss: erro MongoDB {item_key}: {e}")
-        temp = self.FILE_PATH.with_suffix('.tmp')
-        try:
-            with open(temp, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=4, ensure_ascii=False)
-            shutil.move(str(temp), str(self.FILE_PATH))
-        except Exception as e:
-            logger.error(f"dismiss: erro arquivo: {e}")
+        if not MONGO_AVAILABLE:
+            temp = self.FILE_PATH.with_suffix('.tmp')
+            try:
+                with open(temp, 'w', encoding='utf-8') as f:
+                    json.dump(self.data, f, indent=4, ensure_ascii=False)
+                shutil.move(str(temp), str(self.FILE_PATH))
+            except Exception as e:
+                logger.warning(f"dismiss: fallback arquivo falhou: {e}")
 
     def get_waiting(self):
         """Retorna todos os itens aguardando produção."""
@@ -2141,7 +2076,7 @@ class PendingOrdersManager:
 
     def get_in_production(self):
         """Retorna todos os itens em produção."""
-        return [v for v in self.data.values() if v.get('status') in ('in_production', 'marcenaria', 'tapecaria')]
+        return [v for v in self.data.values() if v.get('status') == 'in_production']
 
     def get_done(self):
         """Retorna todos os itens concluídos no mês atual."""
@@ -2260,6 +2195,23 @@ class PendingOrdersManager:
                 if isinstance(contato, dict):
                     cliente = contato.get('nome', '') or contato.get('nomeFantasia', '')
 
+                # Extrai data estimada de entrega — suporte a múltiplos campos da API Bling
+                data_entrega_raw = (
+                    pedido.get('dataEntrega') or
+                    pedido.get('dataPrevista') or
+                    pedido.get('dataSaida') or
+                    item.get('dataEntrega') or
+                    item.get('dataPrevista') or
+                    ''
+                )
+                # Ordem de produção Bling (se vier no item ou pedido)
+                ordem_producao = (
+                    pedido.get('ordemProducao') or
+                    pedido.get('numeroPedido') or
+                    item.get('ordemProducao') or
+                    str(pedido.get('numero', order_id))
+                )
+
                 item_data = {
                     'nome': nome_produto,
                     'nome_original': nome_raw,
@@ -2270,6 +2222,9 @@ class PendingOrdersManager:
                     'pedido_data': pedido.get('data') or pedido.get('dataEmissao', ''),
                     'pedido_numero': pedido.get('numero', order_id),
                     'cliente': cliente,
+                    'data_entrega': data_entrega_raw,
+                    'ordem_producao': ordem_producao,
+                    'order_id_bling': order_id,
                 }
 
                 for unit in range(qtd):
@@ -2292,6 +2247,27 @@ class PendingOrdersManager:
                         existing_order_sku_idx.add((str(order_id), sku_raw, unit))
                         self._save_one(sub_key)
                         added += 1
+                        # ── Computa componentes automaticamente na hora da venda ──
+                        # Não precisa de checklist — já registra ao entrar na fila
+                        try:
+                            nome_upper = nome_produto.upper()
+                            if 'CADEIRA' in nome_upper:
+                                # Evita duplicação: checa se já foi registrado para este sub_key
+                                consumo_key = f"auto_{sub_key}"
+                                _cc = globals().get('component_consumption')
+                                if _cc is not None:
+                                    existing_consumo = _cc.get_current_month().get('checklist_logs', [])
+                                    already_computed = any(
+                                        l.get('produto') == consumo_key for l in existing_consumo
+                                    )
+                                    if not already_computed:
+                                        for comp in RECIPE_CADEIRA:
+                                            _cc.register_component(
+                                                comp['nome'], comp['qtd'], comp['un'], consumo_key
+                                            )
+                                        logger.info(f"✅ Componentes computados automaticamente para pedido {sub_key} ({nome_produto})")
+                        except Exception as _ce:
+                            logger.warning(f"Erro ao computar componentes automáticos: {_ce}")
 
         if added > 0:
             if not MONGO_AVAILABLE:
@@ -2762,7 +2738,14 @@ class Orchestrator:
                     continue
                 detail = resp.get('data', resp)
                 # Mantém campos do pedido original e adiciona itens do detalhe
-                merged = {**pedido, 'itens': detail.get('itens', [])}
+                # Preserva campos de entrega e OP do detalhe individual
+                merged = {
+                    **pedido,
+                    'itens': detail.get('itens', []),
+                    'dataEntrega': detail.get('dataEntrega') or detail.get('dataPrevista') or pedido.get('dataEntrega', ''),
+                    'dataPrevista': detail.get('dataPrevista') or pedido.get('dataPrevista', ''),
+                    'ordemProducao': detail.get('ordemProducao') or pedido.get('ordemProducao', ''),
+                }
                 if merged['itens']:
                     enriched.append(merged)
                     self.logger.debug(f"  Pedido {order_id}: {len(merged['itens'])} itens encontrados")
@@ -2907,7 +2890,20 @@ class Orchestrator:
             payload["component_usage"] = component_usage
             self.logger.debug("Uso de componentes incluído no broadcast.")
 
-        # 3.1 Adiciona lista de produtos se o cache foi atualizado
+        # 3.1 Adiciona snapshot de produção (contadores das 3 etapas)
+        try:
+            waiting_count  = len(pending_orders.get_waiting())
+            inprod_count   = len(pending_orders.get_in_production())
+            done_count     = len(pending_orders.get_done())
+            payload["production_snapshot"] = {
+                "waiting":       waiting_count,
+                "in_production": inprod_count,
+                "done":          done_count,
+            }
+        except Exception:
+            pass
+
+        # 3.2 Adiciona lista de produtos se o cache foi atualizado
         if cache_updated:
             payload["products"] = self.get_all_products()
             payload["kits"] = self.get_all_kits()
@@ -2994,76 +2990,142 @@ class WebServer:
             return jsonify(list(self.orchestrator.sales._orders_cache.values()))
 
         # Novo Endpoint: Histórico de Vendas para Dashboard
+        @self.app.route("/api/sales/orders-summary")
+        @token_required
+        def api_sales_orders_summary(token):
+            """Retorna lista compacta dos pedidos reais do Bling (numero + data) para exibir nos KPI cards."""
+            orders = self.orchestrator.sales._sales_history or []
+            result = []
+            for o in orders:
+                data_str = o.get('data') or o.get('dataEmissao', '')
+                if data_str:
+                    result.append({
+                        'id': o.get('id'),
+                        'numero': o.get('numero') or o.get('id'),
+                        'data': data_str,
+                    })
+            return jsonify({'orders': result[-500:]})  # máx 500 mais recentes
+
+        # Novo Endpoint: Histórico de Vendas para Dashboard
         @self.app.route("/api/sales/history")
         @token_required
         def api_sales_history(token):
+            # Suporta filtro por data via query params
+            date_from = request.args.get('from', '')
+            date_to   = request.args.get('to', '')
             stats = self.orchestrator.sales.stats_history
             if not stats or not stats.get('dates'):
                 if not self.orchestrator.sales.daily_count:
-                     Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
+                    Thread(target=self.orchestrator.process_sales_orders, daemon=True).start()
                 return jsonify({"labels": [], "daily": [], "moving_avg": [], "growth": 0, "avg_daily": 0})
+            labels = stats.get('dates', [])
+            daily  = stats.get('daily', [])
+            # Filtra por período se solicitado
+            if date_from or date_to:
+                filtered = [(l, d) for l, d in zip(labels, daily)
+                            if (not date_from or l >= date_from) and (not date_to or l <= date_to)]
+                labels = [x[0] for x in filtered]
+                daily  = [x[1] for x in filtered]
+                # Recalcula moving_avg (janela de 7 dias)
+                moving_avg = []
+                for i in range(len(daily)):
+                    window = daily[max(0, i-6):i+1]
+                    moving_avg.append(round(sum(window)/len(window), 1) if window else 0)
+                total = sum(daily)
+                n = max(len(daily), 1)
+                lw = sum(daily[-7:]) if len(daily) >= 7 else total
+                # Período anterior do mesmo tamanho
+                all_daily  = stats.get('daily', [])
+                all_labels = stats.get('dates', [])
+                prev = [(l2, d2) for l2, d2 in zip(all_labels, all_daily)
+                        if l2 < (labels[0] if labels else '')]
+                prev_total = sum(x[1] for x in prev[-len(daily):]) if prev else 0
+                growth     = round((total - prev_total) / prev_total * 100, 1) if prev_total else 0
+                avg_daily  = round(total / n, 1)
+            else:
+                moving_avg = stats.get('moving_avg', [])
+                growth     = stats.get('growth', 0)
+                avg_daily  = stats.get('avg_daily', 0)
             return jsonify({
-                "labels": stats.get('dates', []),
-                "daily": stats.get('daily', []),
-                "moving_avg": stats.get('moving_avg', []),
-                "growth": stats.get('growth', 0),
-                "avg_daily": stats.get('avg_daily', 0)
+                "labels": labels, "daily": daily, "moving_avg": moving_avg,
+                "growth": growth, "avg_daily": avg_daily
             })
 
-        @self.app.route('/api/production/report')
+        @self.app.route("/api/production/report")
         @token_required
         def api_production_report(token):
-            """Relatório direto do Bling: pedidos, produzidos, top produtos, crescimento."""
+            """
+            Relatório de produção direto do Bling.
+            Parâmetros: dias=7|30 (padrão 30)
+            Retorna: pedidos recebidos, produzidos, crescimento, tempo médio, top produtos.
+            """
             try:
                 dias = int(request.args.get('dias', 30))
-                hoje     = datetime.now()
+                hoje = datetime.now()
                 data_ini = (hoje - timedelta(days=dias)).strftime('%Y-%m-%d')
-                data_ant = (hoje - timedelta(days=dias*2)).strftime('%Y-%m-%d')
 
+                # Filtra history local (já baixado do Bling)
                 all_orders = self.orchestrator.sales._sales_history or []
-                pedidos_p  = [o for o in all_orders if (o.get('data') or o.get('dataEmissao',''))[:10] >= data_ini]
-                pedidos_a  = [o for o in all_orders if data_ant <= (o.get('data') or o.get('dataEmissao',''))[:10] < data_ini]
+                pedidos_periodo = [
+                    o for o in all_orders
+                    if (o.get('data') or o.get('dataEmissao', ''))[:10] >= data_ini
+                ]
 
-                total_rec  = len(pedidos_p)
-                total_ant  = len(pedidos_a)
-                crescimento = round((total_rec - total_ant) / total_ant * 100, 1) if total_ant else 0
+                # Período anterior (para crescimento)
+                data_ant = (hoje - timedelta(days=dias*2)).strftime('%Y-%m-%d')
+                pedidos_anterior = [
+                    o for o in all_orders
+                    if data_ant <= (o.get('data') or o.get('dataEmissao', ''))[:10] < data_ini
+                ]
 
+                total_recebidos = len(pedidos_periodo)
+                total_anterior  = len(pedidos_anterior)
+                crescimento = round((total_recebidos - total_anterior) / total_anterior * 100, 1) if total_anterior else 0
+
+                # Produzidos no período (do board local)
                 done_items = [i for i in pending_orders.data.values()
-                              if i.get('status')=='done' and (i.get('finished_at','') or '')[:10] >= data_ini]
-                total_prod = len(done_items)
+                              if i.get('status') == 'done'
+                              and (i.get('finished_at', '') or '')[:10] >= data_ini]
+                total_produzidos = len(done_items)
 
-                tempos = [i.get('tempo_producao',0) for i in done_items if i.get('tempo_producao')]
-                avg_tp = round(sum(tempos)/len(tempos)/86400, 2) if tempos else 0
+                # Tempo médio de produção em dias
+                tempos = [i.get('tempo_producao', 0) for i in done_items if i.get('tempo_producao')]
+                avg_tempo_dias = round(sum(tempos) / len(tempos) / 86400, 2) if tempos else 0
 
-                from collections import Counter as _Ctr
-                pc = _Ctr()
-                for o in pedidos_p:
+                # Top 10 produtos mais pedidos no período
+                from collections import Counter
+                produto_counter = Counter()
+                for o in pedidos_periodo:
                     for item in (o.get('itens') or []):
-                        n = (item.get('descricao') or item.get('nome') or '').strip()
-                        if n: pc[n[:60]] += max(1, int(item.get('quantidade',1)))
-                if not pc:
-                    for po in pending_orders.data.values():
-                        oid = str(po.get('order_id_bling') or po.get('order_id') or po.get('pedido_numero') or '')
-                        data_po = (po.get('pedido_data','') or '')[:10]
-                        if data_po >= data_ini:
-                            n = (po.get('nome') or po.get('nome_original') or '').strip()
-                            if n: pc[n[:60]] += 1
+                        nome = item.get('descricao') or item.get('nome') or ''
+                        if nome:
+                            produto_counter[nome[:60]] += int(item.get('quantidade', 1))
+                top_produtos = [{'nome': k, 'qtd': v} for k, v in produto_counter.most_common(10)]
 
-                from collections import defaultdict as _dd
-                pd = _dd(int)
-                for o in pedidos_p:
-                    d = (o.get('data') or o.get('dataEmissao',''))[:10]
-                    if d: pd[d] += 1
-                labels = sorted(pd.keys())
-                counts = [pd[l] for l in labels]
+                # Distribuição por dia
+                from collections import defaultdict
+                por_dia = defaultdict(int)
+                for o in pedidos_periodo:
+                    d = (o.get('data') or o.get('dataEmissao', ''))[:10]
+                    if d: por_dia[d] += 1
+                labels = sorted(por_dia.keys())
+                counts = [por_dia[l] for l in labels]
 
-                return jsonify({'dias':dias,'total_recebidos':total_rec,'total_anterior':total_ant,
-                    'crescimento':crescimento,'total_produzidos':total_prod,'avg_tempo_dias':avg_tp,
-                    'top_produtos':[{'nome':k,'qtd':v} for k,v in pc.most_common(10)],
-                    'labels':labels,'counts':counts})
+                return jsonify({
+                    'dias': dias,
+                    'total_recebidos':  total_recebidos,
+                    'total_anterior':   total_anterior,
+                    'crescimento':      crescimento,
+                    'total_produzidos': total_produzidos,
+                    'avg_tempo_dias':   avg_tempo_dias,
+                    'top_produtos':     top_produtos,
+                    'labels':           labels,
+                    'counts':           counts,
+                })
             except Exception as e:
-                logger.error('api_production_report: {}'.format(e))
-                return jsonify({'error':str(e)}), 500
+                logger.error(f"Erro no relatório de produção: {e}")
+                return jsonify({'error': str(e)}), 500
+
 
 
         @self.app.route('/api/recalculate', methods=['POST'])
@@ -3169,6 +3231,7 @@ class WebServer:
 
             # Enriquece in_production com dados do timer correto
             in_prod = []
+            hoje_ip = datetime.now().date()
             for item in pending_orders.get_in_production():
                 ikey = item.get('item_key', '')
                 nome = item.get('nome') or item.get('nome_original', '')
@@ -3182,6 +3245,19 @@ class WebServer:
                         base_r, cor_r = _extract_base_cor(nome_raw)
                     if base_r: enriched['base'] = base_r
                     if cor_r: enriched['cor'] = cor_r
+                # Prazo
+                data_entrega_str = enriched.get('data_entrega', '')
+                dias_restantes = None
+                urgencia = 'normal'
+                if data_entrega_str:
+                    dt_ent = _parse_order_date(data_entrega_str)
+                    if dt_ent:
+                        dias_restantes = (dt_ent.date() - hoje_ip).days
+                        if dias_restantes < 0: urgencia = 'atrasado'
+                        elif dias_restantes <= 2: urgencia = 'critico'
+                        elif dias_restantes <= 5: urgencia = 'atencao'
+                enriched['dias_restantes'] = dias_restantes
+                enriched['urgencia'] = urgencia
                 in_prod.append(enriched)
 
             # Timers sem pedido vinculado (iniciados via modal diretamente)
@@ -3211,6 +3287,7 @@ class WebServer:
                 })
 
             waiting_enriched = []
+            hoje = datetime.now().date()
             for item in pending_orders.get_waiting():
                 enriched = dict(item)
                 if not enriched.get('cor') and not enriched.get('base'):
@@ -3221,7 +3298,37 @@ class WebServer:
                         base_r, cor_r = _extract_base_cor(nome_raw)
                     if base_r: enriched['base'] = base_r
                     if cor_r: enriched['cor'] = cor_r
+
+                # ── Calcula prazo / urgência ──────────────────────────────
+                data_entrega_str = enriched.get('data_entrega', '')
+                dias_restantes = None
+                urgencia = 'normal'  # normal | atencao | critico | atrasado
+                if data_entrega_str:
+                    dt_ent = _parse_order_date(data_entrega_str)
+                    if dt_ent:
+                        dias_restantes = (dt_ent.date() - hoje).days
+                        if dias_restantes < 0:
+                            urgencia = 'atrasado'
+                        elif dias_restantes == 0:
+                            urgencia = 'critico'
+                        elif dias_restantes <= 2:
+                            urgencia = 'critico'
+                        elif dias_restantes <= 5:
+                            urgencia = 'atencao'
+                enriched['dias_restantes'] = dias_restantes
+                enriched['urgencia'] = urgencia
                 waiting_enriched.append(enriched)
+
+            # ── Ordena: atrasados/críticos primeiro; agrupa por produto; dentro do grupo: urgência primeiro ──
+            def _sort_key(item):
+                urg = item.get('urgencia', 'normal')
+                dias = item.get('dias_restantes')
+                urg_order = {'atrasado': 0, 'critico': 1, 'atencao': 2, 'normal': 3}[urg]
+                dias_val = dias if dias is not None else 9999
+                nome_grp = (item.get('nome') or item.get('nome_original') or '').upper()
+                return (nome_grp, urg_order, dias_val)
+
+            waiting_enriched.sort(key=_sort_key)
 
             # Enriquece done com tempo de produção
             # Prioridade: tempo salvo no item > tempo do histórico de produção (por nome)
@@ -3246,11 +3353,80 @@ class WebServer:
                     enriched_done['tempo_producao'] = tempos[-1] if tempos else 0
                 done_enriched.append(enriched_done)
 
+            # ── Busca OPs do Bling em cache (5min TTL, thread-safe) ───────────
+            with pending_orders._op_cache_lock:
+                _op_cache    = pending_orders._op_cache
+                _op_cache_ts = pending_orders._op_cache_ts
+                needs_refresh = time.time() - _op_cache_ts > 300
+
+            if needs_refresh:
+                new_op_cache = dict(_op_cache)  # cópia para não bloquear leituras
+                order_ids_to_fetch = set()
+                for it in list(pending_orders.data.values()):
+                    oid = (it.get('order_id_bling') or it.get('order_id') or
+                           it.get('pedido_numero'))
+                    if oid:
+                        order_ids_to_fetch.add(str(oid))
+                fetched = 0
+                for oid in list(order_ids_to_fetch):
+                    if fetched >= 25:   # máx 25 req por ciclo para não travar
+                        break
+                    if oid in new_op_cache:  # já cacheado
+                        continue
+                    try:
+                        resp = self.orchestrator.api.get(
+                            'ordens/producao',
+                            params={'numeroPedidoVenda': oid}
+                        )
+                        if resp and resp.get('data'):
+                            ops = resp['data'] if isinstance(resp['data'], list) else [resp['data']]
+                            for op in ops:
+                                numero_op = str(op.get('numero') or op.get('id') or '')
+                                previsao  = (op.get('dataPrevisao') or
+                                             op.get('dataPrevista') or '')
+                                situacao  = ''
+                                sit = op.get('situacao')
+                                if isinstance(sit, dict):
+                                    situacao = sit.get('nome', '')
+                                elif sit:
+                                    situacao = str(sit)
+                                if numero_op:
+                                    new_op_cache[oid] = {
+                                        'numero_op':    numero_op,
+                                        'codigo_barras': numero_op,
+                                        'situacao':     situacao,
+                                        'previsao':     previsao,
+                                    }
+                                    fetched += 1
+                                    break
+                    except Exception:
+                        pass
+                with pending_orders._op_cache_lock:
+                    pending_orders._op_cache    = new_op_cache
+                    pending_orders._op_cache_ts = time.time()
+                _op_cache = new_op_cache
+
+            def _inject_op(item):
+                """Injeta dados da OP do Bling no item se disponível."""
+                oid = str(item.get('order_id_bling') or item.get('order_id') or item.get('pedido_numero') or '')
+                op_data = _op_cache.get(oid, {})
+                if op_data.get('numero_op'):
+                    item['ordem_producao'] = op_data['numero_op']
+                    item['op_situacao']    = op_data.get('situacao', '')
+                    if op_data.get('previsao') and not item.get('data_entrega'):
+                        item['data_entrega'] = op_data['previsao']
+                return item
+
+            # Aplica enriquecimento de OP em todos os grupos
+            waiting_enriched  = [_inject_op(i) for i in waiting_enriched]
+            in_prod           = [_inject_op(i) for i in in_prod]
+            done_enriched_out = [_inject_op(i) for i in done_enriched]
+
             return jsonify({
                 'waiting': waiting_enriched,
                 'in_production': in_prod,
                 'orphan_timers': orphan,
-                'done': done_enriched,
+                'done': done_enriched_out,
                 'server_time': time.time(),
             })
 
@@ -3363,6 +3539,143 @@ class WebServer:
                 }
             })
 
+        @self.app.route('/api/barcode/scan', methods=['POST'])
+        @token_required
+        def api_barcode_scan(token):
+            """
+            Processa leitura de código de barras.
+            Anti-duplicação persistente: cada item só avança UMA VEZ por etapa.
+            1ª leitura (waiting)      → in_production + registra componentes
+            2ª leitura (in_production)→ done + registra tempo
+            """
+            data = request.json or {}
+            codigo = str(data.get('codigo', '')).strip()
+            if not codigo:
+                return jsonify({'error': 'codigo obrigatório'}), 400
+
+            # Busca pedido pelo número do pedido, ordem_producao, order_id ou OP do cache
+            found_key = None
+            found_item = None
+            for key, item in pending_orders.data.items():
+                if item.get('status') == 'done':
+                    continue
+                pnum = str(item.get('pedido_numero', '') or item.get('order_id', '') or '')
+                op   = str(item.get('ordem_producao', '') or '')
+                # Verifica também no cache de OPs do Bling
+                oid  = str(item.get('order_id_bling') or item.get('order_id') or pnum or '')
+                op_cached = ''
+                with pending_orders._op_cache_lock:
+                    op_cached = pending_orders._op_cache.get(oid, {}).get('numero_op', '')
+                if codigo in (pnum, op, op_cached) or key == codigo:
+                    found_key  = key
+                    found_item = item
+                    break
+
+            if not found_item:
+                return jsonify({
+                    'acao': 'nao_encontrado',
+                    'codigo': codigo,
+                    'mensagem': f'Nenhum pedido ativo encontrado para #{codigo}'
+                }), 404
+
+            status_atual = found_item.get('status', 'waiting')
+            nome_produto = found_item.get('nome') or found_item.get('nome_original', '')
+            timer_key    = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
+
+            # ── Anti-duplicação persistente por etapa ──────────────────────
+            # Guarda flag no próprio item: "scan_iniciado" e "scan_concluido"
+            if status_atual == 'waiting':
+                if found_item.get('scan_iniciado'):
+                    return jsonify({
+                        'acao': 'ja_lido_etapa',
+                        'codigo': codigo,
+                        'item_key': found_key,
+                        'nome': nome_produto,
+                        'mensagem': f'Pedido #{codigo} já foi iniciado. Veja a aba Produzindo.'
+                    })
+
+                # ── Inicia produção ─────────────────────────────────────────
+                pending_orders.start_production(found_key)
+                production_timer.start(timer_key)
+                pending_orders.data[found_key]['timer_key']    = timer_key
+                pending_orders.data[found_key]['scan_iniciado'] = True
+                pending_orders._save_one(found_key)
+
+                # Registra componentes automaticamente
+                try:
+                    _cc = globals().get('component_consumption')
+                    if _cc and 'CADEIRA' in nome_produto.upper():
+                        consumo_key = f"scan_{found_key}"
+                        existing_logs = _cc.get_current_month().get('checklist_logs', [])
+                        already = any(l.get('produto') == consumo_key for l in existing_logs)
+                        if not already:
+                            for comp in RECIPE_CADEIRA:
+                                _cc.register_component(comp['nome'], comp['qtd'], comp['un'], consumo_key)
+                            logger.info(f"✅ Componentes registrados via scan para {nome_produto}")
+                except Exception as _ce:
+                    logger.warning(f"Scan: erro componentes: {_ce}")
+
+                def _bcast1():
+                    try:
+                        usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = usage
+                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                    except Exception: pass
+                Thread(target=_bcast1, daemon=True).start()
+
+                return jsonify({
+                    'acao': 'iniciado',
+                    'codigo': codigo,
+                    'item_key': found_key,
+                    'nome': nome_produto,
+                    'timer_key': timer_key,
+                    'mensagem': f'✅ Produção INICIADA: {nome_produto}'
+                })
+
+            elif status_atual == 'in_production':
+                if found_item.get('scan_concluido'):
+                    return jsonify({
+                        'acao': 'ja_lido_etapa',
+                        'codigo': codigo,
+                        'item_key': found_key,
+                        'nome': nome_produto,
+                        'mensagem': f'Pedido #{codigo} já foi concluído. Veja a aba Concluídos.'
+                    })
+
+                # ── Conclui produção ────────────────────────────────────────
+                result = production_timer.stop_and_log(timer_key)
+                tempo  = result.get('elapsed', 0)
+                pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                pending_orders.data[found_key]['scan_concluido'] = True
+                pending_orders._save_one(found_key)
+
+                def _bcast2():
+                    try:
+                        usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = usage
+                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                    except Exception: pass
+                Thread(target=_bcast2, daemon=True).start()
+
+                h = int(tempo // 3600)
+                m = int((tempo % 3600) // 60)
+                s = int(tempo % 60)
+                return jsonify({
+                    'acao': 'concluido',
+                    'codigo': codigo,
+                    'item_key': found_key,
+                    'nome': nome_produto,
+                    'tempo_producao': tempo,
+                    'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
+                })
+
+            else:
+                return jsonify({
+                    'acao': 'ja_concluido',
+                    'codigo': codigo,
+                    'mensagem': f'Pedido #{codigo} já foi concluído anteriormente.'
+                })
+
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         @token_required
         def api_pending_orders_start(token):
@@ -3428,6 +3741,45 @@ class WebServer:
             pending_orders.dismiss(item_key)
             return jsonify({'success': True})
 
+        @self.app.route('/api/bling/ordens-producao')
+        @token_required
+        def api_bling_ordens_producao(token):
+            """
+            Busca ordens de produção do Bling para cada pedido na fila.
+            Retorna mapa order_id -> {numero_op, codigo_barras, situacao, previsao}
+            """
+            try:
+                ordens = {}
+                # Busca os order_ids únicos dos pedidos em espera/produção
+                order_ids = set()
+                for item in pending_orders.data.values():
+                    oid = item.get('order_id') or item.get('order_id_bling')
+                    if oid:
+                        order_ids.add(str(oid))
+
+                for oid in list(order_ids)[:50]:  # limite para não explodir rate limit
+                    try:
+                        resp = self.orchestrator.api.get(f'ordens/producao', params={'numeroPedidoVenda': oid})
+                        if resp and resp.get('data'):
+                            for op in (resp['data'] if isinstance(resp['data'], list) else [resp['data']]):
+                                numero_op = op.get('numero') or op.get('id', '')
+                                previsao = op.get('dataPrevisao') or op.get('dataPrevista') or ''
+                                codigo_barras = op.get('codigoBarras') or str(numero_op)
+                                ordens[oid] = {
+                                    'numero_op': numero_op,
+                                    'codigo_barras': codigo_barras,
+                                    'situacao': op.get('situacao', {}).get('nome', '') if isinstance(op.get('situacao'), dict) else str(op.get('situacao', '')),
+                                    'previsao': previsao,
+                                }
+                                break  # pega a primeira OP do pedido
+                    except Exception as e:
+                        logger.debug(f"OP para pedido {oid}: {e}")
+                        continue
+
+                return jsonify({'ordens': ordens, 'total': len(ordens)})
+            except Exception as e:
+                return jsonify({'ordens': {}, 'error': str(e)}), 500
+
         @self.app.route('/api/pending-orders/sync', methods=['POST'])
         @token_required
         def api_pending_orders_sync(token):
@@ -3461,217 +3813,6 @@ class WebServer:
                 })
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
-
-        @self.app.route('/api/barcode/scan', methods=['POST'])
-        @token_required
-        def api_barcode_scan(token):
-            data    = request.json or {}
-            codigo  = str(data.get('codigo', '')).strip()
-            ikey_ov = str(data.get('item_key_override', '')).strip()
-            if not codigo and not ikey_ov:
-                return jsonify({'error': 'codigo obrigatorio'}), 400
-            found_key = None
-            found_item = None
-            if ikey_ov and ikey_ov in pending_orders.data:
-                item = pending_orders.data[ikey_ov]
-                if item.get('status') != 'done':
-                    found_key = ikey_ov
-                    found_item = item
-            if not found_item and codigo:
-                for key, item in pending_orders.data.items():
-                    if item.get('status') == 'done':
-                        continue
-                    pnum = str(item.get('pedido_numero','') or item.get('order_id','') or '')
-                    op   = str(item.get('ordem_producao','') or '')
-                    if codigo in (pnum, op, key):
-                        found_key = key
-                        found_item = item
-                        break
-            if not found_item:
-                return jsonify({'acao':'nao_encontrado','codigo':codigo,
-                    'mensagem':'Pedido {} nao encontrado.'.format(codigo)}), 404
-            nome  = found_item.get('nome') or found_item.get('nome_original','')
-            cur   = found_item.get('status', 'waiting')
-            prox  = pending_orders._next_state(cur, nome)
-            is_e  = pending_orders._is_esteira(nome)
-            if not prox:
-                return jsonify({'acao':'ja_concluido','codigo':codigo,'mensagem':'Pedido ja concluido.'})
-            timer_key = found_item.get('timer_key') or '{}||{}'.format(nome, found_key)
-            if cur == 'waiting':
-                production_timer.start(timer_key)
-                pending_orders.data[found_key]['timer_key'] = timer_key
-            if cur == 'waiting' and is_e:
-                try:
-                    _cc = globals().get('component_consumption')
-                    if _cc:
-                        ck = 'scan_{}'.format(found_key)
-                        logs = _cc.get_current_month().get('checklist_logs', [])
-                        if not any(l.get('produto') == ck for l in logs):
-                            for comp in RECIPE_CADEIRA:
-                                _cc.register_component(comp['nome'], comp['qtd'], comp['un'], ck)
-                except Exception as _ce:
-                    logger.warning('Scan insumos: {}'.format(_ce))
-            tempo_prod = 0
-            if prox == 'done':
-                result_t   = production_timer.stop_and_log(timer_key)
-                tempo_prod = result_t.get('elapsed', 0)
-            result_item = pending_orders.advance_production(found_key, tempo_segundos=tempo_prod or None)
-            if not result_item:
-                return jsonify({'acao':'erro_fsm','mensagem':'FSM recusou transicao'}), 409
-            def _bc():
-                try:
-                    u = self.orchestrator.calculate_component_usage()
-                    self.orchestrator._component_usage_cache = u
-                    self.orchestrator.broadcast_kpi_update(component_usage=u)
-                except Exception:
-                    pass
-            Thread(target=_bc, daemon=True).start()
-            labels = {'marcenaria':'Marcenaria','tapecaria':'Tapecaria',
-                      'in_production':'Em Producao','done':'Concluido'}
-            label  = labels.get(prox, prox)
-            acao   = 'concluido' if prox == 'done' else 'avancado'
-            h = int(tempo_prod//3600)
-            m = int((tempo_prod%3600)//60)
-            s = int(tempo_prod%60)
-            if prox == 'done':
-                msg = 'CONCLUIDO: {} ({:02d}:{:02d}:{:02d})'.format(nome[:40],h,m,s)
-            else:
-                msg = '{}: {}'.format(label, nome[:40])
-            return jsonify({'acao':acao,'codigo':codigo,'item_key':found_key,
-                'nome':nome,'status_anterior':cur,'status_atual':prox,
-                'status_label':label,'is_esteira':is_e,
-                'tempo_producao':tempo_prod if prox=='done' else 0,'mensagem':msg})
-
-        @self.app.route('/api/expedicao')
-        @token_required
-        def api_expedicao(token):
-            try:
-                def _si(v, d, mx=None):
-                    try:
-                        r = int(str(v).strip())
-                        return max(1, min(r, mx) if mx else r)
-                    except Exception:
-                        return d
-                page     = _si(request.args.get('page', 1), 1)
-                per_page = _si(request.args.get('per_page', 50), 50, mx=200)
-                urg_flt  = request.args.get('urgencia', 'all')
-                hoje     = datetime.now().date()
-                items = []
-                for item in pending_orders.data.values():
-                    if item.get('status') != 'done':
-                        continue
-                    de = item.get('data_entrega', '')
-                    dias = None
-                    urg = 'normal'
-                    if de:
-                        dt = _parse_order_date(de)
-                        if dt:
-                            dias = (dt.date() - hoje).days
-                            if dias < 0:
-                                urg = 'atrasado'
-                            elif dias <= 2:
-                                urg = 'critico'
-                            elif dias <= 5:
-                                urg = 'atencao'
-                    items.append(dict(list(item.items()) + [('dias_restantes', dias), ('urgencia', urg)]))
-                if urg_flt != 'all':
-                    items = [i for i in items if i.get('urgencia') == urg_flt]
-                uo = {'atrasado':0,'critico':1,'atencao':2,'normal':3}
-                items.sort(key=lambda i: (uo.get(i.get('urgencia','normal'), 3), i.get('dias_restantes') or 9999))
-                total = len(items)
-                pg    = items[(page-1)*per_page : page*per_page]
-                return jsonify({'items':pg,'total':total,'page':page,'per_page':per_page,
-                    'pages':max(1,(total+per_page-1)//per_page)})
-            except Exception as e:
-                logger.error('api_expedicao: {}'.format(e))
-                return jsonify({'error':str(e),'items':[],'total':0}), 500
-
-        @self.app.route('/api/production/print-op/<path:item_key>')
-        @token_required
-        def api_print_op(token, item_key):
-            item = pending_orders.data.get(item_key)
-            if not item:
-                return "<h2>Pedido nao encontrado</h2>", 404
-            nome    = item.get('nome') or item.get('nome_original', 'N/D')
-            op_num  = str(item.get('ordem_producao') or item.get('pedido_numero') or item.get('order_id', ''))
-            cliente = item.get('cliente', '-')
-            setor   = (item.get('setor') or '').title() or 'Producao'
-            de      = item.get('data_entrega', '')
-            base    = item.get('base', '')
-            cor     = item.get('cor', '')
-            status  = item.get('status', 'waiting')
-            def fd(ds):
-                if not ds:
-                    return '-'
-                for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d', '%d/%m/%Y'):
-                    try:
-                        import datetime as _dmod
-                        return _dmod.datetime.strptime(ds[:10], fmt[:8]).strftime('%d/%m/%Y')
-                    except Exception:
-                        pass
-                return ds[:10]
-            slabel = {'waiting':'Aguardando','marcenaria':'Marcenaria','tapecaria':'Tapecaria',
-                      'in_production':'Em Producao','done':'Concluido'}.get(status, status)
-            if pending_orders._is_esteira(nome):
-                instrucoes = '1a leitura=Marcenaria | 2a=Tapecaria | 3a=Concluido'
-            else:
-                instrucoes = '1a leitura=Producao | 2a=Concluido'
-            now_str = datetime.now().strftime('%d/%m/%Y %H:%M')
-            bc_color = '#000'
-            bc_bg    = '#fff'
-            html_parts = [
-                '<!DOCTYPE html><html lang="pt-br"><head><meta charset="utf-8">',
-                '<title>OP ' + op_num + '</title>',
-                '<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>',
-                '<style>',
-                'STYLE_PLACEHOLDER',
-                '</style></head><body>',
-                '<div class="hdr">',
-                '<div><div class="em">SW MOVEIS MDF</div>',
-                '<div style="font-size:12px;color:#555">Ordem de Producao</div></div>',
-                '<div style="text-align:right">',
-                '<div class="op">OP #' + op_num + '</div>',
-                '<span class="badge">' + slabel + '</span></div></div>',
-                '<div class="grid">',
-                '<div class="f" style="grid-column:1/-1"><label>Produto</label>',
-                '<span style="font-size:16px">' + nome + '</span></div>',
-                '<div class="f"><label>Setor</label><span>' + setor + '</span></div>',
-                '<div class="f"><label>Cliente</label><span>' + cliente + '</span></div>',
-                '<div class="f"><label>Pedido No</label><span>#' + op_num + '</span></div>',
-                '<div class="f"><label>Base / Cor</label><span>' + base + (' / ' + cor if cor else '') + '</span></div>',
-                '<div class="f"><label>Data Prevista</label><span style="font-size:16px">' + fd(de) + '</span></div>',
-                '</div>',
-                '<div class="bc"><svg id="op-bc"></svg>',
-                '<div style="font-family:monospace;font-size:14px;font-weight:700;margin-top:6px">' + op_num + '</div>',
-                '<div style="font-size:11px;color:#666;margin-top:4px">' + instrucoes + '</div></div>',
-                '<div class="ft">SW Moveis MDF &nbsp;x&nbsp; ' + now_str + ' &nbsp;x&nbsp; OP #' + op_num + '</div>',
-                '<div style="text-align:center;margin-top:16px">',
-                '<button onclick="window.print()" style="padding:10px 24px;font-size:14px;background:#000;',
-                'color:#fff;border:none;border-radius:6px;cursor:pointer">Imprimir</button></div>',
-                '<script>',
-                'JsBarcode("#op-bc","' + op_num + '",',
-                '{format:"CODE128",width:2.5,height:80,displayValue:false,margin:8,',
-                'background:"' + bc_bg + '",lineColor:"' + bc_color + '"});',
-                '</script></body></html>',
-            ]
-            css = (
-                '*{box-sizing:border-box;margin:0;padding:0}'
-                'body{font-family:Arial,sans-serif;padding:20px;background:#fff}'
-                '.hdr{display:flex;justify-content:space-between;border-bottom:3px solid #000;padding-bottom:12px;margin-bottom:16px}'
-                '.em{font-size:22px;font-weight:900}'
-                '.op{font-size:32px;font-weight:900;font-family:monospace}'
-                '.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}'
-                '.f{border:1px solid #ccc;border-radius:4px;padding:8px 10px}'
-                '.f label{font-size:10px;font-weight:700;text-transform:uppercase;color:#666;display:block;margin-bottom:2px}'
-                '.f span{font-size:14px;font-weight:700}'
-                '.bc{text-align:center;border:2px solid #000;border-radius:6px;padding:16px;margin-bottom:16px}'
-                '.badge{display:inline-block;padding:4px 14px;border-radius:50px;font-size:12px;font-weight:700;background:#ffb600;color:#000}'
-                '.ft{border-top:1px solid #ccc;padding-top:8px;font-size:10px;color:#888;text-align:center}'
-                '@media print{button{display:none!important}@page{size:A4;margin:10mm}}'
-            )
-            html = ''.join(html_parts).replace('STYLE_PLACEHOLDER', css)
-            return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
-
 
         @self.app.route('/api/debug/orders-sample')
         @token_required
@@ -3787,33 +3928,8 @@ class WebServer:
         @self.app.route('/api/kits')
         @token_required
         def api_kits(token):
-            """Retorna a lista de todos os kits e produtos simples em cache."""
-            kits = self.orchestrator.get_all_kits()
-            products = self.orchestrator.get_all_products()
-            
-            self.logger.info(f"📦 Endpoint /api/kits chamado. Kits: {len(kits)}, Produtos: {len(products)}")
-            
-            def normalize_for_api(item):
-                estoque_val = item.get("estoqueAtual", item.get("estoque", 0))
-                tipo = item.get("tipo", "P")
-                # Mapeia tipo textual para K/P (compatibilidade)
-                if tipo in ["COMPOSTO", "K"]: tipo_out = "K"
-                else: tipo_out = "P"
-
-                return {
-                    "id": item.get("id"),
-                    "nome": item.get("nome"),
-                    "sku": item.get("sku"),
-                    "estoque": estoque_val,
-                    "estoqueAtual": estoque_val,
-                    "imagemURL": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "imagem": item.get("imagem") if item.get("imagem") else "/static/no-image.png",
-                    "tipo": tipo_out,
-                    "componentes": item.get("componentes", [])
-                }
-
-            all_list = [normalize_for_api(p) for p in kits + products]
-            return jsonify(all_list)
+            """Endpoint mantido por compatibilidade — aba Produtos foi removida."""
+            return jsonify([])
 
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
@@ -4138,1092 +4254,2785 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SW Móveis MDF — Painel de Gestão</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="icon" href="https://i.imgur.com/j79HO6n.png" type="image/png">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.18.6/umd/index.min.js"
+        onerror="console.warn('ZXing não carregado — câmera desativada. Scanner USB ainda funciona.')"></script>
     <style>
+        /* ══════════════════════════════════════════
+           SW MÓVEIS MDF — DESIGN SYSTEM 2025
+           Manual de Identidade Visual
+        ══════════════════════════════════════════ */
         :root {
-            --sw-yellow: #ffb600;
-            --sw-dark:   #01010d;
-            --border:    rgba(255,255,255,0.08);
-            --card-bg:   #ffffff;
-            --success:   #10b981;
-            --danger:    #ef4444;
-            --warning:   #f59e0b;
+            --sw-yellow:       #ffb600;
+            --sw-yellow-light: #fede8f;
+            --sw-yellow-pale:  #f5f5a0;
+            --sw-black:        #01010d;
+            --sw-gray:         #807f7f;
+            --sw-nurse:        #ecedec;
+
+            --primary:     var(--sw-black);
+            --accent:      var(--sw-yellow);
+            --accent-light:var(--sw-yellow-light);
+            --success:     #10b981;
+            --warning:     var(--sw-yellow);
+            --error:       #ef4444;
+            --bg:          #f9f9f7;
+            --bg-card:     #ffffff;
+            --border:      rgba(1,1,13,0.09);
+            --text-muted:  var(--sw-gray);
+            --radius:      12px;
+            --radius-sm:   7px;
+            --shadow:      0 2px 12px rgba(1,1,13,0.07);
+            --shadow-lg:   0 12px 40px rgba(1,1,13,0.13);
         }
-        * { box-sizing: border-box; }
-        body { background: #f4f4f0; font-family: 'Inter', sans-serif; color: #1a1a1a; }
 
-        /* Navbar */
-        .sw-navbar { background: var(--sw-dark); padding: 10px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 2px 20px rgba(0,0,0,.4); position: sticky; top: 0; z-index: 1000; }
-        .sw-logo   { font-family: 'Bebas Neue', sans-serif; font-size: 1.6rem; color: var(--sw-yellow); letter-spacing: .06em; }
-        .sw-logo span { color: #fff; }
+        *, *::before, *::after { box-sizing: border-box; }
 
-        /* Cards */
-        .card { border: none; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.07); background: var(--card-bg); transition: box-shadow .2s, transform .2s; }
-        .card:hover { box-shadow: 0 6px 24px rgba(0,0,0,.12); }
-        .card-header { background: var(--sw-dark) !important; color: #fff; border-radius: 12px 12px 0 0 !important; border: none; padding: 14px 20px; }
+        html { scroll-behavior: smooth; }
 
-        /* KPI cards */
-        .kpi-card { border-radius: 12px; padding: 20px; background: #fff; transition: transform .15s; }
-        .kpi-card:hover { transform: translateY(-2px); }
-        .kpi-card h5 { font-size: .75rem; text-transform: uppercase; letter-spacing: .1em; color: #888; margin-bottom: 6px; }
-        .kpi-card h3 { font-family: 'Bebas Neue', sans-serif; font-size: 3rem; margin: 0; line-height: 1; }
-        .kpi-num    { font-family: 'Bebas Neue', sans-serif; font-size: 2.8rem; line-height: 1; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--primary);
+            font-size: 14px;
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            overflow-x: hidden;
+        }
 
-        /* Nav tabs */
-        .nav-tabs { border-bottom: 2px solid #e5e5e5; flex-wrap: nowrap; overflow-x: auto; }
-        .nav-tabs .nav-link { color: #666; font-weight: 600; font-size: .82rem; padding: 10px 16px; border: none; border-bottom: 3px solid transparent; white-space: nowrap; }
-        .nav-tabs .nav-link.active { color: var(--sw-dark); border-bottom-color: var(--sw-yellow); background: transparent; }
-        .nav-tabs .nav-link:hover  { color: var(--sw-dark); }
+        h1,h2,h3,h4,h5,h6 { font-weight: 700; line-height: 1.2; }
 
-        /* Board cards */
-        .bc-card { background: #fff; border: 2px solid #e5e5e5; border-radius: 12px; padding: 14px; height: 100%; transition: border-color .2s, box-shadow .2s; position: relative; overflow: hidden; }
-        .bc-card:hover { border-color: var(--sw-yellow); box-shadow: 0 4px 16px rgba(0,0,0,.1); }
-        .bc-card.inprod   { border-color: var(--success); background: #f0fdf4; }
-        .bc-card.marcen   { border-color: #f59e0b; background: #fffbeb; }
-        .bc-card.tapec    { border-color: #8b5cf6; background: #faf5ff; }
-        .bc-card.done-card{ border-color: #6366f1; background: #f5f3ff; }
-        .bc-card.urgente  { border-color: var(--danger) !important; background: #fff5f5; }
-        .bc-nome { font-weight: 700; font-size: .88rem; margin-bottom: 4px; line-height: 1.3; }
-        .bc-num  { font-family: monospace; font-size: .75rem; color: #666; margin-bottom: 6px; }
-        .bc-meta { font-size: .7rem; color: #999; margin-top: 6px; }
-        .bc-svg-wrap svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+        /* ══ PATTERN BAR ══ */
+        .sw-pattern-bar {
+            height: 5px;
+            background: repeating-linear-gradient(
+                90deg,
+                var(--sw-yellow) 0, var(--sw-yellow) 12px,
+                var(--sw-black) 12px, var(--sw-black) 18px
+            );
+        }
 
-        /* Board tab buttons */
-        .board-tab-btn { border-radius: 50px; padding: 6px 18px; font-size: .8rem; font-weight: 700; cursor: pointer; transition: all .2s; }
-        .active-board-tab { box-shadow: 0 4px 14px rgba(0,0,0,.2) !important; }
+        /* ══ NAVBAR ══ */
+        .navbar {
+            background: var(--sw-black) !important;
+            border-bottom: 3px solid var(--sw-yellow);
+            padding: 0 1.5rem;
+            min-height: 64px;
+            box-shadow: 0 2px 20px rgba(1,1,13,0.3);
+            will-change: transform;
+        }
 
-        /* Scanner indicator */
-        #scanner-indicator { position: fixed; bottom: 20px; right: 20px; background: var(--sw-dark); color: var(--sw-yellow); border: 2px solid var(--sw-yellow); border-radius: 50px; padding: 8px 20px; font-size: .8rem; font-weight: 700; z-index: 9999; display: none; transition: all .3s; }
-        #scanner-indicator.active { display: block; animation: scan-pulse .4s ease; }
-        @keyframes scan-pulse { 0%{transform:scale(.9);opacity:.6} 100%{transform:scale(1);opacity:1} }
+        .navbar-brand {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            text-decoration: none;
+        }
 
-        /* Animations */
-        @keyframes fadeInUp { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
-        @keyframes pulse-animation { 0%,100%{opacity:1} 50%{opacity:.5} }
-        .fade-in-up { animation: fadeInUp .35s ease both; }
-        .kpi-card.updating { animation: pulse-animation .6s; }
+        .navbar-brand img {
+            height: 40px;
+            width: auto;
+            filter: brightness(1.05);
+        }
 
-        /* Status badges */
-        .badge-marcenaria { background: #f59e0b; color: #000; }
-        .badge-tapecaria  { background: #8b5cf6; color: #fff; }
-        .badge-inprod     { background: var(--success); color: #fff; }
-        .badge-done       { background: #6366f1; color: #fff; }
-        .badge-waiting    { background: var(--sw-yellow); color: #000; }
-        .badge-atrasado   { background: var(--danger); color: #fff; }
-        .badge-critico    { background: #f97316; color: #fff; }
-        .badge-atencao    { background: var(--warning); color: #000; }
+        .navbar-brand-text {
+            display: flex;
+            flex-direction: column;
+            line-height: 1.1;
+        }
 
-        /* Print */
+        .navbar-brand-name {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1.35rem;
+            color: var(--sw-yellow);
+            letter-spacing: 0.07em;
+        }
+
+        .navbar-brand-sub {
+            font-size: 0.58rem;
+            color: rgba(255,255,255,0.45);
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            font-weight: 500;
+        }
+
+        /* ══ STATUS BADGE ══ */
+        #status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.35rem 0.9rem !important;
+            border-radius: 50px !important;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+
+        #status-badge.bg-success {
+            background: #10b981 !important;
+            box-shadow: 0 0 14px rgba(16,185,129,0.4);
+        }
+
+        #status-badge.bg-danger {
+            background: #ef4444 !important;
+        }
+
+        #status-badge.bg-secondary {
+            background: rgba(255,255,255,0.12) !important;
+            color: rgba(255,255,255,0.7);
+        }
+
+        @keyframes pulse-badge {
+            0%,100% { opacity:1; }
+            50% { opacity:0.75; }
+        }
+
+        #status-badge { animation: pulse-badge 2.5s ease-in-out infinite; }
+
+        /* ══ AUTH LINK BUTTON ══ */
+        #auth-link {
+            padding: 0.4rem 1rem;
+            border: 1.5px solid var(--sw-yellow);
+            color: var(--sw-yellow) !important;
+            border-radius: var(--radius-sm);
+            font-size: 0.78rem;
+            font-weight: 700;
+            text-decoration: none;
+            letter-spacing: 0.04em;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+
+        #auth-link:hover {
+            background: var(--sw-yellow);
+            color: var(--sw-black) !important;
+        }
+
+        /* ══ CONTAINER ══ */
+        .container-fluid.px-4.py-5 {
+            max-width: 1440px;
+            margin: 0 auto;
+        }
+
+        /* ══ PAGE TITLE ══ */
+        .page-title {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 2.2rem;
+            letter-spacing: 0.04em;
+            line-height: 1;
+            color: var(--sw-black);
+        }
+
+        .page-title .highlight { color: var(--sw-yellow); }
+
+        /* ══ KPI CARDS ══ */
+        .card {
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--bg-card);
+            box-shadow: var(--shadow);
+            transition: transform 0.25s ease, box-shadow 0.25s ease;
+            will-change: transform;
+        }
+
+        .card:hover {
+            transform: translateY(-3px);
+            box-shadow: var(--shadow-lg);
+            border-color: rgba(255,182,0,0.35);
+        }
+
+        .kpi-card {
+            border-left: 4px solid;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(135deg, rgba(255,255,255,0.5) 0%, transparent 100%);
+            pointer-events: none;
+        }
+
+        .kpi-daily   { border-left-color: var(--sw-yellow); }
+        .kpi-weekly  { border-left-color: var(--sw-yellow-light); }
+        .kpi-historic{ border-left-color: var(--success); }
+
+        .kpi-card h5 {
+            font-size: 0.68rem;
+            font-weight: 800;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 0.6rem;
+        }
+
+        .kpi-card h3 {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 3rem;
+            line-height: 1;
+            margin: 0;
+        }
+
+        #kpi-daily   { color: var(--sw-yellow); }
+        #kpi-weekly  { color: #c49200; }
+        #kpi-historic{ color: var(--success); }
+
+        @keyframes kpi-flash {
+            0%   { background: rgba(255,182,0,0.15); }
+            100% { background: transparent; }
+        }
+
+        .kpi-card.updating { animation: kpi-flash 0.6s ease-out; }
+
+        /* ══ CARD HEADER ══ */
+        .card-header {
+            background: var(--sw-black) !important;
+            color: white;
+            border: none;
+            border-radius: var(--radius) var(--radius) 0 0 !important;
+            font-weight: 600;
+            padding: 1rem 1.25rem;
+        }
+
+        .card-header h5 {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 1rem;
+            letter-spacing: 0.07em;
+            margin: 0;
+            color: white;
+        }
+
+        .card-header small { color: rgba(255,255,255,0.5); font-weight: 400; }
+
+        /* ══ LOG BOX ══ */
+        .log-box {
+            font-family: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+            font-size: 0.76rem;
+            background: #01010d;
+            color: #d4d4d4;
+            border-radius: 0 0 var(--radius) var(--radius);
+            padding: 1rem;
+            max-height: 340px;
+            overflow-y: auto;
+            line-height: 1.6;
+        }
+
+        .log-box::-webkit-scrollbar { width: 4px; }
+        .log-box::-webkit-scrollbar-track { background: rgba(255,255,255,0.03); }
+        .log-box::-webkit-scrollbar-thumb { background: rgba(255,182,0,0.3); border-radius: 2px; }
+        .log-box::-webkit-scrollbar-thumb:hover { background: rgba(255,182,0,0.55); }
+
+        .log-entry { padding: 0.12rem 0; animation: log-slide-in 0.25s ease-out; }
+
+        @keyframes log-slide-in {
+            from { opacity:0; transform: translateX(-8px); }
+            to   { opacity:1; transform: translateX(0); }
+        }
+
+        .log-level-INFO    { color: #4ec9b0; }
+        .log-level-WARNING { color: var(--sw-yellow); }
+        .log-level-ERROR   { color: #f48771; }
+        .log-level-DEBUG   { color: #569cd6; }
+
+        /* ══ TABS ══ */
+        .nav-tabs {
+            border-bottom: 2px solid var(--border);
+            gap: 0.15rem;
+            flex-wrap: nowrap;
+            overflow-x: auto;
+        }
+
+        .nav-tabs::-webkit-scrollbar { display: none; }
+
+        .nav-tabs .nav-link {
+            color: var(--text-muted);
+            border: none;
+            border-bottom: 3px solid transparent;
+            font-weight: 600;
+            font-size: 0.8rem;
+            letter-spacing: 0.02em;
+            padding: 0.65rem 1rem;
+            margin-bottom: -2px;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+            background: none;
+        }
+
+        .nav-tabs .nav-link:hover {
+            color: var(--sw-black);
+            border-bottom-color: rgba(255,182,0,0.4);
+        }
+
+        .nav-tabs .nav-link.active {
+            color: var(--sw-black);
+            background: none;
+            border-bottom-color: var(--sw-yellow);
+            font-weight: 700;
+        }
+
+        .tab-content { animation: fadeIn 0.3s ease-out; }
+
+        @keyframes fadeIn {
+            from { opacity:0; transform: translateY(6px); }
+            to   { opacity:1; transform: translateY(0); }
+        }
+
+        /* ══ BUTTONS ══ */
+        .btn {
+            font-weight: 600;
+            font-size: 0.8rem;
+            letter-spacing: 0.03em;
+            border-radius: var(--radius-sm);
+            transition: all 0.2s ease;
+        }
+
+        .btn-primary {
+            background: var(--sw-yellow) !important;
+            border-color: var(--sw-yellow) !important;
+            color: var(--sw-black) !important;
+        }
+
+        .btn-primary:hover {
+            background: #e6a400 !important;
+            border-color: #e6a400 !important;
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(255,182,0,0.4);
+        }
+
+        .btn-primary:active { transform: translateY(0); }
+
+        .btn-outline-light {
+            border: 1.5px solid rgba(255,255,255,0.3) !important;
+            color: white !important;
+        }
+
+        .btn-outline-light:hover {
+            background: rgba(255,255,255,0.12) !important;
+            border-color: rgba(255,255,255,0.6) !important;
+        }
+
+        /* ══ FORM CONTROLS ══ */
+        .form-control, .form-select {
+            border: 1.5px solid var(--border);
+            border-radius: var(--radius-sm);
+            padding: 0.7rem 0.95rem;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .form-control:focus, .form-select:focus {
+            border-color: var(--sw-yellow);
+            box-shadow: 0 0 0 3px rgba(255,182,0,0.18);
+        }
+
+        /* ══ TABLE ══ */
+        .table { font-size: 0.82rem; }
+
+        .table thead th {
+            background: var(--bg);
+            border: none;
+            border-bottom: 2px solid var(--border);
+            font-weight: 700;
+            color: var(--text-muted);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.09em;
+            padding: 0.8rem 1rem;
+        }
+
+        .table tbody tr {
+            border-bottom: 1px solid var(--border);
+            transition: background 0.15s ease;
+        }
+
+        .table tbody tr:hover { background: rgba(255,182,0,0.04); }
+        .table td { padding: 0.75rem 1rem; vertical-align: middle; }
+
+        /* ══ BADGES ══ */
+        .badge {
+            font-weight: 700;
+            font-size: 0.65rem;
+            letter-spacing: 0.05em;
+            padding: 0.3rem 0.65rem;
+            border-radius: 50px;
+        }
+
+        .badge.bg-success { background: #10b981 !important; }
+        .badge.bg-warning { background: var(--sw-yellow) !important; color: var(--sw-black) !important; }
+        .badge.bg-danger  { background: #ef4444 !important; }
+
+        /* ══ ALERTS ══ */
+        .alert {
+            border: none;
+            border-left: 4px solid;
+            border-radius: var(--radius-sm);
+            font-size: 0.83rem;
+            font-weight: 500;
+        }
+
+        .alert-warning {
+            background: rgba(255,182,0,0.1);
+            border-left-color: var(--sw-yellow);
+            color: #92400e;
+        }
+
+        .alert-info {
+            background: rgba(59,130,246,0.08);
+            border-left-color: #3b82f6;
+            color: #1e3a8a;
+        }
+
+        .alert-danger {
+            background: rgba(239,68,68,0.08);
+            border-left-color: #ef4444;
+            color: #7f1d1d;
+        }
+
+        /* ══ METRIC BOX ══ */
+        .metric-box {
+            background: var(--sw-black);
+            border-radius: var(--radius);
+            padding: 1.3rem;
+            color: white;
+            text-align: center;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            margin-bottom: 1rem;
+        }
+
+        .metric-box:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 12px 30px rgba(1,1,13,0.2);
+        }
+
+        .metric-label {
+            font-size: 0.68rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            color: rgba(255,255,255,0.5);
+            margin-bottom: 0.5rem;
+        }
+
+        .metric-value {
+            font-family: 'Bebas Neue', sans-serif;
+            font-size: 2.4rem;
+            color: var(--sw-yellow);
+            line-height: 1;
+        }
+
+        /* ══ LIST GROUP ══ */
+        .list-group-item {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm) !important;
+            margin-bottom: 0.4rem;
+            font-size: 0.83rem;
+            transition: all 0.2s ease;
+        }
+
+        .list-group-item:hover {
+            border-color: var(--sw-yellow);
+            background: rgba(255,182,0,0.04);
+            transform: translateX(3px);
+        }
+
+        /* ══ ACCORDION ══ */
+        .accordion-button { font-weight: 600; font-size: 0.85rem; }
+
+        .accordion-button:not(.collapsed) {
+            background: rgba(255,182,0,0.08);
+            color: var(--sw-black);
+            box-shadow: none;
+        }
+
+        .accordion-button:focus {
+            box-shadow: 0 0 0 3px rgba(255,182,0,0.2);
+        }
+
+        /* ══ TOAST ══ */
+        .toast-container { z-index: 9999; }
+
+        .toast {
+            background: var(--sw-black);
+            border: none;
+            border-left: 4px solid var(--sw-yellow);
+            border-radius: var(--radius);
+            box-shadow: 0 12px 40px rgba(1,1,13,0.25);
+            animation: toast-in 0.35s cubic-bezier(0.34,1.56,0.64,1);
+        }
+
+        @keyframes toast-in {
+            from { opacity:0; transform: translateX(50px); }
+            to   { opacity:1; transform: translateX(0); }
+        }
+
+        .toast.hide { animation: toast-out 0.25s ease forwards; }
+
+        @keyframes toast-out {
+            to { opacity:0; transform: translateX(50px); }
+        }
+
+        /* ══ MODAL ══ */
+        .modal-content {
+            border: none;
+            border-radius: var(--radius) !important;
+            overflow: hidden;
+            box-shadow: 0 25px 80px rgba(1,1,13,0.3);
+        }
+
+        .modal-header {
+            background: var(--sw-black) !important;
+            border-bottom: 3px solid var(--sw-yellow) !important;
+            color: white;
+        }
+
+        .modal-title { font-family: 'Bebas Neue', sans-serif !important; letter-spacing: 0.06em; }
+
+        /* ══ SCROLLBAR GLOBAL ══ */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg); }
+        ::-webkit-scrollbar-thumb { background: rgba(1,1,13,0.15); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--sw-yellow); }
+
+        /* ══ UTILITY ══ */
+        .hidden { display: none !important; }
+        .stock-badge, .estoque-info, .stock-info-row { display: none !important; }
+        .shadow-2xl { box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25); }
+        .letter-spacing-2 { letter-spacing: 0.1em; }
+
+        /* ══ ANIMATIONS ══ */
+        @keyframes slideDown {
+            from { opacity:0; transform: translateY(-12px); }
+            to   { opacity:1; transform: translateY(0); }
+        }
+
+        @keyframes fadeInUp {
+            from { opacity:0; transform: translateY(14px); }
+            to   { opacity:1; transform: translateY(0); }
+        }
+
+        @keyframes pulse-animation {
+            0%,100% { opacity:1; }
+            50%      { opacity:0.5; }
+        }
+
+        .pulse-animation { animation: pulse-animation 2s infinite; }
+
+        .navbar { animation: slideDown 0.3s ease-out; }
+        .card   { animation: fadeInUp 0.35s ease-out; }
+
+        /* ══ FOOTER ══ */
+        footer {
+            background: var(--sw-black) !important;
+            border-top: 3px solid var(--sw-yellow);
+        }
+
+        /* ══ SCANNER GLOBAL ══ */
+        #scanner-indicator {
+            position: fixed; top: 70px; right: 16px; z-index: 9999;
+            background: #01010d; color: #ffb600;
+            border: 2px solid #ffb600; border-radius: 50px;
+            padding: 6px 14px; font-size: 0.72rem; font-weight: 700;
+            letter-spacing: 0.06em; display: none;
+            box-shadow: 0 4px 20px rgba(255,182,0,0.4);
+            animation: pulse-badge 1s infinite;
+        }
+        #scanner-indicator.active { display: flex; align-items: center; gap: 6px; }
+
+        /* ══ BOARD SUB-ABAS ══ */
+        .board-tab-btn { outline: none; }
+        .board-tab-btn:hover { opacity: 0.85; transform: translateY(-1px); }
+        .active-board-tab { opacity: 1 !important; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
+
+        /* ══ CARD DE BARCODE (Em Espera / Produzindo) ══ */
+        .bc-card {
+            border: 1.5px solid var(--border);
+            border-radius: var(--radius);
+            background: #fff;
+            padding: 18px 16px 14px;
+            transition: box-shadow .2s, border-color .2s, transform .2s;
+            position: relative;
+        }
+        .bc-card:hover { box-shadow: 0 6px 24px rgba(0,0,0,.09); border-color: var(--sw-yellow); transform: translateY(-2px); }
+        .bc-card.urgente { border-color: #ef4444; background: #fff5f5; }
+        .bc-card.atencao { border-color: #f59e0b; }
+        .bc-card.urgente  { border-color: #ef4444 !important; background: #fff5f5; }
+        .bc-card.critico  { border-color: #f97316 !important; background: #fff8f0; }
+        .bc-card.atencao  { border-color: #f59e0b !important; background: #fffbeb; }
+        .bc-card.normal   { border-color: var(--border); }
+        .bc-card.inprod   { border-color: #10b981 !important; background: #f0fdf4; }
+        /* Urgency pulse for overdue */
+        .bc-card.urgente .bc-num { animation: pulse-animation 1.2s infinite; color: #ef4444; }
+
+        .bc-card .bc-num  { font-family: 'Bebas Neue', sans-serif; font-size: 1.5rem; letter-spacing: .05em; color: var(--sw-black); }
+        .bc-card .bc-nome { font-size: 0.78rem; font-weight: 700; color: #374151; margin-bottom: 10px; line-height: 1.3; }
+        .bc-card .bc-meta { font-size: 0.68rem; color: #9ca3af; margin-top: 6px; }
+        .bc-card .bc-prazo { position: absolute; top: 10px; right: 10px; }
+        .bc-card .bc-svg-wrap { background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px 4px; display: inline-block; }
+        .bc-card .bc-lido-overlay {
+            position: absolute; inset: 0; background: rgba(16,185,129,.92); border-radius: var(--radius);
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            color: #fff; font-weight: 800; font-size: 1rem; letter-spacing: .04em;
+            animation: fadeIn .3s ease-out;
+        }
+
+        /* ══ IMPRESSÃO ══ */
         @media print {
             body > *:not(#print-area) { display: none !important; }
-            #print-area { display: block !important; position: fixed !important; inset: 0 !important; background: #fff !important; z-index: 999999 !important; padding: 0 !important; }
-            #print-area * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-            @page { size: A4; margin: 10mm; }
+            #print-area {
+                display: block !important;
+                position: fixed; inset: 0;
+                background: white; z-index: 99999;
+                padding: 20px; text-align: center;
+            }
         }
         #print-area { display: none; }
 
-        /* Toast */
-        .toast-container { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); z-index: 9998; display: flex; flex-direction: column; gap: 8px; align-items: center; }
-        .sw-toast { background: var(--sw-dark); color: #fff; border-left: 4px solid var(--sw-yellow); border-radius: 8px; padding: 12px 20px; font-size: .85rem; font-weight: 600; box-shadow: 0 4px 20px rgba(0,0,0,.3); animation: fadeInUp .3s ease; min-width: 260px; max-width: 420px; }
-        .sw-toast.success { border-left-color: var(--success); }
-        .sw-toast.danger  { border-left-color: var(--danger); }
-        .sw-toast.warning { border-left-color: var(--warning); }
-        .sw-toast.info    { border-left-color: #6366f1; }
-
-        .hidden { display: none !important; }
-        .sw-pattern-bar { height: 4px; background: linear-gradient(90deg, var(--sw-yellow) 0%, #fff 50%, var(--sw-yellow) 100%); }
-
-        /* Setor badge */
-        .setor-badge { font-size: .65rem; font-weight: 700; padding: 2px 8px; border-radius: 50px; display: inline-block; margin-bottom: 4px; }
+        /* ══ RESPONSIVO ══ */
+        @media (max-width: 768px) {
+            .kpi-card h3 { font-size: 2.2rem; }
+            .metric-value { font-size: 1.8rem; }
+            .log-box { max-height: 260px; }
+        }
     </style>
 </head>
 <body>
-    <!-- NAVBAR -->
-    <nav class="sw-navbar">
-        <div class="sw-logo">SW <span>Móveis</span> MDF</div>
-        <div class="d-flex align-items-center gap-2 flex-wrap">
-            <span id="last-reader-badge" style="display:none;padding:3px 10px;border-radius:50px;font-size:.7rem;font-weight:700;transition:all .3s">—</span>
-            <span id="status-badge" class="badge bg-secondary" title="Aguardando...">⏳ Conectando...</span>
-            <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light" style="border-radius:50px">Autenticar</a>
-        </div>
-    </nav>
 
-    <!-- CONTAINER PRINCIPAL -->
-    <div class="container-fluid px-4 py-4">
+    <!-- PATTERN BAR TOP -->
+    <div class="sw-pattern-bar"></div>
 
-        <!-- AUTH REQUIRED -->
-        <div id="auth-required-tabs" class="alert alert-warning hidden mt-3">
-            🔐 Autentique-se para acessar o painel.
-        </div>
+    <!-- SCANNER GLOBAL INDICATOR -->
+    <div id="scanner-indicator">📡 Lendo código...</div>
 
-        <!-- TABS PRINCIPAIS -->
-        <div id="content-tabs" class="hidden">
-            <ul class="nav nav-tabs mb-0 mt-3" id="mainTab">
-                <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-dashboard">📊 Dashboard</button></li>
-                <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-producao">🏭 Produção</button></li>
-                <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-insumos">📦 Insumos</button></li>
-                <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-expedicao">🚚 Expedição</button></li>
-                <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-relatorio">📋 Relatório</button></li>
-                <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-ficha">🔧 Ficha Técnica</button></li>
-            </ul>
-
-            <div class="tab-content pt-4">
-
-                <!-- ═══ TAB 1: DASHBOARD ═══ -->
-                <div class="tab-pane fade show active" id="tab-dashboard">
-                    <!-- Filtro data unificado -->
-                    <div class="d-flex gap-2 align-items-center flex-wrap mb-4">
-                        <label class="text-muted small fw-bold mb-0">De:</label>
-                        <input type="date" id="filter-date-from" class="form-control form-control-sm" style="width:140px">
-                        <label class="text-muted small fw-bold mb-0">Até:</label>
-                        <input type="date" id="filter-date-to" class="form-control form-control-sm" style="width:140px">
-                        <button class="btn btn-primary btn-sm" onclick="applyDashboardFilter()">Filtrar</button>
-                        <button class="btn btn-outline-secondary btn-sm" onclick="resetDashboardFilter()">Limpar</button>
-                        <button class="btn btn-outline-dark btn-sm ms-auto" onclick="printDashboard()">🖨️ Imprimir</button>
-                    </div>
-
-                    <!-- KPIs Pedidos -->
-                    <div class="row g-3 mb-4">
-                        <div class="col-6 col-md-3">
-                            <div class="kpi-card border-start border-4 border-warning fade-in-up">
-                                <h5>Pedidos Hoje</h5>
-                                <div class="kpi-num" id="kpi-daily" style="color:var(--sw-yellow)">0</div>
-                                <div id="kpi-daily-sub" style="font-size:.65rem;color:#aaa;margin-top:4px;max-height:36px;overflow:hidden"></div>
-                            </div>
-                        </div>
-                        <div class="col-6 col-md-3">
-                            <div class="kpi-card border-start border-4 border-warning fade-in-up" style="animation-delay:.05s">
-                                <h5>Esta Semana</h5>
-                                <div class="kpi-num" id="kpi-weekly" style="color:#f59e0b">0</div>
-                            </div>
-                        </div>
-                        <div class="col-6 col-md-3">
-                            <div class="kpi-card border-start border-4 border-success fade-in-up" style="animation-delay:.1s">
-                                <h5>Este Mês</h5>
-                                <div class="kpi-num" id="kpi-historic" style="color:var(--success)">0</div>
-                            </div>
-                        </div>
-                        <div class="col-6 col-md-3">
-                            <div class="kpi-card border-start border-4 fade-in-up" style="border-color:#6366f1!important;animation-delay:.15s">
-                                <h5>Tendência</h5>
-                                <div class="kpi-num" id="trend-indicator" style="font-size:1.4rem;color:#6366f1">—</div>
-                                <div id="growth-weekly" style="font-size:.85rem;font-weight:700"></div>
-                                <div id="growth-tooltip" style="font-size:.6rem;color:#aaa;margin-top:2px;line-height:1.3"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- KPIs Produção (3 etapas) -->
-                    <div class="row g-3 mb-4">
-                        <div class="col-md-4">
-                            <div class="kpi-card text-center fade-in-up" style="border-top:4px solid var(--sw-yellow)">
-                                <h5>⏳ Em Espera</h5>
-                                <div class="kpi-num" id="kpi-waiting" style="color:var(--sw-yellow)">0</div>
-                                <div id="kpi-waiting-nums" style="font-size:.62rem;color:#aaa;max-height:40px;overflow:hidden"></div>
-                            </div>
-                        </div>
-                        <div class="col-md-4">
-                            <div class="kpi-card text-center fade-in-up" style="border-top:4px solid var(--success);animation-delay:.05s">
-                                <h5>⚙️ Produzindo</h5>
-                                <div class="kpi-num" id="kpi-inprod" style="color:var(--success)">0</div>
-                                <div id="kpi-inprod-nums" style="font-size:.62rem;color:#aaa;max-height:40px;overflow:hidden"></div>
-                            </div>
-                        </div>
-                        <div class="col-md-4">
-                            <div class="kpi-card text-center fade-in-up" style="border-top:4px solid #6366f1;animation-delay:.1s">
-                                <h5>✅ Concluídos (Mês)</h5>
-                                <div class="kpi-num" id="kpi-done" style="color:#6366f1">0</div>
-                                <div id="kpi-done-nums" style="font-size:.62rem;color:#aaa;max-height:40px;overflow:hidden"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Gráficos -->
-                    <div class="row g-3 mb-4">
-                        <div class="col-lg-8">
-                            <div class="card">
-                                <div class="card-header d-flex justify-content-between align-items-center">
-                                    <span>📈 Pedidos × Produção <small id="last-recalculated" class="text-white-50 ms-2" style="font-size:.7rem"></small></span>
-                                </div>
-                                <div class="card-body" style="height:300px"><canvas id="salesChart"></canvas></div>
-                            </div>
-                        </div>
-                        <div class="col-lg-4">
-                            <div class="card h-100">
-                                <div class="card-header">⚡ Etapas de Produção</div>
-                                <div class="card-body" style="height:260px"><canvas id="stagesChart"></canvas></div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="row g-3">
-                        <div class="col-md-6">
-                            <div class="card">
-                                <div class="card-header">📊 Produção por Dia</div>
-                                <div class="card-body" style="height:220px"><canvas id="prodBarChart"></canvas></div>
-                            </div>
-                        </div>
-                        <div class="col-md-6">
-                            <div class="card">
-                                <div class="card-header">📉 Queda / 📈 Subida</div>
-                                <div class="card-body" style="height:220px"><canvas id="deltaChart"></canvas></div>
-                            </div>
-                        </div>
-                    </div>
+    <!-- CÂMERA SCANNER MODAL -->
+    <div class="modal fade" id="cameraScanModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered" style="max-width:400px;">
+            <div class="modal-content border-0 shadow-lg">
+                <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
+                    <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">📷 Scanner de Câmera</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="stopCameraScanner()"></button>
                 </div>
-
-                <!-- ═══ TAB 2: PRODUÇÃO ═══ -->
-                <div class="tab-pane fade" id="tab-producao">
-                    <!-- Sub-abas do board -->
-                    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
-                        <div class="d-flex gap-2 flex-wrap">
-                            <button id="tab-waiting-btn" onclick="switchBoardTab('waiting')" class="board-tab-btn active-board-tab"
-                                style="background:rgba(255,182,0,.18);border:2px solid #ffb600;color:#ffb600;">
-                                ⏳ Em Espera <span id="waiting-count-badge" style="background:#ffb600;color:#000;border-radius:50px;padding:1px 8px;font-size:.7rem;margin-left:4px">0</span>
-                            </button>
-                            <button id="tab-inprod-btn" onclick="switchBoardTab('inprod')" class="board-tab-btn"
-                                style="background:rgba(16,185,129,.12);border:2px solid rgba(16,185,129,.4);color:#10b981;">
-                                ⚙️ Produzindo <span id="inprod-count-badge" style="background:#10b981;color:#fff;border-radius:50px;padding:1px 8px;font-size:.7rem;margin-left:4px">0</span>
-                            </button>
-                            <button id="tab-done-btn" onclick="switchBoardTab('done')" class="board-tab-btn"
-                                style="background:rgba(99,102,241,.12);border:2px solid rgba(99,102,241,.3);color:#6366f1;">
-                                ✅ Concluídos <span id="done-count-badge" style="background:#6366f1;color:#fff;border-radius:50px;padding:1px 8px;font-size:.7rem;margin-left:4px">0</span>
-                            </button>
-                        </div>
-                        <button class="btn btn-sm btn-outline-primary" onclick="syncAndRefreshPending()">🔄 Sincronizar</button>
-                    </div>
-
-                    <!-- Setor tabs (visível em Produzindo) -->
-                    <div id="setor-tabs-wrap" style="display:none" class="mb-3">
-                        <div class="d-flex gap-2">
-                            <button onclick="switchSetor('todos')" id="setor-todos" class="btn btn-sm btn-dark">Todos</button>
-                            <button onclick="switchSetor('marcenaria')" id="setor-marc" class="btn btn-sm btn-outline-secondary">🪚 Marcenaria</button>
-                            <button onclick="switchSetor('tapecaria')" id="setor-tape" class="btn btn-sm btn-outline-secondary">🧵 Tapeçaria</button>
-                            <button onclick="printSetor()" class="btn btn-sm btn-outline-dark ms-auto">🖨️ Imprimir Setor</button>
-                        </div>
-                    </div>
-
-                    <!-- Buscador (só em Produzindo) -->
-                    <div id="search-inprod-wrap" style="display:none" class="mb-3">
-                        <input type="text" id="search-inprod" class="form-control form-control-sm" placeholder="🔍 Buscar pedido ou cliente..." oninput="filterInProd(this.value)" style="max-width:360px">
-                    </div>
-
-                    <!-- Painéis -->
-                    <div id="board-waiting" class="board-panel"></div>
-                    <div id="board-inprod"   class="board-panel" style="display:none"></div>
-                    <div id="board-done"     class="board-panel" style="display:none"></div>
+                <div class="modal-body p-0 bg-black text-center" style="min-height:280px;position:relative;">
+                    <video id="camera-preview" style="width:100%;max-height:280px;object-fit:cover;display:block;"></video>
+                    <div id="camera-scan-result" style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.7);color:#fff;padding:8px;font-size:.85rem;display:none;"></div>
+                    <div id="camera-aim" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:200px;height:80px;border:2px solid #ffb600;border-radius:4px;pointer-events:none;"></div>
                 </div>
-
-                <!-- ═══ TAB 3: INSUMOS ═══ -->
-                <div class="tab-pane fade" id="tab-insumos">
-                    <div class="d-flex justify-content-between align-items-center mb-4">
-                        <div><h5 class="mb-0">📦 Gestão de Insumos</h5><small class="text-muted">Consumo real × necessidade pelos pedidos</small></div>
-                    </div>
-                    <div class="card mb-4">
-                        <div class="card-header">🛒 Guia de Compras — Baseado nos Pedidos em Espera</div>
-                        <div class="card-body p-0" id="purchase-guide-section"><div class="text-center py-4 text-muted">⏳ Calculando...</div></div>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">📊 Consumo Real do Mês <small id="consumption-month-label" class="text-white-50"></small></div>
-                        <div class="card-body p-0" id="consumption-table-section"><div class="text-center py-4 text-muted">⏳ Carregando...</div></div>
-                    </div>
-                </div>
-
-                <!-- ═══ TAB 4: EXPEDIÇÃO ═══ -->
-                <div class="tab-pane fade" id="tab-expedicao">
-                    <div class="d-flex justify-content-between align-items-center mb-3">
-                        <h5 class="mb-0">🚚 Expedição</h5>
-                        <button class="btn btn-outline-dark btn-sm" onclick="printExpedicao()">🖨️ Imprimir</button>
-                    </div>
-                    <div class="d-flex gap-2 mb-3 flex-wrap">
-                        <button onclick="filterExpedicao('all')" class="btn btn-sm btn-dark">Todos</button>
-                        <button onclick="filterExpedicao('atrasado')" class="btn btn-sm btn-danger">🔴 Atrasados</button>
-                        <button onclick="filterExpedicao('critico')" class="btn btn-sm btn-warning text-dark">🟡 Crítico</button>
-                        <button onclick="filterExpedicao('atencao')" class="btn btn-sm btn-info text-dark">🔵 Atenção</button>
-                        <button onclick="filterExpedicao('normal')" class="btn btn-sm btn-success">🟢 No prazo</button>
-                    </div>
-                    <div id="expedicao-section"><div class="text-center py-5 text-muted">⏳ Carregando...</div></div>
-                </div>
-
-                <!-- ═══ TAB 5: RELATÓRIO ═══ -->
-                <div class="tab-pane fade" id="tab-relatorio">
-                    <div class="d-flex justify-content-between align-items-center mb-4">
-                        <h5 class="mb-0">📋 Relatório de Produção</h5>
-                        <div class="d-flex gap-2">
-                            <button onclick="loadRelatorio(7)"  class="btn btn-sm btn-outline-primary">7 dias</button>
-                            <button onclick="loadRelatorio(30)" class="btn btn-sm btn-outline-primary">30 dias</button>
-                            <button onclick="printRelatorio()"  class="btn btn-sm btn-outline-dark">🖨️</button>
-                        </div>
-                    </div>
-                    <div id="relatorio-section"><div class="text-center py-5 text-muted">Selecione o período acima.</div></div>
-                    <div class="card mt-4">
-                        <div class="card-header">📜 Histórico de Finalizações</div>
-                        <div class="card-body p-0" id="production-history-section"><div class="text-center py-4 text-muted">⏳ Carregando...</div></div>
-                    </div>
-                </div>
-
-                <!-- ═══ TAB 6: FICHA TÉCNICA ═══ -->
-                <div class="tab-pane fade" id="tab-ficha">
-                    <div class="d-flex justify-content-between align-items-center mb-4">
-                        <h5 class="mb-0">🔧 Ficha Técnica</h5>
-                        <button class="btn btn-sm btn-outline-dark" onclick="printFicha()">🖨️ Imprimir</button>
-                    </div>
-                    <div class="card">
-                        <div class="card-header">📐 Cadeira SW — Insumos por Unidade</div>
-                        <div class="card-body p-0" id="ficha-section"><div class="text-center py-4 text-muted">⏳ Carregando...</div></div>
-                    </div>
+                <div class="modal-footer bg-dark justify-content-between">
+                    <small class="text-muted">Aponte para o código de barras da OP</small>
+                    <button class="btn btn-outline-light btn-sm" onclick="stopCameraScanner()" data-bs-dismiss="modal">Fechar</button>
                 </div>
             </div>
         </div>
     </div>
 
-    <!-- SCANNER INDICATOR -->
-    <div id="scanner-indicator">📡 Lendo código...</div>
-
-    <!-- PRINT AREA -->
+    <!-- ÁREA DE IMPRESSÃO -->
     <div id="print-area"></div>
 
+    <!-- NAVBAR -->
+    <nav class="navbar navbar-expand-lg">
+        <div class="container-fluid px-4">
+            <a class="navbar-brand text-white d-flex align-items-center" href="#" style="gap: 0.75rem;">
+                <img src="https://i.imgur.com/j79HO6n.png" alt="SW Móveis MDF" style="height: 40px; width: auto; filter: brightness(1.1);">
+                <div class="navbar-brand-text">
+                    <span class="navbar-brand-name">SW Móveis MDF</span>
+                    <span class="navbar-brand-sub">Painel de Gestão</span>
+                </div>
+            </a>
+            <div class="d-flex align-items-center gap-2">
+                <span id="status-badge" class="badge bg-secondary" title="Aguardando WebSocket...">⏳ Conectando...</span>
+                <button class="btn btn-sm" onclick="openCameraScanner()"
+                    style="background:#ffb600;color:#000;font-weight:700;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
+                    title="Scanner por câmera do celular">📷 Câmera</button>
+                <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- CONTAINER PRINCIPAL -->
+    <div class="container-fluid px-4 py-5">
+
+        <!-- PAGE HEADER -->
+        <div class="row mb-5">
+            <div class="col-12">
+                <h2 class="mb-1 page-title">Pedidos de <span class="highlight">Venda</span></h2>
+                <p class="text-muted mb-4" style="font-size:0.85rem;">Acompanhe os pedidos abertos e fechados em tempo real</p>
+            </div>
+        </div>
+
+        <!-- KPI CARDS -->
+        <div class="row mb-5">
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-daily text-center">
+                    <h5>⚡ Pedidos Diários</h5>
+                    <h3 id="kpi-daily" class="text-primary">0</h3>
+                    <small class="text-muted">Últimas 24h</small>
+                    <div id="kpi-daily-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
+                </div>
+            </div>
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-weekly text-center">
+                    <h5>📅 Pedidos Semanais</h5>
+                    <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
+                    <small class="text-muted">Últimos 7 dias</small>
+                    <div id="kpi-weekly-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
+                </div>
+            </div>
+            <div class="col-md-4 mb-4">
+                <div class="card p-4 kpi-card kpi-historic text-center">
+                    <h5>📊 Pedidos Mensais</h5>
+                    <h3 id="kpi-historic" style="color: var(--success);">0</h3>
+                    <small class="text-muted">Este Mês</small>
+                    <div id="kpi-monthly-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TIMESTAMP -->
+        <div class="row mb-5">
+            <div class="col-12">
+                <small class="text-muted">
+                    ⏱️ Último Recálculo: <span id="last-recalculated" style="font-weight: 600;">N/D</span>
+                </small>
+            </div>
+        </div>
+
+        <!-- LOGS EM TEMPO REAL -->
+        <div class="row mb-5">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">📋 Logs <span style="color:var(--sw-yellow)">em Tempo Real</span></h5>
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="logs-content" class="log-box"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TABS PRINCIPAIS -->
+        <div class="row">
+            <div class="col-12">
+                <ul class="nav nav-tabs mb-0" id="myTab" role="tablist" style="border-bottom:2px solid var(--border);flex-wrap:nowrap;overflow-x:auto;">
+                    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-dashboard">📊 Dashboard</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-producao">🏭 Produção</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-insumos">📦 Insumos</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-expedicao">🚚 Expedição</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-relatorio">📋 Relatório</button></li>
+                    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-ficha">🔧 Ficha Técnica</button></li>
+                </ul>
+
+                <!-- AUTH REQUIRED -->
+                <div id="auth-required-tabs" class="alert alert-warning hidden mt-3">
+                    🔐 É necessário autenticar com o SW Móveis para visualizar o conteúdo.
+                </div>
+
+                <!-- TAB CONTENT -->
+                <div id="content-tabs" class="tab-content hidden mt-4">
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 1: DASHBOARD
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade show active" id="tab-dashboard" role="tabpanel">
+
+                        <!-- Filtro de data unificado -->
+                        <div class="d-flex align-items-center gap-3 mb-4 flex-wrap">
+                            <div class="d-flex gap-2 align-items-center">
+                                <label class="text-muted small fw-bold mb-0">De:</label>
+                                <input type="date" id="filter-date-from" class="form-control form-control-sm" style="width:140px;">
+                                <label class="text-muted small fw-bold mb-0">Até:</label>
+                                <input type="date" id="filter-date-to" class="form-control form-control-sm" style="width:140px;">
+                                <button class="btn btn-primary btn-sm" onclick="applyDashboardFilter()">Filtrar</button>
+                                <button class="btn btn-outline-secondary btn-sm" onclick="resetDashboardFilter()">Limpar</button>
+                            </div>
+                            <button class="btn btn-outline-dark btn-sm ms-auto" onclick="printDashboard()">🖨️ Imprimir</button>
+                        </div>
+
+                        <!-- KPIs: 3 etapas de produção -->
+                        <div class="row mb-4" id="dash-kpi-row">
+                            <div class="col-md-4 mb-3">
+                                <div class="card p-4 kpi-card kpi-daily text-center h-100">
+                                    <h5>⏳ Em Espera</h5>
+                                    <h3 id="kpi-waiting" class="text-warning">0</h3>
+                                    <small class="text-muted">Pedidos na fila</small>
+                                    <div id="kpi-waiting-nums" class="mt-2" style="font-size:.68rem;color:#888;max-height:50px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <div class="card p-4 kpi-card kpi-weekly text-center h-100">
+                                    <h5>⚙️ Produzindo</h5>
+                                    <h3 id="kpi-inprod" style="color:#10b981;">0</h3>
+                                    <small class="text-muted">Em produção agora</small>
+                                    <div id="kpi-inprod-nums" class="mt-2" style="font-size:.68rem;color:#888;max-height:50px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <div class="card p-4 kpi-card kpi-historic text-center h-100">
+                                    <h5>✅ Concluídos</h5>
+                                    <h3 id="kpi-done" style="color:var(--success);">0</h3>
+                                    <small class="text-muted">Este mês</small>
+                                    <div id="kpi-done-nums" class="mt-2" style="font-size:.68rem;color:#888;max-height:50px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- KPIs: Pedidos -->
+                        <div class="row mb-4">
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#ffb600!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Pedidos Hoje</div>
+                                    <div class="fw-bold" id="kpi-daily" style="font-family:'Bebas Neue',sans-serif;font-size:2.5rem;color:#ffb600;">0</div>
+                                    <div id="kpi-daily-orders" style="font-size:.65rem;color:#aaa;max-height:40px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#f59e0b!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Esta Semana</div>
+                                    <div class="fw-bold" id="kpi-weekly" style="font-family:'Bebas Neue',sans-serif;font-size:2.5rem;color:#f59e0b;">0</div>
+                                    <div id="kpi-weekly-orders" style="font-size:.65rem;color:#aaa;max-height:40px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#10b981!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Este Mês</div>
+                                    <div class="fw-bold" id="kpi-historic" style="font-family:'Bebas Neue',sans-serif;font-size:2.5rem;color:#10b981;">0</div>
+                                    <div id="kpi-monthly-orders" style="font-size:.65rem;color:#aaa;max-height:40px;overflow-y:auto;"></div>
+                                </div>
+                            </div>
+                            <div class="col-md-3 mb-3">
+                                <div class="card p-3 text-center border-start border-4" style="border-color:#6366f1!important;">
+                                    <div style="font-size:.65rem;font-weight:800;text-transform:uppercase;letter-spacing:.1em;color:#807f7f;">Tendência</div>
+                                    <div class="fw-bold" id="trend-indicator" style="font-family:'Bebas Neue',sans-serif;font-size:1.4rem;color:#6366f1;">—</div>
+                                    <div id="growth-weekly" style="font-size:.9rem;font-weight:700;"></div>
+                                    <div id="growth-tooltip" style="font-size:.6rem;color:#aaa;margin-top:3px;line-height:1.3;"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Gráfico principal: pedidos + produção -->
+                        <div class="row mb-4">
+                            <div class="col-lg-8 mb-4">
+                                <div class="card">
+                                    <div class="card-header d-flex justify-content-between align-items-center">
+                                        <h5 class="mb-0">📈 Pedidos × Produção <span style="color:var(--sw-yellow)">(Últimos 30 dias)</span></h5>
+                                        <small id="last-recalculated" class="text-muted"></small>
+                                    </div>
+                                    <div class="card-body" style="height:340px;">
+                                        <canvas id="salesChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-4 mb-4">
+                                <div class="card h-100">
+                                    <div class="card-header"><h5 class="mb-0">⚡ Produção por Etapa</h5></div>
+                                    <div class="card-body" style="height:300px;">
+                                        <canvas id="stagesChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Gráfico barcode por produção + queda/subida -->
+                        <div class="row mb-4">
+                            <div class="col-lg-6 mb-4">
+                                <div class="card">
+                                    <div class="card-header"><h5 class="mb-0">📊 Produção por Dia (Barras)</h5></div>
+                                    <div class="card-body" style="height:260px;">
+                                        <canvas id="prodBarChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="col-lg-6 mb-4">
+                                <div class="card">
+                                    <div class="card-header"><h5 class="mb-0">📉 Queda / 📈 Subida Diária</h5></div>
+                                    <div class="card-body" style="height:260px;">
+                                        <canvas id="deltaChart"></canvas>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 2: PRODUÇÃO
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-producao" role="tabpanel">
+
+                        <!-- Header com sync + sub-abas -->
+                        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+                            <div class="d-flex gap-2 flex-wrap">
+                                <button id="tab-waiting-btn" onclick="switchBoardTab('waiting')" class="board-tab-btn active-board-tab"
+                                    style="background:rgba(255,182,0,0.18);border:2px solid #ffb600;color:#ffb600;border-radius:50px;padding:6px 20px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;">
+                                    ⏳ Em Espera <span id="waiting-count-badge" style="background:#ffb600;color:#000;border-radius:50px;padding:1px 9px;font-size:.72rem;margin-left:4px;">0</span>
+                                </button>
+                                <button id="tab-inprod-btn" onclick="switchBoardTab('inprod')" class="board-tab-btn"
+                                    style="background:rgba(16,185,129,0.12);border:2px solid rgba(16,185,129,0.4);color:#10b981;border-radius:50px;padding:6px 20px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;">
+                                    ⚙️ Produzindo <span id="inprod-count-badge" style="background:#10b981;color:#fff;border-radius:50px;padding:1px 9px;font-size:.72rem;margin-left:4px;">0</span>
+                                </button>
+                                <button id="tab-done-btn" onclick="switchBoardTab('done')" class="board-tab-btn"
+                                    style="background:rgba(99,102,241,0.12);border:2px solid rgba(99,102,241,0.3);color:#6366f1;border-radius:50px;padding:6px 20px;font-size:.8rem;font-weight:700;cursor:pointer;transition:all .2s;">
+                                    ✅ Concluídos <span id="done-count-badge" style="background:#6366f1;color:#fff;border-radius:50px;padding:1px 9px;font-size:.72rem;margin-left:4px;">0</span>
+                                </button>
+                            </div>
+                            <button class="btn btn-sm btn-outline-primary" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                        </div>
+
+                        <!-- Sub-abas Marcenaria / Tapeçaria (visível na aba Produzindo) -->
+                        <div id="setor-tabs-wrap" style="display:none;" class="mb-3">
+                            <div class="d-flex gap-2">
+                                <button onclick="switchSetor('todos')" id="setor-todos" class="btn btn-sm btn-dark active">Todos</button>
+                                <button onclick="switchSetor('marcenaria')" id="setor-marc" class="btn btn-sm btn-outline-secondary">🪚 Marcenaria</button>
+                                <button onclick="switchSetor('tapecaria')" id="setor-tape" class="btn btn-sm btn-outline-secondary">🧵 Tapeçaria</button>
+                                <button onclick="printSetor()" class="btn btn-sm btn-outline-dark ms-auto">🖨️ Imprimir Setor</button>
+                            </div>
+                        </div>
+
+                        <!-- Buscador (visível na aba Produzindo) -->
+                        <div id="search-inprod-wrap" style="display:none;" class="mb-3">
+                            <input type="text" id="search-inprod" class="form-control form-control-sm" placeholder="🔍 Buscar por número do pedido ou cliente..."
+                                oninput="filterInProd(this.value)" style="max-width:360px;">
+                        </div>
+
+                        <!-- Painéis das 3 sub-abas -->
+                        <div id="board-waiting" class="board-panel"></div>
+                        <div id="board-inprod"   class="board-panel" style="display:none;"></div>
+                        <div id="board-done"     class="board-panel" style="display:none;"></div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 3: INSUMOS
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-insumos" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <div>
+                                <h5 class="mb-0">📦 Gestão de Insumos</h5>
+                                <small class="text-muted">Consumo real × necessidade por pedidos em espera</small>
+                            </div>
+                            <span class="badge bg-light text-dark border" id="consumption-total-badge">0 insumos</span>
+                        </div>
+
+                        <!-- Guia Compras (necessidade baseada em pedidos) -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header" style="background:linear-gradient(135deg,#1e3a5f,#2563eb)!important;">
+                                <h5 class="mb-0">🛒 Guia de Compras — Baseado nos Pedidos em Espera</h5>
+                                <small class="text-white-50">Quantidade necessária para produzir todos os pedidos aguardando</small>
+                            </div>
+                            <div class="card-body p-0" id="purchase-guide-section">
+                                <div class="text-center py-4 text-muted">⏳ Calculando...</div>
+                            </div>
+                        </div>
+
+                        <!-- Consumo Mensal -->
+                        <div class="card mb-4 border-0 shadow-sm">
+                            <div class="card-header d-flex justify-content-between align-items-center" style="background:linear-gradient(135deg,#065f46,#059669)!important;">
+                                <div>
+                                    <h5 class="mb-0">📊 Consumo Real do Mês</h5>
+                                    <small class="text-white-50" id="consumption-month-label">Mês atual</small>
+                                </div>
+                            </div>
+                            <div class="card-body p-0" id="consumption-table-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando...</div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 4: EXPEDIÇÃO
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-expedicao" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <h5 class="mb-0">🚚 Expedição — Pedidos Prontos para Envio</h5>
+                            <button class="btn btn-outline-dark btn-sm" onclick="printExpedicao()">🖨️ Imprimir Lista</button>
+                        </div>
+
+                        <!-- Filtro de prazo por cor -->
+                        <div class="d-flex gap-2 mb-3 flex-wrap">
+                            <button onclick="filterExpedicao('all')" class="btn btn-sm btn-dark">Todos</button>
+                            <button onclick="filterExpedicao('atrasado')" class="btn btn-sm btn-danger">🔴 Atrasados</button>
+                            <button onclick="filterExpedicao('critico')" class="btn btn-sm btn-warning text-dark">🟡 Crítico (≤2d)</button>
+                            <button onclick="filterExpedicao('atencao')" class="btn btn-sm btn-info text-dark">🔵 Atenção (≤5d)</button>
+                            <button onclick="filterExpedicao('normal')" class="btn btn-sm btn-success">🟢 No prazo</button>
+                        </div>
+
+                        <div id="expedicao-section">
+                            <div class="text-center py-5 text-muted">⏳ Carregando...</div>
+                        </div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 5: RELATÓRIO
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-relatorio" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <h5 class="mb-0">📋 Relatório de Produção</h5>
+                            <div class="d-flex gap-2">
+                                <button onclick="loadRelatorio(7)"  class="btn btn-sm btn-outline-primary">7 dias</button>
+                                <button onclick="loadRelatorio(30)" class="btn btn-sm btn-outline-primary">30 dias</button>
+                                <button onclick="printRelatorio()"  class="btn btn-sm btn-outline-dark">🖨️ Imprimir</button>
+                            </div>
+                        </div>
+
+                        <div id="relatorio-section">
+                            <div class="text-center py-5 text-muted">⏳ Selecione o período acima.</div>
+                        </div>
+
+                        <!-- Histórico de Finalizações -->
+                        <div class="card border-0 shadow-sm mt-4">
+                            <div class="card-header" style="background:linear-gradient(135deg,#3b0764,#7c3aed)!important;">
+                                <h5 class="mb-0">📜 Histórico de Finalizações (Mês)</h5>
+                            </div>
+                            <div class="card-body p-0" id="production-history-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando...</div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    <!-- ══════════════════════════════════════════════
+                         TAB 6: FICHA TÉCNICA
+                    ══════════════════════════════════════════════ -->
+                    <div class="tab-pane fade" id="tab-ficha" role="tabpanel">
+
+                        <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+                            <h5 class="mb-0">🔧 Ficha Técnica de Produtos</h5>
+                            <button class="btn btn-sm btn-outline-dark" onclick="printFicha()">🖨️ Imprimir</button>
+                        </div>
+
+                        <div class="card border-0 shadow-sm">
+                            <div class="card-header" style="background:linear-gradient(135deg,#01010d,#374151)!important;">
+                                <h5 class="mb-0">📐 Cadeira SW — Lista Técnica de Insumos</h5>
+                                <small class="text-white-50">Componentes por unidade produzida</small>
+                            </div>
+                            <div class="card-body p-0" id="ficha-section">
+                                <div class="text-center py-4 text-muted">⏳ Carregando...</div>
+                            </div>
+                        </div>
+
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </div>
+
+
     <!-- TOAST CONTAINER -->
-    <div class="toast-container" id="toast-container"></div>
+    <div class="toast-container position-fixed bottom-0 end-0 p-4"></div>
 
-    <div class="sw-pattern-bar mt-4"></div>
+    <!-- BOOTSTRAP JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
+<script>
         const API = '/api';
         let isAuthenticated = false;
-        let salesChart = null, stagesChart = null, prodBarChart = null, deltaChart = null;
+        let salesChart = null;
+        let stagesChart = null;
+        let prodBarChart = null;
+        let deltaChart = null;
         let _currentSetor = 'todos';
-        let _boardDataRaw = null;
-        let _boardData    = null;
-        let _currentBoardTab = 'waiting';
-        let _boardPoll = null;
-        let _boardTick = null;
-        let _boardInitialized = false;
-        let _expedicaoPage = 1;
-        let _expedicaoFilter = 'all';
-        let _dashFilter = {from: null, to: null};
-        let wsKpi = null;
-        let _kpiReconnectDelay = 2000;
-        let _kpiReconnectTimer = null;
-        let _wsFirstAuthDone = false;
-        let _wsConnected = false;
+        let _boardDataRaw = null;  // raw data for filtering
 
-        /* ── Safe date helpers ── */
-        function safeDate(raw) {
-            if (!raw || raw === 'null' || raw === 'N/D') return null;
-            raw = String(raw).trim();
-            if (raw.length >= 8 && raw[2] === '/' && raw[5] === '/') {
-                raw = raw.slice(6,10) + '-' + raw.slice(3,5) + '-' + raw.slice(0,2);
+        /* ✅ DESIGN: Fetch API com Tratamento */
+        async function fetchAPI(url, options = {}) {
+            const response = await fetch(url, options);
+
+            if (response.status === 401) {
+                // Token expirado: atualiza UI sem redirecionar (evita loop)
+                isAuthenticated = false;
+                const badge = document.getElementById('status-badge');
+                if (badge) { badge.className = 'badge bg-warning text-dark'; badge.textContent = '🟡 Sessão expirada'; }
+                const authLink = document.getElementById('auth-link');
+                if (authLink) authLink.classList.remove('d-none');
+                throw new Error('401');
             }
-            if (raw.length > 10 && raw[10] === ' ') raw = raw.slice(0,10) + 'T' + raw.slice(11);
-            const dt = new Date(raw);
-            return isNaN(dt.getTime()) ? null : dt;
+
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => response.statusText);
+                throw new Error(`HTTP ${response.status}: ${errorText}`);
+            }
+
+            return response.json().catch(() => ({}));
         }
-        function safeDateStr(raw, opts) {
-            const d = safeDate(raw);
-            return d ? d.toLocaleDateString('pt-BR', opts||{}) : '—';
-        }
-        function safeDateTimeStr(raw) {
-            const d = safeDate(raw);
-            return d ? d.toLocaleString('pt-BR') : '—';
-        }
-        function formatDateTime(iso) {
-            if (!iso) return '—';
-            try {
-                const d = new Date(iso);
-                if (isNaN(d.getTime())) return '—';
-                return d.toLocaleString('pt-BR');
-            } catch(e) { return '—'; }
-        }
-        function formatSeconds(s) {
-            if (!s || s<=0) return '—';
-            if (s>=86400) return (s/86400).toFixed(2)+'d';
-            if (s>=3600)  return Math.floor(s/3600)+'h'+String(Math.floor((s%3600)/60)).padStart(2,'0')+'m';
-            return Math.floor(s/60)+'m'+String(Math.floor(s%60)).padStart(2,'0')+'s';
-        }
+
+        /* Sanitização contra XSS — escapa dados externos antes de inserir no DOM */
         function escapeHtml(str) {
-            if (!str) return '';
-            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+            if (str == null) return '—';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
 
-        /* ── Toast ── */
-        function showToast(title, msg, type) {
-            type = type || 'info';
-            const c = document.getElementById('toast-container');
-            if (!c) return;
-            const t = document.createElement('div');
-            t.className = 'sw-toast ' + type;
-            t.innerHTML = '<strong>' + escapeHtml(title) + '</strong>' + (msg ? '<br><span style="font-weight:400;opacity:.85">' + escapeHtml(String(msg).slice(0,80)) + '</span>' : '');
-            c.appendChild(t);
-            setTimeout(() => { t.style.opacity='0'; t.style.transform='translateY(8px)'; setTimeout(()=>t.remove(),300); }, 3500);
-        }
+        /* ✅ DESIGN: Toast com Animação */
+        function showToast(title, message, type = 'info') {
+            const toastContainer = document.querySelector('.toast-container');
+            const bgClass = type === 'info' ? 'bg-primary' : type === 'warning' ? 'bg-warning' : type === 'danger' ? 'bg-danger' : 'bg-success';
+            const textClass = type === 'warning' ? 'text-dark' : 'text-white';
 
-        /* ── fetchAPI ── */
-        async function fetchAPI(url, opts) {
-            const res = await fetch(url, opts||{});
-            if (!res.ok) throw new Error('HTTP ' + res.status + ': ' + await res.text().catch(()=>''));
-            return res.json();
-        }
+            const toastHtml = `
+                <div class="toast align-items-center ${bgClass} ${textClass} border-0" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
+                    <div class="d-flex">
+                        <div class="toast-body fw-600">
+                            <strong>${title}:</strong> ${message}
+                        </div>
+                        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                    </div>
+                </div>
+            `;
 
-        /* ── Auth status ── */
-        function updateAuthStatus(authenticated, authUrl) {
-            isAuthenticated = !!authenticated;
-            const badge  = document.getElementById('status-badge');
-            const link   = document.getElementById('auth-link');
-            const tabs   = document.getElementById('content-tabs');
-            const authEl = document.getElementById('auth-required-tabs');
-            if (badge) {
-                badge.textContent = authenticated ? '✅ Autenticado' : '⚠️ Não autenticado';
-                badge.className   = 'badge ' + (authenticated ? 'bg-success' : 'bg-warning text-dark');
-            }
-            if (link)   link.style.display   = authenticated ? 'none' : '';
-            if (tabs)   tabs.classList.toggle('hidden', !authenticated);
-            if (authEl) authEl.classList.toggle('hidden', !!authenticated);
-        }
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = toastHtml;
+            const toastElement = tempDiv.firstChild;
 
-        /* ── Setor classifier ── */
-        function _classifySetor(nome) {
-            const n = (nome||'').toUpperCase();
-            const tape = ['CADEIRA','POLTRONA','EVIDENCE','BERLIN','MADRID','DIAMANTE',
-                          'HIDRÁULICA','HIDRAULICA','RECLINÁVEL','RECLINAVEL','ASSENTO','ESPUMA'];
-            const marc = ['MDF','COMPENSADO','MADEIRA','SARRAFO','ARMÁRIO','ARMARIO',
-                          'BALCÃO','BALCAO','BANCADA','CARRINHO','LAVATÓRIO','LAVATORIO'];
-            if (tape.some(k => n.includes(k))) return 'tapecaria';
-            if (marc.some(k => n.includes(k))) return 'marcenaria';
-            return 'outros';
-        }
+            toastContainer.appendChild(toastElement);
 
-        /* ═══════════════════════════════════════════════════
-           SCANNER USB — buffer inteligente
-        ═══════════════════════════════════════════════════ */
-        /* ═══════════════════════════════════════════════════════════
-           SISTEMA DE IDENTIFICAÇÃO DE LEITORES
-           4 leitores físicos USB — cada um identificado pelo prefixo
-           que o usuário configura no programa de configuração do leitor:
-             Leitor 1 (Entrada/Espera):    prefixo R1-
-             Leitor 2 (Marcenaria):        prefixo R2-
-             Leitor 3 (Tapeçaria):         prefixo R3-
-             Leitor 4 (Conclusão/QC):      prefixo R4-
-           Sem prefixo: qualquer leitor pode ler (modo universal)
-        ═══════════════════════════════════════════════════════════ */
-        const LEITOR_CONFIG = {
-            'R1-': { nome: 'Leitor 1 — Entrada',     cor: '#ffb600', etapa: 'waiting'      },
-            'R2-': { nome: 'Leitor 2 — Marcenaria',  cor: '#f59e0b', etapa: 'marcenaria'   },
-            'R3-': { nome: 'Leitor 3 — Tapeçaria',   cor: '#8b5cf6', etapa: 'tapecaria'    },
-            'R4-': { nome: 'Leitor 4 — Conclusão',   cor: '#10b981', etapa: 'done'         },
-        };
-        let _lastLeitor = null;
+            const toast = new bootstrap.Toast(toastElement);
+            toast.show();
 
-        function _detectLeitor(codigo) {
-            for (const [prefix, cfg] of Object.entries(LEITOR_CONFIG)) {
-                if (codigo.startsWith(prefix)) {
-                    return { ...cfg, prefix, codigoPuro: codigo.slice(prefix.length) };
-                }
-            }
-            return { nome: 'Leitor Universal', cor: '#6366f1', etapa: null, prefix: '', codigoPuro: codigo };
-        }
-
-        (function() {
-            let _buf = '', _timer = null, _lastAt = 0;
-            const MIN_LEN = 4, SCAN_GAP = 100;
-            const _ind = document.getElementById('scanner-indicator');
-
-            function _showInd(msg, color) {
-                if (!_ind) return;
-                _ind.textContent = '📡 ' + msg;
-                _ind.style.borderColor = color || '#ffb600';
-                _ind.style.color       = color || '#ffb600';
-                _ind.classList.add('active');
-                clearTimeout(_ind._t);
-                _ind._t = setTimeout(() => _ind.classList.remove('active'), 3500);
-            }
-
-            async function _processScan(codigoRaw) {
-                if (!isAuthenticated) { _showInd('Não autenticado', '#ef4444'); return; }
-
-                // Detecta qual leitor enviou o código
-                const leitor = _detectLeitor(codigoRaw);
-                const codigo = leitor.codigoPuro;
-                _lastLeitor  = leitor;
-
-                // Mostra identificação do leitor + código
-                _showInd(leitor.nome + ' · #' + codigo, leitor.cor);
-
-                // Exibe badge do leitor na UI
-                const lBadge = document.getElementById('last-reader-badge');
-                if (lBadge) {
-                    lBadge.textContent = leitor.nome;
-                    lBadge.style.background = leitor.cor;
-                    lBadge.style.color = leitor.cor === '#ffb600' || leitor.cor === '#f59e0b' ? '#000' : '#fff';
-                    lBadge.style.display = 'inline-block';
-                }
-
-                try {
-                    const res = await fetch('/api/barcode/scan', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({codigo: codigo, leitor: leitor.nome})
-                    });
-                    const result = await res.json();
-                    const acao   = result.acao   || '';
-                    const nome   = result.nome    || '';
-                    const label  = result.status_label || '';
-                    const isEst  = result.is_esteira || false;
-
-                    if (acao === 'avancado') {
-                        const colors = {marcenaria:'#f59e0b', tapecaria:'#8b5cf6', in_production:'#10b981'};
-                        const c = colors[result.status_atual] || leitor.cor;
-                        const instrucao = isEst && result.status_atual === 'marcenaria'
-                            ? '→ Leia novamente para Tapeçaria'
-                            : isEst && result.status_atual === 'tapecaria'
-                            ? '→ Leia novamente para Concluir'
-                            : '→ Leia novamente para Concluir';
-                        _showInd(leitor.nome + ' · ' + label + ' · ' + nome.slice(0,20), c);
-                        showToast(
-                            leitor.nome + ' · ' + label,
-                            nome + '
-' + instrucao,
-                            'success'
-                        );
-                        await loadProductionBoard();
-                        switchBoardTab('inprod');
-                        if (result.status_atual === 'marcenaria') switchSetor('marcenaria');
-                        else if (result.status_atual === 'tapecaria') switchSetor('tapecaria');
-
-                    } else if (acao === 'concluido') {
-                        const tp = result.tempo_producao || 0;
-                        _showInd(leitor.nome + ' · ✅ CONCLUÍDO · ' + nome.slice(0,20), '#6366f1');
-                        showToast(
-                            leitor.nome + ' · ✅ Concluído!',
-                            nome + (tp ? ' · ' + formatSeconds(tp) : ''),
-                            'success'
-                        );
-                        await loadProductionBoard();
-                        switchBoardTab('done');
-
-                    } else if (acao === 'nao_encontrado') {
-                        _showInd(leitor.nome + ' · ❌ Não encontrado: #' + codigo, '#ef4444');
-                        showToast('Não encontrado', 'Pedido #' + codigo + ' não está na fila ativa.', 'warning');
-
-                    } else if (acao === 'ja_concluido') {
-                        _showInd(leitor.nome + ' · Já concluído', '#6b7280');
-                        showToast('Info', result.mensagem||'Pedido já concluído.', 'info');
-
-                    } else {
-                        _showInd(leitor.nome + ' · ' + (result.mensagem || 'Processado'), '#6b7280');
-                    }
-                } catch(e) {
-                    _showInd(leitor.nome + ' · ❌ Erro de comunicação', '#ef4444');
-                    showToast('Erro Scanner', 'Falha ao comunicar com servidor. Verifique conexão.', 'danger');
-                    console.error('Scanner error:', e);
-                }
-            }
-
-            document.addEventListener('keydown', function(e) {
-                const tag = (document.activeElement?.tagName||'').toLowerCase();
-                if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
-                const now = Date.now();
-                if (e.key === 'Enter') {
-                    const code = _buf.trim().split(' ').join('');
-                    _buf = ''; clearTimeout(_timer);
-                    if (code.length >= MIN_LEN) _processScan(code);
-                    return;
-                }
-                if (e.key.length === 1) {
-                    if (_buf.length > 0 && (now - _lastAt) > 300) _buf = '';
-                    _buf += e.key; _lastAt = now;
-                    clearTimeout(_timer);
-                    _timer = setTimeout(() => { _buf = ''; }, 500);
-                }
+            toastElement.addEventListener('hidden.bs.toast', () => {
+                toastElement.remove();
             });
-        })();
-
-        /* ═══════════════════════════════════════════════════
-           WEBSOCKET com reconexão
-        ═══════════════════════════════════════════════════ */
-        function _scheduleReconnect() {
-            _wsConnected = false;
-            _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
-            _kpiReconnectTimer = setTimeout(_connectKpiWs, _kpiReconnectDelay);
         }
 
-        function _connectKpiWs() {
-            if (_kpiReconnectTimer) { clearTimeout(_kpiReconnectTimer); _kpiReconnectTimer = null; }
-            if (wsKpi && wsKpi.readyState < 2) try { wsKpi.close(); } catch(e) {}
-            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        function formatLog(log) {
+            const levelClass = `log-level-${log.level}`;
+            return `<div class="log-entry ${levelClass}">[${log.timestamp}] [${log.level}] ${log.message}</div>`;
+        }
+
+        /* ✅ DESIGN: Formatação de Data/Hora */
+        function formatDateTime(isoString) {
+            if (!isoString || isoString === 'N/D') return 'N/D';
             try {
-                wsKpi = new WebSocket(proto + '://' + window.location.host + '/ws/kpi-updates');
-            } catch(e) { _scheduleReconnect(); return; }
+                const date = new Date(isoString);
+                const now = new Date();
+                const isToday = date.toDateString() === now.toDateString();
 
-            wsKpi.onopen = () => { _wsConnected = true; _kpiReconnectDelay = 2000; };
-            wsKpi.onclose = () => _scheduleReconnect();
-            wsKpi.onerror = () => {};
-
-            wsKpi.onmessage = (e) => {
-                let data;
-                try { data = JSON.parse(e.data); } catch { return; }
-                if (data.type !== 'full_update') return;
-
-                updateAuthStatus(data.authenticated, data.auth_url);
-                if (data.sales_stats) updateKpis(data.sales_stats);
-                if (data.production_snapshot) {
-                    const ps = data.production_snapshot;
-                    const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
-                    set('kpi-waiting', ps.waiting||0);
-                    set('kpi-inprod',  ps.in_production||0);
-                    set('kpi-done',    ps.done||0);
-                    set('waiting-count-badge', ps.waiting||0);
-                    set('inprod-count-badge',  ps.in_production||0);
-                    set('done-count-badge',    ps.done||0);
+                if (isToday) {
+                    return date.toLocaleTimeString('pt-BR');
+                } else {
+                    return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' }) + ' ' + date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
                 }
-                if (data.authenticated && !_wsFirstAuthDone) {
-                    _wsFirstAuthDone = true;
-                    _onAuthConfirmed();
-                    fetch('/api/pending-orders/sync', {method:'POST'}).catch(()=>{});
-                }
-                if (data.cache_updated) showToast('Cache', 'Produtos atualizados.', 'info');
-            };
-        }
-
-        document.addEventListener('visibilitychange', () => {
-            if (!document.hidden) {
-                if (!wsKpi || wsKpi.readyState > 1) { _kpiReconnectDelay = 2000; _connectKpiWs(); }
-                if (isAuthenticated && _boardInitialized) loadProductionBoard();
+            } catch (e) {
+                return 'N/D';
             }
-        });
-
-        /* ═══════════════════════════════════════════════════
-           AUTH CONFIRMED
-        ═══════════════════════════════════════════════════ */
-        function _onAuthConfirmed() {
-            _boardInitialized = true;
-            loadProductionBoard();
-            loadKPIChart();
-            // Note: _boardPoll is managed by tab shown/hidden listeners
-            // to avoid duplicate polling when switching tabs
         }
 
-        /* ═══════════════════════════════════════════════════
-           KPI UPDATE
-        ═══════════════════════════════════════════════════ */
-        function updateKpis(s) {
-            const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
-            set('kpi-daily',    s.daily_count ?? s.daily   ?? 0);
-            set('kpi-weekly',   s.weekly_count ?? s.weekly  ?? 0);
-            set('kpi-historic', s.monthly_count ?? s.monthly ?? 0);
+        // WebSocket de logs com reconexão automática e limite de linhas
+        const _MAX_LOG_LINES = 300;
+        let _wsLogs = null;
+
+        function _connectWsLogs() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            _wsLogs = new WebSocket(`${proto}://${window.location.host}/ws/logs`);
+            _wsLogs.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                const box = document.getElementById('logs-content');
+                if (!box || !data.logs) return;
+                // Adicionar novas linhas sem acumular memória infinita
+                data.logs.forEach(l => box.insertAdjacentHTML('beforeend', formatLog(l)));
+                // Limitar linhas visíveis
+                const entries = box.querySelectorAll('.log-entry');
+                if (entries.length > _MAX_LOG_LINES) {
+                    for (let i = 0; i < entries.length - _MAX_LOG_LINES; i++) {
+                        entries[i].remove();
+                    }
+                }
+                box.scrollTop = box.scrollHeight;
+            };
+            _wsLogs.onclose = () => {
+                setTimeout(_connectWsLogs, 4000);
+            };
+            _wsLogs.onerror = () => _wsLogs.close();
+        }
+        _connectWsLogs();
+
+        /* Atualizar Status de Autenticação */
+        function updateAuthStatus(authenticated, authUrl) {
+            const badge = document.getElementById('status-badge');
+            const wasAuthenticated = isAuthenticated;
+            isAuthenticated = authenticated;
+
+            if (isAuthenticated) {
+                if (badge) { badge.className = 'badge bg-success'; badge.textContent = '🟢 Online'; }
+                const al = document.getElementById('auth-link');
+                if (al) al.classList.add('d-none');
+                const ct = document.getElementById('content-tabs');
+                if (ct) ct.classList.remove('hidden');
+                const at = document.getElementById('auth-required-tabs');
+                if (at) at.classList.add('hidden');
+                _onAuthConfirmed();
+            } else {
+                if (badge) { badge.className = 'badge bg-danger'; badge.textContent = '🔴 Offline'; }
+                const al = document.getElementById('auth-link');
+                if (al) al.classList.remove('d-none');
+                const ct = document.getElementById('content-tabs');
+                if (ct) ct.classList.add('hidden');
+                const at = document.getElementById('auth-required-tabs');
+                if (at) at.classList.remove('hidden');
+                // Reseta flag para recarregar kits quando voltar a autenticar
+                if (wasAuthenticated) _kitsLoaded = false;
+            }
+            const al = document.getElementById('auth-link');
+            if (al && authUrl) al.href = authUrl;
+        }
+
+        /* Atualizar KPIs com Animação */
+        /* Atualizar KPIs — V5.0: crescimento vs média mensal ÷ 20 dias úteis */
+        function updateKpis(dSalesStats) {
+            const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+            set('kpi-daily',    dSalesStats.daily_count   ?? dSalesStats.daily   ?? 0);
+            set('kpi-weekly',   dSalesStats.weekly_count  ?? dSalesStats.weekly  ?? 0);
+            set('kpi-historic', dSalesStats.monthly_count ?? dSalesStats.monthly ?? 0);
             const lu = document.getElementById('last-recalculated');
-            if (lu) lu.textContent = '⏱ ' + formatDateTime(s.last_update || s.last_recalculated);
-            const gr    = s.growth  || 0;
-            const last7 = s.last_7  || 0;
-            const ritmo = s.ritmo_7d || 0;
-            let icon='📊 Estável', color='#6366f1';
-            if (gr>10)      {icon='📈 Acelerando'; color='#10b981';}
-            else if (gr>0)  {icon='📈 Subindo';    color='#10b981';}
-            else if (gr<-10){icon='📉 Caindo';     color='#ef4444';}
-            else if (gr<0)  {icon='📉 Abaixo';     color='#f59e0b';}
-            set('trend-indicator', icon);
-            set('growth-weekly', (gr>0?'+':'') + gr.toFixed(1) + '%');
+            if (lu) lu.textContent = '⏱ ' + formatDateTime(dSalesStats.last_update);
+
+            const gr    = dSalesStats.growth  || 0;
+            const last7 = dSalesStats.last_7  || 0;
+            const ritmo = dSalesStats.ritmo_7d || 0;
+
+            let trendIcon = '📊 Estável'; let trendColor = '#6366f1';
+            if (gr > 10)       { trendIcon = '📈 Acelerando'; trendColor = '#10b981'; }
+            else if (gr > 0)   { trendIcon = '📈 Subindo';    trendColor = '#10b981'; }
+            else if (gr < -10) { trendIcon = '📉 Caindo';     trendColor = '#ef4444'; }
+            else if (gr < 0)   { trendIcon = '📉 Abaixo';     trendColor = '#f59e0b'; }
+
+            set('trend-indicator', trendIcon);
+            set('growth-weekly', (gr > 0 ? '+' : '') + gr.toFixed(1) + '%');
             const tEl = document.getElementById('trend-indicator');
             const gEl = document.getElementById('growth-weekly');
-            if (tEl) tEl.style.color = color;
-            if (gEl) gEl.style.color = color;
+            if (tEl) tEl.style.color = trendColor;
+            if (gEl) gEl.style.color = trendColor;
             const ttEl = document.getElementById('growth-tooltip');
-            if (ttEl && ritmo>0) ttEl.textContent = '7d: ' + last7 + ' · Ritmo: ' + ritmo.toFixed(1) + ' (mês÷20×7)';
+            if (ttEl) ttEl.textContent = ritmo > 0
+                ? `7d: ${last7} pedidos · Ritmo esperado: ${ritmo.toFixed(1)} (mês÷20×7)`
+                : '';
+
+            if (isAuthenticated) _loadKpiOrderNumbers();
             document.querySelectorAll('.kpi-card').forEach(c => {
                 c.classList.add('updating');
                 setTimeout(() => c.classList.remove('updating'), 600);
             });
         }
 
-        function updateProductionKpis(bd) {
-            const w = (bd.waiting||[]).length;
-            const p = (bd.in_production||[]).length + (bd.orphan_timers||[]).length;
-            const d = (bd.done||[]).length;
-            const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
-            set('kpi-waiting', w); set('kpi-inprod', p); set('kpi-done', d);
-            set('waiting-count-badge', w); set('inprod-count-badge', p); set('done-count-badge', d);
-            const fmtNums = arr => arr.map(i=>'#'+(i.pedido_numero||i.order_id||'')).filter(Boolean).slice(0,8).join(' ');
+        /* Atualiza KPIs de produção (3 etapas) */
+        function updateProductionKpis(boardData) {
+            const waiting = (boardData.waiting || []).length;
+            const inprod  = (boardData.in_production || []).length + (boardData.orphan_timers || []).length;
+            const done    = (boardData.done || []).length;
+            const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+            set('kpi-waiting', waiting);
+            set('kpi-inprod',  inprod);
+            set('kpi-done',    done);
+            // Números dos pedidos em cada etapa
+            const fmtNums = arr => arr.map(i => '#'+(i.pedido_numero||i.order_id||'')).filter(Boolean).join(' · ');
             const dw = document.getElementById('kpi-waiting-nums');
             const di = document.getElementById('kpi-inprod-nums');
             const dd = document.getElementById('kpi-done-nums');
-            if (dw) dw.textContent = fmtNums(bd.waiting||[]);
-            if (di) di.textContent = fmtNums([...(bd.in_production||[]),...(bd.orphan_timers||[])]);
-            if (dd) dd.textContent = fmtNums((bd.done||[]).slice(-6));
+            if (dw) dw.textContent = fmtNums(boardData.waiting||[]);
+            if (di) di.textContent = fmtNums([...(boardData.in_production||[]),...(boardData.orphan_timers||[])]);
+            if (dd) dd.textContent = fmtNums((boardData.done||[]).slice(-5));
         }
 
-        /* ═══════════════════════════════════════════════════
-           PRODUCTION BOARD
-        ═══════════════════════════════════════════════════ */
+
+        async function _loadKpiOrderNumbers() {
+            try {
+                const res = await fetch('/api/sales/orders-summary');
+                if (!res.ok) return;
+                const data = await res.json();
+
+                // Usa data local (sem timezone offset) para comparar corretamente
+                const now = new Date();
+                const todayStr = now.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+                const weekAgo = new Date(now); weekAgo.setDate(now.getDate() - 7);
+                const weekAgoStr = weekAgo.toISOString().slice(0, 10);
+                const monthStr = now.toISOString().slice(0, 7); // 'YYYY-MM'
+
+                const dailyNums = [], weeklyNums = [], monthlyNums = [];
+                (data.orders || []).forEach(o => {
+                    // data pode vir como 'YYYY-MM-DD' ou 'YYYY-MM-DD HH:MM'
+                    const dateStr = (o.data || '').slice(0, 10);
+                    const num = '#' + (o.numero || o.id);
+                    if (dateStr === todayStr) dailyNums.push(num);
+                    if (dateStr >= weekAgoStr) weeklyNums.push(num);
+                    if (dateStr.startsWith(monthStr)) monthlyNums.push(num);
+                });
+
+                // Mostra todos (sem limite de 10) — scroll no div
+                const fmt = (arr) => arr.length === 0 ? '—' : arr.join(' · ');
+
+                const dEl = document.getElementById('kpi-daily-orders');
+                const wEl = document.getElementById('kpi-weekly-orders');
+                const mEl = document.getElementById('kpi-monthly-orders');
+                if (dEl) dEl.textContent = fmt(dailyNums);
+                if (wEl) wEl.textContent = fmt(weeklyNums);
+                if (mEl) mEl.textContent = fmt(monthlyNums);
+            } catch(e) { /* silencioso */ }
+        }
+
+        /* ✅ DESIGN: Lista Técnica Hardcoded (Engenharia) */
+        const RECIPE_CADEIRA = [
+            {"nome": "COMPENSADO 50X52X17", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 52", "qtd": 3, "un": "Peças"},
+            {"nome": "SARRAFO 46", "qtd": 1, "un": "Peça"},
+            {"nome": "SARRAFO 14", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 6MM 52X35", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 33", "qtd": 2, "un": "Peças"},
+            {"nome": "SARRAFO 10", "qtd": 2, "un": "Peças"},
+            {"nome": "MDF 15MM", "qtd": 1, "un": "Peça"},
+            {"nome": "TECIDO", "qtd": 3, "un": "Metros"},
+            {"nome": "ESPUMA ACOPLAGEM", "qtd": 0.5, "un": "Metro"},
+            {"nome": "ESPUMA ASSENTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ENCOSTO", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "ESPUMA ASSENTO 52X7,5X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA ASSENTO 54X14X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X21X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 52X35X1", "qtd": 1, "un": "Peça"},
+            {"nome": "ESPUMA BRAÇO 35X9,5X1", "qtd": 4, "un": "Peças"},
+            {"nome": "ESPUMA BRAÇO 54X9,5X2", "qtd": 2, "un": "Peças"},
+            {"nome": "LINHA", "qtd": 1, "un": "Unid"},
+            {"nome": "COLA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA CROMADA", "qtd": 1, "un": "Unid"},
+            {"nome": "LAMINA DE CABEÇOTE", "qtd": 1, "un": "Unid"},
+            {"nome": "PARAFUSO 1/4 X 1", "qtd": 15, "un": "Peças"},
+            {"nome": "PARAFUSO 1/4 X 2.1/4", "qtd": 8, "un": "Peças"},
+            {"nome": "PARAFUSO 5X25", "qtd": 6, "un": "Peças"},
+            {"nome": "PORCA GARRA 1/4", "qtd": 20, "un": "Peças"},
+            {"nome": "GRAMPO 80/10", "qtd": 1, "un": "Unid"},
+            {"nome": "GRAMPO 14/40", "qtd": 1, "un": "Unid"},
+            {"nome": "COSTUREIRA", "qtd": 1, "un": "Serviço"},
+            {"nome": "EMBALAGEM", "qtd": 1, "un": "Unid"},
+            {"nome": "BASE", "qtd": 1, "un": "Unid"}
+        ];
+
+        /* ✅ DESIGN: Abrir Checklist de Produção com Cronômetro */
+        let timerInterval = null;
+
+        function openProductionChecklist(productName, timerKey) {
+            // timerKey é o identificador único do timer (pode ser "nome||item_key" ou apenas "nome")
+            const _timerKey = timerKey || productName;
+            const isCadeira = productName.toUpperCase().includes('CADEIRA');
+            let checklistHtml = '';
+
+            if (isCadeira) {
+                // encodedTimerKey: identifica o timer no servidor (pode ser "nome||item_key")
+                // encodedProductName: nome legível para registro de consumo
+                const encodedTimerKey   = encodeURIComponent(_timerKey);
+                const encodedProductName = encodeURIComponent(productName);
+                checklistHtml = `
+                    <h6 class="text-muted mb-3">📋 Marque o que foi retirado/usado para esta unidade</h6>
+                    <div class="row g-2 mb-4" style="max-height: 320px; overflow-y: auto;">
+                        ${RECIPE_CADEIRA.map((item, i) => `
+                            <div class="col-md-6">
+                                <div class="form-check p-2 border rounded bg-white d-flex align-items-center gap-2 checklist-item" 
+                                     id="checklist-row-${i}"
+                                     style="cursor:pointer; transition: background 0.2s, border-color 0.2s;">
+                                    <input class="form-check-input ms-1" type="checkbox" id="check${i}"
+                                        onchange="handleChecklistChange(this, ${i}, '${encodedTimerKey}', '${encodedProductName}')">
+                                    <label class="form-check-label flex-grow-1 small fw-bold mb-0" for="check${i}" style="cursor:pointer;">
+                                        ${item.nome} 
+                                        <span class="badge bg-light text-dark border float-end">${item.qtd} ${item.un}</span>
+                                    </label>
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                    <div id="checklist-progress" class="alert alert-info py-2 small mb-0">
+                        <strong>0 / ${RECIPE_CADEIRA.length}</strong> itens marcados como usados
+                    </div>
+                `;
+            } else {
+                checklistHtml = `<div class="alert alert-secondary">Este produto não possui lista técnica automática de insumos.</div>`;
+            }
+
+            const modalHtml = `
+                <div class="modal fade" id="productionModal" tabindex="-1" data-bs-backdrop="static">
+                    <div class="modal-dialog modal-lg modal-dialog-centered">
+                        <div class="modal-content border-0 shadow-2xl">
+                            <div class="modal-header text-white" style="background: linear-gradient(135deg, #1e293b 0%, #334155 100%);">
+                                <h5 class="modal-title">🛠️ Produção: ${productName}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)"></button>
+                            </div>
+                            <div class="modal-body" style="background: #f8fafc;">
+                                <!-- Timer Section -->
+                                <div class="card mb-4 border-0" style="background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); color: white;">
+                                    <div class="card-body text-center py-4">
+                                        <div class="text-uppercase small fw-bold mb-2" style="letter-spacing:.1em; opacity:.7;">⏱ Tempo de Produção</div>
+                                        <div id="timer-display" class="fw-bold font-monospace mb-3" style="font-size: 3.5rem; letter-spacing:.05em; text-shadow: 0 0 20px rgba(99,102,241,.6);">
+                                            00:00:00
+                                        </div>
+                                        <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
+                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group"
+                                             data-produto="${encodeURIComponent(_timerKey)}"
+                                             data-display="${encodeURIComponent(productName)}">
+                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
+                                                ▶ Iniciar
+                                            </button>
+                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
+                                                ⏸ Pausar
+                                            </button>
+                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
+                                                ↺ Zerar
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Checklist -->
+                                ${checklistHtml}
+                            </div>
+                            <div class="modal-footer bg-white d-flex justify-content-between">
+                                <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
+                                    Fechar
+                                </button>
+                                <button type="button" class="btn btn-success px-4 fw-bold"
+                                    onclick="controlTimer('finish', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
+                                    ✅ CONCLUIR & SALVAR
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            const oldModal = document.getElementById('productionModal');
+            if (oldModal) oldModal.remove();
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            
+            const modal = new bootstrap.Modal(document.getElementById('productionModal'));
+            modal.show();
+
+            // Carrega estado do timer (usa timer_key) e checklist (usa timer_key para encontrar o estado correto)
+            controlTimer('get', _timerKey);
+            _loadChecklistState(productName, _timerKey);
+        }
+
+        const checklistState = {};
+
+        async function _loadChecklistState(productName, timerKey) {
+            // Usa timerKey se disponível (para encontrar checklist salvo no timer correto)
+            const keyToLoad = timerKey || productName;
+            try {
+                const safe = encodeURIComponent(keyToLoad);
+                const res = await fetch(`/api/checklist/state/${safe}`);
+                const data = await res.json();
+                const saved = data.checklist || {};
+                // Restaura checkboxes marcados
+                RECIPE_CADEIRA.forEach((item, i) => {
+                    if (saved[item.nome]) {
+                        const cb = document.getElementById(`check${i}`);
+                        const row = document.getElementById(`checklist-row-${i}`);
+                        if (cb) {
+                            cb.checked = true;
+                            if (row) {
+                                row.style.background = '#d1fae5';
+                                row.style.borderColor = '#10b981';
+                            }
+                        }
+                    }
+                });
+                _updateChecklistProgress();
+            } catch(e) { console.error('Erro ao carregar checklist:', e); }
+        }
+
+        function _updateChecklistProgress() {
+            const total = RECIPE_CADEIRA.length;
+            const checked = document.querySelectorAll('#productionModal .form-check-input:checked').length;
+            const progressDiv = document.getElementById('checklist-progress');
+            if (progressDiv) {
+                progressDiv.innerHTML = '<strong>' + checked + ' / ' + total + '</strong> itens marcados' + (checked === total ? ' ✅ Tudo marcado!' : '');
+                progressDiv.className = 'alert py-2 small mb-0 ' + (checked === total ? 'alert-success' : 'alert-info');
+            }
+        }
+
+        function handleChecklistChange(cb, idx, encodedTimerKey, encodedProductName) {
+            // encodedTimerKey: chave do timer no servidor (para salvar estado do checklist)
+            // encodedProductName: nome legível (para registrar consumo)
+            const timerKey   = decodeURIComponent(encodedTimerKey);
+            const productName = encodedProductName ? decodeURIComponent(encodedProductName) : timerKey.split('||')[0];
+            const isChecked = cb.checked;
+            const item = RECIPE_CADEIRA[idx];
+            const row = document.getElementById('checklist-row-' + idx);
+
+            if (row) {
+                if (isChecked) {
+                    row.style.background = '#d1fae5';
+                    row.style.borderColor = '#10b981';
+                } else {
+                    row.style.background = '';
+                    row.style.borderColor = '';
+                }
+            }
+
+            // Salva estado da checklist no servidor usando o timerKey correto
+            fetch('/api/checklist/state', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ produto: timerKey, componente: item.nome, checked: isChecked })
+            }).catch(e => console.error('Erro ao salvar checklist:', e));
+
+            // Registra consumo usando o nome legível do produto
+            registerConsumption(item.nome, item.qtd, item.un, productName, isChecked);
+            _updateChecklistProgress();
+        }
+
+        function toggleChecklist(container, idx, productName, timerKey) {
+            const cb = container.querySelector('input[type=checkbox]');
+            const tkey = timerKey || productName;
+            if (cb) handleChecklistChange(cb, idx, encodeURIComponent(tkey), encodeURIComponent(productName));
+        }
+
+        async function registerConsumption(componentName, qty, unit, productName, checked) {
+            try {
+                const res = await fetch('/api/consumption/register', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ component_name: componentName, qty: qty, unit: unit, product_name: productName, checked: checked })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const tab = document.getElementById('tab-insumos');
+                if (tab && tab.classList.contains('active')) {
+                    setTimeout(() => fetchAPI('/api/consumption/summary').then(d => renderConsumptionTable(d)).catch(() => {}), 400);
+                }
+            } catch(e) {
+                console.error('Erro ao registrar consumo:', e);
+                showToast('Aviso', 'Falha ao registrar insumo', 'warning');
+            }
+        }
+
+        /* Lógica do Timer Conectada ao Backend */
+        async function controlTimer(action, produto) {
+            try {
+                const res = await fetch('/api/timer/action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ action: action, produto: produto })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const data = await res.json();
+
+                if (action === 'finish') {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                    const elapsed = (data.registro ? data.registro.tempo_segundos : null) || data.elapsed || 0;
+                    // Recarrega o board para remover o item da lista in_production
+                    if (typeof loadProductionBoard === 'function') {
+                        setTimeout(() => loadProductionBoard(), 800);
+                    }
+
+                    // ── Animação de conclusão ──────────────────────────────
+                    const modalEl = document.getElementById('productionModal');
+                    if (modalEl) {
+                        const modalContent = modalEl.querySelector('.modal-content');
+                        const modalBody    = modalEl.querySelector('.modal-body');
+                        const modalFooter  = modalEl.querySelector('.modal-footer');
+
+                        // Congela botões imediatamente
+                        if (modalFooter) modalFooter.style.display = 'none';
+
+                        // Substitui o body pelo painel de sucesso
+                        if (modalBody) {
+                            modalBody.innerHTML = `
+                                <div id="finish-anim" style="
+                                    display:flex; flex-direction:column; align-items:center;
+                                    justify-content:center; min-height:320px; gap:1rem;
+                                    background:linear-gradient(135deg,#064e3b 0%,#065f46 100%);
+                                    border-radius:0 0 12px 12px;">
+
+                                    <!-- Ícone animado -->
+                                    <div id="fa-icon" style="
+                                        width:90px; height:90px; border-radius:50%;
+                                        background:rgba(255,255,255,.12);
+                                        display:flex; align-items:center; justify-content:center;
+                                        font-size:3rem;
+                                        animation: fa-pop .4s cubic-bezier(.34,1.56,.64,1) both;">
+                                        ✅
+                                    </div>
+
+                                    <!-- Título -->
+                                    <div style="color:#fff; font-size:1.5rem; font-weight:800;
+                                                letter-spacing:.02em; text-align:center;
+                                                animation: fa-fadein .3s .2s both;">
+                                        Produção Concluída!
+                                    </div>
+
+                                    <!-- Produto -->
+                                    <div style="color:#6ee7b7; font-size:1rem; font-weight:600;
+                                                text-align:center; max-width:280px;
+                                                animation: fa-fadein .3s .35s both;">
+                                        ${produto.split('||')[0]}
+                                    </div>
+
+                                    <!-- Tempo registrado -->
+                                    <div style="
+                                        background:rgba(255,255,255,.1); border-radius:12px;
+                                        padding:.75rem 2rem; text-align:center;
+                                        animation: fa-fadein .3s .45s both;">
+                                        <div style="color:rgba(255,255,255,.6); font-size:.7rem;
+                                                    text-transform:uppercase; letter-spacing:.1em;">
+                                            Tempo registrado
+                                        </div>
+                                        <div style="color:#fff; font-size:2.2rem; font-weight:700;
+                                                    font-family:monospace; letter-spacing:.05em;
+                                                    text-shadow:0 0 20px rgba(110,231,183,.5);">
+                                            ${formatSeconds(elapsed)}
+                                        </div>
+                                    </div>
+
+                                    <!-- Componentes registrados -->
+                                    <div style="color:rgba(255,255,255,.55); font-size:.82rem;
+                                                text-align:center;
+                                                animation: fa-fadein .3s .55s both;">
+                                        📦 Insumos computados automaticamente
+                                    </div>
+                                </div>
+
+                                <style>
+                                @keyframes fa-pop {
+                                    0%   { transform: scale(0); opacity:0; }
+                                    100% { transform: scale(1); opacity:1; }
+                                }
+                                @keyframes fa-fadein {
+                                    from { opacity:0; transform:translateY(10px); }
+                                    to   { opacity:1; transform:translateY(0); }
+                                }
+                                </style>
+                            `;
+                        }
+
+                        // Fecha após 2.2s
+                        setTimeout(() => {
+                            try {
+                                const bsModal = bootstrap.Modal.getInstance(modalEl);
+                                if (bsModal) bsModal.hide();
+                            } catch {}
+                            setTimeout(() => {
+                                modalEl.remove();
+                                document.querySelectorAll('.modal-backdrop').forEach(e => e.remove());
+                                document.body.classList.remove('modal-open');
+                                document.body.style.removeProperty('overflow');
+                                document.body.style.removeProperty('padding-right');
+                            }, 300);
+                        }, 2200);
+                    }
+
+                    await loadProductionBoard();
+                    await refreshComponentTab();
+                    return;
+                }
+
+                updateTimerDisplay(data.elapsed || 0, data.state || 'stopped');
+                if (action === 'start' || (action === 'get' && data.state === 'running')) {
+                    startLocalCounter(data.elapsed || 0);
+                } else {
+                    clearInterval(timerInterval);
+                    timerInterval = null;
+                }
+            } catch (e) {
+                console.error("Erro no timer:", e);
+                showToast('Erro', 'Falha ao comunicar com servidor.', 'danger');
+            }
+        }
+
+        function formatSeconds(s) {
+            s = Math.floor(s || 0);
+            const h = Math.floor(s / 3600).toString().padStart(2,'0');
+            const m = Math.floor((s % 3600) / 60).toString().padStart(2,'0');
+            const sec = (s % 60).toString().padStart(2,'0');
+            return `${h}:${m}:${sec}`;
+        }
+
+        function startLocalCounter(startSeconds) {
+            clearInterval(timerInterval);
+            let seconds = Math.floor(startSeconds || 0);
+            const display = document.getElementById('timer-display');
+            timerInterval = setInterval(() => {
+                seconds++;
+                if (display) display.textContent = formatSeconds(seconds);
+            }, 1000);
+        }
+
+        function updateTimerDisplay(seconds, state) {
+            const display = document.getElementById('timer-display');
+            const badge = document.getElementById('timer-status');
+            
+            if (display) display.textContent = formatSeconds(seconds);
+            
+            if(state === 'running') {
+                badge.className = 'mt-2 badge bg-success';
+                badge.textContent = 'Em Produção...';
+                badge.classList.add('pulse-animation');
+            } else if (state === 'paused') {
+                badge.className = 'mt-2 badge bg-warning text-dark';
+                badge.textContent = 'Pausado';
+                badge.classList.remove('pulse-animation');
+            } else {
+                badge.className = 'mt-2 badge bg-secondary';
+                badge.textContent = 'Parado';
+                badge.classList.remove('pulse-animation');
+            }
+        }
+
+        /* ════════════════════════════════════════════════════════════
+           PAINEL DE PRODUÇÃO UNIFICADO
+           - Busca /api/production/board a cada 10s automaticamente
+           - Em Espera + Em Produção + Concluídos numa única view
+           ════════════════════════════════════════════════════════════ */
+
+        let _boardTick = null;
+        let _boardPoll = null;
+        let _boardTimerState = {};
+        let _currentBoardTab = 'waiting';   // aba activa
+        let _boardData = null;               // último snapshot
+        // Set de item_keys já lidos nesta sessão — anti-duplicação por aba
+        // Formato: "itemKey:etapa" onde etapa = 'waiting'|'inprod'
+        const _scannedThisSession = new Set();
+
+        /* Troca a sub-aba visível */
+        function switchBoardTab(tab) {
+            _currentBoardTab = tab;
+            ['waiting','inprod','done'].forEach(t => {
+                const panel = document.getElementById('board-' + t);
+                const btn   = document.getElementById('tab-' + t + '-btn');
+                if (!panel || !btn) return;
+                const isActive = t === tab;
+                panel.style.display = isActive ? 'block' : 'none';
+                btn.classList.toggle('active-board-tab', isActive);
+                btn.style.opacity = isActive ? '1' : '0.65';
+                btn.style.boxShadow = isActive ? '0 4px 14px rgba(0,0,0,.25)' : 'none';
+            });
+            // Mostra buscador e setor tabs só quando Produzindo está ativo
+            const sw = document.getElementById('setor-tabs-wrap');
+            const si = document.getElementById('search-inprod-wrap');
+            const isInprod = tab === 'inprod';
+            if (sw) sw.style.display = isInprod ? 'block' : 'none';
+            if (si) si.style.display = isInprod ? 'block' : 'none';
+            // Limpa busca ao trocar aba
+            if (!isInprod) {
+                const inp = document.getElementById('search-inprod');
+                if (inp) inp.value = '';
+                if (_boardDataRaw) _boardData = _boardDataRaw;
+            }
+            if (_boardData) _renderCurrentTab();
+        }
+
+        async function syncAndRefreshPending() {
+            const btn = document.querySelector('[onclick="syncAndRefreshPending()"]');
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ Sincronizando...'; }
+            try {
+                const res = await fetchAPI('/api/pending-orders/sync', { method: 'POST' });
+                if (res.message) showToast('Info', res.message, 'info');
+                else showToast('Sucesso', `${res.added || 0} novos itens adicionados.`, 'success');
+            } catch(e) {
+                showToast('Aviso', 'Faça login para sincronizar.', 'warning');
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '🔄 Sincronizar Bling'; }
+            }
+            await loadProductionBoard();
+        }
+
+        async function loadPendingOrders() { await loadProductionBoard(); }
+
         async function loadProductionBoard() {
             try {
-                const data = await fetch('/api/production/board').then(r=>r.json());
-                _boardDataRaw = data; _boardData = data;
+                const data = await fetch('/api/production/board').then(r => r.json());
+                _boardDataRaw = data;
+                _boardData = data;
                 renderProductionBoard(data);
                 updateProductionKpis(data);
                 _updateDashboardStagesChart(data);
-            } catch(e) { console.error('Board error:', e); }
+            } catch(e) {
+                console.error('Erro ao carregar board:', e);
+            }
         }
 
         function renderProductionBoard(data) {
-            _renderWaiting(data.waiting || []);
-            _renderInProd([...(data.in_production||[]), ...(data.orphan_timers||[])]);
-            _renderDone(data.done || []);
+            const waiting  = data.waiting       || [];
+            const inProd   = data.in_production  || [];
+            const orphans  = data.orphan_timers  || [];
+            const done     = data.done           || [];
+            const serverTime = data.server_time  || (Date.now() / 1000);
+
+            // Combina in_production + orphans
+            const allInProd = [...inProd, ...orphans];
+
+            // Atualiza contadores nas badges
+            const wb = document.getElementById('waiting-count-badge');
+            const ib = document.getElementById('inprod-count-badge');
+            const db = document.getElementById('done-count-badge');
+            if (wb) wb.textContent = waiting.length;
+            if (ib) ib.textContent = allInProd.length;
+            if (db) db.textContent = done.length;
+
+            // Alerta de urgência
+            const atrasados = waiting.filter(i => i.urgencia === 'atrasado').length;
+            if (atrasados > 0 && !window._alertedAtrasados) {
+                window._alertedAtrasados = true;
+                showToast('🚨 ATENÇÃO', `${atrasados} pedido(s) em ATRASO!`, 'danger');
+            }
+
+            // Para ticker anterior
+            if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
+            _boardTimerState = {};
+
+            // Salva para o ticker
+            allInProd.forEach(item => {
+                const tkey = item.timer_key || item.nome || item.nome_original || '';
+                if (tkey) {
+                    _boardTimerState[tkey] = {
+                        base: item.tempo_decorrido || 0,
+                        startedAt: Date.now() / 1000,
+                        estado: item.estado || 'paused',
+                        serverTime
+                    };
+                }
+            });
+
+            _boardData = { waiting, allInProd, done, serverTime };
+            _renderCurrentTab();
+
+            // Ticker ao vivo para produzindo
+            _boardTick = setInterval(() => {
+                Object.entries(_boardTimerState).forEach(([tkey, s]) => {
+                    if (s.estado !== 'running') return;
+                    const elapsed = s.base + (Date.now() / 1000 - s.startedAt);
+                    const displayNome = tkey.includes('||') ? tkey.split('||')[0] : tkey;
+                    const safeId = displayNome.replace(/[^a-zA-Z0-9]/g, '_');
+                    const el = document.getElementById('btimer_' + safeId);
+                    if (el) el.textContent = formatSeconds(Math.floor(elapsed));
+                });
+            }, 1000);
         }
 
         function _renderCurrentTab() {
             if (!_boardData) return;
-            if (_currentBoardTab === 'waiting') _renderWaiting(_boardData.waiting||[]);
-            else if (_currentBoardTab === 'inprod') {
-                let items = [...(_boardData.in_production||[]),...(_boardData.orphan_timers||[])];
-                if (_currentSetor === 'marcenaria') items = items.filter(i => (i.setor||i.status) === 'marcenaria');
-                else if (_currentSetor === 'tapecaria') items = items.filter(i => (i.setor||i.status) === 'tapecaria');
-                _renderInProd(items);
-            }
-            else _renderDone(_boardData.done||[]);
-        }
-
-        function switchBoardTab(tab) {
-            _currentBoardTab = tab;
-            ['waiting','inprod','done'].forEach(t => {
-                const panel = document.getElementById('board-'+t);
-                const btn   = document.getElementById('tab-'+t+'-btn');
-                if (panel) panel.style.display = t===tab ? 'block' : 'none';
-                if (btn)   btn.classList.toggle('active-board-tab', t===tab);
-            });
-            const sw = document.getElementById('setor-tabs-wrap');
-            const si = document.getElementById('search-inprod-wrap');
-            if (sw) sw.style.display = tab==='inprod' ? 'block' : 'none';
-            if (si) si.style.display = tab==='inprod' ? 'block' : 'none';
-            if (tab !== 'inprod') { const inp=document.getElementById('search-inprod'); if(inp) inp.value=''; }
-            if (_boardData) _renderCurrentTab();
-            // Re-render barcodes when switching to Produzindo (were hidden before)
-            if (tab === 'inprod') {
-                setTimeout(() => {
-                    if (window._lastInProdItems) {
-                        window._lastInProdItems.forEach(item => {
-                            const op    = String(item.ordem_producao || item.pedido_numero || item.order_id || '');
-                            const svgId = 'bci_' + (item.item_key||'').replace(/[^a-z0-9]/gi,'_');
-                            const svgEl = document.getElementById(svgId);
-                            if (svgEl && op && svgEl.children.length === 0) {
-                                try { JsBarcode(svgEl, op, {format:'CODE128',width:2.4,height:65,displayValue:true,fontSize:13,margin:6,background:'#fff',lineColor:'#000'}); }
-                                catch(e) {}
-                            }
-                        });
-                    }
-                }, 120);
+            const { waiting, allInProd, done } = _boardData;
+            switch (_currentBoardTab) {
+                case 'waiting': _renderWaiting(waiting); break;
+                case 'inprod':  _renderInProd(allInProd); break;
+                case 'done':    _renderDone(done); break;
             }
         }
 
-        function switchSetor(s) {
-            _currentSetor = s;
-            ['todos','marc','tape'].forEach(id => {
-                const b = document.getElementById('setor-'+id);
-                if (b) b.className = 'btn btn-sm ' + (
-                    (id==='todos'&&s==='todos')||(id==='marc'&&s==='marcenaria')||(id==='tape'&&s==='tapecaria')
-                    ? 'btn-dark' : 'btn-outline-secondary');
-            });
-            _renderCurrentTab();
-        }
-
-        function filterInProd(q) {
-            if (!_boardDataRaw) return;
-            q = q.toLowerCase().trim();
-            if (!q) { _boardData = _boardDataRaw; }
-            else {
-                _boardData = {..._boardDataRaw,
-                    in_production: (_boardDataRaw.in_production||[]).filter(i =>
-                        (i.pedido_numero||'').toLowerCase().includes(q) ||
-                        (i.order_id||'').toLowerCase().includes(q) ||
-                        (i.cliente||'').toLowerCase().includes(q) ||
-                        (i.nome||'').toLowerCase().includes(q)
-                    )
-                };
-            }
-            _renderCurrentTab();
-        }
-
-        /* ── Waiting board ── */
+        /* ── ABA EM ESPERA: cards com barcode, leitura única por pedido ── */
         function _renderWaiting(items) {
             const div = document.getElementById('board-waiting');
             if (!div) return;
-            if (!items.length) {
-                div.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3">📦</div><p class="mt-2">Nenhum pedido aguardando.</p></div>';
+            if (items.length === 0) {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">📭</div>
+                    <p class="mt-2">Nenhum pedido em espera.</p>
+                    <button class="btn btn-sm btn-outline-primary mt-2" onclick="syncAndRefreshPending()">🔄 Sincronizar Bling</button>
+                </div>`;
                 return;
             }
-            // Agrupa por pedido (order_id)
-            const pedidos = {};
-            items.forEach(item => {
-                const pid = item.order_id || item.pedido_numero || item.order_id_bling || 'sem-pedido';
-                if (!pedidos[pid]) pedidos[pid] = {id: pid, numero: item.pedido_numero||pid, cliente: item.cliente||'', itens: []};
-                pedidos[pid].itens.push(item);
-            });
-            let html = '<div class="row g-3 p-2">';
-            Object.values(pedidos).forEach(ped => {
-                const urgencia = ped.itens.some(i => i.urgencia==='atrasado') ? 'atrasado' :
-                                 ped.itens.some(i => i.urgencia==='critico')  ? 'critico'  : 'normal';
-                const borderColor = urgencia==='atrasado' ? '#ef4444' : urgencia==='critico' ? '#f97316' : '#e5e5e5';
-                html += '<div class="col-12 col-md-6 col-lg-4 fade-in-up"><div class="bc-card" style="border-color:' + borderColor + '">';
-                html += '<div class="d-flex justify-content-between align-items-start mb-2">';
-                html += '<span class="badge" style="background:#ffb600;color:#000">Pedido #' + escapeHtml(String(ped.numero)) + '</span>';
-                if (ped.cliente) html += '<small class="text-muted" style="font-size:.7rem">' + escapeHtml(ped.cliente.slice(0,20)) + '</small>';
-                html += '</div>';
-                ped.itens.forEach((item, idx) => {
-                    const ikey = item.item_key || '';
-                    const nome = item.nome || item.nome_original || 'N/D';
-                    const op   = item.ordem_producao || item.pedido_numero || ikey;
-                    const isEsteira = _classifySetor(nome) === 'tapecaria';
-                    const setor_lbl = isEsteira ? '🧵 Cadeira (3 etapas)' : '🪚 MDF (2 etapas)';
-                    const prazo = safeDateStr(item.data_entrega);
-                    const dias  = item.dias_restantes;
-                    const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_') + '_' + idx;
 
-                    html += '<div style="border-top:1px solid #f0f0f0;padding-top:8px;margin-top:8px">';
-                    html += '<div class="bc-nome">' + escapeHtml(nome) + '</div>';
-                    html += '<div style="font-size:.65rem;color:#888;margin-bottom:4px">' + setor_lbl + '</div>';
+            // Agrupa por produto
+            const grupos = {};
+            items.forEach(item => {
+                const key = (item.nome || item.nome_original || 'N/D').toUpperCase();
+                if (!grupos[key]) grupos[key] = { nome: item.nome || item.nome_original || 'N/D', items: [] };
+                grupos[key].items.push(item);
+            });
+
+            // Ordena grupos: urgentes primeiro
+            const gruposArr = Object.values(grupos).sort((a, b) => {
+                const urgMap = {atrasado:0,critico:1,atencao:2,normal:3};
+                const urgA = Math.min(...a.items.map(i => urgMap[i.urgencia||'normal']));
+                const urgB = Math.min(...b.items.map(i => urgMap[i.urgencia||'normal']));
+                return urgA !== urgB ? urgA - urgB : a.nome.localeCompare(b.nome);
+            });
+
+            let html = '<div class="p-3">';
+            gruposArr.forEach(grupo => {
+                const hasUrgent = grupo.items.some(i => ['atrasado','critico'].includes(i.urgencia||'normal'));
+                html += `<div class="mb-4">
+                    <div class="d-flex align-items-center gap-2 mb-2">
+                        <span style="font-family:'Bebas Neue',sans-serif;font-size:1.1rem;letter-spacing:.04em;color:${hasUrgent?'#b91c1c':'#01010d'};">
+                            ${hasUrgent?'🔴':'🟡'} ${escapeHtml(grupo.nome)}
+                        </span>
+                        <span class="badge" style="background:${hasUrgent?'#ef4444':'#ffb600'};color:${hasUrgent?'#fff':'#000'};">${grupo.items.length} un.</span>
+                    </div>
+                    <div class="row g-3">`;
+
+                grupo.items.forEach(item => {
+                    const ikey = item.item_key || '';
+                    const op = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                    const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
+                    const urg = item.urgencia || 'normal';
+                    const dias = item.dias_restantes;
+                    const jaLido = _scannedThisSession.has(ikey + ':waiting');
+
+                    let prazoBadge = '';
                     if (dias !== null && dias !== undefined) {
-                        const urgCls = dias<0 ? 'badge-atrasado' : dias<=2 ? 'badge-critico' : dias<=5 ? 'badge-atencao' : 'bg-success text-white';
-                        html += '<span class="badge ' + urgCls + '" style="font-size:.62rem">' + (dias<0?'ATRASO '+Math.abs(dias)+'d':dias===0?'HOJE':dias+'d') + '</span> ';
+                        if (urg==='atrasado') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">⚠️ ${Math.abs(dias)}d ATRASO</span>`;
+                        else if (urg==='critico') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">🔥 ${dias===0?'HOJE':dias+'d'}</span>`;
+                        else if (urg==='atencao') prazoBadge = `<span class="badge bg-warning text-dark" style="font-size:.65rem;">⏰ ${dias}d</span>`;
+                        else prazoBadge = `<span class="badge bg-light text-dark border" style="font-size:.65rem;">${dias}d</span>`;
                     }
-                    html += '<span class="badge bg-light text-dark" style="font-size:.6rem">📅 ' + prazo + '</span>';
-                    html += '<div class="text-center my-2"><svg id="' + svgId + '"></svg></div>';
-                    html += '</div>';
+
+                    html += `<div class="col-sm-6 col-lg-4 col-xl-3">
+                        <div class="bc-card ${urg==='atrasado'||urg==='critico'?'urgente':urg==='atencao'?'atencao':''}">
+                            ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
+                            <div class="bc-nome">${escapeHtml(item.nome||item.nome_original||'N/D')}</div>
+                            ${item.base||item.cor ? `<div style="font-size:.68rem;color:#6b7280;margin-bottom:8px;">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))}</div>` : ''}
+                            <div class="bc-num">#${escapeHtml(String(op))}</div>
+                            <div class="bc-svg-wrap my-2 text-center">
+                                <svg id="${svgId}"></svg>
+                            </div>
+                            <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data ? '· '+new Date(item.pedido_data).toLocaleDateString('pt-BR') : ''}</div>
+                            ${jaLido
+                                ? `<div class="bc-lido-overlay">✅ CÓDIGO LIDO<br><small style="font-weight:400;font-size:.72rem;">Indo para Produzindo...</small></div>`
+                                : `<div class="mt-2 d-flex gap-2">
+                                    <button class="btn btn-success btn-sm fw-bold flex-grow-1"
+                                        data-ikey="${ikey}" data-pnome="${escapeHtml(item.nome||item.nome_original||'')}" data-op="${escapeHtml(String(op))}"
+                                        onclick="scanOrStartWaiting(this)">
+                                        ▶ Iniciar Produção
+                                    </button>
+                                    <button class="btn btn-outline-secondary btn-sm" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
+                                   </div>`
+                            }
+                        </div>
+                    </div>`;
                 });
-                html += '</div></div>';
+
+                html += `</div></div>`;
             });
             html += '</div>';
             div.innerHTML = html;
 
-            // Render barcodes
-            items.forEach((item, idx) => {
-                const ikey  = item.item_key || '';
-                const op    = String(item.ordem_producao || item.pedido_numero || item.order_id || '');
-                const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_') + '_' + idx;
+            // Renderiza barcodes
+            items.forEach(item => {
+                const ikey = item.item_key || '';
+                const op = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
                 const svgEl = document.getElementById(svgId);
                 if (svgEl && op) {
                     try {
-                        JsBarcode(svgEl, op, {format:'CODE128',width:1.8,height:50,
-                            displayValue:true,fontSize:11,margin:4,background:'#fff',lineColor:'#000'});
-                    } catch(e) { if(svgEl) svgEl.textContent = op; }
+                        JsBarcode(svgEl, String(op), { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { if (svgEl) svgEl.innerHTML = `<text font-size="10">${op}</text>`; }
                 }
             });
         }
 
-        /* ── InProd board ── */
+        /* Botão "Iniciar" ou leitura via scanner — anti-duplicação */
+        /* Remove pedido da fila (botão ✕) */
+        async function dismissPendingOrder(itemKey, evt) {
+            if (evt) { evt.stopPropagation(); evt.preventDefault(); }
+            if (!itemKey) return;
+            if (!confirm('Remover este pedido da fila de produção?')) return;
+            try {
+                await fetch('/api/pending-orders/dismiss', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ item_key: itemKey })
+                });
+                showToast('Removido', 'Pedido removido da fila.', 'info');
+                await loadProductionBoard();
+            } catch(e) {
+                showToast('Erro', 'Falha ao remover pedido.', 'danger');
+            }
+        }
+
+        async function scanOrStartWaiting(btn) {
+            const ikey  = btn.dataset.ikey;
+            const pnome = btn.dataset.pnome;
+            const op    = btn.dataset.op;
+            if (!ikey) return;
+            if (_scannedThisSession.has(ikey + ':waiting')) {
+                showToast('Aviso', 'Este pedido já foi iniciado nesta sessão.', 'warning');
+                return;
+            }
+            btn.disabled = true;
+            btn.textContent = '⏳...';
+            try {
+                const res = await fetch('/api/pending-orders/start', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome })
+                });
+                if (!res.ok) throw new Error('Erro servidor');
+                _scannedThisSession.add(ikey + ':waiting');
+                showToast('🚀 Iniciado', pnome, 'success');
+                // Registra componentes automaticamente
+                _autoRegisterComponents(pnome, ikey);
+                await loadProductionBoard();
+                switchBoardTab('inprod');
+            } catch(e) {
+                btn.disabled = false; btn.textContent = '▶ Iniciar Produção';
+                showToast('Erro', 'Falha ao iniciar produção', 'danger');
+            }
+        }
+
+        /* ── ABA PRODUZINDO: cards com barcode + timer, leitura única ── */
         function _renderInProd(items) {
             const div = document.getElementById('board-inprod');
             if (!div) return;
-            if (!items.length) {
-                div.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3">⚙️</div><p class="mt-2">Nenhum item em produção.</p></div>';
+
+            // Filtra por setor usando classificação semântica
+            let filtered = items;
+            if (_currentSetor === 'marcenaria') {
+                filtered = items.filter(i => _classifySetor(i.nome||i.nome_original||'') === 'marcenaria');
+            } else if (_currentSetor === 'tapecaria') {
+                filtered = items.filter(i => _classifySetor(i.nome||i.nome_original||'') === 'tapecaria');
+            }
+
+            if (filtered.length === 0) {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">⚙️</div>
+                    <p class="mt-2">${items.length === 0 ? 'Nenhum item em produção.' : 'Nenhum item para este setor.'}</p>
+                </div>`;
                 return;
             }
-            let html = '<div class="row g-3 p-2">';
-            items.forEach(item => {
-                const ikey    = item.item_key || '';
-                const nome    = item.nome || item.nome_original || 'N/D';
-                const op      = item.ordem_producao || item.pedido_numero || item.order_id || '';
-                const status  = item.status || 'in_production';
-                const setor   = item.setor  || status;
-                const isEst   = _classifySetor(nome) === 'tapecaria';
+
+            let html = '<div class="p-3 row g-3">';
+            filtered.forEach(item => {
+                const ikey  = item.item_key || '';
+                const nome  = item.nome || item.nome_original || item.produto || 'N/D';
+                const op    = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const tkey  = item.timer_key || nome;
+                const safeId = nome.replace(/[^a-zA-Z0-9]/g,'_');
+                const svgId  = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
                 const elapsed = item.tempo_decorrido || 0;
                 const estado  = item.estado || 'paused';
-                const safeId  = ('bci_' + ikey.replace(/[^a-z0-9]/gi,'_'));
-                const dias    = item.dias_restantes;
-                const prazo   = safeDateStr(item.data_entrega);
+                const jaLido  = _scannedThisSession.has(ikey + ':inprod');
+                const urg = item.urgencia || 'normal';
+                const dias = item.dias_restantes;
 
-                // Stage badge
-                const stageBadges = {
-                    marcenaria:    '<span class="setor-badge" style="background:#f59e0b;color:#000">🪚 Marcenaria</span>',
-                    tapecaria:     '<span class="setor-badge" style="background:#8b5cf6;color:#fff">🧵 Tapeçaria</span>',
-                    in_production: '<span class="setor-badge" style="background:#10b981;color:#fff">⚙️ Em Produção</span>',
-                };
-                const stageBadge = stageBadges[setor] || stageBadges['in_production'];
-
-                // Next action
-                // Buttons removed — scan only
-                
-                
-                
-
-                // Urgência
-                let urgBadge = '';
+                let prazoBadge = '';
                 if (dias !== null && dias !== undefined) {
-                    if (dias<0)     urgBadge = '<span class="badge badge-atrasado" style="font-size:.62rem">⚠️ '+Math.abs(dias)+'d ATRASO</span> ';
-                    else if(dias<=2)urgBadge = '<span class="badge badge-critico" style="font-size:.62rem">🔥 '+dias+'d</span> ';
-                    else if(dias<=5)urgBadge = '<span class="badge badge-atencao" style="font-size:.62rem">⏰ '+dias+'d</span> ';
+                    if (urg==='atrasado') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">⚠️ ${Math.abs(dias)}d ATRASO</span>`;
+                    else if (urg==='critico') prazoBadge = `<span class="badge bg-danger" style="font-size:.65rem;">🔥 ${dias===0?'HOJE':dias+'d'}</span>`;
+                    else if (urg==='atencao') prazoBadge = `<span class="badge bg-warning text-dark" style="font-size:.65rem;">⏰ ${dias}d</span>`;
                 }
 
-                const cardClass = setor==='marcenaria' ? 'bc-card marcen' : setor==='tapecaria' ? 'bc-card tapec' : 'bc-card inprod';
+                // Tempo em dias/horas
+                const elapsedFmt = elapsed > 86400
+                    ? (elapsed/86400).toFixed(1)+'d'
+                    : formatSeconds(elapsed);
 
-                html += '<div class="col-sm-6 col-lg-4 col-xl-3 fade-in-up">';
-                html += '<div class="' + cardClass + '">';
-                html += stageBadge;
-                if (urgBadge) html += '<div class="mb-1">' + urgBadge + '</div>';
-                html += '<div class="bc-nome">' + escapeHtml(nome) + '</div>';
-                html += '<div class="bc-num">#' + escapeHtml(String(op)) + '</div>';
-                if (prazo !== '—') html += '<div style="font-size:.65rem;color:#888;margin-bottom:4px">📅 ' + prazo + '</div>';
+                // Data prevista formatada
+                const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
 
-                // BARCODE — renderizado imediatamente via SVG
-                html += '<div class="bc-svg-wrap my-2 text-center"><svg id="' + safeId + '"></svg></div>';
-
-                // Timer
-                html += '<div class="text-center my-1">';
-                html += '<span class="font-monospace fw-bold" id="btimer_' + safeId + '" style="font-size:1.3rem;color:#10b981">' + formatSeconds(elapsed) + '</span>';
-                html += '<div><span class="badge ' + (estado==='running'?'bg-success':'bg-warning text-dark') + '" style="font-size:.65rem' + (estado==='running'?';animation:pulse-animation 1.5s infinite':'') + '">' + (estado==='running'?'🟢 RODANDO':'⏸ PAUSADO') + '</span></div>';
-                html += '</div>';
-
-                // Info: leitor instrução
-                html += '<div class="text-center mt-2" style="font-size:.7rem;color:#888;font-style:italic">' + btnLabel + '</div>';
-
-                if (item.cliente) html += '<div class="bc-meta">' + escapeHtml(item.cliente) + '</div>';
-                html += '</div></div>';
+                html += `<div class="col-sm-6 col-lg-4 col-xl-3">
+                    <div class="bc-card inprod">
+                        ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
+                        <div class="bc-nome">${escapeHtml(nome)}</div>
+                        <div class="bc-num">#${escapeHtml(String(op))}</div>
+                        ${dataEntFmt ? `<div style="font-size:.65rem;color:#6b7280;margin-bottom:4px;">📅 Previsto: ${dataEntFmt}</div>` : ''}
+                        <div class="bc-svg-wrap my-2 text-center">
+                            <svg id="${svgId}"></svg>
+                        </div>
+                        <!-- Timer ao vivo -->
+                        <div class="text-center my-2">
+                            <span id="btimer_${safeId}" class="font-monospace fw-bold" style="font-size:1.5rem;color:#10b981;">${elapsedFmt}</span>
+                            <div>
+                                <span class="badge ${estado==='running'?'bg-success':'bg-warning text-dark'}" style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
+                                    ${estado==='running'?'🟢 PRODUZINDO':'⏸ PAUSADO'}
+                                </span>
+                            </div>
+                        </div>
+                        <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data?'· '+new Date(item.pedido_data).toLocaleDateString('pt-BR'):''}</div>
+                        ${jaLido
+                            ? `<div class="bc-lido-overlay">✅ CONCLUÍDO!<br><small style="font-weight:400;font-size:.72rem;">Registrado com sucesso</small></div>`
+                            : `<div class="mt-2">
+                                <button class="btn btn-danger btn-sm fw-bold w-100"
+                                    data-ikey="${ikey}" data-pnome="${escapeHtml(nome)}" data-tkey="${encodeURIComponent(tkey)}"
+                                    onclick="scanOrFinishInProd(this)">
+                                    ✅ Concluir Produção
+                                </button>
+                               </div>`
+                        }
+                    </div>
+                </div>`;
             });
             html += '</div>';
             div.innerHTML = html;
 
-            // Render barcodes — use 150ms delay to ensure DOM is visible
-            // JsBarcode fails silently on display:none elements
-            function _renderBcInProd() {
-                items.forEach(item => {
-                    const ikey  = item.item_key || '';
-                    const op    = String(item.ordem_producao || item.pedido_numero || item.order_id || '');
-                    if (!op) return;
-                    const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                    const svgEl = document.getElementById(svgId);
-                    if (!svgEl) return;
-                    // Skip if panel still hidden
-                    const panel = document.getElementById('board-inprod');
-                    if (panel && panel.style.display === 'none') return;
+            // Renderiza barcodes
+            filtered.forEach(item => {
+                const ikey = item.item_key || '';
+                const op   = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
+                const svgEl = document.getElementById(svgId);
+                if (svgEl && op) {
                     try {
-                        JsBarcode(svgEl, op, {
-                            format: 'CODE128', width: 2.4, height: 65,
-                            displayValue: true, fontSize: 13, margin: 6,
-                            background: '#fff', lineColor: '#000'
-                        });
-                    } catch(e) {
-                        if (svgEl) svgEl.innerHTML = '<text x="4" y="20" font-family="monospace" font-size="13">' + op + '</text>';
-                    }
-                });
-            }
-            // First attempt after short delay
-            setTimeout(_renderBcInProd, 100);
-            // Second attempt after panel is definitely visible
-            setTimeout(_renderBcInProd, 500);
-            // Store for re-render on tab switch
-            window._lastInProdItems = items;
+                        JsBarcode(svgEl, String(op), { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { if (svgEl) svgEl.innerHTML = `<text font-size="10">${op}</text>`; }
+                }
+            });
         }
 
-        /* ── Done board ── */
+        /* Botão "Concluir" ou leitura via scanner — anti-duplicação */
+        async function scanOrFinishInProd(btn) {
+            const ikey  = btn.dataset.ikey;
+            const pnome = btn.dataset.pnome;
+            const tkey  = decodeURIComponent(btn.dataset.tkey || '');
+            if (!ikey) return;
+            if (_scannedThisSession.has(ikey + ':inprod')) {
+                showToast('Aviso', 'Este pedido já foi concluído nesta sessão.', 'warning');
+                return;
+            }
+            btn.disabled = true; btn.textContent = '⏳...';
+            try {
+                const res = await fetch('/api/pending-orders/finish', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome, timer_key: tkey||null })
+                });
+                if (!res.ok) throw new Error('Erro servidor');
+                const result = await res.json();
+                _scannedThisSession.add(ikey + ':inprod');
+                const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
+                showToast('✅ Concluído!', pnome + tempoFmt, 'success');
+                await loadProductionBoard();
+                await refreshComponentTab();
+                switchBoardTab('done');
+            } catch(e) {
+                btn.disabled = false; btn.textContent = '✅ Concluir Produção';
+                showToast('Erro', 'Falha ao concluir produção', 'danger');
+            }
+        }
+
+        /* ── ABA CONCLUÍDOS: tabela simples ── */
         function _renderDone(items) {
             const div = document.getElementById('board-done');
             if (!div) return;
-            if (!items.length) {
-                div.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3">✅</div><p class="mt-2">Nenhum item concluído este mês.</p></div>';
+            if (items.length === 0) {
+                div.innerHTML = `<div class="text-center py-5 text-muted">
+                    <div style="font-size:3rem;opacity:.3;">✅</div>
+                    <p class="mt-2">Nenhum item concluído este mês.</p>
+                </div>`;
                 return;
             }
-            let html = '<div class="table-responsive p-2"><table class="table table-hover table-sm align-middle mb-0">';
-            html += '<thead><tr style="background:#f9f9f7"><th class="ps-3">Produto</th><th>Setor</th><th>#Pedido</th><th class="text-center">Tempo</th><th class="text-center">Concluído</th><th></th></tr></thead><tbody>';
-            [...items].reverse().forEach(item => {
-                const nome  = item.nome || item.nome_original || 'N/D';
-                const op    = item.ordem_producao || item.pedido_numero || item.order_id || '—';
-                const setor = (item.setor||'').replace('in_production','MDF').replace('marcenaria','Marc.').replace('tapecaria','Tapec.');
-                const tp    = item.tempo_producao || 0;
-                const finAt = safeDateTimeStr(item.finished_at);
-                html += '<tr>';
-                html += '<td class="ps-3 fw-bold" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(nome) + '</td>';
-                html += '<td><span class="badge badge-done" style="font-size:.65rem">' + escapeHtml(setor||'MDF') + '</span></td>';
-                html += '<td class="small text-muted">#' + escapeHtml(String(op)) + '</td>';
-                html += '<td class="text-center fw-bold text-success font-monospace" style="font-size:.8rem">' + formatSeconds(tp) + '</td>';
-                html += '<td class="text-center small text-muted">' + finAt + '</td>';
-                html += '<td><button class="btn btn-outline-secondary btn-sm" style="font-size:.65rem;padding:2px 8px" onclick="printOP(\'' + escapeHtml(String(op)) + '\',\'' + escapeHtml(nome.replace(/'/g,'')) + '\',\'' + escapeHtml(item.item_key||'') + '\')">🖨️</button></td>';
-                html += '</tr>';
+            let html = `<div class="table-responsive">
+                <table class="table table-sm align-middle mb-0">
+                    <thead class="table-success">
+                        <tr>
+                            <th class="ps-3">Produto</th>
+                            <th>Base / Cor</th>
+                            <th>#Pedido / OP</th>
+                            <th>Cliente</th>
+                            <th class="text-center">Tempo</th>
+                            <th class="text-center">Concluído em</th>
+                        </tr>
+                    </thead>
+                    <tbody>`;
+            items.slice().reverse().forEach(item => {
+                const nome   = escapeHtml(item.nome || item.nome_original || 'N/D');
+                const baseCor = escapeHtml(((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))||'—');
+                const op     = escapeHtml(item.ordem_producao || item.pedido_numero || item.order_id || '—');
+                const fin    = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                const tempo  = item.tempo_producao
+                    ? (() => {
+                        const tp = item.tempo_producao;
+                        const fmt = tp > 86400
+                            ? `<span class="fw-bold text-success">${(tp/86400).toFixed(2)}d</span>`
+                            : tp > 3600
+                                ? `<span class="font-monospace fw-bold text-success">${Math.floor(tp/3600)}h${Math.floor((tp%3600)/60)}m</span>`
+                                : `<span class="font-monospace fw-bold text-success">${Math.floor(tp/60)}m</span>`;
+                        return fmt;
+                    })()
+                    : '<span class="text-muted">—</span>';
+                html += `<tr class="table-success">
+                    <td class="ps-3 fw-bold text-success">${nome}</td>
+                    <td class="text-muted small">${baseCor}</td>
+                    <td class="text-muted small">#${op}</td>
+                    <td class="text-muted small">${escapeHtml(item.cliente||'—')}</td>
+                    <td class="text-center">${tempo}</td>
+                    <td class="text-center"><small class="text-muted">${fin}</small></td>
+                </tr>`;
             });
-            html += '</tbody></table></div>';
+            html += `</tbody></table></div>`;
             div.innerHTML = html;
         }
 
-        /* ── Print OP ── */
-        function printOP(op, nome, ikey) {
-            if (ikey) {
-                const w = window.open('/api/production/print-op/' + encodeURIComponent(ikey), '_blank', 'width=800,height=650,toolbar=yes');
-                if (!w) showToast('Pop-up bloqueado', 'Permita pop-ups para imprimir.', 'warning');
-            } else {
-                showToast('Erro', 'item_key não disponível para impressão', 'danger');
-            }
-        }
-
-        /* ── Sync ── */
-        async function syncAndRefreshPending() {
+        /* Auto-registra componentes quando inicia produção via botão */
+        async function _autoRegisterComponents(nomeProduto, itemKey) {
+            if (!nomeProduto.toUpperCase().includes('CADEIRA')) return;
+            // O backend já registra via sync_from_orders — aqui é redundância
+            // para garantir no caso de pedidos antigos sem registro automático
+            const consumoKey = 'scan_btn_' + itemKey;
             try {
-                await fetch('/api/pending-orders/sync', {method:'POST'});
-                await loadProductionBoard();
-                showToast('Sincronizado', 'Pedidos atualizados do Bling.', 'success');
-            } catch(e) { showToast('Erro', 'Falha ao sincronizar', 'danger'); }
+                for (const comp of RECIPE_CADEIRA) {
+                    await fetch('/api/consumption/register', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify({ component_name: comp.nome, qty: comp.qtd, unit: comp.un, product_name: consumoKey, checked: true })
+                    });
+                    break; // faz só 1 para checar duplicação — o backend cuida do resto
+                }
+            } catch(e) { /* silencioso */ }
         }
 
-        /* ═══════════════════════════════════════════════════
-           DASHBOARD CHARTS
-        ═══════════════════════════════════════════════════ */
-        let _dashFilter = {from:null, to:null};
+        /** Renderiza mini-barcodes reais (JsBarcode) nas células da tabela */
+        function _renderBarcodes() {
+            document.querySelectorAll('svg[id^="bc_"]').forEach(svg => {
+                const wrap = svg.closest('[onclick]');
+                if (!wrap) return;
+                const onclk = wrap.getAttribute('onclick') || '';
+                const m = onclk.match(/openOPModal..([^']+)/);
+                if (!m) return;
+                const val = m[1];
+                if (!val || svg.children.length > 0) return;
+                try {
+                    JsBarcode(svg, val, { format:'CODE128', width:1.2, height:24, displayValue:false, margin:2, background:'#ffffff', lineColor:'#000000' });
+                } catch(e) {
+                    svg.innerHTML = `<text x="0" y="12" font-size="9" font-family="monospace">${val}</text>`;
+                }
+            });
+        }
+
+
+        /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
+        function openOPModal(numeroOP, nomeProduto, itemKey) {
+            const existing = document.getElementById('opModal');
+            if (existing) { bootstrap.Modal.getInstance(existing)?.hide(); existing.remove(); }
+
+            const modalHtml = `
+            <div class="modal fade" id="opModal" tabindex="-1">
+                <div class="modal-dialog modal-dialog-centered" style="max-width:420px;">
+                    <div class="modal-content border-0 shadow-lg">
+                        <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
+                            <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">
+                                📋 Ordem de Produção
+                            </h5>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                        </div>
+                        <div class="modal-body text-center" style="background:#f9f9f7;padding:24px;">
+                            <p class="text-muted small mb-1" style="font-size:0.78rem;">${escapeHtml(nomeProduto)}</p>
+                            <h4 class="fw-bold font-monospace mb-4" style="color:#01010d;letter-spacing:.06em;">
+                                OP # ${escapeHtml(numeroOP)}
+                            </h4>
+
+                            <!-- Barcode real via JsBarcode -->
+                            <div id="op-barcode-wrap" style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:20px 16px 12px;display:inline-block;margin-bottom:16px;min-width:280px;">
+                                <svg id="opBarcodeReal"></svg>
+                            </div>
+
+                            <!-- Status do pedido -->
+                            <div id="op-status-box" class="mt-2 mb-1"></div>
+
+                            <p class="text-muted mb-0" style="font-size:0.72rem;">
+                                Scanner: aponte para o código acima.<br>
+                                <strong>1ª leitura</strong> = Iniciar · <strong>2ª leitura</strong> = Concluir
+                            </p>
+                        </div>
+                        <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
+                            <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
+                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(numeroOP)}', '${escapeHtml(nomeProduto)}')">
+                                🖨️ Imprimir OP
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            const modal = new bootstrap.Modal(document.getElementById('opModal'));
+            modal.show();
+
+            // Renderiza barcode real com JsBarcode (Code128 — lido por qualquer scanner)
+            setTimeout(() => {
+                try {
+                    JsBarcode('#opBarcodeReal', String(numeroOP), {
+                        format: 'CODE128',
+                        width: 2.2,
+                        height: 70,
+                        displayValue: true,
+                        fontSize: 14,
+                        fontOptions: 'bold',
+                        margin: 6,
+                        background: '#ffffff',
+                        lineColor: '#000000',
+                        textMargin: 4,
+                    });
+                } catch(e) {
+                    document.getElementById('op-barcode-wrap').innerHTML =
+                        `<div class="font-monospace fw-bold" style="font-size:1.4rem;letter-spacing:.15em;">${escapeHtml(numeroOP)}</div>`;
+                }
+
+                // Mostra status atual do pedido
+                _updateOPStatusBox(numeroOP);
+            }, 60);
+        }
+
+        async function _updateOPStatusBox(numeroOP) {
+            const box = document.getElementById('op-status-box');
+            if (!box) return;
+            try {
+                const res = await fetch('/api/production/board');
+                const data = await res.json();
+                const all = [...(data.waiting||[]), ...(data.in_production||[]), ...(data.done||[])];
+                const item = all.find(i => String(i.pedido_numero||i.order_id||i.ordem_producao||'') === String(numeroOP));
+                if (!item) {
+                    box.innerHTML = `<span class="badge bg-secondary">Status desconhecido</span>`;
+                    return;
+                }
+                const st = item.status || 'waiting';
+                const labels = {
+                    waiting:      `<span class="badge bg-warning text-dark">⏳ Aguardando</span>`,
+                    in_production:`<span class="badge bg-success" style="animation:pulse-animation 1.5s infinite;">⚙️ Em Produção</span>`,
+                    done:         `<span class="badge bg-primary">✅ Concluído</span>`,
+                };
+                box.innerHTML = labels[st] || `<span class="badge bg-secondary">${st}</span>`;
+            } catch { box.innerHTML = ''; }
+        }
+
+        /** Impressão da OP em página limpa (sem travar) */
+        function printOP(numeroOP, nomeProduto) {
+            // Gera SVG do barcode num canvas auxiliar
+            const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            tempSvg.id = '_printBcSvg';
+            tempSvg.style.display = 'none';
+            document.body.appendChild(tempSvg);
+
+            try {
+                JsBarcode('#_printBcSvg', String(numeroOP), {
+                    format: 'CODE128', width: 3, height: 90,
+                    displayValue: true, fontSize: 16, fontOptions: 'bold',
+                    margin: 8, background: '#ffffff', lineColor: '#000000'
+                });
+            } catch(e) {}
+
+            const svgHtml = tempSvg.outerHTML;
+            tempSvg.remove();
+
+            const printContent = `
+                <div style="font-family:Arial,sans-serif;text-align:center;padding:30px;">
+                    <h2 style="letter-spacing:.05em;margin-bottom:4px;">SW Móveis MDF</h2>
+                    <p style="color:#666;font-size:13px;margin-bottom:20px;">Ordem de Produção</p>
+                    <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;min-width:300px;">
+                        <div style="font-size:13px;color:#555;margin-bottom:8px;">${nomeProduto}</div>
+                        <div style="font-size:28px;font-weight:900;font-family:monospace;margin-bottom:16px;letter-spacing:.06em;">
+                            OP # ${numeroOP}
+                        </div>
+                        ${svgHtml}
+                    </div>
+                    <p style="color:#888;font-size:11px;margin-top:16px;">
+                        1ª leitura = Iniciar Produção &nbsp;|&nbsp; 2ª leitura = Concluir Produção
+                    </p>
+                    <script>window.onload=function(){window.print();window.onafterprint=function(){document.getElementById('print-area').style.display='none';}}</scr' + 'ipt>
+                </div>`;
+
+            const printArea = document.getElementById('print-area');
+            printArea.innerHTML = printContent;
+            printArea.style.display = 'block';
+            window.print();
+            // Limpa após impressão
+            window.onafterprint = () => {
+                printArea.innerHTML = '';
+                printArea.style.display = 'none';
+                window.onafterprint = null;
+            };
+        }
+
+        /** ════════════════════════════════════════════════════
+         *  LISTENER GLOBAL DE SCANNER DE CÓDIGO DE BARRAS
+         *  Scanners USB emulam teclado: digitam o código + Enter
+         *  1ª leitura (Em Espera)   → inicia produção
+         *  2ª leitura (Produzindo)  → conclui produção
+         *  Anti-duplicação: _scannedThisSession por item+etapa
+         *  ════════════════════════════════════════════════════ */
+        (function() {
+            let _scanBuffer = '';
+            let _scanTimer  = null;
+            const _MIN_LEN  = 3;
+
+            const _indicator = document.getElementById('scanner-indicator');
+
+            function _showIndicator(msg, color) {
+                if (!_indicator) return;
+                _indicator.textContent = '📡 ' + msg;
+                _indicator.style.borderColor = color || '#ffb600';
+                _indicator.style.color = color || '#ffb600';
+                _indicator.classList.add('active');
+                clearTimeout(_indicator._hideTimer);
+                _indicator._hideTimer = setTimeout(() => _indicator.classList.remove('active'), 3500);
+            }
+
+            document.addEventListener('keydown', function(e) {
+                const tag = document.activeElement?.tagName?.toLowerCase();
+                if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+                if (e.key === 'Enter') {
+                    const code = _scanBuffer.trim();
+                    _scanBuffer = '';
+                    clearTimeout(_scanTimer);
+                    if (code.length >= _MIN_LEN) _processScan(code);
+                    return;
+                }
+                if (e.key.length === 1) {
+                    _scanBuffer += e.key;
+                    clearTimeout(_scanTimer);
+                    _scanTimer = setTimeout(() => { _scanBuffer = ''; }, 400);
+                }
+            });
+
+            async function _processScan(codigo) {
+                if (!isAuthenticated) {
+                    _showIndicator('Não autenticado', '#ef4444');
+                    return;
+                }
+                _showIndicator('Lendo: ' + codigo, '#ffb600');
+                try {
+                    const res = await fetch('/api/barcode/scan', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ codigo: codigo })
+                    });
+                    const result = await res.json();
+
+                    if (res.status === 404) {
+                        _showIndicator('Não encontrado: ' + codigo, '#ef4444');
+                        showToast('Scanner', result.mensagem || 'Código não encontrado', 'warning');
+                        return;
+                    }
+
+                    const acao   = result.acao;
+                    const ikey   = result.item_key || '';
+                    const nome   = result.nome || '';
+
+                    if (acao === 'ja_lido_etapa') {
+                        // Backend sinalizou que já foi processado nesta etapa
+                        _showIndicator('Já processado nesta etapa', '#6b7280');
+                        showToast('Aviso', result.mensagem, 'warning');
+                        return;
+                    }
+
+                    if (acao === 'iniciado') {
+                        // Marca no Set do front para bloquear botão visualmente
+                        if (ikey) _scannedThisSession.add(ikey + ':waiting');
+                        _showIndicator('✅ INICIADO — ' + nome, '#10b981');
+                        showToast('🚀 Produção Iniciada', nome + ' · #' + codigo, 'success');
+                        await loadProductionBoard();
+                        switchBoardTab('inprod');
+
+                    } else if (acao === 'concluido') {
+                        if (ikey) _scannedThisSession.add(ikey + ':inprod');
+                        _showIndicator('✅ CONCLUÍDO — ' + nome, '#6366f1');
+                        const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
+                        showToast('✅ Concluído!', nome + tempoFmt, 'success');
+                        await loadProductionBoard();
+                        await refreshComponentTab();
+                        switchBoardTab('done');
+
+                    } else if (acao === 'ja_concluido') {
+                        _showIndicator('Já concluído', '#6b7280');
+                        showToast('Info', result.mensagem, 'info');
+
+                    } else {
+                        _showIndicator(result.mensagem || 'Processado', '#ffb600');
+                    }
+                } catch(e) {
+                    _showIndicator('Erro de comunicação', '#ef4444');
+                    showToast('Erro', 'Falha ao processar leitura', 'danger');
+                }
+            }
+
+            // Para testes no console: window._testScan('2781')
+            window._testScan = _processScan;
+        })();
+
+        function updateComponentUsage(usageData) {
+            if (usageData && usageData.history_production) renderProductionHistory(usageData.history_production);
+        }
+
+        async function refreshComponentTab() {
+            try {
+                const consumptionData = await fetchAPI('/api/consumption/summary');
+                renderConsumptionTable(consumptionData);
+            } catch(e) {
+                const sec = document.getElementById('consumption-table-section');
+                if (sec) sec.innerHTML = '<div class="alert alert-warning m-3">⚠️ Erro ao carregar consumo.</div>';
+            }
+            try {
+                const histData = await fetchAPI('/api/components/usage');
+                if (histData && histData.history_production) {
+                    renderProductionHistory(histData.history_production);
+                }
+            } catch(e) { /* silencioso */ }
+        }
+
+        function renderActiveTimers(activeProduction) {}
+
+        function renderConsumptionTable(data) {
+            const tableSection = document.getElementById('consumption-table-section');
+            const monthLabel = document.getElementById('consumption-month-label');
+            const totalBadge = document.getElementById('consumption-total-badge');
+            if (!tableSection) return;
+            const monthStr = data.month || '';
+            const [year, month] = monthStr.split('-');
+            const monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+            const monthName = month ? `${monthNames[parseInt(month)-1]}/${year}` : monthStr;
+            if (monthLabel) monthLabel.textContent = `${monthName} • Reinicia todo mês`;
+            const summary = data.summary || [];
+            if (totalBadge) totalBadge.textContent = `${summary.length} insumos registrados`;
+            if (summary.length === 0) {
+                tableSection.innerHTML = `<div class="text-center py-5"><div style="font-size:3rem;opacity:.3;">📦</div><p class="text-muted mt-2">Nenhum insumo registrado ainda este mês.</p><small class="text-muted">Abra um produto e marque os itens na checklist para registrar o consumo.</small></div>`;
+                return;
+            }
+            tableSection.innerHTML = `<div class="table-responsive"><table class="table table-hover align-middle mb-0">
+                <thead style="background:#f8fafc;"><tr><th class="ps-3">Insumo / Componente</th><th class="text-center">Qtd Usada (Mês)</th><th class="text-center">Un.</th><th class="text-center">Registros</th></tr></thead>
+                <tbody>${summary.map(item => `<tr>
+                    <td class="ps-3 fw-bold">${item.nome}</td>
+                    <td class="text-center"><span class="badge fs-6" style="background:linear-gradient(135deg,#059669,#10b981);color:white;padding:.4rem .9rem;">${item.qtd_total}</span></td>
+                    <td class="text-center text-muted small">${item.un}</td>
+                    <td class="text-center"><span class="badge bg-light text-dark border">${item.num_registros}x</span></td>
+                </tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function renderProductionHistory(history) {
+            const div = document.getElementById('production-history-section');
+            if (!div) return;
+            const reversed = [...(history || [])].reverse();
+            if (reversed.length === 0) {
+                div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado este mês.</div>';
+                return;
+            }
+
+            function fmtTempo(secs) {
+                if (!secs || secs <= 0) return '—';
+                if (secs >= 86400) return (secs/86400).toFixed(2) + 'd';
+                if (secs >= 3600)  return Math.floor(secs/3600) + 'h' + Math.floor((secs%3600)/60) + 'm';
+                return Math.floor(secs/60) + 'min';
+            }
+
+            div.innerHTML = `<div class="table-responsive" style="max-height:340px;overflow-y:auto;">
+                <table class="table table-sm table-striped align-middle mb-0">
+                <thead class="table-dark sticky-top"><tr>
+                    <th class="ps-3">Data/Hora</th>
+                    <th>Produto</th>
+                    <th class="text-center">Tempo</th>
+                    <th>#Pedido</th>
+                </tr></thead>
+                <tbody>${reversed.map(h => {
+                    const dt = h.data_conclusao ? new Date(h.data_conclusao) : null;
+                    const dtStr = (dt && !isNaN(dt)) ? dt.toLocaleString('pt-BR') : (h.data_conclusao || '—');
+                    const nome  = escapeHtml(h.produto || h.nome || 'N/D');
+                    const pedNum = h.pedido_numero || h.order_id || '';
+                    const tempo  = fmtTempo(h.tempo_segundos || 0);
+                    return `<tr>
+                        <td class="ps-3 small text-muted">${dtStr}</td>
+                        <td class="fw-bold" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${nome}">${nome}</td>
+                        <td class="text-center fw-bold text-success font-monospace">${tempo}</td>
+                        <td class="small text-muted">${pedNum ? '#'+pedNum : '—'}</td>
+                    </tr>`;
+                }).join('')}</tbody></table></div>`;
+        }
+
+        /* WebSocket KPI com reconexão e backoff */
+        let wsKpi = null;
+        let _kpiReconnectDelay = 3000; // declarado fora para persistir entre reconexões
+
+        function _connectKpiWs() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            wsKpi = new WebSocket(`${proto}://${window.location.host}/ws/kpi-updates`);
+            setupKpiWebSocket();
+        }
+
+        function setupKpiWebSocket() {
+            wsKpi.onopen = () => {
+                _kpiReconnectDelay = 3000; // reset ao conectar com sucesso
+            };
+
+            let _wsFirstAuthDone = false;
+            wsKpi.onmessage = (e) => {
+                let data;
+                try { data = JSON.parse(e.data); } catch { return; }
+
+                if (data.type === 'full_update') {
+                    updateAuthStatus(data.authenticated, data.auth_url);
+
+                    if (data.sales_stats) updateKpis(data.sales_stats);
+                    if (data.component_usage) updateComponentUsage(data.component_usage);
+
+                    // Atualiza KPIs das 3 etapas de produção via broadcast (sem reload do board)
+                    if (data.production_snapshot) {
+                        const ps = data.production_snapshot;
+                        const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                        set('kpi-waiting', ps.waiting || 0);
+                        set('kpi-inprod',  ps.in_production || 0);
+                        set('kpi-done',    ps.done || 0);
+                        set('waiting-count-badge', ps.waiting || 0);
+                        set('inprod-count-badge',  ps.in_production || 0);
+                        set('done-count-badge',    ps.done || 0);
+                    }
+
+                    // Primeira mensagem autenticada: sync pedidos + recarrega board
+                    if (data.authenticated && !_wsFirstAuthDone) {
+                        _wsFirstAuthDone = true;
+                        fetch('/api/pending-orders/sync', { method: 'POST' }).catch(() => {});
+                        const prodTab = document.getElementById('tab-producao');
+                        if (prodTab && prodTab.classList.contains('active')) {
+                            loadProductionBoard();
+                        }
+                    }
+
+                    // Sincroniza cache: não há mais botão de recarregar na aba Produtos
+                    if (data.cache_updated) {
+                        showToast('Cache', 'Produtos atualizados no servidor.', 'info');
+                    }
+                }
+            };
+
+            wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
+
+            wsKpi.onclose = () => {
+                _wsFirstAuthDone = false;
+                setTimeout(() => {
+                    _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
+                    _connectKpiWs();
+                }, _kpiReconnectDelay);
+            };
+        }
+
+        _connectKpiWs();
+
+        /* ══════════════════════════════════════════════════════════
+           DASHBOARD — Gráficos unificados
+        ══════════════════════════════════════════════════════════ */
+
+        let _dashFilter = { from: null, to: null };
 
         function applyDashboardFilter() {
-            _dashFilter.from = document.getElementById('filter-date-from')?.value || null;
-            _dashFilter.to   = document.getElementById('filter-date-to')?.value   || null;
+            const f = document.getElementById('filter-date-from')?.value;
+            const t = document.getElementById('filter-date-to')?.value;
+            _dashFilter = { from: f || null, to: t || null };
             loadKPIChart();
         }
         function resetDashboardFilter() {
-            _dashFilter = {from:null,to:null};
-            const f=document.getElementById('filter-date-from'), t=document.getElementById('filter-date-to');
-            if(f) f.value=''; if(t) t.value='';
+            _dashFilter = { from: null, to: null };
+            const f = document.getElementById('filter-date-from');
+            const t = document.getElementById('filter-date-to');
+            if (f) f.value = ''; if (t) t.value = '';
             loadKPIChart();
+        }
+        function printDashboard() {
+            const area = document.getElementById('print-area');
+            const dash = document.getElementById('tab-dashboard');
+            if (area && dash) {
+                area.innerHTML = '<div style="padding:20px;">' + dash.innerHTML + '</div>';
+                area.style.display = 'block';
+                window.print();
+                window.onafterprint = () => { area.innerHTML = ''; area.style.display = 'none'; window.onafterprint = null; };
+            }
         }
 
         async function loadKPIChart() {
             try {
                 let url = '/api/sales/history';
-                const ps = [];
-                if (_dashFilter.from) ps.push('from='+_dashFilter.from);
-                if (_dashFilter.to)   ps.push('to='+_dashFilter.to);
-                if (ps.length) url += '?' + ps.join('&');
+                const params = [];
+                if (_dashFilter.from) params.push('from=' + _dashFilter.from);
+                if (_dashFilter.to)   params.push('to='   + _dashFilter.to);
+                if (params.length) url += '?' + params.join('&');
+
                 const data = await fetchAPI(url);
-                const ctx  = document.getElementById('salesChart')?.getContext('2d');
+                const ctx = document.getElementById('salesChart')?.getContext('2d');
                 if (!ctx) return;
                 if (salesChart) salesChart.destroy();
 
-                const bd = _boardDataRaw || {};
+                // Dados de produção concluída (do board)
+                const boardData = _boardDataRaw || {};
+                const doneItems = boardData.done || [];
+                // Conta concluídos por data
                 const doneByDate = {};
-                (bd.done||[]).forEach(d => { const ds=(d.finished_at||'').slice(0,10); if(ds) doneByDate[ds]=(doneByDate[ds]||0)+1; });
+                doneItems.forEach(d => {
+                    const ds = (d.finished_at||'').slice(0,10);
+                    if (ds) doneByDate[ds] = (doneByDate[ds]||0) + 1;
+                });
                 const prodCounts = (data.labels||[]).map(l => doneByDate[l]||0);
 
                 salesChart = new Chart(ctx, {
-                    type:'line', data:{labels:data.labels||[],datasets:[
-                        {label:'Pedidos',data:data.daily||[],borderColor:'#ffb600',backgroundColor:'rgba(255,182,0,.1)',tension:.4,fill:true,borderWidth:2,pointRadius:3},
-                        {label:'Produzidos',data:prodCounts,borderColor:'#10b981',backgroundColor:'rgba(16,185,129,.08)',tension:.4,fill:true,borderWidth:2,pointRadius:3},
-                        {label:'Média 7d',data:data.moving_avg||[],borderColor:'#6366f1',borderDash:[5,5],tension:.4,borderWidth:1.5,pointRadius:0},
-                    ]},
-                    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top'},tooltip:{mode:'index',intersect:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                    type: 'line',
+                    data: {
+                        labels: data.labels || [],
+                        datasets: [
+                            {
+                                label: 'Pedidos Recebidos',
+                                data: data.daily || [],
+                                borderColor: '#ffb600',
+                                backgroundColor: 'rgba(255,182,0,0.1)',
+                                tension: 0.4, fill: true, borderWidth: 2,
+                                pointRadius: 3,
+                            },
+                            {
+                                label: 'Produção Concluída',
+                                data: prodCounts,
+                                borderColor: '#10b981',
+                                backgroundColor: 'rgba(16,185,129,0.08)',
+                                tension: 0.4, fill: true, borderWidth: 2,
+                                pointRadius: 3,
+                            },
+                            {
+                                label: 'Média Móvel (7d)',
+                                data: data.moving_avg || [],
+                                borderColor: '#6366f1',
+                                borderDash: [5,5],
+                                tension: 0.4, borderWidth: 1.5,
+                                pointRadius: 0,
+                            }
+                        ]
+                    },
+                    options: {
+                        responsive: true, maintainAspectRatio: false,
+                        plugins: { legend: { position: 'top' }, tooltip: { mode: 'index', intersect: false } },
+                        scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+                    }
                 });
 
+                // Gráfico de barras de produção por dia
                 _buildProdBarChart(data.labels||[], data.daily||[], prodCounts);
+                // Gráfico delta (queda/subida)
                 _buildDeltaChart(data.labels||[], data.daily||[]);
 
-                const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=v;};
-                set('growth-weekly', (data.growth>0?'+':'') + (data.growth||0).toFixed(1)+'%');
-            } catch(e) { console.error('KPI chart error:', e); }
+                // Métricas
+                const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                set('avg-daily',    (data.avg_daily||0).toFixed(1));
+                const gr = data.growth||0;
+                set('growth-weekly', (gr>0?'+':'')+gr.toFixed(1)+'%');
+                set('trend-indicator', gr>5?'📈 Subindo':gr<-5?'📉 Caindo':'📊 Estável');
+            } catch(e) {
+                console.error('Erro ao carregar KPI Chart:', e);
+            }
         }
 
         function _buildProdBarChart(labels, pedidos, producao) {
             const ctx = document.getElementById('prodBarChart')?.getContext('2d');
             if (!ctx) return;
             if (prodBarChart) prodBarChart.destroy();
+            const last14 = -14;
             prodBarChart = new Chart(ctx, {
-                type:'bar', data:{labels:labels.slice(-14),datasets:[
-                    {label:'Pedidos',data:pedidos.slice(-14),backgroundColor:'rgba(255,182,0,.7)',borderRadius:4},
-                    {label:'Produzidos',data:producao.slice(-14),backgroundColor:'rgba(16,185,129,.7)',borderRadius:4},
-                ]},
-                options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'top'}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}
+                type: 'bar',
+                data: {
+                    labels: labels.slice(last14),
+                    datasets: [
+                        { label: 'Pedidos', data: pedidos.slice(last14), backgroundColor: 'rgba(255,182,0,0.7)', borderRadius: 4 },
+                        { label: 'Produzidos', data: producao.slice(last14), backgroundColor: 'rgba(16,185,129,0.7)', borderRadius: 4 }
+                    ]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { position: 'top' } },
+                    scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+                }
             });
         }
 
@@ -5231,251 +7040,689 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const ctx = document.getElementById('deltaChart')?.getContext('2d');
             if (!ctx) return;
             if (deltaChart) deltaChart.destroy();
-            const last14 = counts.slice(-14);
-            const deltas = last14.map((v,i) => i===0?0:v-last14[i-1]);
+            const last14 = -14;
+            const lbl = labels.slice(last14);
+            const cnt = counts.slice(last14);
+            const deltas = cnt.map((v,i) => i === 0 ? 0 : v - cnt[i-1]);
             deltaChart = new Chart(ctx, {
-                type:'bar', data:{labels:labels.slice(-14),datasets:[
-                    {label:'Variação',data:deltas,backgroundColor:deltas.map(d=>d>=0?'rgba(16,185,129,.75)':'rgba(239,68,68,.75)'),borderRadius:4}
-                ]},
-                options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{ticks:{precision:0}}}}
+                type: 'bar',
+                data: {
+                    labels: lbl,
+                    datasets: [{
+                        label: 'Variação Diária',
+                        data: deltas,
+                        backgroundColor: deltas.map(d => d >= 0 ? 'rgba(16,185,129,0.75)' : 'rgba(239,68,68,0.75)'),
+                        borderRadius: 4,
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: { y: { ticks: { precision: 0 } } }
+                }
             });
         }
 
-        function _updateDashboardStagesChart(bd) {
+        function _updateDashboardStagesChart(boardData) {
             const ctx = document.getElementById('stagesChart')?.getContext('2d');
             if (!ctx) return;
             if (stagesChart) stagesChart.destroy();
-            const w = (bd.waiting||[]).length;
-            const p = (bd.in_production||[]).length + (bd.orphan_timers||[]).length;
-            const d = (bd.done||[]).length;
+            const w = (boardData.waiting||[]).length;
+            const p = (boardData.in_production||[]).length + (boardData.orphan_timers||[]).length;
+            const d = (boardData.done||[]).length;
             stagesChart = new Chart(ctx, {
-                type:'doughnut', data:{
-                    labels:['Em Espera','Produzindo','Concluídos'],
-                    datasets:[{data:[w,p,d],backgroundColor:['#ffb600','#10b981','#6366f1'],borderWidth:2,borderColor:'#fff'}]
+                type: 'doughnut',
+                data: {
+                    labels: ['Em Espera', 'Produzindo', 'Concluídos'],
+                    datasets: [{
+                        data: [w, p, d],
+                        backgroundColor: ['#ffb600','#10b981','#6366f1'],
+                        borderWidth: 2,
+                        borderColor: '#fff',
+                    }]
                 },
-                options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    plugins: {
+                        legend: { position: 'bottom' },
+                        tooltip: { callbacks: { label: ctx => ` ${ctx.label}: ${ctx.raw} pedido(s)` } }
+                    }
+                }
             });
         }
 
-        /* ═══════════════════════════════════════════════════
+        /* ══════════════════════════════════════════════════════════
+           SETOR: Marcenaria / Tapeçaria + Buscador
+        ══════════════════════════════════════════════════════════ */
+
+        function _classifySetor(nome) {
+            const n = (nome || '').toUpperCase();
+            // Tapeçaria: produtos com acabamento têxtil, estofamento
+            const tapecaria_kw = ['CADEIRA','POLTRONA','ESTOFADO','ESPUMA','TECIDO',
+                'COURVIM','COURO','VELUDO','LINHO','MATELASSÊ','MATELASSE',
+                'ASSENTO','ENCOSTO','BASE ESTOFADA','RECLINÁVEL','RECLINAVEL',
+                'HIDRÁULICA','HIDRAULICA','BERLIN','EVIDENCE','MADRID','LUNA'];
+            // Marcenaria: estrutura em madeira/MDF
+            const marcenaria_kw = ['MDF','COMPENSADO','MADEIRA','COMPENSAD','SARRAFO',
+                'ARMÁRIO','ARMARIO','BALCÃO','BALCAO','BANCADA','CARRINHO','GABINETE',
+                'LAVATÓRIO','LAVATORIO','ESPELHO','PRATELEIRA','NICHO','PAINEL'];
+            const isTape = tapecaria_kw.some(k => n.includes(k));
+            const isMarc = marcenaria_kw.some(k => n.includes(k));
+            if (isTape && isMarc) return 'tapecaria';  // prioriza tapeçaria em ambiguidade
+            if (isTape) return 'tapecaria';
+            if (isMarc) return 'marcenaria';
+            return 'outros';
+        }
+
+        function switchSetor(setor) {
+            _currentSetor = setor;
+            ['todos','marc','tape'].forEach(s => {
+                const btn = document.getElementById('setor-'+s);
+                if (btn) btn.className = btn.className.replace('btn-dark','btn-outline-secondary');
+            });
+            const map = {todos:'setor-todos', marcenaria:'setor-marc', tapecaria:'setor-tape'};
+            const btn = document.getElementById(map[setor]);
+            if (btn) btn.className = btn.className.replace('btn-outline-secondary','btn-dark');
+            _renderCurrentTab();
+        }
+
+        function filterInProd(query) {
+            if (!_boardDataRaw) return;
+            const q = query.toLowerCase().trim();
+            if (!q) { _boardData = _boardDataRaw; }
+            else {
+                _boardData = {
+                    ..._boardDataRaw,
+                    in_production: (_boardDataRaw.in_production||[]).filter(i =>
+                        (i.pedido_numero||'').toLowerCase().includes(q) ||
+                        (i.order_id||'').toLowerCase().includes(q) ||
+                        (i.cliente||'').toLowerCase().includes(q) ||
+                        (i.nome||'').toLowerCase().includes(q)
+                    ),
+                    orphan_timers: (_boardDataRaw.orphan_timers||[]).filter(i =>
+                        (i.nome||'').toLowerCase().includes(q)
+                    )
+                };
+            }
+            _renderCurrentTab();
+        }
+
+        function printSetor() {
+            const area = document.getElementById('print-area');
+            const boardEl = document.getElementById('board-inprod');
+            if (!area || !boardEl) return;
+            const titulo = _currentSetor === 'todos' ? 'Todos os Setores' :
+                           _currentSetor === 'marcenaria' ? '🪚 Marcenaria' : '🧵 Tapeçaria';
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2 style="text-align:center;">SW Móveis MDF — Produção: ${titulo}</h2>
+                <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${boardEl.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+        }
+
+        /* ══════════════════════════════════════════════════════════
            EXPEDIÇÃO
-        ═══════════════════════════════════════════════════ */
-        async function loadExpedicao(page) {
-            _expedicaoPage = page || 1;
+        ══════════════════════════════════════════════════════════ */
+        let _expedicaoFilter = 'all';
+
+        async function loadExpedicao() {
             const sec = document.getElementById('expedicao-section');
             if (!sec) return;
-            sec.innerHTML = '<div class="text-center py-4 text-muted">⏳ Carregando...</div>';
             try {
-                const data = await fetchAPI('/api/expedicao?page=' + _expedicaoPage + '&per_page=50&urgencia=' + _expedicaoFilter);
-                _renderExpedicao(data.items||[], data.total||0, data.pages||1);
+                const data = await fetch('/api/production/board').then(r => r.json());
+                const done = data.done || [];
+                _renderExpedicao(done);
             } catch(e) {
-                sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar expedição: ' + escapeHtml(e.message) + '</div>';
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar expedição.</div>';
             }
         }
 
-        function filterExpedicao(f) { _expedicaoFilter = f; loadExpedicao(1); }
+        function filterExpedicao(filter) {
+            _expedicaoFilter = filter;
+            loadExpedicao();
+        }
 
-        function _renderExpedicao(items, total, pages) {
+        function _renderExpedicao(items) {
             const sec = document.getElementById('expedicao-section');
             if (!sec) return;
-            if (!items.length) {
-                sec.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3">🚚</div><p class="mt-2">Nenhum item.</p></div>';
+            let filtered = items;
+            if (_expedicaoFilter !== 'all') {
+                filtered = items.filter(i => (i.urgencia||'normal') === _expedicaoFilter);
+            }
+            if (filtered.length === 0) {
+                sec.innerHTML = '<div class="text-center py-5 text-muted"><div style="font-size:3rem;opacity:.3;">🚚</div><p class="mt-2">Nenhum item neste filtro.</p></div>';
                 return;
             }
-            const urgColors = {atrasado:'#ef4444',critico:'#f97316',atencao:'#f59e0b',normal:'#10b981'};
-            let pag = '';
-            if (pages > 1) {
-                pag = '<div class="d-flex gap-1 align-items-center">';
-                if (_expedicaoPage>1)    pag += '<button class="btn btn-sm btn-outline-secondary" onclick="loadExpedicao(' + (_expedicaoPage-1) + ')">‹</button>';
-                pag += '<small class="text-muted px-2">' + _expedicaoPage + '/' + pages + '</small>';
-                if (_expedicaoPage<pages) pag += '<button class="btn btn-sm btn-outline-secondary" onclick="loadExpedicao(' + (_expedicaoPage+1) + ')">›</button>';
-                pag += '</div>';
-            }
-            let html = '<div class="d-flex justify-content-between align-items-center px-3 py-2 border-bottom"><small class="text-muted">' + total + ' item(s)</small>' + pag + '</div>';
-            html += '<div class="table-responsive"><table class="table table-hover table-sm align-middle mb-0"><thead><tr style="background:#f9f9f7"><th class="ps-3">Produto</th><th>#Pedido</th><th>Cliente</th><th class="text-center">Prazo</th><th class="text-center">Dias</th><th class="text-center">Tempo Prod.</th><th class="text-center">Concluído</th></tr></thead><tbody>';
-            items.forEach(item => {
-                const urg  = item.urgencia || 'normal';
+            const urgColors = { atrasado:'#ef4444', critico:'#f97316', atencao:'#f59e0b', normal:'#10b981' };
+            let html = `<div class="table-responsive"><table class="table table-hover table-sm align-middle mb-0">
+                <thead><tr style="background:#f9f9f7;">
+                    <th class="ps-3">Produto</th><th>Base/Cor</th><th>#Pedido</th>
+                    <th>Cliente</th><th class="text-center">Prazo</th>
+                    <th class="text-center">Dias Rest.</th><th class="text-center">Tempo Prod.</th>
+                    <th class="text-center">Concluído em</th>
+                </tr></thead><tbody>`;
+            filtered.slice().sort((a,b) => {
+                const uo = {atrasado:0,critico:1,atencao:2,normal:3};
+                return (uo[a.urgencia||'normal']||3) - (uo[b.urgencia||'normal']||3);
+            }).forEach(item => {
+                const urg = item.urgencia || 'normal';
                 const dias = item.dias_restantes;
-                const rb   = urg==='atrasado'?'background:rgba(239,68,68,.07);':urg==='critico'?'background:rgba(249,115,22,.05);':'';
-                const dc   = dias===null||dias===undefined ? '—' :
-                    '<span class="badge" style="background:' + urgColors[urg] + ';color:#fff">' + (dias<0?'⚠️ '+Math.abs(dias)+'d':dias===0?'HOJE':dias+'d') + '</span>';
-                const tp   = item.tempo_producao||0;
-                const tpF  = tp>86400?(tp/86400).toFixed(2)+'d':tp>3600?Math.floor(tp/3600)+'h'+String(Math.floor((tp%3600)/60)).padStart(2,'0')+'m':tp>0?Math.floor(tp/60)+'m':'—';
-                html += '<tr style="' + rb + '"><td class="ps-3 fw-bold" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(item.nome||'N/D') + '</td>';
-                html += '<td class="small">#' + escapeHtml(String(item.pedido_numero||'—')) + '</td>';
-                html += '<td class="small text-muted" style="max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(item.cliente||'—') + '</td>';
-                html += '<td class="text-center small">' + safeDateStr(item.data_entrega) + '</td>';
-                html += '<td class="text-center">' + dc + '</td>';
-                html += '<td class="text-center fw-bold text-success">' + tpF + '</td>';
-                html += '<td class="text-center small text-muted">' + safeDateTimeStr(item.finished_at) + '</td></tr>';
+                const rowBg = urg==='atrasado' ? 'background:rgba(239,68,68,.07);' : urg==='critico' ? 'background:rgba(249,115,22,.05);' : '';
+                const diasCell = dias === null || dias === undefined ? '—' :
+                    `<span class="badge" style="background:${urgColors[urg]};color:#fff;">${dias<0?'ATRASO '+Math.abs(dias)+'d':dias===0?'HOJE':dias+'d'}</span>`;
+                const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '—';
+                const finFmt = item.finished_at ? new Date(item.finished_at).toLocaleString('pt-BR') : '—';
+                // Converte tempo de produção para dias/horas
+                const tp = item.tempo_producao || 0;
+                const tpFmt = tp > 86400 ? (tp/86400).toFixed(1)+'d' : tp > 3600 ? Math.floor(tp/3600)+'h'+Math.floor((tp%3600)/60)+'m' : tp > 0 ? Math.floor(tp/60)+'m' : '—';
+                html += `<tr style="${rowBg}">
+                    <td class="ps-3 fw-bold">${escapeHtml(item.nome||item.nome_original||'N/D')}</td>
+                    <td class="small text-muted">${escapeHtml(((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))||'—')}</td>
+                    <td class="small">#${escapeHtml(String(item.pedido_numero||item.order_id||'—'))}</td>
+                    <td class="small text-muted">${escapeHtml(item.cliente||'—')}</td>
+                    <td class="text-center small">${dataEntFmt}</td>
+                    <td class="text-center">${diasCell}</td>
+                    <td class="text-center small fw-bold text-success">${tpFmt}</td>
+                    <td class="text-center small text-muted">${finFmt}</td>
+                </tr>`;
             });
             html += '</tbody></table></div>';
             sec.innerHTML = html;
         }
 
-        /* ═══════════════════════════════════════════════════
-           RELATÓRIO
-        ═══════════════════════════════════════════════════ */
+        function printExpedicao() {
+            const area = document.getElementById('print-area');
+            const sec  = document.getElementById('expedicao-section');
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2 style="text-align:center;">SW Móveis MDF — Lista de Expedição</h2>
+                <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${sec.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+        }
+
+        /* ══════════════════════════════════════════════════════════
+           RELATÓRIO DE PRODUÇÃO (7 / 30 dias)
+        ══════════════════════════════════════════════════════════ */
+
         async function loadRelatorio(dias) {
             const sec = document.getElementById('relatorio-section');
             if (!sec) return;
-            sec.innerHTML = '<div class="text-center py-4 text-muted">⏳ Buscando dados...</div>';
+            sec.innerHTML = '<div class="text-center py-4 text-muted">⏳ Buscando dados do Bling...</div>';
             try {
                 const data = await fetchAPI('/api/production/report?dias=' + dias);
-                if (data.error) { sec.innerHTML = '<div class="alert alert-danger m-3">' + escapeHtml(data.error) + '</div>'; return; }
-                const gc = data.crescimento>=0 ? '#10b981' : '#ef4444';
-                const gs = data.crescimento>=0 ? '+' : '';
-                sec.innerHTML = '<div class="row g-3 mb-4">' +
-                    kpiBox('Pedidos Recebidos', data.total_recebidos, 'Últimos '+dias+' dias', '#ffb600') +
-                    kpiBox('Produzidos', data.total_produzidos, 'Concluídos', '#10b981') +
-                    kpiBox('Crescimento', gs+data.crescimento+'%', 'vs período anterior', gc) +
-                    kpiBox('Tempo Médio', (data.avg_tempo_dias||'—')+'d', 'por pedido', '#6366f1') +
-                    '</div>' +
-                    '<div class="row g-3"><div class="col-lg-7"><div class="card p-3"><div style="height:200px"><canvas id="relatorio-chart"></canvas></div></div></div>' +
-                    '<div class="col-lg-5"><div class="card p-3 h-100"><div class="fw-bold mb-2" style="font-size:.85rem">🏆 Top Produtos</div><div style="max-height:220px;overflow-y:auto">' +
-                    (data.top_produtos||[]).map((p,i) => '<div class="d-flex justify-content-between align-items-center py-1 border-bottom"><span style="font-size:.75rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><span class="badge bg-light text-dark border me-1">' + (i+1) + '</span>' + escapeHtml(p.nome) + '</span><span class="badge bg-warning text-dark ms-2">' + p.qtd + ' un.</span></div>').join('') +
-                    '</div></div></div></div>';
+
+                if (data.error) {
+                    sec.innerHTML = '<div class="alert alert-danger m-3">Erro: ' + escapeHtml(data.error) + '</div>';
+                    return;
+                }
+
+                const growthColor = data.crescimento >= 0 ? '#10b981' : '#ef4444';
+                const growthSign  = data.crescimento >= 0 ? '+' : '';
+
+                sec.innerHTML = `
+                <div class="row g-3 mb-4">
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid #ffb600;">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Pedidos Recebidos</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:#ffb600;line-height:1;">${data.total_recebidos}</div>
+                            <small class="text-muted">Últimos ${dias} dias</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid #10b981;">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Produzidos</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:#10b981;line-height:1;">${data.total_produzidos}</div>
+                            <small class="text-muted">Concluídos no período</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid ${growthColor};">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Crescimento</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:${growthColor};line-height:1;">${growthSign}${data.crescimento}%</div>
+                            <small class="text-muted">vs. ${dias} dias anteriores</small>
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <div class="card p-3 text-center h-100" style="border-left:4px solid #6366f1;">
+                            <div class="text-muted small fw-bold text-uppercase" style="font-size:.65rem;letter-spacing:.08em;">Tempo Médio</div>
+                            <div style="font-size:2.8rem;font-family:'Bebas Neue',sans-serif;color:#6366f1;line-height:1;">${data.avg_tempo_dias || '—'}</div>
+                            <small class="text-muted">dias por pedido</small>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row g-3 mb-4">
+                    <div class="col-lg-7">
+                        <div class="card p-3">
+                            <div class="fw-bold mb-2" style="font-size:.85rem;">📊 Pedidos por Dia (últimos ${dias}d)</div>
+                            <div style="height:220px;"><canvas id="relatorio-chart"></canvas></div>
+                        </div>
+                    </div>
+                    <div class="col-lg-5">
+                        <div class="card p-3 h-100">
+                            <div class="fw-bold mb-2" style="font-size:.85rem;">🏆 Top 10 Produtos Mais Vendidos</div>
+                            <div style="max-height:240px;overflow-y:auto;">
+                            ${(data.top_produtos||[]).map((p,i) => `
+                                <div class="d-flex justify-content-between align-items-center py-1 border-bottom">
+                                    <span style="font-size:.75rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(p.nome)}">
+                                        <span class="badge bg-light text-dark border me-1">${i+1}</span>${escapeHtml(p.nome)}
+                                    </span>
+                                    <span class="badge bg-warning text-dark ms-2">${p.qtd} un.</span>
+                                </div>`).join('')}
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+
+                // Renderiza gráfico de barras
                 setTimeout(() => {
                     const ctx = document.getElementById('relatorio-chart')?.getContext('2d');
                     if (!ctx) return;
-                    new Chart(ctx, {type:'bar',data:{labels:data.labels||[],datasets:[{label:'Pedidos/dia',data:data.counts||[],backgroundColor:'rgba(255,182,0,.75)',borderRadius:4}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true,ticks:{precision:0}}}}});
+                    new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels: data.labels,
+                            datasets: [{
+                                label: 'Pedidos / dia',
+                                data: data.counts,
+                                backgroundColor: 'rgba(255,182,0,0.75)',
+                                borderRadius: 4
+                            }]
+                        },
+                        options: {
+                            responsive: true, maintainAspectRatio: false,
+                            plugins: { legend: { display: false } },
+                            scales: { y: { beginAtZero: true, ticks: { precision: 0 } } }
+                        }
+                    });
                 }, 80);
-            } catch(e) { sec.innerHTML = '<div class="alert alert-danger m-3">Erro: ' + escapeHtml(e.message) + '</div>'; }
+
+            } catch(e) {
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar relatório: ' + e.message + '</div>';
+            }
         }
 
-        function kpiBox(label, val, sub, color) {
-            return '<div class="col-6 col-md-3"><div class="kpi-card text-center" style="border-left:4px solid '+color+'"><h5>'+label+'</h5><div class="kpi-num" style="font-size:2.2rem;color:'+color+'">'+val+'</div><small class="text-muted">'+sub+'</small></div></div>';
+        function printRelatorio() {
+            const area = document.getElementById('print-area');
+            const sec  = document.getElementById('relatorio-section');
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2 style="text-align:center;">SW Móveis MDF — Relatório de Produção</h2>
+                <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${sec.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
-        /* ═══════════════════════════════════════════════════
-           INSUMOS / FICHA
-        ═══════════════════════════════════════════════════ */
-        async function loadPurchaseGuide() {
-            const sec = document.getElementById('purchase-guide-section');
-            if (!sec) return;
-            try {
-                const bd = await fetch('/api/production/board').then(r=>r.json());
-                const n  = (bd.waiting||[]).filter(i=>_classifySetor(i.nome||i.nome_original||'') === 'tapecaria').length;
-                if (!n) { sec.innerHTML = '<div class="text-center py-4 text-muted">Nenhuma cadeira em espera.</div>'; return; }
-                let html = '<div class="p-3"><div class="alert alert-info border-0 py-2 mb-3"><strong>' + n + ' cadeira(s)</strong> em espera</div>';
-                html += '<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr style="background:#f0f9ff"><th class="ps-3">Insumo</th><th class="text-center">Qtd/un</th><th class="text-center text-primary fw-bold">Total</th><th>Unidade</th></tr></thead><tbody>';
-                RECIPE_CADEIRA.forEach(c => {
-                    const tot = c.qtd * n;
-                    html += '<tr><td class="ps-3">' + escapeHtml(c.nome) + '</td><td class="text-center text-muted">' + c.qtd + '</td><td class="text-center fw-bold text-primary">' + (tot%1===0?tot:tot.toFixed(2)) + '</td><td class="text-muted small">' + escapeHtml(c.un) + '</td></tr>';
-                });
-                html += '</tbody></table></div></div>';
-                sec.innerHTML = html;
-            } catch(e) { sec.innerHTML = '<div class="alert alert-danger m-3">Erro</div>'; }
-        }
+        /* ══════════════════════════════════════════════════════════
+           FICHA TÉCNICA
+        ══════════════════════════════════════════════════════════ */
 
         async function loadFichaTecnica() {
             const sec = document.getElementById('ficha-section');
             if (!sec) return;
-            let html = '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr style="background:#01010d;color:#fff"><th class="ps-3">#</th><th>Componente</th><th class="text-center">Qtd</th><th>Un.</th><th class="text-center">Para 10 un.</th></tr></thead><tbody>';
-            RECIPE_CADEIRA.forEach((c,i) => {
-                html += '<tr class="' + (i%2?'table-light':'') + '"><td class="ps-3 text-muted small">' + (i+1) + '</td><td class="fw-bold">' + escapeHtml(c.nome) + '</td><td class="text-center">' + c.qtd + '</td><td class="text-muted small">' + escapeHtml(c.un) + '</td><td class="text-center text-primary fw-bold">' + (c.qtd*10) + '</td></tr>';
-            });
-            html += '</tbody></table></div><div class="p-3 border-top"><small class="text-muted"><strong>' + RECIPE_CADEIRA.length + '</strong> componentes por unidade</small></div>';
+
+            // Contagem de quantas cadeiras estão em espera para contextualizar
+            let waitingCount = 0;
+            try {
+                const bd = await fetch('/api/production/board').then(r => r.json());
+                waitingCount = (bd.waiting || []).filter(i =>
+                    (i.nome||i.nome_original||'').toUpperCase().includes('CADEIRA') ||
+                    (i.nome||i.nome_original||'').toUpperCase().includes('POLTRONA')
+                ).length;
+            } catch(e) {}
+
+            let html = `
+            <div class="p-3">
+                ${waitingCount > 0 ? `<div class="alert alert-info border-0 py-2 mb-3">
+                    <strong>${waitingCount}</strong> cadeira(s)/poltrona(s) em espera — 
+                    <a href="#" onclick="switchTabTo('tab-insumos');return false;">ver guia de compras</a>
+                </div>` : ''}
+
+                <div class="table-responsive">
+                <table class="table table-sm align-middle mb-0 border">
+                    <thead><tr style="background:#01010d;color:#fff;">
+                        <th class="ps-3 py-2">#</th>
+                        <th>Componente / Insumo</th>
+                        <th class="text-center">Qtd/un</th>
+                        <th>Unidade</th>
+                        <th class="text-center">Para 10 un.</th>
+                        <th class="text-center">Para ${waitingCount > 0 ? waitingCount + ' em espera' : '20 un.'}</th>
+                    </tr></thead>
+                    <tbody>
+                    ${RECIPE_CADEIRA.map((c, i) => {
+                        const for10  = (c.qtd * 10);
+                        const forWait = (c.qtd * (waitingCount || 20));
+                        return `<tr class="${i%2===0?'':'table-light'}">
+                            <td class="ps-3 text-muted small">${i+1}</td>
+                            <td class="fw-bold">${escapeHtml(c.nome)}</td>
+                            <td class="text-center">${c.qtd}</td>
+                            <td class="text-muted small">${escapeHtml(c.un)}</td>
+                            <td class="text-center text-primary fw-bold">${for10 % 1 === 0 ? for10 : for10.toFixed(2)}</td>
+                            <td class="text-center fw-bold" style="color:${waitingCount>0?'#10b981':'#6366f1'};">
+                                ${forWait % 1 === 0 ? forWait : forWait.toFixed(2)}
+                            </td>
+                        </tr>`;
+                    }).join('')}
+                    </tbody>
+                </table>
+                </div>
+
+                <div class="mt-3 p-3 border-top d-flex gap-3 flex-wrap align-items-center">
+                    <small class="text-muted">
+                        <strong>${RECIPE_CADEIRA.length}</strong> componentes cadastrados · 
+                        Computados automaticamente na venda · 
+                        Categoria: <strong>Cadeiras / Poltronas</strong>
+                    </small>
+                    <button class="btn btn-sm btn-outline-dark ms-auto" onclick="printFicha()">🖨️ Imprimir Ficha</button>
+                </div>
+            </div>`;
             sec.innerHTML = html;
         }
 
-        function refreshComponentTab() {
-            loadPurchaseGuide();
-            fetchAPI('/api/consumption/summary').then(d => { if (d && typeof renderConsumptionTable === 'function') renderConsumptionTable(d); }).catch(()=>{});
-            fetchAPI('/api/components/usage').then(d => { if (d && d.history_production) renderProductionHistory(d.history_production); }).catch(()=>{});
+        function switchTabTo(tabId) {
+            const btn = document.querySelector('[data-bs-target="#'+tabId+'"]');
+            if (btn) { try { new bootstrap.Tab(btn).show(); } catch(e) {} }
         }
 
-        function renderConsumptionTable(data) {
-            const sec = document.getElementById('consumption-table-section');
-            if (!sec || !data) return;
-            const lbl = document.getElementById('consumption-month-label');
-            if (lbl && data.month) lbl.textContent = data.month;
-            if (!data.components || !Object.keys(data.components).length) { sec.innerHTML = '<div class="text-center py-4 text-muted">Sem consumo registrado.</div>'; return; }
-            let html = '<div class="table-responsive"><table class="table table-sm mb-0"><thead><tr style="background:#f9f9f7"><th class="ps-3">Componente</th><th class="text-center">Total Usado</th><th>Un.</th></tr></thead><tbody>';
-            Object.entries(data.components).forEach(([nome, info]) => {
-                html += '<tr><td class="ps-3 fw-bold">' + escapeHtml(nome) + '</td><td class="text-center">' + (info.total||0) + '</td><td class="text-muted small">' + escapeHtml(info.unidade||'') + '</td></tr>';
-            });
-            html += '</tbody></table></div>';
-            sec.innerHTML = html;
+        function printFicha() {
+            const area = document.getElementById('print-area');
+            const sec  = document.getElementById('ficha-section');
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+                <h2>SW Móveis MDF — Ficha Técnica: Cadeira SW</h2>
+                <p style="color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
+                ${sec.innerHTML}
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
-        function renderProductionHistory(history) {
-            const div = document.getElementById('production-history-section');
-            if (!div) return;
-            const rev = [...(history||[])].reverse();
-            if (!rev.length) { div.innerHTML = '<div class="text-center py-4 text-muted">Nenhum produto finalizado.</div>'; return; }
-            div.innerHTML = '<div class="table-responsive" style="max-height:320px;overflow-y:auto"><table class="table table-sm table-striped mb-0 align-middle"><thead class="table-dark sticky-top"><tr><th class="ps-3">Data</th><th>Produto</th><th class="text-center">Tempo</th><th>#Pedido</th></tr></thead><tbody>' +
-                rev.map(h => '<tr><td class="ps-3 small text-muted">' + safeDateTimeStr(h.data_conclusao||h.finished_at) + '</td><td class="fw-bold" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(h.produto||h.nome||'N/D') + '</td><td class="text-center fw-bold text-success font-monospace">' + formatSeconds(h.tempo_segundos||0) + '</td><td class="small text-muted">' + (h.pedido_numero ? '#'+h.pedido_numero : '—') + '</td></tr>').join('') +
-                '</tbody></table></div>';
+        /* ══════════════════════════════════════════════════════════
+           GUIA DE COMPRAS (Insumos necessários pelos pedidos)
+        ══════════════════════════════════════════════════════════ */
+
+        async function loadPurchaseGuide() {
+            const sec = document.getElementById('purchase-guide-section');
+            if (!sec) return;
+            try {
+                const data = await fetch('/api/production/board').then(r => r.json());
+                const waiting = data.waiting || [];
+                // Conta quantas cadeiras estão em espera
+                const cadeiras = waiting.filter(i => (i.nome||i.nome_original||'').toUpperCase().includes('CADEIRA')).length;
+                if (cadeiras === 0) {
+                    sec.innerHTML = '<div class="text-center py-4 text-muted">Nenhuma cadeira em espera no momento.</div>';
+                    return;
+                }
+                let html = `<div class="p-3">
+                    <div class="alert alert-info border-0 mb-3">
+                        <strong>${cadeiras} cadeira(s)</strong> em espera · Calculando insumos necessários para produção completa
+                    </div>
+                    <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+                        <thead><tr style="background:#f0f9ff;">
+                            <th class="ps-3">Insumo</th><th class="text-center">Qtd/un</th>
+                            <th class="text-center fw-bold text-primary">Total Necessário</th><th>Unidade</th>
+                        </tr></thead><tbody>`;
+                RECIPE_CADEIRA.forEach(c => {
+                    const total = (c.qtd * cadeiras);
+                    html += `<tr>
+                        <td class="ps-3">${escapeHtml(c.nome)}</td>
+                        <td class="text-center text-muted">${c.qtd}</td>
+                        <td class="text-center fw-bold text-primary">${total % 1 === 0 ? total : total.toFixed(2)}</td>
+                        <td class="text-muted small">${escapeHtml(c.un)}</td>
+                    </tr>`;
+                });
+                html += `</tbody></table></div></div>`;
+                sec.innerHTML = html;
+            } catch(e) {
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao calcular guia de compras.</div>';
+            }
         }
 
-        /* ── Print helpers ── */
-        function _print(htmlContent, title) {
-            const a = document.getElementById('print-area');
-            a.innerHTML = '<div style="padding:20px;font-family:Arial,sans-serif"><h2 style="text-align:center">SW Móveis MDF — ' + title + '</h2><p style="text-align:center;color:#666;font-size:12px">' + new Date().toLocaleString('pt-BR') + '</p>' + htmlContent + '</div>';
-            a.style.display = 'block'; window.print();
-            window.onafterprint = () => { a.innerHTML=''; a.style.display='none'; window.onafterprint=null; };
-        }
-        function printDashboard()  { _print(document.getElementById('tab-dashboard')?.innerHTML||'', 'Dashboard'); }
-        function printExpedicao()  { _print(document.getElementById('expedicao-section')?.innerHTML||'', 'Expedição'); }
-        function printRelatorio()  { _print(document.getElementById('relatorio-section')?.innerHTML||'', 'Relatório'); }
-        function printFicha()      { _print(document.getElementById('ficha-section')?.innerHTML||'', 'Ficha Técnica'); }
-        function printSetor() {
-            const s = _currentSetor==='marcenaria'?'Marcenaria':_currentSetor==='tapecaria'?'Tapeçaria':'Todos os Setores';
-            _print(document.getElementById('board-inprod')?.innerHTML||'', 'Produção: '+s);
+
+        /* ══════════════════════════════════════════════════════════
+           CÂMERA SCANNER — ZXing (celular / webcam)
+        ══════════════════════════════════════════════════════════ */
+        let _codeReader = null;
+        let _cameraActive = false;
+
+        function openCameraScanner() {
+            if (!isAuthenticated) {
+                showToast('Aviso', 'Autentique-se antes de usar o scanner.', 'warning');
+                return;
+            }
+            // Verifica suporte a câmera
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showToast('Aviso', 'Câmera não suportada neste dispositivo/browser.', 'warning');
+                return;
+            }
+            if (typeof ZXing === 'undefined') {
+                showToast('Aviso', 'Biblioteca ZXing não carregada. Use o scanner USB ou recarregue a página.', 'warning');
+                return;
+            }
+            const modal = new bootstrap.Modal(document.getElementById('cameraScanModal'));
+            modal.show();
+            setTimeout(_startCameraScanner, 400);
         }
 
-        /* ═══════════════════════════════════════════════════
-           DOM READY — TAB LISTENERS
-        ═══════════════════════════════════════════════════ */
+        async function _startCameraScanner() {
+            const video = document.getElementById('camera-preview');
+            const resultBox = document.getElementById('camera-scan-result');
+            if (!video) return;
+
+            // Verifica se ZXing está disponível
+            if (typeof ZXing === 'undefined') {
+                if (resultBox) {
+                    resultBox.style.display = 'block';
+                    resultBox.textContent = '⚠️ Biblioteca de scanner não carregada. Usando scanner USB.';
+                }
+                return;
+            }
+
+            try {
+                _codeReader = new ZXing.BrowserMultiFormatReader();
+                _cameraActive = true;
+
+                // Lista câmeras disponíveis e prefere a traseira
+                const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
+                const backCam = devices.find(d =>
+                    d.label.toLowerCase().includes('back') ||
+                    d.label.toLowerCase().includes('tras') ||
+                    d.label.toLowerCase().includes('rear') ||
+                    d.label.toLowerCase().includes('environment')
+                ) || devices[devices.length - 1] || devices[0];
+
+                if (!backCam) {
+                    if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Nenhuma câmera encontrada.'; }
+                    return;
+                }
+
+                await _codeReader.decodeFromVideoDevice(backCam.deviceId, video, async (result, err) => {
+                    if (result && _cameraActive) {
+                        const codigo = result.getText();
+                        _cameraActive = false; // Para de ler após 1 leitura
+                        if (resultBox) {
+                            resultBox.style.display = 'block';
+                            resultBox.textContent = '⏳ Processando: ' + codigo;
+                            resultBox.style.background = 'rgba(255,182,0,.85)';
+                            resultBox.style.color = '#000';
+                        }
+                        // Envia para o backend (mesma lógica do scanner USB)
+                        try {
+                            const res = await fetch('/api/barcode/scan', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ codigo })
+                            });
+                            const data = await res.json();
+                            const acao = data.acao || '';
+
+                            if (resultBox) {
+                                if (acao === 'iniciado') {
+                                    resultBox.style.background = 'rgba(16,185,129,.9)';
+                                    resultBox.style.color = '#fff';
+                                    resultBox.textContent = '✅ INICIADO: ' + (data.nome || codigo);
+                                    showToast('🚀 Iniciado!', data.nome + ' · #' + codigo, 'success');
+                                    setTimeout(() => { loadProductionBoard(); switchBoardTab('inprod'); }, 800);
+                                } else if (acao === 'concluido') {
+                                    resultBox.style.background = 'rgba(99,102,241,.9)';
+                                    resultBox.style.color = '#fff';
+                                    const tf = data.tempo_producao ? ' · ' + formatSeconds(data.tempo_producao) : '';
+                                    resultBox.textContent = '✅ CONCLUÍDO: ' + (data.nome || codigo) + tf;
+                                    showToast('✅ Concluído!', data.nome + tf, 'success');
+                                    setTimeout(() => { loadProductionBoard(); refreshComponentTab(); switchBoardTab('done'); }, 800);
+                                } else if (acao === 'ja_lido_etapa') {
+                                    resultBox.style.background = 'rgba(107,114,128,.85)';
+                                    resultBox.style.color = '#fff';
+                                    resultBox.textContent = '⚠️ ' + (data.mensagem || 'Já processado nesta etapa');
+                                    showToast('Aviso', data.mensagem, 'warning');
+                                } else if (acao === 'nao_encontrado') {
+                                    resultBox.style.background = 'rgba(239,68,68,.85)';
+                                    resultBox.style.color = '#fff';
+                                    resultBox.textContent = '❌ Não encontrado: ' + codigo;
+                                    showToast('Não encontrado', 'Pedido #' + codigo + ' não está na fila.', 'warning');
+                                } else {
+                                    resultBox.textContent = data.mensagem || 'Código: ' + codigo;
+                                }
+                            }
+
+                            // Re-habilita leitura após 3s (para ler próximo pedido)
+                            setTimeout(() => {
+                                _cameraActive = true;
+                                if (resultBox) {
+                                    resultBox.style.display = 'none';
+                                    resultBox.style.background = 'rgba(0,0,0,.7)';
+                                    resultBox.style.color = '#fff';
+                                }
+                            }, 3000);
+
+                        } catch(e) {
+                            if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Erro de comunicação'; }
+                            setTimeout(() => { _cameraActive = true; }, 2000);
+                        }
+                    }
+                });
+            } catch(e) {
+                console.error('Erro câmera:', e);
+                if (resultBox) {
+                    resultBox.style.display = 'block';
+                    resultBox.textContent = '❌ Erro ao acessar câmera: ' + (e.message || 'Permissão negada');
+                }
+            }
+        }
+
+        function stopCameraScanner() {
+            _cameraActive = false;
+            if (_codeReader) {
+                try { _codeReader.reset(); } catch(e) {}
+                _codeReader = null;
+            }
+            const video = document.getElementById('camera-preview');
+            if (video && video.srcObject) {
+                video.srcObject.getTracks().forEach(t => t.stop());
+                video.srcObject = null;
+            }
+        }
+
+        // Para câmera quando modal fecha
         document.addEventListener('DOMContentLoaded', () => {
-            // Default board tab = Em Espera
-            switchBoardTab('waiting');
+            const camModal = document.getElementById('cameraScanModal');
+            if (camModal) camModal.addEventListener('hidden.bs.modal', stopCameraScanner);
+        });
 
-            document.querySelector('[data-bs-target="#tab-dashboard"]')?.addEventListener('shown.bs.tab', loadKPIChart);
-            document.querySelector('[data-bs-target="#tab-producao"]')?.addEventListener('shown.bs.tab', () => {
+
+
+        function _onAuthConfirmed() {
+            if (!_boardInitialized) {
+                _boardInitialized = true;
                 loadProductionBoard();
+                refreshComponentTab();
+                loadKPIChart();
                 if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
+            }
+        }
+
+        /* Inicializa conexão WS após declarar todas as funções */
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Tab Dashboard
+            document.querySelector('[data-bs-target="#tab-dashboard"]')?.addEventListener('shown.bs.tab', () => {
+                loadKPIChart();
             });
-            document.querySelector('[data-bs-target="#tab-producao"]')?.addEventListener('hidden.bs.tab', () => {
-                if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
+
+            // Tab Produção
+            const prodTab = document.querySelector('[data-bs-target="#tab-producao"]');
+            if (prodTab) {
+                prodTab.addEventListener('shown.bs.tab', () => {
+                    loadProductionBoard();
+                    if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
+                });
+                prodTab.addEventListener('hidden.bs.tab', () => {
+                    if (_boardPoll) { clearInterval(_boardPoll); _boardPoll = null; }
+                    if (_boardTick) { clearInterval(_boardTick); _boardTick = null; }
+                    // Esconde buscador e setor tabs ao sair
+                    const sw = document.getElementById('setor-tabs-wrap');
+                    const si = document.getElementById('search-inprod-wrap');
+                    if (sw) sw.style.display = 'none';
+                    if (si) si.style.display = 'none';
+                });
+            }
+
+            // Tab Insumos
+            document.querySelector('[data-bs-target="#tab-insumos"]')?.addEventListener('shown.bs.tab', () => {
+                refreshComponentTab();
+                loadPurchaseGuide();
             });
-            document.querySelector('[data-bs-target="#tab-insumos"]')?.addEventListener('shown.bs.tab', refreshComponentTab);
-            document.querySelector('[data-bs-target="#tab-expedicao"]')?.addEventListener('shown.bs.tab', () => loadExpedicao(1));
-            document.querySelector('[data-bs-target="#tab-relatorio"]')?.addEventListener('shown.bs.tab', () => loadRelatorio(30));
+
+            // Tab Expedição
+            document.querySelector('[data-bs-target="#tab-expedicao"]')?.addEventListener('shown.bs.tab', loadExpedicao);
+
+            // Tab Relatório
+            document.querySelector('[data-bs-target="#tab-relatorio"]')?.addEventListener('shown.bs.tab', () => {
+                loadRelatorio(30);
+                // Carrega histórico de finalizações
+                try { fetchAPI('/api/components/usage').then(d => { if(d.history_production) renderProductionHistory(d.history_production); }).catch(()=>{}); } catch(e) {}
+            });
+
+            // Tab Ficha Técnica
             document.querySelector('[data-bs-target="#tab-ficha"]')?.addEventListener('shown.bs.tab', loadFichaTecnica);
 
-            // WS logs
-            let _wsLogs;
-            function _connectWsLogs() {
-                const proto = location.protocol==='https:'?'wss':'ws';
-                _wsLogs = new WebSocket(proto+'://'+location.host+'/ws/logs');
-                _wsLogs.onmessage = e => {
-                    try {
-                        const d = JSON.parse(e.data);
-                        const box = document.getElementById('logs-content');
-                        if (!box || !d.logs) return;
-                        d.logs.forEach(l => {
-                            const div = document.createElement('div');
-                            div.textContent = '['+l.timestamp+'] ['+l.level+'] '+l.message;
-                            div.style.color = l.level==='ERROR'?'#ef4444':l.level==='WARNING'?'#f59e0b':'#d1d5db';
-                            box.appendChild(div);
-                        });
-                        const entries = box.querySelectorAll('div');
-                        if (entries.length > 200) for(let i=0;i<entries.length-200;i++) entries[i].remove();
-                        box.scrollTop = box.scrollHeight;
-                    } catch(e) {}
-                };
-                _wsLogs.onclose = () => setTimeout(_connectWsLogs, 4000);
-                _wsLogs.onerror = () => _wsLogs.close();
-            }
-            _connectWsLogs();
-            _connectKpiWs();
         });
     </script>
+
+    <!-- FOOTER -->
+    <footer class="bg-primary text-white mt-5 py-4">
+        <div class="container-fluid px-4">
+            <div class="row align-items-center">
+                <div class="col-md-6">
+                    <p class="mb-0">
+                        <strong style="color:var(--sw-yellow)">SW Móveis MDF</strong> — Gestão Inteligente de Pedidos
+                    </p>
+                    <small class="text-white-50">© 2025 — Desenvolvido por João Victor Dias Santana</small>
+                </div>
+                <div class="col-md-6 text-md-end">
+                    <p class="mb-0">
+                        <strong style="color:var(--sw-yellow)">Versão</strong> 4.6
+                    </p>
+                    <small class="text-white-50">Sistema Integrado Bling API v3</small>
+                </div>
+            </div>
+        </div>
+    </footer>
+    <div class="sw-pattern-bar"></div>
+
 </body>
-</html>
-"""
+</html>"""
 
 # ============================================================================
 # 10. EXECUÇÃO
