@@ -1440,24 +1440,20 @@ class ProductionTimer:
             return {}
 
     def _save(self):
-        """Salva timers no MongoDB (primário). Arquivo só como fallback sem Mongo."""
+        """Salva timers — MongoDB E arquivo local (dupla redundância)."""
         if MONGO_AVAILABLE:
             try:
                 MongoStore.set('production_timers', {'timers': self.timers}, 'timers', replace=True)
-                return  # MongoDB OK — não precisa de arquivo
             except Exception as e:
                 logger.error(f"Erro ao salvar timers no MongoDB: {e}")
-        # Fallback: arquivo local (só quando MongoDB indisponível)
-        if not MONGO_AVAILABLE:
-            temp_file = self.FILE_PATH.with_suffix('.tmp')
-            try:
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.timers, f, indent=4, ensure_ascii=False)
-                import shutil
-                shutil.move(str(temp_file), str(self.FILE_PATH))
-            except Exception as e:
-                logger.warning(f"Fallback timer arquivo: {e}")
-
+        # Sempre salva no arquivo também (seguro contra falha do MongoDB)
+        temp_file = self.FILE_PATH.with_suffix('.tmp')
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(self.timers, f, indent=4, ensure_ascii=False)
+            shutil.move(str(temp_file), str(self.FILE_PATH))
+        except Exception as e:
+            logger.error(f"Erro ao salvar timers em arquivo: {e}")
 
     def _auto_pause_on_restart(self):
         """
@@ -1965,19 +1961,9 @@ class PendingOrdersManager:
     """
     FILE_PATH = DATA_DIR / 'pending_orders.json'
 
-    # Palavras-chave que identificam produtos de ESTEIRA (cadeiras/poltronas — 3 leituras).
-    # REGRA: deve conter UMA dessas palavras E ser reconhecidamente uma cadeira/poltrona.
-    # Palavras genéricas como EVIDENCE/BERLIN sozinhas classificam LAVATÓRIO EVIDENCE errado.
     ESTEIRA_KW = frozenset([
-        'CADEIRA','POLTRONA',
-        'HIDRÁULICA','HIDRAULICA',
-        'RECLINÁVEL','RECLINAVEL',
-    ])
-    # Palavras que EXCLUEM da esteira mesmo se ESTEIRA_KW der match
-    ESTEIRA_EXCL = frozenset([
-        'LAVATÓRIO','LAVATORIO','ARMÁRIO','ARMARIO',
-        'BANCADA','BALCÃO','BALCAO','CARRINHO','ESPELHO',
-        'PAINEL','NICHO','PRATELEIRA','GABINETE',
+        'CADEIRA','POLTRONA','EVIDENCE','BERLIN','MADRID','DIAMANTE',
+        'HIDRÁULICA','HIDRAULICA','RECLINÁVEL','RECLINAVEL',
     ])
     ESTEIRA_TRANSITIONS = {'waiting': 'marcenaria', 'marcenaria': 'tapecaria', 'tapecaria': 'done'}
     SIMPLES_TRANSITIONS = {'waiting': 'in_production', 'in_production': 'done'}
@@ -1985,12 +1971,7 @@ class PendingOrdersManager:
 
     @classmethod
     def _is_esteira(cls, nome: str) -> bool:
-        """Retorna True APENAS se for cadeira/poltrona real (não lavatório/móvel MDF)."""
-        n = nome.upper()
-        # Se contém palavra de exclusão, nunca é esteira
-        if any(excl in n for excl in cls.ESTEIRA_EXCL):
-            return False
-        return any(k in n for k in cls.ESTEIRA_KW)
+        return any(k in nome.upper() for k in cls.ESTEIRA_KW)
 
     @classmethod
     def _next_state(cls, current: str, nome: str) -> Optional[str]:
@@ -3493,7 +3474,7 @@ class WebServer:
             found_item = None
             if ikey_ov and ikey_ov in pending_orders.data:
                 item = pending_orders.data[ikey_ov]
-                if item.get('status') not in ('done',):
+                if item.get('status') != 'done':
                     found_key = ikey_ov
                     found_item = item
             if not found_item and codigo:
@@ -3502,27 +3483,10 @@ class WebServer:
                         continue
                     pnum = str(item.get('pedido_numero','') or item.get('order_id','') or '')
                     op   = str(item.get('ordem_producao','') or '')
-                    # Each product is unique — match by item_key OR barcode
                     if codigo in (pnum, op, key):
                         found_key = key
                         found_item = item
                         break
-
-            # Anti-dup: each item has a unique scan_state tracking
-            # 'scan_state' advances only ONCE per step per item
-            if found_item and found_key:
-                cur_status = found_item.get('status', 'waiting')
-                scan_key   = f"scan_{found_key}_{cur_status}"
-                # Use a short TTL flag in the item itself to prevent double-scan
-                if found_item.get('_last_scan_key') == scan_key:
-                    import time as _t
-                    last_scan_ts = found_item.get('_last_scan_ts', 0)
-                    if _t.time() - last_scan_ts < 5:  # 5s debounce per item per state
-                        return jsonify({'acao':'ja_lido_etapa','codigo':codigo,
-                            'mensagem':f'Produto já foi lido nesta etapa. Aguarde.'}), 200
-                # Mark this scan
-                found_item['_last_scan_key'] = scan_key
-                found_item['_last_scan_ts']  = __import__('time').time()
             if not found_item:
                 return jsonify({'acao':'nao_encontrado','codigo':codigo,
                     'mensagem':'Pedido {} nao encontrado.'.format(codigo)}), 404
