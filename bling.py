@@ -3035,14 +3035,23 @@ class WebServer:
         def auth():
             from flask import redirect
             import secrets
-            
-            # 1. GERAÇÃO DO STATE (REGRA DE OURO)
-            state = secrets.token_urlsafe(32)
+
+            # Debug: log exact credentials being used
+            cid = self.orchestrator.auth.config.CLIENT_ID
+            ruri = self.orchestrator.auth.config.REDIRECT_URI
+            logger.info(f"🔐 /auth iniciado | CLIENT_ID: {cid[:8]}...{cid[-4:] if len(cid)>12 else cid} | REDIRECT_URI: {ruri}")
+
+            if not cid or not ruri:
+                missing = []
+                if not cid: missing.append('BLING_CLIENT_ID')
+                if not ruri: missing.append('BLING_REDIRECT_URI')
+                logger.error(f"❌ Variáveis faltando no Render: {', '.join(missing)}")
+                return f"Erro: configure {', '.join(missing)} nas variáveis de ambiente do Render.", 500
+
+            state    = secrets.token_urlsafe(32)
             self.orchestrator.auth._save_oauth_state(state)
-            
-            # 2. Constrói a URL de autorização usando o AuthManager
             auth_url = self.orchestrator.auth.create_auth_flow(state)
-            
+            logger.info(f"🔗 Redirecionando para Bling OAuth: {auth_url[:80]}...")
             return redirect(auth_url)
 
         # Rota /api/webhook mantida como alias para /webhook (retrocompatibilidade)
@@ -3777,18 +3786,23 @@ class WebServer:
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
-            code = request.args.get('code')
+            code  = request.args.get('code')
             state = request.args.get('state')
-            
+            error = request.args.get('error')
+
+            if error:
+                logger.error(f"❌ Bling retornou erro no OAuth: {error} — {request.args.get('error_description','')}")
+                return f"Erro Bling OAuth: {error}. Tente novamente em /auth", 400
+
             logger.info("🔐 Callback OAuth recebido.")
-            
+
             if not code:
                 logger.error("Código de autorização OAuth não recebido.")
                 return "Erro: Código de autorização não recebido.", 400
-                
+
             if not self.orchestrator.auth._validate_oauth_state(state):
-                logger.error("State OAuth inválido ou expirado.")
-                return "Erro: State inválido ou expirado.", 403
+                logger.error(f"State OAuth inválido. Recebido: {state[:10] if state else 'None'}...")
+                return "Erro: State inválido ou expirado. Acesse /auth novamente.", 403
 
             success = self.orchestrator.auth.exchange_code_for_token(code)
 
@@ -3806,7 +3820,7 @@ class WebServer:
                 return redirect('/')
             else:
                 logger.error("Falha ao trocar código OAuth pelo token.")
-                return "Erro ao trocar código pelo token.", 500
+                return "Erro ao trocar código pelo token. Verifique os logs.", 500
 
         # Rota de Busca com correção de 404 e Imagem
         @self.app.route('/api/products/search')
