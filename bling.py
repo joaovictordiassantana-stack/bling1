@@ -830,26 +830,12 @@ class BlingAPIClient:
                 self.logger.warning(f"⚠️ Token expirado/inválido ({e.response.status_code}) em {endpoint} — tentando refresh automático...")
                 try:
                     if self.auth.refresh_token():
-                        self.logger.info("✅ Token renovado — re-tentando requisição imediatamente.")
-                        try:
-                            new_token = self.auth._access_token
-                            # Atualiza o header de autorização no kwargs original e re-tenta
-                            kwargs['headers']['Authorization'] = f'Bearer {new_token}'
-                            retry_resp = self.session.request(method, url, timeout=45, **kwargs)
-                            retry_resp.raise_for_status()
-                            return retry_resp.json()
-                        except Exception as _re:
-                            self.logger.error(f"Re-tentativa após refresh falhou: {_re}")
-                            # Se o retry também falhou com 403, o refresh_token expirou
-                            # Força limpeza dos tokens para obrigar re-autenticação
-                            if '403' in str(_re) or 'Forbidden' in str(_re):
-                                self.logger.error("🔐 Refresh token expirado. AÇÃO NECESSÁRIA: Acesse /auth para re-autenticar com o Bling.")
-                                self.auth._access_token  = None
-                                self.auth._refresh_token = None
-                                self.auth._expires_at    = 0
-                            return None
+                        self.logger.info("✅ Token renovado automaticamente — repetindo requisição.")
+                        # Retry once after refresh
+                        self._access_token = self.auth._access_token
+                        return None  # Caller will retry on next cycle
                     else:
-                        self.logger.error("❌ Refresh falhou — acesse /auth para re-autenticar.")
+                        self.logger.error("❌ Refresh de token falhou — re-autenticação necessária.")
                 except Exception as _re:
                     self.logger.error(f"Erro no auto-refresh: {_re}")
             self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
@@ -1026,13 +1012,6 @@ class AuthManager:
             'client_id': self.config.CLIENT_ID,
             'state': state,
             'redirect_uri': self.config.REDIRECT_URI,
-            'scope': (
-                'produtos:read produtos:write '
-                'pedidos:read pedidos:write '
-                'estoques:read estoques:write '
-                'contatos:read contatos:write '
-                'notafiscal:read notafiscal:write'
-            ),
         }
         
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"
@@ -1488,41 +1467,17 @@ class ProductionTimer:
         """
         changed = False
         now = time.time()
-        MAX_TIMER_SECONDS = 30 * 24 * 3600   # 30 dias — cap máximo razoável
-        CLEANUP_AFTER     = 60 * 24 * 3600   # 60 dias — remove timers abandonados
-
-        stale_keys = []
-        for k, v in list(self.timers.items()):
-            acc = v.get('accumulated', 0)
-
-            # Remove timers muito antigos (>60 dias abandonados)
-            if acc > CLEANUP_AFTER:
-                logger.info(f"🗑️ Timer '{k[:40]}' removido (>60d sem conclusao).")
-                stale_keys.append(k)
-                changed = True
-                continue
-
+        for k, v in self.timers.items():
             if v.get('state') == 'running':
                 start_ts = v.get('start_ts', 0)
                 if start_ts and start_ts > 0:
-                    v['accumulated'] = acc + (now - start_ts)
-
-                # Cap: pausa timers que excedem 30 dias
-                if v['accumulated'] > MAX_TIMER_SECONDS:
-                    logger.warning(f"⏰ Timer '{k[:50]}' excedeu 30d — pausado automaticamente.")
-                    v['state']    = 'paused'
-                    v['start_ts'] = 0
-                    changed = True
-                    continue
-
+                    # Soma o tempo decorrido desde o último checkpoint
+                    v['accumulated'] = v.get('accumulated', 0) + (now - start_ts)
+                # Retoma imediatamente — timer continua rodando
                 v['start_ts'] = now
-                v['state']    = 'running'
+                v['state'] = 'running'
                 changed = True
                 logger.info(f"▶️ Restart: timer '{k}' retomado automaticamente ({int(v['accumulated'])}s acumulados).")
-
-        for k in stale_keys:
-            del self.timers[k]
-
         if changed:
             self._save()
 
@@ -3035,23 +2990,14 @@ class WebServer:
         def auth():
             from flask import redirect
             import secrets
-
-            # Debug: log exact credentials being used
-            cid = self.orchestrator.auth.config.CLIENT_ID
-            ruri = self.orchestrator.auth.config.REDIRECT_URI
-            logger.info(f"🔐 /auth iniciado | CLIENT_ID: {cid[:8]}...{cid[-4:] if len(cid)>12 else cid} | REDIRECT_URI: {ruri}")
-
-            if not cid or not ruri:
-                missing = []
-                if not cid: missing.append('BLING_CLIENT_ID')
-                if not ruri: missing.append('BLING_REDIRECT_URI')
-                logger.error(f"❌ Variáveis faltando no Render: {', '.join(missing)}")
-                return f"Erro: configure {', '.join(missing)} nas variáveis de ambiente do Render.", 500
-
-            state    = secrets.token_urlsafe(32)
+            
+            # 1. GERAÇÃO DO STATE (REGRA DE OURO)
+            state = secrets.token_urlsafe(32)
             self.orchestrator.auth._save_oauth_state(state)
+            
+            # 2. Constrói a URL de autorização usando o AuthManager
             auth_url = self.orchestrator.auth.create_auth_flow(state)
-            logger.info(f"🔗 Redirecionando para Bling OAuth: {auth_url[:80]}...")
+            
             return redirect(auth_url)
 
         # Rota /api/webhook mantida como alias para /webhook (retrocompatibilidade)
@@ -3786,23 +3732,18 @@ class WebServer:
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
-            code  = request.args.get('code')
+            code = request.args.get('code')
             state = request.args.get('state')
-            error = request.args.get('error')
-
-            if error:
-                logger.error(f"❌ Bling retornou erro no OAuth: {error} — {request.args.get('error_description','')}")
-                return f"Erro Bling OAuth: {error}. Tente novamente em /auth", 400
-
+            
             logger.info("🔐 Callback OAuth recebido.")
-
+            
             if not code:
                 logger.error("Código de autorização OAuth não recebido.")
                 return "Erro: Código de autorização não recebido.", 400
-
+                
             if not self.orchestrator.auth._validate_oauth_state(state):
-                logger.error(f"State OAuth inválido. Recebido: {state[:10] if state else 'None'}...")
-                return "Erro: State inválido ou expirado. Acesse /auth novamente.", 403
+                logger.error("State OAuth inválido ou expirado.")
+                return "Erro: State inválido ou expirado.", 403
 
             success = self.orchestrator.auth.exchange_code_for_token(code)
 
@@ -3820,7 +3761,7 @@ class WebServer:
                 return redirect('/')
             else:
                 logger.error("Falha ao trocar código OAuth pelo token.")
-                return "Erro ao trocar código pelo token. Verifique os logs.", 500
+                return "Erro ao trocar código pelo token.", 500
 
         # Rota de Busca com correção de 404 e Imagem
         @self.app.route('/api/products/search')
@@ -3912,28 +3853,13 @@ class WebServer:
 
         @self.app.route('/api/status')
         def api_status():
-            """HTTP status — also tries to reload token from disk if memory token expired."""
-            import time as _t
-            auth = self.orchestrator.auth
-            # Try memory token first
-            auth_ok = bool(auth._access_token and auth._expires_at > _t.time() + 30)
-            # If not OK, try loading from disk (handles restart without re-auth)
-            if not auth_ok:
-                try:
-                    auth.reload_tokens_from_disk()
-                    auth_ok = bool(auth._access_token and auth._expires_at > _t.time() + 30)
-                except Exception:
-                    pass
-            # If still not OK, try refresh
-            if not auth_ok and auth._refresh_token:
-                try:
-                    if auth.refresh_token():
-                        auth_ok = True
-                except Exception:
-                    pass
+            """HTTP status endpoint — used by frontend as fallback when WS is slow."""
+            auth_ok = (self.orchestrator.auth._access_token and
+                       self.orchestrator.auth._expires_at > __import__('time').time() + 60)
+            ps = pending_orders.get_production_snapshot() if hasattr(pending_orders, 'get_production_snapshot') else {}
             return jsonify({
-                'authenticated': auth_ok,
-                'auth_url':      auth.get_auth_url(),
+                'authenticated': bool(auth_ok),
+                'auth_url':      self.orchestrator.auth.get_auth_url(),
                 'production': {
                     'waiting':       len(pending_orders.get_waiting()),
                     'in_production': len(pending_orders.get_in_production()),
@@ -5193,9 +5119,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 };
                 const stageBadge = stageBadges[setor] || stageBadges['in_production'];
 
-                                // Next action
-                let btnLabel = (setor === 'marcenaria') ? 'Próximo: Tapeçaria' : 
-                               (setor === 'tapecaria')  ? 'Próximo: Finalizar' : 'Próximo: Concluir';
+                // Next action
+                // Buttons removed — scan only
+                
+                
+                
 
                 // Urgência
                 let urgBadge = '';
@@ -5696,15 +5624,11 @@ def create_app() -> Flask:
     # CRÍTICO: Sempre configure FLASK_SECRET_KEY como variável de ambiente em produção.
     _secret = os.environ.get('FLASK_SECRET_KEY')
     if not _secret:
-        # Derive stable key from MongoDB URI (persistent across restarts)
-        # This prevents OAuth state cookie invalidation
-        import hashlib as _hl
-        _seed = (os.environ.get('MONGODB_URI') or os.environ.get('MONGO_URI') or 'sw-moveis-mdf-fallback-2026')
-        _secret = _hl.sha256(_seed.encode()).hexdigest()
         logger.warning(
-            "⚠️  FLASK_SECRET_KEY não configurada! Usando chave estável derivada do MongoDB URI. "
-            "Configure FLASK_SECRET_KEY no Render para máxima segurança."
+            "⚠️  FLASK_SECRET_KEY não configurada! Usando chave temporária gerada aleatoriamente. "
+            "Configure essa variável em produção para evitar invalidação de sessões ao reiniciar."
         )
+        _secret = secrets.token_hex(32)
     flask_app.config['SECRET_KEY'] = _secret
     
     # 4. Inicializa o WebServer (Rotas e WebSockets)
