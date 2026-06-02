@@ -1440,24 +1440,20 @@ class ProductionTimer:
             return {}
 
     def _save(self):
-        """Salva timers no MongoDB (primário). Arquivo só como fallback sem Mongo."""
+        """Salva timers — MongoDB E arquivo local (dupla redundância)."""
         if MONGO_AVAILABLE:
             try:
                 MongoStore.set('production_timers', {'timers': self.timers}, 'timers', replace=True)
-                return  # MongoDB OK — não precisa de arquivo
             except Exception as e:
                 logger.error(f"Erro ao salvar timers no MongoDB: {e}")
-        # Fallback: arquivo local (só quando MongoDB indisponível)
-        if not MONGO_AVAILABLE:
-            temp_file = self.FILE_PATH.with_suffix('.tmp')
-            try:
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.timers, f, indent=4, ensure_ascii=False)
-                import shutil
-                shutil.move(str(temp_file), str(self.FILE_PATH))
-            except Exception as e:
-                logger.warning(f"Fallback timer arquivo: {e}")
-
+        # Sempre salva no arquivo também (seguro contra falha do MongoDB)
+        temp_file = self.FILE_PATH.with_suffix('.tmp')
+        try:
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(self.timers, f, indent=4, ensure_ascii=False)
+            shutil.move(str(temp_file), str(self.FILE_PATH))
+        except Exception as e:
+            logger.error(f"Erro ao salvar timers em arquivo: {e}")
 
     def _auto_pause_on_restart(self):
         """
@@ -1965,19 +1961,9 @@ class PendingOrdersManager:
     """
     FILE_PATH = DATA_DIR / 'pending_orders.json'
 
-    # Palavras-chave que identificam produtos de ESTEIRA (cadeiras/poltronas — 3 leituras).
-    # REGRA: deve conter UMA dessas palavras E ser reconhecidamente uma cadeira/poltrona.
-    # Palavras genéricas como EVIDENCE/BERLIN sozinhas classificam LAVATÓRIO EVIDENCE errado.
     ESTEIRA_KW = frozenset([
-        'CADEIRA','POLTRONA',
-        'HIDRÁULICA','HIDRAULICA',
-        'RECLINÁVEL','RECLINAVEL',
-    ])
-    # Palavras que EXCLUEM da esteira mesmo se ESTEIRA_KW der match
-    ESTEIRA_EXCL = frozenset([
-        'LAVATÓRIO','LAVATORIO','ARMÁRIO','ARMARIO',
-        'BANCADA','BALCÃO','BALCAO','CARRINHO','ESPELHO',
-        'PAINEL','NICHO','PRATELEIRA','GABINETE',
+        'CADEIRA','POLTRONA','EVIDENCE','BERLIN','MADRID','DIAMANTE',
+        'HIDRÁULICA','HIDRAULICA','RECLINÁVEL','RECLINAVEL',
     ])
     ESTEIRA_TRANSITIONS = {'waiting': 'marcenaria', 'marcenaria': 'tapecaria', 'tapecaria': 'done'}
     SIMPLES_TRANSITIONS = {'waiting': 'in_production', 'in_production': 'done'}
@@ -1985,12 +1971,7 @@ class PendingOrdersManager:
 
     @classmethod
     def _is_esteira(cls, nome: str) -> bool:
-        """Retorna True APENAS se for cadeira/poltrona real (não lavatório/móvel MDF)."""
-        n = nome.upper()
-        # Se contém palavra de exclusão, nunca é esteira
-        if any(excl in n for excl in cls.ESTEIRA_EXCL):
-            return False
-        return any(k in n for k in cls.ESTEIRA_KW)
+        return any(k in nome.upper() for k in cls.ESTEIRA_KW)
 
     @classmethod
     def _next_state(cls, current: str, nome: str) -> Optional[str]:
@@ -3493,7 +3474,7 @@ class WebServer:
             found_item = None
             if ikey_ov and ikey_ov in pending_orders.data:
                 item = pending_orders.data[ikey_ov]
-                if item.get('status') not in ('done',):
+                if item.get('status') != 'done':
                     found_key = ikey_ov
                     found_item = item
             if not found_item and codigo:
@@ -3502,27 +3483,10 @@ class WebServer:
                         continue
                     pnum = str(item.get('pedido_numero','') or item.get('order_id','') or '')
                     op   = str(item.get('ordem_producao','') or '')
-                    # Each product is unique — match by item_key OR barcode
                     if codigo in (pnum, op, key):
                         found_key = key
                         found_item = item
                         break
-
-            # Anti-dup: each item has a unique scan_state tracking
-            # 'scan_state' advances only ONCE per step per item
-            if found_item and found_key:
-                cur_status = found_item.get('status', 'waiting')
-                scan_key   = f"scan_{found_key}_{cur_status}"
-                # Use a short TTL flag in the item itself to prevent double-scan
-                if found_item.get('_last_scan_key') == scan_key:
-                    import time as _t
-                    last_scan_ts = found_item.get('_last_scan_ts', 0)
-                    if _t.time() - last_scan_ts < 5:  # 5s debounce per item per state
-                        return jsonify({'acao':'ja_lido_etapa','codigo':codigo,
-                            'mensagem':f'Produto já foi lido nesta etapa. Aguarde.'}), 200
-                # Mark this scan
-                found_item['_last_scan_key'] = scan_key
-                found_item['_last_scan_ts']  = __import__('time').time()
             if not found_item:
                 return jsonify({'acao':'nao_encontrado','codigo':codigo,
                     'mensagem':'Pedido {} nao encontrado.'.format(codigo)}), 404
@@ -3850,22 +3814,6 @@ class WebServer:
 
             all_list = [normalize_for_api(p) for p in kits + products]
             return jsonify(all_list)
-
-        @self.app.route('/api/status')
-        def api_status():
-            """HTTP status endpoint — used by frontend as fallback when WS is slow."""
-            auth_ok = (self.orchestrator.auth._access_token and
-                       self.orchestrator.auth._expires_at > __import__('time').time() + 60)
-            ps = pending_orders.get_production_snapshot() if hasattr(pending_orders, 'get_production_snapshot') else {}
-            return jsonify({
-                'authenticated': bool(auth_ok),
-                'auth_url':      self.orchestrator.auth.get_auth_url(),
-                'production': {
-                    'waiting':       len(pending_orders.get_waiting()),
-                    'in_production': len(pending_orders.get_in_production()),
-                    'done':          len(pending_orders.get_done()),
-                }
-            })
 
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
@@ -4286,9 +4234,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .sw-toast.info    { border-left-color: #6366f1; }
 
         .hidden { display: none !important; }
-        /* Auth-required visible by default until JS confirms auth */
-        #content-tabs { display: none; }
-        #auth-required-tabs { display: block; }
         .sw-pattern-bar { height: 4px; background: linear-gradient(90deg, var(--sw-yellow) 0%, #fff 50%, var(--sw-yellow) 100%); }
 
         /* Setor badge */
@@ -4310,19 +4255,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <div class="container-fluid px-4 py-4">
 
         <!-- AUTH REQUIRED -->
-        <!-- AUTH REQUIRED — sempre visível até autenticação confirmada -->
-        <div id="auth-required-tabs" class="mt-4" style="display:block">
-            <div class="text-center py-5">
-                <div style="font-size:4rem;margin-bottom:16px">🔐</div>
-                <h3 class="fw-bold mb-2">Autenticação necessária</h3>
-                <p class="text-muted mb-4">Conecte sua conta Bling para acessar o painel de produção SW Móveis MDF.</p>
-                <a id="auth-link-main" href="/auth" class="btn btn-warning btn-lg fw-bold px-5" style="border-radius:50px;font-size:1.1rem">
-                    🔗 Autenticar com Bling
-                </a>
-                <div class="mt-3" id="connect-status" style="font-size:.82rem;color:#888">
-                    ⏳ Verificando conexão...
-                </div>
-            </div>
+        <div id="auth-required-tabs" class="alert alert-warning hidden mt-3">
+            🔐 Autentique-se para acessar o painel.
         </div>
 
         <!-- TABS PRINCIPAIS -->
@@ -4642,24 +4576,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const tabs   = document.getElementById('content-tabs');
             const authEl = document.getElementById('auth-required-tabs');
             if (badge) {
-                badge.textContent = authenticated ? '✅ Autenticado' : '⚠️ Não autenticado — clique em Autenticar';
+                badge.textContent = authenticated ? '✅ Autenticado' : '⚠️ Não autenticado';
                 badge.className   = 'badge ' + (authenticated ? 'bg-success' : 'bg-warning text-dark');
             }
-            if (authUrl) {
-                const lnk = document.getElementById('auth-link');
-                if (lnk) lnk.href = authUrl;
-            }
-            if (link)   link.style.display = authenticated ? 'none' : 'inline-block';
+            if (link)   link.style.display   = authenticated ? 'none' : '';
             if (tabs)   tabs.classList.toggle('hidden', !authenticated);
-            // Always show auth-required section when NOT authenticated
-            // Show/hide auth-required section
-            if (authEl) {
-                authEl.style.display = authenticated ? 'none' : 'block';
-            }
-            // Show/hide main content tabs
-            if (tabs) {
-                tabs.style.display = authenticated ? 'block' : 'none';
-            }
+            if (authEl) authEl.classList.toggle('hidden', !!authenticated);
         }
 
         /* ── Setor classifier ── */
@@ -5510,45 +5432,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             // Default board tab = Em Espera
             switchBoardTab('waiting');
 
-            // HTTP fallback: check auth status immediately (don't wait for WS)
-            // This ensures the page shows content even if WS is slow to connect
-            (async () => {
-                try {
-                    const r = await fetch('/api/status');
-                    if (r.ok) {
-                        const d = await r.json();
-                        updateAuthStatus(d.authenticated, d.auth_url);
-                        // Update connect status message
-                        const cs = document.getElementById('connect-status');
-                        if (cs) cs.textContent = d.authenticated ? '✅ Autenticado' : '⚠️ Token expirado — clique em Autenticar';
-                        // Update main auth link href
-                        const aml = document.getElementById('auth-link-main');
-                        if (aml && d.auth_url) aml.href = d.auth_url;
-
-                        if (d.authenticated && !_wsFirstAuthDone) {
-                            _wsFirstAuthDone = true;
-                            _onAuthConfirmed();
-                        }
-                        // Update production KPI badges from HTTP
-                        if (d.production) {
-                            const set = (id,v) => { const el=document.getElementById(id); if(el) el.textContent=v; };
-                            set('kpi-waiting', d.production.waiting||0);
-                            set('kpi-inprod',  d.production.in_production||0);
-                            set('kpi-done',    d.production.done||0);
-                            set('waiting-count-badge', d.production.waiting||0);
-                            set('inprod-count-badge',  d.production.in_production||0);
-                            set('done-count-badge',    d.production.done||0);
-                        }
-                    }
-                } catch(e) {
-                    console.warn('HTTP status check failed:', e);
-                    const cs = document.getElementById('connect-status');
-                    if (cs) cs.textContent = '⚠️ Erro de conexão — tente recarregar a página';
-                }
-                // Always connect WS regardless of HTTP check result
-                _connectKpiWs();
-            })();
-
             document.querySelector('[data-bs-target="#tab-dashboard"]')?.addEventListener('shown.bs.tab', loadKPIChart);
             document.querySelector('[data-bs-target="#tab-producao"]')?.addEventListener('shown.bs.tab', () => {
                 loadProductionBoard();
@@ -5587,6 +5470,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _wsLogs.onerror = () => _wsLogs.close();
             }
             _connectWsLogs();
+            _connectKpiWs();
         });
     </script>
 </body>
