@@ -5193,11 +5193,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 };
                 const stageBadge = stageBadges[setor] || stageBadges['in_production'];
 
-                // Next action
-                // Buttons removed — scan only
-                
-                
-                
+                                // Next action
+                let btnLabel = (setor === 'marcenaria') ? 'Próximo: Tapeçaria' : 
+                               (setor === 'tapecaria')  ? 'Próximo: Finalizar' : 'Próximo: Concluir';
 
                 // Urgência
                 let urgBadge = '';
