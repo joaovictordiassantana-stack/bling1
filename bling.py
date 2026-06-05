@@ -1005,13 +1005,6 @@ class AuthManager:
             'client_id': self.config.CLIENT_ID,
             'state': state,
             'redirect_uri': self.config.REDIRECT_URI,
-            'scope': (
-                'produtos:read produtos:write '
-                'pedidos:read pedidos:write '
-                'estoques:read estoques:write '
-                'contatos:read contatos:write '
-                'notafiscal:read notafiscal:write'
-            ),
         }
         
         return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"
