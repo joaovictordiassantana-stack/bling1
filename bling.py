@@ -1926,13 +1926,69 @@ def _extract_base_cor(nome: str):
 
 class PendingOrdersManager:
     """
-    Gerencia pedidos do Bling que chegaram e estão aguardando produção.
-    Persiste no MongoDB (principal) ou arquivo (fallback).
+    FSM de produção com esteira por tipo de produto.
+    CADEIRAS: waiting→marcenaria→tapecaria→done (3 leituras)
+    MDF/OUTROS: waiting→in_production→done (2 leituras)
     """
     FILE_PATH = DATA_DIR / 'pending_orders.json'
 
+    # Palavras-chave que identificam cadeiras/poltronas (esteira 3 etapas)
+    ESTEIRA_KW = frozenset([
+        'CADEIRA','POLTRONA','HIDRÁULICA','HIDRAULICA',
+        'RECLINÁVEL','RECLINAVEL',
+    ])
+    # Palavras que EXCLUEM da esteira mesmo com KW match
+    ESTEIRA_EXCL = frozenset([
+        'LAVATÓRIO','LAVATORIO','ARMÁRIO','ARMARIO',
+        'BANCADA','BALCÃO','BALCAO','CARRINHO',
+        'ESPELHO','PAINEL','NICHO','PRATELEIRA','GABINETE',
+    ])
+    ESTEIRA_TRANSITIONS = {'waiting':'marcenaria','marcenaria':'tapecaria','tapecaria':'done'}
+    SIMPLES_TRANSITIONS = {'waiting':'in_production','in_production':'done'}
+    ACTIVE_STATES       = {'waiting','in_production','marcenaria','tapecaria'}
+
+    @classmethod
+    def _is_esteira(cls, nome):
+        n = nome.upper()
+        if any(e in n for e in cls.ESTEIRA_EXCL): return False
+        return any(k in n for k in cls.ESTEIRA_KW)
+
+    @classmethod
+    def _next_state(cls, current, nome):
+        if cls._is_esteira(nome): return cls.ESTEIRA_TRANSITIONS.get(current)
+        return cls.SIMPLES_TRANSITIONS.get(current)
+
+    def advance_production(self, item_key, tempo_segundos=None):
+        item = self.data.get(item_key)
+        if not item: return None
+        current = item.get('status','waiting')
+        nome    = item.get('nome') or item.get('nome_original','')
+        target  = self._next_state(current, nome)
+        if not target: return None
+        now = datetime.now()
+        item['status']       = target
+        item['setor']        = target if target not in ('done',) else item.get('setor','')
+        item[f'ts_{target}'] = now.isoformat()
+        if current == 'waiting':
+            item['started_at'] = now.isoformat()
+        if target == 'done':
+            item['finished_at']   = now.isoformat()
+            item['mes_conclusao'] = now.strftime('%Y-%m')
+            if tempo_segundos: item['tempo_producao'] = int(tempo_segundos)
+        self._save_one(item_key)
+        logger.info(f"FSM: '{nome[:35]}' {current}→{target}")
+        return item
+
+    def start_production(self, item_key, setor='tapecaria'):
+        return self.advance_production(item_key)
+
+    def finish_production(self, item_key, tempo_segundos=None):
+        return self.advance_production(item_key, tempo_segundos=tempo_segundos)
+
     def __init__(self):
         self.data = self._load()
+        self._op_cache = {}
+        self._op_cache_lock = __import__('threading').Lock()
         self._restore_in_production_to_waiting()
         self._op_cache     = {}   # oid -> {numero_op, situacao, previsao}
         self._op_cache_ts  = 0.0  # timestamp do último refresh
@@ -2076,7 +2132,7 @@ class PendingOrdersManager:
 
     def get_in_production(self):
         """Retorna todos os itens em produção."""
-        return [v for v in self.data.values() if v.get('status') == 'in_production']
+        return [v for v in self.data.values() if v.get('status') in ('in_production','marcenaria','tapecaria')]
 
     def get_done(self):
         """Retorna todos os itens concluídos no mês atual."""
@@ -3571,6 +3627,17 @@ class WebServer:
                     found_item = item
                     break
 
+            # Anti-dup: 5s debounce por item por estado
+            if found_item and found_key:
+                import time as _t
+                cur_st   = found_item.get('status','waiting')
+                scan_key = '{}:{}'.format(found_key, cur_st)
+                if found_item.get('_last_scan_key') == scan_key and (_t.time() - found_item.get('_last_scan_ts',0)) < 5:
+                    return jsonify({'acao':'ja_lido_etapa','codigo':codigo,
+                        'mensagem':'Produto ja lido nesta etapa. Aguarde 5s.'})
+                found_item['_last_scan_key'] = scan_key
+                found_item['_last_scan_ts']  = _t.time()
+
             if not found_item:
                 return jsonify({
                     'acao': 'nao_encontrado',
@@ -4889,6 +4956,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /* ══ IMPRESSÃO ══ */
         @media print {
             body > *:not(#print-area) { display: none !important; }
+            nav, footer, .sw-pattern-bar { display: none !important; }
+            #print-area {
+                display: block !important;
+                position: fixed !important;
+                inset: 0 !important;
+                background: #fff !important;
+                z-index: 999999 !important;
+                padding: 0 !important;
+            }
+            #print-area * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+            @page { size: A4; margin: 10mm; }
+        }
             #print-area {
                 display: block !important;
                 position: fixed; inset: 0;
@@ -4915,14 +4994,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <div id="scanner-indicator">📡 Lendo código...</div>
 
     <!-- CÂMERA SCANNER MODAL -->
-    <div class="modal fade" id="cameraScanModal" tabindex="-1">
-        <div class="modal-dialog modal-dialog-centered" style="max-width:400px;">
-            <div class="modal-content border-0 shadow-lg">
-                <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
-                    <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">📷 Scanner de Câmera</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="stopCameraScanner()"></button>
-                </div>
-                <div class="modal-body p-0 bg-black text-center" style="min-height:280px;position:relative;">
+    <div class="modal-body p-0 bg-black text-center" style="min-height:280px;position:relative;">
                     <video id="camera-preview" style="width:100%;max-height:280px;object-fit:cover;display:block;"></video>
                     <div id="camera-scan-result" style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.7);color:#fff;padding:8px;font-size:.85rem;display:none;"></div>
                     <div id="camera-aim" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:200px;height:80px;border:2px solid #ffb600;border-radius:4px;pointer-events:none;"></div>
@@ -6204,11 +6276,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             ${jaLido
                                 ? `<div class="bc-lido-overlay">✅ CÓDIGO LIDO<br><small style="font-weight:400;font-size:.72rem;">Indo para Produzindo...</small></div>`
                                 : `<div class="mt-2 d-flex gap-2">
-                                    <button class="btn btn-success btn-sm fw-bold flex-grow-1"
-                                        data-ikey="${ikey}" data-pnome="${escapeHtml(item.nome||item.nome_original||'')}" data-op="${escapeHtml(String(op))}"
-                                        onclick="scanOrStartWaiting(this)">
-                                        ▶ Iniciar Produção
-                                    </button>
+                                    
                                     <button class="btn btn-outline-secondary btn-sm" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -6254,36 +6322,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        async function scanOrStartWaiting(btn) {
-            const ikey  = btn.dataset.ikey;
-            const pnome = btn.dataset.pnome;
-            const op    = btn.dataset.op;
-            if (!ikey) return;
-            if (_scannedThisSession.has(ikey + ':waiting')) {
-                showToast('Aviso', 'Este pedido já foi iniciado nesta sessão.', 'warning');
-                return;
-            }
-            btn.disabled = true;
-            btn.textContent = '⏳...';
-            try {
-                const res = await fetch('/api/pending-orders/start', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome })
-                });
-                if (!res.ok) throw new Error('Erro servidor');
-                _scannedThisSession.add(ikey + ':waiting');
-                showToast('🚀 Iniciado', pnome, 'success');
-                // Registra componentes automaticamente
-                _autoRegisterComponents(pnome, ikey);
-                await loadProductionBoard();
-                switchBoardTab('inprod');
-            } catch(e) {
-                btn.disabled = false; btn.textContent = '▶ Iniciar Produção';
-                showToast('Erro', 'Falha ao iniciar produção', 'danger');
-            }
-        }
-
-        /* ── ABA PRODUZINDO: cards com barcode + timer, leitura única ── */
+        async 
         function _renderInProd(items) {
             const div = document.getElementById('board-inprod');
             if (!div) return;
@@ -6355,11 +6394,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         ${jaLido
                             ? `<div class="bc-lido-overlay">✅ CONCLUÍDO!<br><small style="font-weight:400;font-size:.72rem;">Registrado com sucesso</small></div>`
                             : `<div class="mt-2">
-                                <button class="btn btn-danger btn-sm fw-bold w-100"
-                                    data-ikey="${ikey}" data-pnome="${escapeHtml(nome)}" data-tkey="${encodeURIComponent(tkey)}"
-                                    onclick="scanOrFinishInProd(this)">
-                                    ✅ Concluir Produção
-                                </button>
+                                
                                </div>`
                         }
                     </div>
@@ -6367,6 +6402,25 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
             html += '</div>';
             div.innerHTML = html;
+            // Render barcodes after DOM update (JsBarcode fails on hidden elements)
+            function _renderBcInProd() {
+                (items||[]).forEach(item => {
+                    const ikey = item.item_key || '';
+                    const op   = String(item.ordem_producao || item.pedido_numero || item.order_id || '');
+                    if (!op) return;
+                    const svgEl = document.getElementById('bci_' + ikey.replace(/[^a-z0-9]/gi,'_'));
+                    if (!svgEl) return;
+                    const panel = document.getElementById('board-inprod');
+                    if (panel && panel.style.display === 'none') return;
+                    try {
+                        JsBarcode(svgEl, op, {format:'CODE128',width:2.2,height:60,
+                            displayValue:true,fontSize:12,margin:5,background:'#fff',lineColor:'#000'});
+                    } catch(e) { if(svgEl) svgEl.innerHTML = '<text x="4" y="16" font-size="11">' + op + '</text>'; }
+                });
+            }
+            setTimeout(_renderBcInProd, 100);
+            setTimeout(_renderBcInProd, 500);
+            window._lastInProdItems = items;
 
             // Renderiza barcodes
             filtered.forEach(item => {
@@ -6383,36 +6437,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /* Botão "Concluir" ou leitura via scanner — anti-duplicação */
-        async function scanOrFinishInProd(btn) {
-            const ikey  = btn.dataset.ikey;
-            const pnome = btn.dataset.pnome;
-            const tkey  = decodeURIComponent(btn.dataset.tkey || '');
-            if (!ikey) return;
-            if (_scannedThisSession.has(ikey + ':inprod')) {
-                showToast('Aviso', 'Este pedido já foi concluído nesta sessão.', 'warning');
-                return;
-            }
-            btn.disabled = true; btn.textContent = '⏳...';
-            try {
-                const res = await fetch('/api/pending-orders/finish', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome, timer_key: tkey||null })
-                });
-                if (!res.ok) throw new Error('Erro servidor');
-                const result = await res.json();
-                _scannedThisSession.add(ikey + ':inprod');
-                const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
-                showToast('✅ Concluído!', pnome + tempoFmt, 'success');
-                await loadProductionBoard();
-                await refreshComponentTab();
-                switchBoardTab('done');
-            } catch(e) {
-                btn.disabled = false; btn.textContent = '✅ Concluir Produção';
-                showToast('Erro', 'Falha ao concluir produção', 'danger');
-            }
-        }
-
-        /* ── ABA CONCLUÍDOS: tabela simples ── */
+        async 
         function _renderDone(items) {
             const div = document.getElementById('board-done');
             if (!div) return;
@@ -6651,6 +6676,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
          *  2ª leitura (Produzindo)  → conclui produção
          *  Anti-duplicação: _scannedThisSession por item+etapa
          *  ════════════════════════════════════════════════════ */
+        const LEITOR_CONFIG = {
+            'R1-': {nome:'Leitor 1 — Entrada',   cor:'#ffb600'},
+            'R2-': {nome:'Leitor 2 — Marcenaria', cor:'#f59e0b'},
+            'R3-': {nome:'Leitor 3 — Tapecaria',  cor:'#8b5cf6'},
+            'R4-': {nome:'Leitor 4 — Conclusao',  cor:'#10b981'},
+        };
+        let _lastLeitor = null;
+        function _detectLeitor(codigo) {
+            for (const [prefix, cfg] of Object.entries(LEITOR_CONFIG)) {
+                if (codigo.startsWith(prefix)) {
+                    return {...cfg, prefix, codigoPuro: codigo.slice(prefix.length)};
+                }
+            }
+            return {nome:'Leitor Universal', cor:'#6366f1', prefix:'', codigoPuro: codigo};
+        }
+
         (function() {
             let _scanBuffer = '';
             let _scanTimer  = null;
@@ -6686,12 +6727,23 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }
             });
 
-            async function _processScan(codigo) {
+            async function _processScan(codigoRaw) {
                 if (!isAuthenticated) {
-                    _showIndicator('Não autenticado', '#ef4444');
+                    _showIndicator('Nao autenticado', '#ef4444');
                     return;
                 }
-                _showIndicator('Lendo: ' + codigo, '#ffb600');
+                const leitor = _detectLeitor(codigoRaw);
+                const codigo = leitor.codigoPuro;
+                _lastLeitor  = leitor;
+                _showIndicator(leitor.nome + ' · #' + codigo, leitor.cor);
+                // Atualiza badge do leitor na navbar
+                const lb = document.getElementById('last-reader-badge');
+                if (lb) {
+                    lb.textContent = leitor.nome;
+                    lb.style.background = leitor.cor;
+                    lb.style.color = (leitor.cor === '#ffb600' || leitor.cor === '#f59e0b') ? '#000' : '#fff';
+                    lb.style.display = 'inline-block';
+                }
                 try {
                     const res = await fetch('/api/barcode/scan', {
                         method: 'POST',
@@ -6706,9 +6758,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         return;
                     }
 
-                    const acao   = result.acao;
-                    const ikey   = result.item_key || '';
-                    const nome   = result.nome || '';
+                    const acao        = result.acao || '';
+                    const ikey        = result.item_key || '';
+                    const nome        = result.nome || '';
+                    const statusAtual = result.status_atual || '';
+                    const label       = result.status_label || '';
+                    const isEsteira   = result.is_esteira || false;
 
                     if (acao === 'ja_lido_etapa') {
                         // Backend sinalizou que já foi processado nesta etapa
@@ -6717,7 +6772,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         return;
                     }
 
-                    if (acao === 'iniciado') {
+                    if (acao === 'avancado') {
+                        const colorMap = {marcenaria:'#f59e0b',tapecaria:'#8b5cf6',in_production:'#10b981'};
+                        const c = colorMap[result.status_atual] || '#10b981';
+                        _showIndicator((result.status_label||'Avancado') + ' · ' + nome.slice(0,25), c);
+                        showToast(result.status_label||'Avancado', nome + (result.is_esteira ? ' → Leia novamente para proxima etapa' : ''), 'success');
+                        await loadProductionBoard();
+                        switchBoardTab('inprod');
+                    } else if (acao === 'iniciado') {
                         // Marca no Set do front para bloquear botão visualmente
                         if (ikey) _scannedThisSession.add(ikey + ':waiting');
                         _showIndicator('✅ INICIADO — ' + nome, '#10b981');
@@ -7496,159 +7558,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         let _codeReader = null;
         let _cameraActive = false;
 
-        function openCameraScanner() {
-            if (!isAuthenticated) {
-                showToast('Aviso', 'Autentique-se antes de usar o scanner.', 'warning');
-                return;
-            }
-            // Verifica suporte a câmera
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                showToast('Aviso', 'Câmera não suportada neste dispositivo/browser.', 'warning');
-                return;
-            }
-            if (typeof ZXing === 'undefined') {
-                showToast('Aviso', 'Biblioteca ZXing não carregada. Use o scanner USB ou recarregue a página.', 'warning');
-                return;
-            }
-            const modal = new bootstrap.Modal(document.getElementById('cameraScanModal'));
-            modal.show();
-            setTimeout(_startCameraScanner, 400);
-        }
-
-        async function _startCameraScanner() {
-            const video = document.getElementById('camera-preview');
-            const resultBox = document.getElementById('camera-scan-result');
-            if (!video) return;
-
-            // Verifica se ZXing está disponível
-            if (typeof ZXing === 'undefined') {
-                if (resultBox) {
-                    resultBox.style.display = 'block';
-                    resultBox.textContent = '⚠️ Biblioteca de scanner não carregada. Usando scanner USB.';
-                }
-                return;
-            }
-
-            try {
-                _codeReader = new ZXing.BrowserMultiFormatReader();
-                _cameraActive = true;
-
-                // Lista câmeras disponíveis e prefere a traseira
-                const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
-                const backCam = devices.find(d =>
-                    d.label.toLowerCase().includes('back') ||
-                    d.label.toLowerCase().includes('tras') ||
-                    d.label.toLowerCase().includes('rear') ||
-                    d.label.toLowerCase().includes('environment')
-                ) || devices[devices.length - 1] || devices[0];
-
-                if (!backCam) {
-                    if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Nenhuma câmera encontrada.'; }
-                    return;
-                }
-
-                await _codeReader.decodeFromVideoDevice(backCam.deviceId, video, async (result, err) => {
-                    if (result && _cameraActive) {
-                        const codigo = result.getText();
-                        _cameraActive = false; // Para de ler após 1 leitura
-                        if (resultBox) {
-                            resultBox.style.display = 'block';
-                            resultBox.textContent = '⏳ Processando: ' + codigo;
-                            resultBox.style.background = 'rgba(255,182,0,.85)';
-                            resultBox.style.color = '#000';
-                        }
-                        // Envia para o backend (mesma lógica do scanner USB)
-                        try {
-                            const res = await fetch('/api/barcode/scan', {
-                                method: 'POST',
-                                headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify({ codigo })
-                            });
-                            const data = await res.json();
-                            const acao = data.acao || '';
-
-                            if (resultBox) {
-                                if (acao === 'iniciado') {
-                                    resultBox.style.background = 'rgba(16,185,129,.9)';
-                                    resultBox.style.color = '#fff';
-                                    resultBox.textContent = '✅ INICIADO: ' + (data.nome || codigo);
-                                    showToast('🚀 Iniciado!', data.nome + ' · #' + codigo, 'success');
-                                    setTimeout(() => { loadProductionBoard(); switchBoardTab('inprod'); }, 800);
-                                } else if (acao === 'concluido') {
-                                    resultBox.style.background = 'rgba(99,102,241,.9)';
-                                    resultBox.style.color = '#fff';
-                                    const tf = data.tempo_producao ? ' · ' + formatSeconds(data.tempo_producao) : '';
-                                    resultBox.textContent = '✅ CONCLUÍDO: ' + (data.nome || codigo) + tf;
-                                    showToast('✅ Concluído!', data.nome + tf, 'success');
-                                    setTimeout(() => { loadProductionBoard(); refreshComponentTab(); switchBoardTab('done'); }, 800);
-                                } else if (acao === 'ja_lido_etapa') {
-                                    resultBox.style.background = 'rgba(107,114,128,.85)';
-                                    resultBox.style.color = '#fff';
-                                    resultBox.textContent = '⚠️ ' + (data.mensagem || 'Já processado nesta etapa');
-                                    showToast('Aviso', data.mensagem, 'warning');
-                                } else if (acao === 'nao_encontrado') {
-                                    resultBox.style.background = 'rgba(239,68,68,.85)';
-                                    resultBox.style.color = '#fff';
-                                    resultBox.textContent = '❌ Não encontrado: ' + codigo;
-                                    showToast('Não encontrado', 'Pedido #' + codigo + ' não está na fila.', 'warning');
-                                } else {
-                                    resultBox.textContent = data.mensagem || 'Código: ' + codigo;
-                                }
-                            }
-
-                            // Re-habilita leitura após 3s (para ler próximo pedido)
-                            setTimeout(() => {
-                                _cameraActive = true;
-                                if (resultBox) {
-                                    resultBox.style.display = 'none';
-                                    resultBox.style.background = 'rgba(0,0,0,.7)';
-                                    resultBox.style.color = '#fff';
-                                }
-                            }, 3000);
-
-                        } catch(e) {
-                            if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Erro de comunicação'; }
-                            setTimeout(() => { _cameraActive = true; }, 2000);
-                        }
-                    }
-                });
-            } catch(e) {
-                console.error('Erro câmera:', e);
-                if (resultBox) {
-                    resultBox.style.display = 'block';
-                    resultBox.textContent = '❌ Erro ao acessar câmera: ' + (e.message || 'Permissão negada');
-                }
-            }
-        }
-
-        function stopCameraScanner() {
-            _cameraActive = false;
-            if (_codeReader) {
-                try { _codeReader.reset(); } catch(e) {}
-                _codeReader = null;
-            }
-            const video = document.getElementById('camera-preview');
-            if (video && video.srcObject) {
-                video.srcObject.getTracks().forEach(t => t.stop());
-                video.srcObject = null;
-            }
-        }
-
-        // Para câmera quando modal fecha
-        document.addEventListener('DOMContentLoaded', () => {
-            const camModal = document.getElementById('cameraScanModal');
-            if (camModal) camModal.addEventListener('hidden.bs.modal', stopCameraScanner);
-        });
-
-
-
+        
+        
         function _onAuthConfirmed() {
             if (!_boardInitialized) {
                 _boardInitialized = true;
                 loadProductionBoard();
                 refreshComponentTab();
                 loadKPIChart();
-                if (!_boardPoll) _boardPoll = setInterval(loadProductionBoard, 10000);
+                // Poll gerenciado pelo tab listener — nao duplicar aqui
             }
         }
 
@@ -7685,7 +7603,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
 
             // Tab Expedição
-            document.querySelector('[data-bs-target="#tab-expedicao"]')?.addEventListener('shown.bs.tab', loadExpedicao);
+            document.querySelector('[data-bs-target="#tab-expedicao"]')?.addEventListener('shown.bs.tab', () => loadExpedicao(1));
 
             // Tab Relatório
             document.querySelector('[data-bs-target="#tab-relatorio"]')?.addEventListener('shown.bs.tab', () => {
