@@ -3960,26 +3960,31 @@ class WebServer:
             """
             if request.method == 'POST':
                 try:
-                    # Limpa MongoDB
-                    db = self.orchestrator.auth._get_db()
-                    if db is not None:
-                        db['tokens'].delete_many({})
+                    # 1) Limpa MongoDB via _mongo_db global
+                    if _mongo_db is not None:
+                        _mongo_db['tokens'].delete_many({})
                         logger.info("🗑️  Tokens apagados do MongoDB via /admin/reset-tokens")
-                    # Limpa arquivo local
+                    # 2) Limpa arquivo local
                     tokens_path = Path(self.orchestrator.auth.config.TOKENS_FILE)
                     if tokens_path.exists():
                         tokens_path.write_text('{}')
-                    # Limpa memória
-                    self.orchestrator.auth._access_token  = None
-                    self.orchestrator.auth._refresh_token = None
-                    self.orchestrator.auth._expires_at    = 0
-                    self.orchestrator.stop_worker()
-                    logger.info("🔄 Worker parado. Aguardando nova autenticação.")
+                    # 3) Limpa memória do AuthManager
+                    auth = self.orchestrator.auth
+                    auth._tokens       = {}
+                    auth._access_token  = None
+                    auth._refresh_token = None
+                    auth._expires_at    = 0
+                    # 4) Para o worker de background
+                    try:
+                        self.orchestrator.stop_worker()
+                    except Exception:
+                        pass
+                    logger.info("🔄 Tokens resetados. Aguardando nova autenticação.")
                 except Exception as e:
                     logger.error(f"Erro ao resetar tokens: {e}")
-                    return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px">
-                        <h2>❌ Erro ao resetar tokens</h2><pre>{e}</pre>
-                        <a href="/admin/reset-tokens">← Voltar</a></body></html>""", 500
+                    return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
+                        <h2>❌ Erro ao resetar tokens</h2><pre style="color:#f87171">{e}</pre>
+                        <a href="/admin/reset-tokens" style="color:#60a5fa">← Voltar</a></body></html>""", 500
                 return redirect('/auth')
 
             # GET → página com botão
