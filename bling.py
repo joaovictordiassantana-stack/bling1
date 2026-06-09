@@ -748,9 +748,10 @@ class BlingAPIClient:
                 self.logger.warning(f"Token ausente para {endpoint}.")
             return None
             
-        # Garante header de auth atualizado
+        # Garante header de auth atualizado + JWT obrigatório (Bling descontinuou token opaco)
         kwargs.setdefault('headers', {})
         kwargs['headers']['Authorization'] = f'Bearer {token}'
+        kwargs['headers']['enable-jwt']    = '1'
         
         # Rate Limiter
         self.rate_limiter.wait()
@@ -768,6 +769,7 @@ class BlingAPIClient:
                 if self.auth.refresh_token():
                     new_token = self.auth.get_access_token()
                     kwargs['headers']['Authorization'] = f'Bearer {new_token}'
+                    kwargs['headers']['enable-jwt']    = '1'
                     # Tenta novamente (apenas 1 vez para evitar loop infinito)
                     response = self.session.request(method, url, timeout=45, **kwargs)
                 else:
@@ -1075,7 +1077,8 @@ class AuthManager:
         
         headers = {
             'Authorization': f'Basic {auth_header}',
-            'Content-Type': 'application/x-www-form-urlencoded'
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'enable-jwt': '1',   # ← OBRIGATÓRIO: Bling descontinuou token opaco
         }
         
         data = {
