@@ -773,6 +773,16 @@ class BlingAPIClient:
                 else:
                     return None
 
+            if response.status_code == 403:
+                self.logger.error(
+                    f"⛔ HTTP 403 Forbidden em '{endpoint}'. "
+                    "Causas possíveis: (1) Token sem escopo para este recurso — verifique as permissões "
+                    "no painel do Bling em Configurações > API > Aplicativos; "
+                    "(2) Token revogado — reexecute o fluxo OAuth em /auth/bling; "
+                    "(3) Plano Bling não inclui este endpoint."
+                )
+                return None   # Retorna None para o chamador tratar sem levantar exceção
+
             if response.status_code == 429:
                 self.logger.warning(f"Rate limit (429) em {endpoint}. urllib3 já retentará automaticamente.")
                 # Não levanta exceção aqui — o Retry adapter já tratou via status_forcelist
@@ -3060,7 +3070,12 @@ class WebServer:
             Retorna: pedidos recebidos, produzidos, crescimento, tempo médio, top produtos.
             """
             try:
-                dias = int(request.args.get('dias', 30))
+                _dias_raw = request.args.get('dias', '30')
+                try:
+                    dias = int(_dias_raw)
+                except (ValueError, TypeError):
+                    logger.warning(f"/api/report: parâmetro 'dias' inválido recebido: {_dias_raw!r}. Usando padrão 30.")
+                    dias = 30
                 hoje = datetime.now()
                 data_ini = (hoje - timedelta(days=dias)).strftime('%Y-%m-%d')
 
@@ -3543,17 +3558,43 @@ class WebServer:
         @token_required
         def api_barcode_scan(token):
             """
-            Processa leitura de código de barras.
-            Anti-duplicação persistente: cada item só avança UMA VEZ por etapa.
-            1ª leitura (waiting)      → in_production + registra componentes
-            2ª leitura (in_production)→ done + registra tempo
+            Processa leitura de código de barras com FSM de etapas e identificação de leitor.
+
+            Formato do campo 'codigo': pode vir com prefixo de leitor "R1:", "R2:", "R3:", "R4:"
+            emitido pelo próprio scanner (programado para prefixar).  Ex: "R2:2781"
+            Se não vier prefixo, o reader_id fica None e qualquer leitor é aceito.
+
+            FSM — Cadeiras/Poltronas/Estofados (3 leituras):
+              waiting         → [qualquer leitor] → in_production (Marcenaria iniciada)
+              in_production   → [R2 ou R3] se fsm_step=='marcenaria' → tapecaria
+              tapecaria       → [R3 ou R4] → done
+
+            FSM — MDF / demais produtos (2 leituras):
+              waiting         → [qualquer leitor] → in_production
+              in_production   → [qualquer leitor] → done
+
+            Anti-duplicação: flags scan_iniciado / scan_concluido / scan_tapecaria no item.
             """
             data = request.json or {}
-            codigo = str(data.get('codigo', '')).strip()
-            if not codigo:
+            raw_codigo = str(data.get('codigo', '')).strip()
+            if not raw_codigo:
                 return jsonify({'error': 'codigo obrigatório'}), 400
 
-            # Busca pedido pelo número do pedido, ordem_producao, order_id ou OP do cache
+            # ── Extrai reader_id do prefixo R1:/R2:/R3:/R4: ──────────────────
+            reader_id = None
+            codigo    = raw_codigo
+            import re as _re_scan
+            _pfx = _re_scan.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_scan.IGNORECASE)
+            if _pfx:
+                reader_id = _pfx.group(1).upper()   # "R1", "R2", "R3" ou "R4"
+                codigo    = _pfx.group(2).strip()
+
+            # ── Classifica produto como cadeira (3 leituras) ou MDF (2 leituras) ──
+            def _is_cadeira(nome: str) -> bool:
+                n = nome.upper()
+                return any(k in n for k in ('CADEIRA', 'POLTRONA', 'ESTOFADO', 'SOFÁ', 'SOFA'))
+
+            # ── Busca pedido pelo número do pedido, ordem_producao, order_id ou OP ──
             found_key = None
             found_item = None
             for key, item in pending_orders.data.items():
@@ -3561,7 +3602,6 @@ class WebServer:
                     continue
                 pnum = str(item.get('pedido_numero', '') or item.get('order_id', '') or '')
                 op   = str(item.get('ordem_producao', '') or '')
-                # Verifica também no cache de OPs do Bling
                 oid  = str(item.get('order_id_bling') or item.get('order_id') or pnum or '')
                 op_cached = ''
                 with pending_orders._op_cache_lock:
@@ -3575,36 +3615,52 @@ class WebServer:
                 return jsonify({
                     'acao': 'nao_encontrado',
                     'codigo': codigo,
+                    'reader_id': reader_id,
                     'mensagem': f'Nenhum pedido ativo encontrado para #{codigo}'
                 }), 404
 
-            status_atual = found_item.get('status', 'waiting')
-            nome_produto = found_item.get('nome') or found_item.get('nome_original', '')
-            timer_key    = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
+            status_atual  = found_item.get('status', 'waiting')
+            nome_produto  = found_item.get('nome') or found_item.get('nome_original', '')
+            timer_key     = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
+            eh_cadeira    = _is_cadeira(nome_produto)
+            fsm_step      = found_item.get('fsm_step', '')   # '' | 'marcenaria' | 'tapecaria'
 
-            # ── Anti-duplicação persistente por etapa ──────────────────────
-            # Guarda flag no próprio item: "scan_iniciado" e "scan_concluido"
+            def _broadcast_async():
+                def _do():
+                    try:
+                        usage = self.orchestrator.calculate_component_usage()
+                        self.orchestrator._component_usage_cache = usage
+                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                    except Exception: pass
+                Thread(target=_do, daemon=True).start()
+
+            # ══════════════════════════════════════════════════════════════
+            # ETAPA 1 — waiting → in_production (Marcenaria / Início MDF)
+            # ══════════════════════════════════════════════════════════════
             if status_atual == 'waiting':
                 if found_item.get('scan_iniciado'):
                     return jsonify({
                         'acao': 'ja_lido_etapa',
                         'codigo': codigo,
+                        'reader_id': reader_id,
                         'item_key': found_key,
                         'nome': nome_produto,
                         'mensagem': f'Pedido #{codigo} já foi iniciado. Veja a aba Produzindo.'
                     })
 
-                # ── Inicia produção ─────────────────────────────────────────
                 pending_orders.start_production(found_key)
                 production_timer.start(timer_key)
-                pending_orders.data[found_key]['timer_key']    = timer_key
+                pending_orders.data[found_key]['timer_key']   = timer_key
                 pending_orders.data[found_key]['scan_iniciado'] = True
+                pending_orders.data[found_key]['reader_inicio'] = reader_id
+                # Para cadeiras, a 1ª leitura coloca na etapa marcenaria
+                pending_orders.data[found_key]['fsm_step'] = 'marcenaria' if eh_cadeira else 'mdf'
                 pending_orders._save_one(found_key)
 
-                # Registra componentes automaticamente
+                # Registra componentes automaticamente para cadeiras
                 try:
                     _cc = globals().get('component_consumption')
-                    if _cc and 'CADEIRA' in nome_produto.upper():
+                    if _cc and eh_cadeira:
                         consumo_key = f"scan_{found_key}"
                         existing_logs = _cc.get_current_month().get('checklist_logs', [])
                         already = any(l.get('produto') == consumo_key for l in existing_logs)
@@ -3615,64 +3671,123 @@ class WebServer:
                 except Exception as _ce:
                     logger.warning(f"Scan: erro componentes: {_ce}")
 
-                def _bcast1():
-                    try:
-                        usage = self.orchestrator.calculate_component_usage()
-                        self.orchestrator._component_usage_cache = usage
-                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
-                    except Exception: pass
-                Thread(target=_bcast1, daemon=True).start()
-
+                _broadcast_async()
+                etapa_label = 'Marcenaria' if eh_cadeira else 'Produção'
                 return jsonify({
                     'acao': 'iniciado',
                     'codigo': codigo,
+                    'reader_id': reader_id,
                     'item_key': found_key,
                     'nome': nome_produto,
                     'timer_key': timer_key,
-                    'mensagem': f'✅ Produção INICIADA: {nome_produto}'
+                    'fsm_step': pending_orders.data[found_key]['fsm_step'],
+                    'mensagem': f'✅ {etapa_label} INICIADA: {nome_produto}'
                 })
 
+            # ══════════════════════════════════════════════════════════════
+            # ETAPA 2 — in_production, FSM marcenaria → tapecaria (cadeiras)
+            #           in_production, FSM mdf → done
+            # ══════════════════════════════════════════════════════════════
             elif status_atual == 'in_production':
-                if found_item.get('scan_concluido'):
+                current_step = found_item.get('fsm_step', 'mdf')
+
+                # ── Cadeira: marcenaria → tapecaria ──────────────────────
+                if eh_cadeira and current_step == 'marcenaria':
+                    if found_item.get('scan_tapecaria'):
+                        return jsonify({
+                            'acao': 'ja_lido_etapa',
+                            'codigo': codigo,
+                            'reader_id': reader_id,
+                            'item_key': found_key,
+                            'nome': nome_produto,
+                            'mensagem': f'#{codigo} já passou para Tapeçaria.'
+                        })
+                    pending_orders.data[found_key]['fsm_step']       = 'tapecaria'
+                    pending_orders.data[found_key]['scan_tapecaria']  = True
+                    pending_orders.data[found_key]['reader_tapecaria'] = reader_id
+                    pending_orders._save_one(found_key)
+                    _broadcast_async()
                     return jsonify({
-                        'acao': 'ja_lido_etapa',
+                        'acao': 'tapecaria',
                         'codigo': codigo,
+                        'reader_id': reader_id,
                         'item_key': found_key,
                         'nome': nome_produto,
-                        'mensagem': f'Pedido #{codigo} já foi concluído. Veja a aba Concluídos.'
+                        'fsm_step': 'tapecaria',
+                        'mensagem': f'🧵 Tapeçaria INICIADA: {nome_produto}'
                     })
 
-                # ── Conclui produção ────────────────────────────────────────
-                result = production_timer.stop_and_log(timer_key)
-                tempo  = result.get('elapsed', 0)
-                pending_orders.finish_production(found_key, tempo_segundos=tempo)
-                pending_orders.data[found_key]['scan_concluido'] = True
-                pending_orders._save_one(found_key)
+                # ── Cadeira: tapecaria → done ─────────────────────────────
+                if eh_cadeira and current_step == 'tapecaria':
+                    if found_item.get('scan_concluido'):
+                        return jsonify({
+                            'acao': 'ja_lido_etapa',
+                            'codigo': codigo,
+                            'reader_id': reader_id,
+                            'item_key': found_key,
+                            'nome': nome_produto,
+                            'mensagem': f'Pedido #{codigo} já foi concluído.'
+                        })
+                    result = production_timer.stop_and_log(timer_key)
+                    tempo  = result.get('elapsed', 0)
+                    pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                    pending_orders.data[found_key]['scan_concluido']  = True
+                    pending_orders.data[found_key]['reader_conclusao'] = reader_id
+                    pending_orders._save_one(found_key)
+                    _broadcast_async()
+                    h = int(tempo // 3600); m = int((tempo % 3600) // 60); s = int(tempo % 60)
+                    return jsonify({
+                        'acao': 'concluido',
+                        'codigo': codigo,
+                        'reader_id': reader_id,
+                        'item_key': found_key,
+                        'nome': nome_produto,
+                        'tempo_producao': tempo,
+                        'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
+                    })
 
-                def _bcast2():
-                    try:
-                        usage = self.orchestrator.calculate_component_usage()
-                        self.orchestrator._component_usage_cache = usage
-                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
-                    except Exception: pass
-                Thread(target=_bcast2, daemon=True).start()
+                # ── MDF / outros: in_production → done ───────────────────
+                if not eh_cadeira or current_step == 'mdf':
+                    if found_item.get('scan_concluido'):
+                        return jsonify({
+                            'acao': 'ja_lido_etapa',
+                            'codigo': codigo,
+                            'reader_id': reader_id,
+                            'item_key': found_key,
+                            'nome': nome_produto,
+                            'mensagem': f'Pedido #{codigo} já foi concluído. Veja a aba Concluídos.'
+                        })
+                    result = production_timer.stop_and_log(timer_key)
+                    tempo  = result.get('elapsed', 0)
+                    pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                    pending_orders.data[found_key]['scan_concluido']  = True
+                    pending_orders.data[found_key]['reader_conclusao'] = reader_id
+                    pending_orders._save_one(found_key)
+                    _broadcast_async()
+                    h = int(tempo // 3600); m = int((tempo % 3600) // 60); s = int(tempo % 60)
+                    return jsonify({
+                        'acao': 'concluido',
+                        'codigo': codigo,
+                        'reader_id': reader_id,
+                        'item_key': found_key,
+                        'nome': nome_produto,
+                        'tempo_producao': tempo,
+                        'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
+                    })
 
-                h = int(tempo // 3600)
-                m = int((tempo % 3600) // 60)
-                s = int(tempo % 60)
+                # Caso residual: step desconhecido — protege contra estado corrompido
+                logger.warning(f"Scan: estado FSM inesperado para {found_key}: step={current_step} status={status_atual}")
                 return jsonify({
-                    'acao': 'concluido',
+                    'acao': 'erro_fsm',
                     'codigo': codigo,
-                    'item_key': found_key,
-                    'nome': nome_produto,
-                    'tempo_producao': tempo,
-                    'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
-                })
+                    'mensagem': f'Estado de produção inconsistente para #{codigo}. Contate o administrador.'
+                }), 500
 
             else:
                 return jsonify({
                     'acao': 'ja_concluido',
                     'codigo': codigo,
+                    'reader_id': reader_id,
                     'mensagem': f'Pedido #{codigo} já foi concluído anteriormente.'
                 })
 
@@ -6586,10 +6701,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     box.innerHTML = `<span class="badge bg-secondary">Status desconhecido</span>`;
                     return;
                 }
-                const st = item.status || 'waiting';
+                const st      = item.status || 'waiting';
+                const fsmStep = item.fsm_step || '';
+                let inProdLabel = `<span class="badge bg-success" style="animation:pulse-animation 1.5s infinite;">⚙️ Em Produção</span>`;
+                if (st === 'in_production') {
+                    if (fsmStep === 'marcenaria')
+                        inProdLabel = `<span class="badge bg-warning text-dark" style="animation:pulse-animation 1.5s infinite;">🪚 Marcenaria</span>`;
+                    else if (fsmStep === 'tapecaria')
+                        inProdLabel = `<span class="badge bg-info text-dark" style="animation:pulse-animation 1.5s infinite;">🧵 Tapeçaria</span>`;
+                }
                 const labels = {
                     waiting:      `<span class="badge bg-warning text-dark">⏳ Aguardando</span>`,
-                    in_production:`<span class="badge bg-success" style="animation:pulse-animation 1.5s infinite;">⚙️ Em Produção</span>`,
+                    in_production: inProdLabel,
                     done:         `<span class="badge bg-primary">✅ Concluído</span>`,
                 };
                 box.innerHTML = labels[st] || `<span class="badge bg-secondary">${st}</span>`;
@@ -6627,7 +6750,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         ${svgHtml}
                     </div>
                     <p style="color:#888;font-size:11px;margin-top:16px;">
-                        1ª leitura = Iniciar Produção &nbsp;|&nbsp; 2ª leitura = Concluir Produção
+                        1ª leitura = Marcenaria &nbsp;|&nbsp; 2ª leitura = Tapeçaria &nbsp;|&nbsp; 3ª leitura = Concluído
                     </p>
                     <script>window.onload=function(){window.print();window.onafterprint=function(){document.getElementById('print-area').style.display='none';}}</scr' + 'ipt>
                 </div>`;
@@ -6691,7 +6814,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     _showIndicator('Não autenticado', '#ef4444');
                     return;
                 }
-                _showIndicator('Lendo: ' + codigo, '#ffb600');
+                // Extrai prefixo de leitor do código (ex: "R2:2781" → reader "R2", codigo "2781")
+                const _pfxMatch = codigo.match(/^(R[1-4]):(.+)$/i);
+                const readerLabel = _pfxMatch ? ` [${_pfxMatch[1].toUpperCase()}]` : '';
+                _showIndicator('Lendo: ' + codigo + readerLabel, '#ffb600');
                 try {
                     const res = await fetch('/api/barcode/scan', {
                         method: 'POST',
@@ -6709,25 +6835,34 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     const acao   = result.acao;
                     const ikey   = result.item_key || '';
                     const nome   = result.nome || '';
+                    const rLabel = result.reader_id ? ` [${result.reader_id}]` : '';
 
                     if (acao === 'ja_lido_etapa') {
-                        // Backend sinalizou que já foi processado nesta etapa
                         _showIndicator('Já processado nesta etapa', '#6b7280');
                         showToast('Aviso', result.mensagem, 'warning');
                         return;
                     }
 
                     if (acao === 'iniciado') {
-                        // Marca no Set do front para bloquear botão visualmente
                         if (ikey) _scannedThisSession.add(ikey + ':waiting');
-                        _showIndicator('✅ INICIADO — ' + nome, '#10b981');
-                        showToast('🚀 Produção Iniciada', nome + ' · #' + codigo, 'success');
+                        const fsm = result.fsm_step || '';
+                        const etiqLabel = fsm === 'marcenaria' ? '🪚 MARCENARIA INICIADA' : '🚀 PRODUÇÃO INICIADA';
+                        _showIndicator(etiqLabel + rLabel + ' — ' + nome, '#10b981');
+                        showToast(etiqLabel, nome + ' · #' + (result.codigo || codigo), 'success');
+                        await loadProductionBoard();
+                        switchBoardTab('inprod');
+
+                    } else if (acao === 'tapecaria') {
+                        // Cadeira avançou Marcenaria → Tapeçaria
+                        if (ikey) _scannedThisSession.add(ikey + ':marcenaria');
+                        _showIndicator('🧵 TAPEÇARIA INICIADA' + rLabel + ' — ' + nome, '#6366f1');
+                        showToast('🧵 Tapeçaria', nome + ' · #' + (result.codigo || codigo), 'success');
                         await loadProductionBoard();
                         switchBoardTab('inprod');
 
                     } else if (acao === 'concluido') {
                         if (ikey) _scannedThisSession.add(ikey + ':inprod');
-                        _showIndicator('✅ CONCLUÍDO — ' + nome, '#6366f1');
+                        _showIndicator('✅ CONCLUÍDO' + rLabel + ' — ' + nome, '#6366f1');
                         const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
                         showToast('✅ Concluído!', nome + tempoFmt, 'success');
                         await loadProductionBoard();
@@ -6737,6 +6872,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     } else if (acao === 'ja_concluido') {
                         _showIndicator('Já concluído', '#6b7280');
                         showToast('Info', result.mensagem, 'info');
+
+                    } else if (acao === 'erro_fsm') {
+                        _showIndicator('Erro de estado — contacte admin', '#ef4444');
+                        showToast('Erro FSM', result.mensagem, 'danger');
 
                     } else {
                         _showIndicator(result.mensagem || 'Processado', '#ffb600');
