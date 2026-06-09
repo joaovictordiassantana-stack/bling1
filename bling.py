@@ -1058,8 +1058,17 @@ class AuthManager:
 
     def _perform_token_request(self, grant_type: str, **kwargs) -> bool:
         """Executa a requisição de troca/renovação de token."""
-        self.logger.debug(f"Iniciando requisição de token: grant_type={grant_type}")
-        
+        # ── LOG CRÍTICO DE DIAGNÓSTICO ────────────────────────────────────────
+        client_id_preview = (self.config.CLIENT_ID or '')[:8] + '...' if self.config.CLIENT_ID else '❌ VAZIO'
+        secret_ok         = '✅ presente' if self.config.CLIENT_ID and self.config.CLIENT_SECRET else '❌ VAZIO'
+        redirect_uri      = self.config.REDIRECT_URI or '❌ VAZIO'
+        self.logger.critical(
+            f"🔐 TOKEN REQUEST | grant_type={grant_type} | "
+            f"client_id={client_id_preview} | secret={secret_ok} | "
+            f"redirect_uri={redirect_uri} | url={self.config.TOKEN_URL} | "
+            f"extra_keys={list(kwargs.keys())}"
+        )
+
         auth_header = base64.b64encode(
             f"{self.config.CLIENT_ID}:{self.config.CLIENT_SECRET}".encode()
         ).decode()
@@ -1069,12 +1078,12 @@ class AuthManager:
             'Content-Type': 'application/x-www-form-urlencoded'
         }
         
-        # ✅ Definição da variável 'data' (Correção de bug: garante que 'data' está definido)
         data = {
             'grant_type': grant_type,
             **kwargs
         }
         
+        response = None
         try:
             response = requests.post(
                 self.config.TOKEN_URL,
@@ -1082,25 +1091,46 @@ class AuthManager:
                 data=data,
                 timeout=self.config.AUTH_TIMEOUT
             )
+
+            # ── LOG CRÍTICO: sempre loga status + corpo da resposta do Bling ──
+            self.logger.critical(
+                f"🔐 BLING RESPONSE | status={response.status_code} | "
+                f"body={response.text[:600]!r}"
+            )
+
             response.raise_for_status()
             
             token_data = response.json()
             
-            self._access_token = token_data.get('access_token')
-            self._refresh_token = token_data.get('refresh_token', self._refresh_token) # Refresh token pode não vir na resposta
-            expires_in = token_data.get('expires_in', 3600) # Padrão 1 hora
-            self._expires_at = time.time() + expires_in
+            self._access_token  = token_data.get('access_token')
+            self._refresh_token = token_data.get('refresh_token', self._refresh_token)
+            expires_in          = token_data.get('expires_in', 3600)
+            self._expires_at    = time.time() + expires_in
+
+            self.logger.critical(
+                f"✅ TOKEN OK | access_token={str(self._access_token or '')[:12]}... | "
+                f"expires_in={expires_in}s | "
+                f"refresh={'presente' if self._refresh_token else 'ausente'}"
+            )
             
             self._save_tokens()
             return True
             
         except requests.exceptions.HTTPError as e:
-            self.logger.exception(f"Erro HTTP na requisição de token. Resposta: {safe_dict(response.text)}")
+            body = response.text[:600] if response is not None else 'sem resposta'
+            status = response.status_code if response is not None else '?'
+            self.logger.critical(
+                f"❌ TOKEN HTTP ERROR | status={status} | "
+                f"grant_type={grant_type} | body={body!r}"
+            )
         except RequestException as e:
-            # Garante que 'response' não é acessado aqui
-            self.logger.exception(f"Erro de conexão na requisição de token.")
+            self.logger.critical(
+                f"❌ TOKEN CONNECTION ERROR | grant_type={grant_type} | erro={e}"
+            )
         except Exception as e:
-            self.logger.exception(f"Erro inesperado na requisição de token.")
+            self.logger.critical(
+                f"❌ TOKEN UNEXPECTED ERROR | grant_type={grant_type} | erro={e}"
+            )
             
         return False
 
@@ -2984,7 +3014,14 @@ class WebServer:
             
             # 2. Constrói a URL de autorização usando o AuthManager
             auth_url = self.orchestrator.auth.create_auth_flow(state)
-            
+
+            logger.critical(
+                f"\U0001f510 /auth INICIADO | "
+                f"client_id={'\u2705 ' + (self.config.CLIENT_ID or '')[:8] + '...' if self.config.CLIENT_ID else '\u274c VAZIO'} | "
+                f"redirect_uri={self.config.REDIRECT_URI!r} | "
+                f"auth_url={auth_url[:120]!r}"
+            )
+
             return redirect(auth_url)
 
         # Rota /api/webhook mantida como alias para /webhook (retrocompatibilidade)
@@ -4058,17 +4095,30 @@ class WebServer:
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
-            code = request.args.get('code')
+            code  = request.args.get('code')
             state = request.args.get('state')
+            error = request.args.get('error')
             
-            logger.info("🔐 Callback OAuth recebido.")
+            logger.critical(
+                f"🔐 CALLBACK RECEBIDO | code={'✅ presente' if code else '❌ ausente'} | "
+                f"state={'✅ presente' if state else '❌ ausente'} | "
+                f"error={error!r} | "
+                f"args={dict(request.args)}"
+            )
+
+            if error:
+                logger.critical(f"❌ BLING RETORNOU ERRO NO CALLBACK: {error!r}")
+                return f"Bling retornou erro: {error}", 400
             
             if not code:
                 logger.error("Código de autorização OAuth não recebido.")
                 return "Erro: Código de autorização não recebido.", 400
                 
             if not self.orchestrator.auth._validate_oauth_state(state):
-                logger.error("State OAuth inválido ou expirado.")
+                logger.critical(
+                    f"❌ STATE INVÁLIDO | recebido={state!r} | "
+                    f"session_keys={list(session.keys())}"
+                )
                 return "Erro: State inválido ou expirado.", 403
 
             success = self.orchestrator.auth.exchange_code_for_token(code)
