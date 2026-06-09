@@ -3949,6 +3949,107 @@ class WebServer:
                 })
             return jsonify({'total_pedidos': len(orders), 'sample': result})
 
+        # ── Rota de emergência: reset de tokens OAuth ─────────────────────────────
+        @self.app.route('/admin/reset-tokens', methods=['GET', 'POST'])
+        def admin_reset_tokens():
+            """
+            Página de emergência para limpar tokens OAuth revogados/corrompidos
+            e reiniciar o fluxo de autenticação com o Bling.
+            GET  → exibe página com botão de reset
+            POST → executa o reset e redireciona para /auth
+            """
+            if request.method == 'POST':
+                try:
+                    # Limpa MongoDB
+                    db = self.orchestrator.auth._get_db()
+                    if db is not None:
+                        db['tokens'].delete_many({})
+                        logger.info("🗑️  Tokens apagados do MongoDB via /admin/reset-tokens")
+                    # Limpa arquivo local
+                    tokens_path = Path(self.orchestrator.auth.config.TOKENS_FILE)
+                    if tokens_path.exists():
+                        tokens_path.write_text('{}')
+                    # Limpa memória
+                    self.orchestrator.auth._access_token  = None
+                    self.orchestrator.auth._refresh_token = None
+                    self.orchestrator.auth._expires_at    = 0
+                    self.orchestrator.stop_worker()
+                    logger.info("🔄 Worker parado. Aguardando nova autenticação.")
+                except Exception as e:
+                    logger.error(f"Erro ao resetar tokens: {e}")
+                    return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px">
+                        <h2>❌ Erro ao resetar tokens</h2><pre>{e}</pre>
+                        <a href="/admin/reset-tokens">← Voltar</a></body></html>""", 500
+                return redirect('/auth')
+
+            # GET → página com botão
+            return """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reset OAuth — SW Móveis MDF</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: #0f172a; font-family: 'Segoe UI', sans-serif; color: #e2e8f0;
+    }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 16px;
+      padding: 48px 40px; max-width: 480px; width: 100%; text-align: center;
+      box-shadow: 0 20px 60px rgba(0,0,0,.5);
+    }
+    .icon { font-size: 56px; margin-bottom: 16px; }
+    h1 { font-size: 22px; font-weight: 700; color: #f1f5f9; margin-bottom: 8px; }
+    p  { color: #94a3b8; font-size: 14px; line-height: 1.6; margin-bottom: 24px; }
+    .badge {
+      display: inline-block; background: #ef444420; color: #f87171;
+      border: 1px solid #ef444440; border-radius: 8px;
+      padding: 6px 14px; font-size: 13px; margin-bottom: 28px;
+    }
+    .btn-reset {
+      display: block; width: 100%; padding: 14px;
+      background: #ef4444; color: #fff; border: none; border-radius: 10px;
+      font-size: 16px; font-weight: 600; cursor: pointer; transition: background .2s;
+      margin-bottom: 12px;
+    }
+    .btn-reset:hover { background: #dc2626; }
+    .btn-back {
+      display: block; width: 100%; padding: 12px;
+      background: #1e293b; color: #94a3b8; border: 1px solid #334155;
+      border-radius: 10px; font-size: 14px; text-decoration: none; transition: background .2s;
+    }
+    .btn-back:hover { background: #0f172a; color: #e2e8f0; }
+    .warning {
+      background: #78350f20; border: 1px solid #78350f60; border-radius: 8px;
+      padding: 12px; font-size: 12px; color: #fbbf24; margin-top: 20px; text-align: left;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🔑</div>
+    <h1>Reset de Autenticação Bling</h1>
+    <p>Use este botão quando a API do Bling retornar <strong>HTTP 403</strong> mesmo com token aparentemente válido. O reset apaga os tokens salvos e inicia um novo fluxo OAuth.</p>
+    <div class="badge">⚠️ Token atual: revogado / inválido</div>
+
+    <form method="POST">
+      <button type="submit" class="btn-reset">🗑️ Resetar Tokens e Reautenticar</button>
+    </form>
+    <a href="/" class="btn-back">← Voltar ao Dashboard</a>
+
+    <div class="warning">
+      <strong>O que acontece:</strong><br>
+      1. Tokens apagados do MongoDB e disco<br>
+      2. Worker de background pausado<br>
+      3. Redirecionado para o Bling para nova autorização<br>
+      4. Após autorizar, o sistema retoma automaticamente
+    </div>
+  </div>
+</body>
+</html>"""
+
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
@@ -5069,6 +5170,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     style="background:#ffb600;color:#000;font-weight:700;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
                     title="Scanner por câmera do celular">📷 Câmera</button>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
+                <a href="/admin/reset-tokens" class="btn btn-sm"
+                   style="background:#ef4444;color:#fff;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
+                   title="Resetar tokens OAuth (use quando API retornar 403)">🔑 Reset OAuth</a>
             </div>
         </div>
     </nav>
