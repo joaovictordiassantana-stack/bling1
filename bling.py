@@ -46,7 +46,6 @@ import base64
 import secrets
 import shutil
 import hmac
-import hashlib
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -438,8 +437,8 @@ class Config:
     REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', '')
     
     # API
-    BLING_API_URL: str = 'https://www.bling.com.br/Api/v3'
-    TOKEN_URL: str = 'https://www.bling.com.br/Api/v3/oauth/token'
+    BLING_API_URL: str = 'https://api.bling.com.br/Api/v3'
+    TOKEN_URL: str = 'https://api.bling.com.br/Api/v3/oauth/token'
     
     # Retry e Timeout
     REQUEST_TIMEOUT: int = 30
@@ -451,9 +450,6 @@ class Config:
     MAX_PAGES_PER_BATCH: int = 5  # Pode aumentar um pouco se quiser
     DELAY_BETWEEN_PAGES: float = 0.8  # Reduzido de 5.0 para 0.8 (mais rápido)
     DELAY_BETWEEN_BATCHES: float = 5.0  # Reduzido de 15.0 para 5.0
-    
-    # Automação
-    
     
     # Arquivos
     TOKENS_FILE: Path = DATA_DIR / 'tokens.json'
@@ -776,14 +772,31 @@ class BlingAPIClient:
                     return None
 
             if response.status_code == 403:
+                # Antes de desistir: recarrega tokens do MongoDB (outro worker pode ter salvo um novo)
+                self.logger.warning(f"⚠️ 403 em '{endpoint}' — recarregando tokens do storage e tentando novamente...")
+                if self.auth.reload_tokens_from_disk():
+                    fresh_token = self.auth._access_token
+                    if fresh_token and fresh_token != token:
+                        self.logger.info(f"🔄 Token renovado do storage — retentando '{endpoint}'")
+                        kwargs['headers']['Authorization'] = f'Bearer {fresh_token}'
+                        kwargs['headers']['enable-jwt']    = '1'
+                        try:
+                            response = self.session.request(method, url, timeout=45, **kwargs)
+                            self.logger.info(f"♻️  Retry '{endpoint}' → status {response.status_code}")
+                            if response.status_code not in (403, 401):
+                                try:
+                                    return response.json()
+                                except Exception:
+                                    return {}
+                        except Exception as _re:
+                            self.logger.error(f"Retry pós-403 falhou em '{endpoint}': {_re}")
                 self.logger.error(
-                    f"⛔ HTTP 403 Forbidden em '{endpoint}'. "
-                    "Causas possíveis: (1) Token sem escopo para este recurso — verifique as permissões "
-                    "no painel do Bling em Configurações > API > Aplicativos; "
-                    "(2) Token revogado — reexecute o fluxo OAuth em /auth/bling; "
-                    "(3) Plano Bling não inclui este endpoint."
+                    f"⛔ HTTP 403 definitivo em '{endpoint}'. "
+                    f"Body Bling: {response.text[:300]!r}. "
+                    "Token inválido mesmo após recarregar. "
+                    "Acesse /admin/reset-tokens e reautentique."
                 )
-                return None   # Retorna None para o chamador tratar sem levantar exceção
+                return None
 
             if response.status_code == 429:
                 self.logger.warning(f"Rate limit (429) em {endpoint}. urllib3 já retentará automaticamente.")
@@ -966,8 +979,27 @@ class AuthManager:
         return False
 
     def get_access_token(self) -> Optional[str]:
-        """Retorna o token de acesso, renovando se necessário."""
-        if self._access_token and self._expires_at > time.time() + 60:
+        """Retorna o token de acesso, renovando se necessário.
+        
+        Re-sincroniza do MongoDB a cada 5 minutos para garantir que múltiplos
+        workers Gunicorn compartilhem sempre o mesmo token fresco.
+        """
+        now = time.time()
+
+        # Re-sincroniza do storage a cada 5 minutos (evita divergência entre workers)
+        last_sync = getattr(self, '_last_storage_sync', 0)
+        if now - last_sync > 300:
+            self._last_storage_sync = now
+            disk = self._load_tokens()
+            disk_access  = disk.get('access_token')
+            disk_expires = disk.get('expires_at', 0)
+            # Só atualiza memória se o token do storage for diferente e mais fresco
+            if disk_access and disk_access != self._access_token:
+                self._access_token  = disk_access
+                self._refresh_token = disk.get('refresh_token', self._refresh_token)
+                self._expires_at    = disk_expires
+
+        if self._access_token and self._expires_at > now + 60:
             return self._access_token
             
         if self._refresh_token:
@@ -998,7 +1030,7 @@ class AuthManager:
             'redirect_uri': self.config.REDIRECT_URI,
         }
         
-        return f"https://www.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"
+        return f"https://api.bling.com.br/Api/v3/oauth/authorize?{urlencode(params)}"
     
     def exchange_code_for_token(self, code: str) -> bool:
         """Troca o código de autorização por tokens de acesso e refresh."""
@@ -3207,43 +3239,15 @@ class WebServer:
 
             if not action or not produto:
                 return jsonify({'error': 'action e produto são obrigatórios'}), 400
-            if action not in ('start', 'pause', 'reset', 'finish', 'get'):
-                return jsonify({'error': f'action inválida: {action}'}), 400
 
-            if action == 'start':
-                status = production_timer.start(produto)
-            elif action == 'pause':
-                status = production_timer.pause(produto)
-            elif action == 'reset':
-                status = production_timer.reset(produto)
-            elif action == 'finish':
-                status = production_timer.stop_and_log(produto)
-                tempo_prod = status.get('elapsed') or 0
-                # Finaliza o pending_order vinculado a este timer_key
-                if '||' in produto:
-                    ikey = produto.split('||', 1)[1]
-                    if ikey in pending_orders.data:
-                        pending_orders.finish_production(ikey, tempo_segundos=tempo_prod)
-                else:
-                    # Fallback: busca por nome do produto em status in_production
-                    for ikey, pitem in list(pending_orders.data.items()):
-                        nome_item = pitem.get('nome') or pitem.get('nome_original', '')
-                        if nome_item == produto and pitem.get('status') == 'in_production':
-                            pending_orders.finish_production(ikey, tempo_segundos=tempo_prod)
-                            break
-            else:
-                status = production_timer.get_status(produto)
-                
-            # Força recálculo e notifica TODOS os usuários via WebSocket
-            def update_and_broadcast():
-                try:
-                    usage = self.orchestrator.calculate_component_usage()
-                    self.orchestrator._component_usage_cache = usage
-                    self.orchestrator.broadcast_kpi_update(component_usage=usage)
-                except Exception as e:
-                    self.logger.error(f'Erro no broadcast pós-timer: {e}')
-            Thread(target=update_and_broadcast, daemon=True).start()
-                
+            # Apenas leitura permitida — escrita vai via /api/barcode/scan
+            if action != 'get':
+                return jsonify({
+                    'error': 'Controle manual do timer desativado. Use o leitor de código de barras.',
+                    'use': '/api/barcode/scan'
+                }), 403
+
+            status = production_timer.get_status(produto)
             return jsonify(status)
 
         @self.app.route('/api/production/board')
@@ -3251,10 +3255,10 @@ class WebServer:
         def api_production_board(token):
             """
             Retorna snapshot completo da aba de produção.
-            - waiting: pedidos do Bling aguardando alguém clicar em Produzir
+            - waiting: pedidos aguardando leitura do código de barras para iniciar
             - in_production: pedidos em andamento + tempo ao vivo do timer
             - done: concluídos do mês (para histórico)
-            - timers_orphan: timers sem item_key (iniciados manualmente)
+            - timers_orphan: timers sem item_key
             """
             timers = production_timer.timers
 
@@ -3834,56 +3838,20 @@ class WebServer:
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         @token_required
         def api_pending_orders_start(token):
-            """Move pedido de 'Em Espera' para 'Em Produção' e inicia timer."""
-            data = request.json
-            item_key = data.get('item_key', '')
-            produto_nome = data.get('produto_nome', '')
-            if not item_key:
-                return jsonify({'error': 'item_key obrigatório'}), 400
-            item = pending_orders.start_production(item_key)
-            timer_key = None
-            if produto_nome:
-                timer_key = f"{produto_nome}||{item_key}"
-                production_timer.start(timer_key)
-                if item_key in pending_orders.data:
-                    pending_orders.data[item_key]['timer_key'] = timer_key
-                    pending_orders._save_one(item_key)
-            return jsonify({'success': True, 'item': item, 'timer_key': timer_key})
+            """DESATIVADO — produção só avança via leitura de código de barras (/api/barcode/scan)."""
+            return jsonify({
+                'error': 'Operação não permitida. Use o leitor de código de barras para iniciar a produção.',
+                'use': '/api/barcode/scan'
+            }), 403
 
         @self.app.route('/api/pending-orders/finish', methods=['POST'])
         @token_required
         def api_pending_orders_finish(token):
-            """Finaliza produção de um pedido pendente."""
-            data = request.json
-            item_key = data.get('item_key', '')
-            produto_nome = data.get('produto_nome', '')
-            if not item_key:
-                return jsonify({'error': 'item_key obrigatório'}), 400
-            item_data = pending_orders.data.get(item_key, {})
-            # Prioridade: timer_key do cliente > timer_key salvo no item > reconstruído
-            timer_key = (
-                data.get('timer_key') or
-                item_data.get('timer_key') or
-                (f"{produto_nome}||{item_key}" if produto_nome else None)
-            )
-            # Para o timer ANTES de finalizar o pedido (para capturar o tempo)
-            tempo_producao = None
-            if timer_key:
-                result = production_timer.stop_and_log(timer_key)
-                tempo_producao = result.get('elapsed') or 0
-                # Se tempo=0 e tem || no timer_key, tenta fallback pelo nome
-                if tempo_producao == 0 and '||' in timer_key:
-                    nome_fallback = timer_key.split('||')[0]
-                    if nome_fallback in production_timer.timers:
-                        result2 = production_timer.stop_and_log(nome_fallback)
-                        tempo_producao = result2.get('elapsed') or 0
-            elif produto_nome:
-                result = production_timer.stop_and_log(produto_nome)
-                tempo_producao = result.get('elapsed') or 0
-
-            # Finaliza o pedido com o tempo capturado
-            item = pending_orders.finish_production(item_key, tempo_segundos=tempo_producao)
-            return jsonify({'success': True, 'item': item, 'tempo_producao': tempo_producao})
+            """DESATIVADO — produção só conclui via leitura de código de barras (/api/barcode/scan)."""
+            return jsonify({
+                'error': 'Operação não permitida. Use o leitor de código de barras para concluir a produção.',
+                'use': '/api/barcode/scan'
+            }), 403
 
         @self.app.route('/api/pending-orders/dismiss', methods=['POST'])
         @token_required
@@ -3895,79 +3863,6 @@ class WebServer:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             pending_orders.dismiss(item_key)
             return jsonify({'success': True})
-
-        @self.app.route('/api/bling/ordens-producao')
-        @token_required
-        def api_bling_ordens_producao(token):
-            """
-            Busca ordens de produção do Bling para cada pedido na fila.
-            Retorna mapa order_id -> {numero_op, codigo_barras, situacao, previsao}
-            """
-            try:
-                ordens = {}
-                # Busca os order_ids únicos dos pedidos em espera/produção
-                order_ids = set()
-                for item in pending_orders.data.values():
-                    oid = item.get('order_id') or item.get('order_id_bling')
-                    if oid:
-                        order_ids.add(str(oid))
-
-                for oid in list(order_ids)[:50]:  # limite para não explodir rate limit
-                    try:
-                        resp = self.orchestrator.api.get(f'ordens/producao', params={'numeroPedidoVenda': oid})
-                        if resp and resp.get('data'):
-                            for op in (resp['data'] if isinstance(resp['data'], list) else [resp['data']]):
-                                numero_op = op.get('numero') or op.get('id', '')
-                                previsao = op.get('dataPrevisao') or op.get('dataPrevista') or ''
-                                codigo_barras = op.get('codigoBarras') or str(numero_op)
-                                ordens[oid] = {
-                                    'numero_op': numero_op,
-                                    'codigo_barras': codigo_barras,
-                                    'situacao': op.get('situacao', {}).get('nome', '') if isinstance(op.get('situacao'), dict) else str(op.get('situacao', '')),
-                                    'previsao': previsao,
-                                }
-                                break  # pega a primeira OP do pedido
-                    except Exception as e:
-                        logger.debug(f"OP para pedido {oid}: {e}")
-                        continue
-
-                return jsonify({'ordens': ordens, 'total': len(ordens)})
-            except Exception as e:
-                return jsonify({'ordens': {}, 'error': str(e)}), 500
-
-        @self.app.route('/api/pending-orders/sync', methods=['POST'])
-        @token_required
-        def api_pending_orders_sync(token):
-            """Força sincronização imediata dos pedidos do Bling com a fila pendente."""
-            try:
-                with self.orchestrator._cache_lock:
-                    cache_flat = {**self.orchestrator._products_cache, **self.orchestrator._kits_cache}
-                orders = self.orchestrator.sales._sales_history or []
-                
-                # Tenta sync direto primeiro
-                added = pending_orders.sync_from_orders(orders, cache_flat)
-                
-                # Se não adicionou nada, busca pedidos individualmente em background
-                if added == 0 and orders:
-                    Thread(
-                        target=self.orchestrator._fetch_orders_with_items,
-                        args=(orders, cache_flat),
-                        daemon=True
-                    ).start()
-                    return jsonify({
-                        'success': True,
-                        'added': 0,
-                        'message': f'Buscando itens de {len(orders)} pedidos individualmente... Aguarde 30s e atualize a página.',
-                        'total_waiting': len(pending_orders.get_waiting())
-                    })
-
-                return jsonify({
-                    'success': True,
-                    'added': added,
-                    'total_waiting': len(pending_orders.get_waiting())
-                })
-            except Exception as e:
-                return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/debug/orders-sample')
         @token_required
@@ -4000,26 +3895,32 @@ class WebServer:
             """
             if request.method == 'POST':
                 try:
-                    # 1) Limpa MongoDB via _mongo_db global
+                    # 1) Limpa MongoDB — collection correta é 'auth_tokens', doc_id='tokens'
+                    #    (MongoStore.set usa _mongo_db['auth_tokens'], NÃO _mongo_db['tokens'])
                     if _mongo_db is not None:
-                        _mongo_db['tokens'].delete_many({})
-                        logger.info("🗑️  Tokens apagados do MongoDB via /admin/reset-tokens")
+                        result_at = _mongo_db['auth_tokens'].delete_many({})
+                        result_t  = _mongo_db['tokens'].delete_many({})  # limpa ambas por segurança
+                        logger.info(
+                            f"🗑️  MongoDB limpo: auth_tokens={result_at.deleted_count} docs, "
+                            f"tokens={result_t.deleted_count} docs"
+                        )
                     # 2) Limpa arquivo local
                     tokens_path = Path(self.orchestrator.auth.config.TOKENS_FILE)
                     if tokens_path.exists():
                         tokens_path.write_text('{}')
-                    # 3) Limpa memória do AuthManager
+                    # 3) Limpa TODA a memória do AuthManager — incluindo env var
                     auth = self.orchestrator.auth
-                    auth._tokens       = {}
+                    auth._tokens        = {}
                     auth._access_token  = None
                     auth._refresh_token = None
                     auth._expires_at    = 0
+                    auth._initial_load_failed = False
                     # 4) Para o worker de background
                     try:
                         self.orchestrator.stop_worker()
                     except Exception:
                         pass
-                    logger.info("🔄 Tokens resetados. Aguardando nova autenticação.")
+                    logger.info("🔄 Tokens resetados corretamente. Aguardando nova autenticação.")
                 except Exception as e:
                     logger.error(f"Erro ao resetar tokens: {e}")
                     return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
@@ -4128,6 +4029,8 @@ class WebServer:
 
             if success:
                 logger.info("✅ Autenticação OAuth concluída com sucesso.")
+                # Força re-sincronização imediata ignorando o cache de 5min
+                self.orchestrator.auth._last_storage_sync = 0
                 self.orchestrator.auth.reload_tokens_from_disk()
 
                 if not self.orchestrator.is_running():
@@ -4135,6 +4038,8 @@ class WebServer:
                     start_cleanup_timer()
                     logger.info("🚀 Worker iniciado após autenticação.")
                 else:
+                    # Acorda o worker E reseta o timer de sync para ele pegar o token novo
+                    self.orchestrator.auth._last_storage_sync = 0
                     self.orchestrator.wake_worker()
 
                 return redirect('/')
@@ -4184,26 +4089,6 @@ class WebServer:
             
             self.logger.info(f"✅ Busca finalizada: {len(results)} resultados encontrados.")
             return jsonify(results[:50]) # Aumentado para 50 resultados
-
-        @self.app.route('/api/debug/cache')
-        @token_required
-        def api_debug_cache(token):
-            c = self.orchestrator
-            with c._cache_lock:
-                sample_products = list(c._products_cache.values())[:5]
-                sample_kits = list(c._kits_cache.values())[:5]
-                return jsonify({
-                    "products_count": len(c._products_cache),
-                    "kits_count": len(c._kits_cache),
-                    "sample_products": sample_products,
-                    "sample_kits": sample_kits
-                })
-
-        @self.app.route('/api/kits')
-        @token_required
-        def api_kits(token):
-            """Endpoint mantido por compatibilidade — aba Produtos foi removida."""
-            return jsonify([])
 
         @self.app.route('/api/mongo-status')
         def api_mongo_status():
@@ -4535,8 +4420,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.18.6/umd/index.min.js"
-        onerror="console.warn('ZXing não carregado — câmera desativada. Scanner USB ainda funciona.')"></script>
     <style>
         /* ══════════════════════════════════════════
            SW MÓVEIS MDF — DESIGN SYSTEM 2025
@@ -5188,27 +5071,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <!-- SCANNER GLOBAL INDICATOR -->
     <div id="scanner-indicator">📡 Lendo código...</div>
 
-    <!-- CÂMERA SCANNER MODAL -->
-    <div class="modal fade" id="cameraScanModal" tabindex="-1">
-        <div class="modal-dialog modal-dialog-centered" style="max-width:400px;">
-            <div class="modal-content border-0 shadow-lg">
-                <div class="modal-header" style="background:#01010d;color:#fff;border-bottom:3px solid #ffb600;">
-                    <h5 class="modal-title" style="font-family:'Bebas Neue',sans-serif;letter-spacing:.06em;">📷 Scanner de Câmera</h5>
-                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" onclick="stopCameraScanner()"></button>
-                </div>
-                <div class="modal-body p-0 bg-black text-center" style="min-height:280px;position:relative;">
-                    <video id="camera-preview" style="width:100%;max-height:280px;object-fit:cover;display:block;"></video>
-                    <div id="camera-scan-result" style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.7);color:#fff;padding:8px;font-size:.85rem;display:none;"></div>
-                    <div id="camera-aim" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:200px;height:80px;border:2px solid #ffb600;border-radius:4px;pointer-events:none;"></div>
-                </div>
-                <div class="modal-footer bg-dark justify-content-between">
-                    <small class="text-muted">Aponte para o código de barras da OP</small>
-                    <button class="btn btn-outline-light btn-sm" onclick="stopCameraScanner()" data-bs-dismiss="modal">Fechar</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
     <!-- ÁREA DE IMPRESSÃO -->
     <div id="print-area"></div>
 
@@ -5224,9 +5086,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             </a>
             <div class="d-flex align-items-center gap-2">
                 <span id="status-badge" class="badge bg-secondary" title="Aguardando WebSocket...">⏳ Conectando...</span>
-                <button class="btn btn-sm" onclick="openCameraScanner()"
-                    style="background:#ffb600;color:#000;font-weight:700;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
-                    title="Scanner por câmera do celular">📷 Câmera</button>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
                 <a href="/admin/reset-tokens" class="btn btn-sm"
                    style="background:#ef4444;color:#fff;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
@@ -5959,18 +5818,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                             00:00:00
                                         </div>
                                         <div id="timer-status" class="badge mb-3" style="font-size:.85rem; padding:.4rem 1rem;">Parado</div>
-                                        <div class="d-flex justify-content-center gap-2" id="timer-btn-group"
-                                             data-produto="${encodeURIComponent(_timerKey)}"
-                                             data-display="${encodeURIComponent(productName)}">
-                                            <button class="btn btn-success px-4 fw-bold" onclick="controlTimer('start', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                                ▶ Iniciar
-                                            </button>
-                                            <button class="btn btn-warning px-4 fw-bold text-dark" onclick="controlTimer('pause', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                                ⏸ Pausar
-                                            </button>
-                                            <button class="btn btn-outline-light px-4" onclick="controlTimer('reset', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                                ↺ Zerar
-                                            </button>
+                                        <div class="text-center mt-2" style="background:#1e293b;border-radius:8px;padding:8px 12px;">
+                                            <span style="font-size:.75rem;color:#94a3b8;">
+                                                ⚠️ Controle exclusivo por leitura de código de barras
+                                            </span>
                                         </div>
                                     </div>
                                 </div>
@@ -5982,10 +5833,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" onclick="clearInterval(timerInterval)">
                                     Fechar
                                 </button>
-                                <button type="button" class="btn btn-success px-4 fw-bold"
-                                    onclick="controlTimer('finish', decodeURIComponent(document.getElementById('timer-btn-group').dataset.produto))">
-                                    ✅ CONCLUIR & SALVAR
-                                </button>
+                                <span style="font-size:.75rem;color:#64748b;">Apenas leitura de código conclui a produção</span>
                             </div>
                         </div>
                     </div>
@@ -6481,12 +6329,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             ${jaLido
                                 ? `<div class="bc-lido-overlay">✅ CÓDIGO LIDO<br><small style="font-weight:400;font-size:.72rem;">Indo para Produzindo...</small></div>`
                                 : `<div class="mt-2 d-flex gap-2">
-                                    <button class="btn btn-success btn-sm fw-bold flex-grow-1"
-                                        data-ikey="${ikey}" data-pnome="${escapeHtml(item.nome||item.nome_original||'')}" data-op="${escapeHtml(String(op))}"
-                                        onclick="scanOrStartWaiting(this)">
-                                        ▶ Iniciar Produção
-                                    </button>
-                                    <button class="btn btn-outline-secondary btn-sm" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
+                                    <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
+                                        📷 Bipe o código de barras para iniciar
+                                    </div>
+                                    <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
                         </div>
@@ -6512,7 +6358,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        /* Botão "Iniciar" ou leitura via scanner — anti-duplicação */
         /* Remove pedido da fila (botão ✕) */
         async function dismissPendingOrder(itemKey, evt) {
             if (evt) { evt.stopPropagation(); evt.preventDefault(); }
@@ -6528,35 +6373,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 await loadProductionBoard();
             } catch(e) {
                 showToast('Erro', 'Falha ao remover pedido.', 'danger');
-            }
-        }
-
-        async function scanOrStartWaiting(btn) {
-            const ikey  = btn.dataset.ikey;
-            const pnome = btn.dataset.pnome;
-            const op    = btn.dataset.op;
-            if (!ikey) return;
-            if (_scannedThisSession.has(ikey + ':waiting')) {
-                showToast('Aviso', 'Este pedido já foi iniciado nesta sessão.', 'warning');
-                return;
-            }
-            btn.disabled = true;
-            btn.textContent = '⏳...';
-            try {
-                const res = await fetch('/api/pending-orders/start', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome })
-                });
-                if (!res.ok) throw new Error('Erro servidor');
-                _scannedThisSession.add(ikey + ':waiting');
-                showToast('🚀 Iniciado', pnome, 'success');
-                // Registra componentes automaticamente
-                _autoRegisterComponents(pnome, ikey);
-                await loadProductionBoard();
-                switchBoardTab('inprod');
-            } catch(e) {
-                btn.disabled = false; btn.textContent = '▶ Iniciar Produção';
-                showToast('Erro', 'Falha ao iniciar produção', 'danger');
             }
         }
 
@@ -6632,11 +6448,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         ${jaLido
                             ? `<div class="bc-lido-overlay">✅ CONCLUÍDO!<br><small style="font-weight:400;font-size:.72rem;">Registrado com sucesso</small></div>`
                             : `<div class="mt-2">
-                                <button class="btn btn-danger btn-sm fw-bold w-100"
-                                    data-ikey="${ikey}" data-pnome="${escapeHtml(nome)}" data-tkey="${encodeURIComponent(tkey)}"
-                                    onclick="scanOrFinishInProd(this)">
-                                    ✅ Concluir Produção
-                                </button>
+                                <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
+                                    📷 Bipe o código de barras para concluir
+                                </div>
                                </div>`
                         }
                     </div>
@@ -6659,35 +6473,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             });
         }
 
-        /* Botão "Concluir" ou leitura via scanner — anti-duplicação */
-        async function scanOrFinishInProd(btn) {
-            const ikey  = btn.dataset.ikey;
-            const pnome = btn.dataset.pnome;
-            const tkey  = decodeURIComponent(btn.dataset.tkey || '');
-            if (!ikey) return;
-            if (_scannedThisSession.has(ikey + ':inprod')) {
-                showToast('Aviso', 'Este pedido já foi concluído nesta sessão.', 'warning');
-                return;
-            }
-            btn.disabled = true; btn.textContent = '⏳...';
-            try {
-                const res = await fetch('/api/pending-orders/finish', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({ item_key: ikey, produto_nome: pnome, timer_key: tkey||null })
-                });
-                if (!res.ok) throw new Error('Erro servidor');
-                const result = await res.json();
-                _scannedThisSession.add(ikey + ':inprod');
-                const tempoFmt = result.tempo_producao ? ' · ' + formatSeconds(result.tempo_producao) : '';
-                showToast('✅ Concluído!', pnome + tempoFmt, 'success');
-                await loadProductionBoard();
-                await refreshComponentTab();
-                switchBoardTab('done');
-            } catch(e) {
-                btn.disabled = false; btn.textContent = '✅ Concluir Produção';
-                showToast('Erro', 'Falha ao concluir produção', 'danger');
-            }
-        }
+        /* scanOrStartWaiting e scanOrFinishInProd removidos — produção avança exclusivamente via /api/barcode/scan */
 
         /* ── ABA CONCLUÍDOS: tabela simples ── */
         function _renderDone(items) {
@@ -7792,154 +7578,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 
         /* ══════════════════════════════════════════════════════════
-           CÂMERA SCANNER — ZXing (celular / webcam)
-        ══════════════════════════════════════════════════════════ */
-        let _codeReader = null;
-        let _cameraActive = false;
+        /* ══════════════════════════════════════════════════════════ */
 
-        function openCameraScanner() {
-            if (!isAuthenticated) {
-                showToast('Aviso', 'Autentique-se antes de usar o scanner.', 'warning');
-                return;
-            }
-            // Verifica suporte a câmera
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                showToast('Aviso', 'Câmera não suportada neste dispositivo/browser.', 'warning');
-                return;
-            }
-            if (typeof ZXing === 'undefined') {
-                showToast('Aviso', 'Biblioteca ZXing não carregada. Use o scanner USB ou recarregue a página.', 'warning');
-                return;
-            }
-            const modal = new bootstrap.Modal(document.getElementById('cameraScanModal'));
-            modal.show();
-            setTimeout(_startCameraScanner, 400);
-        }
-
-        async function _startCameraScanner() {
-            const video = document.getElementById('camera-preview');
-            const resultBox = document.getElementById('camera-scan-result');
-            if (!video) return;
-
-            // Verifica se ZXing está disponível
-            if (typeof ZXing === 'undefined') {
-                if (resultBox) {
-                    resultBox.style.display = 'block';
-                    resultBox.textContent = '⚠️ Biblioteca de scanner não carregada. Usando scanner USB.';
-                }
-                return;
-            }
-
-            try {
-                _codeReader = new ZXing.BrowserMultiFormatReader();
-                _cameraActive = true;
-
-                // Lista câmeras disponíveis e prefere a traseira
-                const devices = await ZXing.BrowserMultiFormatReader.listVideoInputDevices();
-                const backCam = devices.find(d =>
-                    d.label.toLowerCase().includes('back') ||
-                    d.label.toLowerCase().includes('tras') ||
-                    d.label.toLowerCase().includes('rear') ||
-                    d.label.toLowerCase().includes('environment')
-                ) || devices[devices.length - 1] || devices[0];
-
-                if (!backCam) {
-                    if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Nenhuma câmera encontrada.'; }
-                    return;
-                }
-
-                await _codeReader.decodeFromVideoDevice(backCam.deviceId, video, async (result, err) => {
-                    if (result && _cameraActive) {
-                        const codigo = result.getText();
-                        _cameraActive = false; // Para de ler após 1 leitura
-                        if (resultBox) {
-                            resultBox.style.display = 'block';
-                            resultBox.textContent = '⏳ Processando: ' + codigo;
-                            resultBox.style.background = 'rgba(255,182,0,.85)';
-                            resultBox.style.color = '#000';
-                        }
-                        // Envia para o backend (mesma lógica do scanner USB)
-                        try {
-                            const res = await fetch('/api/barcode/scan', {
-                                method: 'POST',
-                                headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify({ codigo })
-                            });
-                            const data = await res.json();
-                            const acao = data.acao || '';
-
-                            if (resultBox) {
-                                if (acao === 'iniciado') {
-                                    resultBox.style.background = 'rgba(16,185,129,.9)';
-                                    resultBox.style.color = '#fff';
-                                    resultBox.textContent = '✅ INICIADO: ' + (data.nome || codigo);
-                                    showToast('🚀 Iniciado!', data.nome + ' · #' + codigo, 'success');
-                                    setTimeout(() => { loadProductionBoard(); switchBoardTab('inprod'); }, 800);
-                                } else if (acao === 'concluido') {
-                                    resultBox.style.background = 'rgba(99,102,241,.9)';
-                                    resultBox.style.color = '#fff';
-                                    const tf = data.tempo_producao ? ' · ' + formatSeconds(data.tempo_producao) : '';
-                                    resultBox.textContent = '✅ CONCLUÍDO: ' + (data.nome || codigo) + tf;
-                                    showToast('✅ Concluído!', data.nome + tf, 'success');
-                                    setTimeout(() => { loadProductionBoard(); refreshComponentTab(); switchBoardTab('done'); }, 800);
-                                } else if (acao === 'ja_lido_etapa') {
-                                    resultBox.style.background = 'rgba(107,114,128,.85)';
-                                    resultBox.style.color = '#fff';
-                                    resultBox.textContent = '⚠️ ' + (data.mensagem || 'Já processado nesta etapa');
-                                    showToast('Aviso', data.mensagem, 'warning');
-                                } else if (acao === 'nao_encontrado') {
-                                    resultBox.style.background = 'rgba(239,68,68,.85)';
-                                    resultBox.style.color = '#fff';
-                                    resultBox.textContent = '❌ Não encontrado: ' + codigo;
-                                    showToast('Não encontrado', 'Pedido #' + codigo + ' não está na fila.', 'warning');
-                                } else {
-                                    resultBox.textContent = data.mensagem || 'Código: ' + codigo;
-                                }
-                            }
-
-                            // Re-habilita leitura após 3s (para ler próximo pedido)
-                            setTimeout(() => {
-                                _cameraActive = true;
-                                if (resultBox) {
-                                    resultBox.style.display = 'none';
-                                    resultBox.style.background = 'rgba(0,0,0,.7)';
-                                    resultBox.style.color = '#fff';
-                                }
-                            }, 3000);
-
-                        } catch(e) {
-                            if (resultBox) { resultBox.style.display='block'; resultBox.textContent='❌ Erro de comunicação'; }
-                            setTimeout(() => { _cameraActive = true; }, 2000);
-                        }
-                    }
-                });
-            } catch(e) {
-                console.error('Erro câmera:', e);
-                if (resultBox) {
-                    resultBox.style.display = 'block';
-                    resultBox.textContent = '❌ Erro ao acessar câmera: ' + (e.message || 'Permissão negada');
-                }
-            }
-        }
-
-        function stopCameraScanner() {
-            _cameraActive = false;
-            if (_codeReader) {
-                try { _codeReader.reset(); } catch(e) {}
-                _codeReader = null;
-            }
-            const video = document.getElementById('camera-preview');
-            if (video && video.srcObject) {
-                video.srcObject.getTracks().forEach(t => t.stop());
-                video.srcObject = null;
-            }
-        }
-
-        // Para câmera quando modal fecha
-        document.addEventListener('DOMContentLoaded', () => {
-            const camModal = document.getElementById('cameraScanModal');
-            if (camModal) camModal.addEventListener('hidden.bs.modal', stopCameraScanner);
-        });
 
 
 
@@ -8074,6 +7714,8 @@ def create_app() -> Flask:
             time.sleep(2)  # aguarda Flask terminar de subir
             if orchestrator.is_running():
                 return
+            # Reseta timer de sync para garantir leitura fresca do MongoDB no boot
+            orchestrator.auth._last_storage_sync = 0
             orchestrator.auth.reload_tokens_from_disk()
             # Renova via refresh_token se o access_token expirou
             if (orchestrator.auth._refresh_token and not (
