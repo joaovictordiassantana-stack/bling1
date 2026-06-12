@@ -196,9 +196,11 @@ class RateLimiter:
     """Limitador de taxa centralizado para evitar 429 da API Bling.
     
     Garante intervalo mínimo entre requisições, thread-safe.
-    Taxa segura: ~2.5 req/s (min_interval=0.4s)
+    Taxa segura por worker: ~1.2 req/s (min_interval=0.85s).
+    Com 2 workers Gunicorn ativos, a taxa agregada fica ~2.4 req/s,
+    dentro do limite do Bling (que costuma ser ~3 req/s).
     """
-    def __init__(self, min_interval=0.4):
+    def __init__(self, min_interval=0.85):
         self.min_interval = min_interval
         self.lock = Lock()
         self.last_call = 0.0
@@ -710,7 +712,7 @@ class BlingAPIClient:
         self.auth = auth_manager
         self.logger = logging.getLogger('bling_automacao')
         self.metrics = MetricsManager()
-        self.rate_limiter = RateLimiter(min_interval=0.4)
+        self.rate_limiter = RateLimiter(min_interval=0.85)
         
         # Configuração de Sessão com Retry Automático
         self.session = requests.Session()
@@ -718,10 +720,11 @@ class BlingAPIClient:
         # Estratégia de Retry: Tenta 3 vezes em caso de falha de conexão, reset ou 50x
         retry_strategy = Retry(
             total=3,
-            backoff_factor=1,  # Espera 1s, 2s, 4s
+            backoff_factor=2,  # Espera 2s, 4s, 8s — mais folga para 429 do Bling
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST", "PUT", "DELETE"],
-            raise_on_status=False
+            raise_on_status=False,
+            respect_retry_after_header=True,  # Honra header Retry-After do Bling se presente
         )
         
         adapter = HTTPAdapter(max_retries=retry_strategy)
@@ -5270,15 +5273,30 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             <div class="d-flex align-items-center gap-2">
                 <span id="status-badge" class="badge bg-secondary" title="Aguardando WebSocket...">⏳ Conectando...</span>
                 <a id="auth-link" href="{{ auth_url }}" class="btn btn-sm btn-outline-light">Autenticar</a>
-                <a href="/admin/reset-tokens" class="btn btn-sm"
-                   style="background:#ef4444;color:#fff;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
-                   title="Resetar tokens OAuth (use quando API retornar 403)">🔑 Reset OAuth</a>
-                <a href="/admin/repair-orders" class="btn btn-sm"
-                   style="background:#3b82f6;color:#fff;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
-                   title="Reparar pedidos sem número">🔧 Reparar</a>
-                <a href="/admin/purge-ghost-orders" class="btn btn-sm"
-                   style="background:#f59e0b;color:#000;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
-                   title="Remover pedidos fantasma e antigos">🧹 Purge</a>
+
+                <!-- Menu unificado de administração -->
+                <div class="dropdown">
+                    <button class="btn btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false"
+                        style="background:#1e293b;color:#fff;font-weight:600;border:1px solid #334155;border-radius:50px;padding:4px 14px;font-size:.72rem;">
+                        ⚙️ Admin
+                    </button>
+                    <ul class="dropdown-menu dropdown-menu-end" style="font-size:.82rem;min-width:240px;">
+                        <li><a class="dropdown-item" href="/admin/reset-tokens">
+                            🔑 Reset OAuth
+                            <div class="text-muted" style="font-size:.68rem;">Use quando a API retornar 403</div>
+                        </a></li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item" href="/admin/repair-orders">
+                            🔧 Reparar Pedidos
+                            <div class="text-muted" style="font-size:.68rem;">Preenche número de pedido ausente</div>
+                        </a></li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item" href="/admin/purge-ghost-orders">
+                            🧹 Limpar Antigos
+                            <div class="text-muted" style="font-size:.68rem;">Remove pedidos fantasma/+30 dias</div>
+                        </a></li>
+                    </ul>
+                </div>
             </div>
         </div>
     </nav>
@@ -5287,47 +5305,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     <div class="container-fluid px-4 py-5">
 
         <!-- PAGE HEADER -->
-        <div class="row mb-5">
+        <div class="row mb-4">
             <div class="col-12">
-                <h2 class="mb-1 page-title">Pedidos de <span class="highlight">Venda</span></h2>
-                <p class="text-muted mb-4" style="font-size:0.85rem;">Acompanhe os pedidos abertos e fechados em tempo real</p>
-            </div>
-        </div>
-
-        <!-- KPI CARDS -->
-        <div class="row mb-5">
-            <div class="col-md-4 mb-4">
-                <div class="card p-4 kpi-card kpi-daily text-center">
-                    <h5>⚡ Pedidos Diários</h5>
-                    <h3 id="kpi-daily" class="text-primary">0</h3>
-                    <small class="text-muted">Últimas 24h</small>
-                    <div id="kpi-daily-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
-                </div>
-            </div>
-            <div class="col-md-4 mb-4">
-                <div class="card p-4 kpi-card kpi-weekly text-center">
-                    <h5>📅 Pedidos Semanais</h5>
-                    <h3 id="kpi-weekly" style="color: var(--warning);">0</h3>
-                    <small class="text-muted">Últimos 7 dias</small>
-                    <div id="kpi-weekly-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
-                </div>
-            </div>
-            <div class="col-md-4 mb-4">
-                <div class="card p-4 kpi-card kpi-historic text-center">
-                    <h5>📊 Pedidos Mensais</h5>
-                    <h3 id="kpi-historic" style="color: var(--success);">0</h3>
-                    <small class="text-muted">Este Mês</small>
-                    <div id="kpi-monthly-orders" class="mt-2" style="font-size:0.7rem;color:#888;max-height:60px;overflow-y:auto;line-height:1.5;"></div>
-                </div>
-            </div>
-        </div>
-
-        <!-- TIMESTAMP -->
-        <div class="row mb-5">
-            <div class="col-12">
-                <small class="text-muted">
-                    ⏱️ Último Recálculo: <span id="last-recalculated" style="font-weight: 600;">N/D</span>
-                </small>
+                <h2 class="mb-0 page-title">Painel de <span class="highlight">Produção</span></h2>
             </div>
         </div>
 
@@ -6614,7 +6594,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     else if (urg==='atencao') prazoBadge = `<span class="badge bg-warning text-dark" style="font-size:.65rem;">⏰ ${dias}d</span>`;
                 }
 
-                // Tempo em dias/horas
+                // Tempo em dias/horas — alerta visual se exceder 24h (provável bug/item travado)
+                const TEMPO_ANOMALO = 86400; // 24h
+                const isAnomalo = elapsed > TEMPO_ANOMALO;
                 const elapsedFmt = elapsed > 86400
                     ? (elapsed/86400).toFixed(1)+'d'
                     : formatSeconds(elapsed);
@@ -6633,12 +6615,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                         <!-- Timer ao vivo -->
                         <div class="text-center my-2">
-                            <span id="btimer_${safeId}" class="font-monospace fw-bold" style="font-size:1.5rem;color:#10b981;">${elapsedFmt}</span>
+                            <span id="btimer_${safeId}" class="font-monospace fw-bold" style="font-size:1.5rem;color:${isAnomalo?'#ef4444':'#10b981'};">${elapsedFmt}</span>
                             <div>
                                 <span class="badge ${estado==='running'?'bg-success':'bg-warning text-dark'}" style="${estado==='running'?'animation:pulse-animation 1.5s infinite;':''}">
                                     ${estado==='running'?'🟢 PRODUZINDO':'⏸ PAUSADO'}
                                 </span>
                             </div>
+                            ${isAnomalo ? `<div style="font-size:.65rem;color:#ef4444;font-weight:700;margin-top:4px;">⚠️ Tempo anômalo — possível item travado</div>` : ''}
                         </div>
                         <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data?'· '+new Date(item.pedido_data).toLocaleDateString('pt-BR'):''}</div>
                         ${jaLido
