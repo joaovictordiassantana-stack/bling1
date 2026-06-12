@@ -2177,40 +2177,60 @@ class PendingOrdersManager:
         Regras:
         - 'done': só remove se mes_conclusao (ou finished_at) for de mês anterior
         - 'waiting'/'in_production': remove se added_at for de mês anterior
-        Itens 'done' do mês atual são mantidos como histórico visível.
+        - Qualquer item sem pedido_numero E sem ordem_producao válidos é removido (dado fantasma)
+        - Qualquer item 'in_production' ou 'waiting' com mais de 30 dias é removido
         """
         agora = datetime.now()
         mes_atual = f"{agora.year}-{agora.month:02d}"
         to_remove = []
+
         for key, item in self.data.items():
             status = item.get('status', 'waiting')
+
+            # ── Regra 0: remove dados fantasma (sem identificador válido) ────
+            has_id = (item.get('pedido_numero') or item.get('ordem_producao') or
+                      item.get('order_id') or item.get('order_id_bling'))
+            if not has_id:
+                to_remove.append(key)
+                logger.info(f"🗑️ Purge: item '{key}' sem identificador — removido (dado fantasma).")
+                continue
+
             try:
                 if status == 'done':
-                    # Para itens concluídos, usa o mês de conclusão
                     mes_ref = item.get('mes_conclusao', '')
                     if not mes_ref:
                         fin = item.get('finished_at', '')
                         mes_ref = fin[:7] if fin else item.get('added_at', '')[:7]
+                    if mes_ref and mes_ref != mes_atual:
+                        to_remove.append(key)
                 else:
-                    # Para itens em espera/produção, usa quando foi adicionado
                     mes_ref = item.get('added_at', '')[:7]
-
-                if mes_ref and mes_ref != mes_atual:
-                    to_remove.append(key)
+                    # Regra extra: in_production/waiting sem added_at válido OU com > 30 dias → remove
+                    if not mes_ref or mes_ref != mes_atual:
+                        to_remove.append(key)
+                        continue
+                    # Hard limit 30 dias para itens não concluídos
+                    try:
+                        added_dt = datetime.fromisoformat(item.get('added_at', ''))
+                        if (agora - added_dt).days >= 30:
+                            to_remove.append(key)
+                            logger.info(f"🗑️ Purge: '{key}' em status '{status}' há {(agora-added_dt).days}d — removido.")
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
         if to_remove:
-            for key in to_remove:
-                del self.data[key]
+            for key in set(to_remove):
+                self.data.pop(key, None)
                 if MONGO_AVAILABLE:
                     try:
                         _mongo_db['pending_orders'].delete_one({'_id': key})
                     except Exception:
                         pass
-            self._save()  # sempre sincroniza arquivo
-            logger.info(f"🗓️ Reset mensal: {len(to_remove)} itens antigos removidos da fila.")
-        return len(to_remove)
+            self._save()
+            logger.info(f"🗓️ Reset: {len(set(to_remove))} itens antigos/fantasma removidos da fila.")
+        return len(set(to_remove))
 
     def sync_from_orders(self, orders: list, products_cache: dict):
         """
@@ -2279,13 +2299,15 @@ class PendingOrdersManager:
                     item.get('dataPrevista') or
                     ''
                 )
-                # Ordem de produção Bling (se vier no item ou pedido)
+                # Ordem de produção Bling (OP interna — NÃO mistura com número do pedido)
                 ordem_producao = (
                     pedido.get('ordemProducao') or
-                    pedido.get('numeroPedido') or
                     item.get('ordemProducao') or
-                    str(pedido.get('numero', order_id))
+                    ''   # vazio é correto — não usar numero do pedido como OP
                 )
+
+                # Número do pedido Bling — usado como barcode principal
+                numero_pedido = str(pedido.get('numero') or order_id)
 
                 item_data = {
                     'nome': nome_produto,
@@ -2295,10 +2317,11 @@ class PendingOrdersManager:
                     'cor': cor,
                     'imagem': imagem,
                     'pedido_data': pedido.get('data') or pedido.get('dataEmissao', ''),
-                    'pedido_numero': pedido.get('numero', order_id),
+                    'pedido_numero': numero_pedido,
                     'cliente': cliente,
                     'data_entrega': data_entrega_raw,
                     'ordem_producao': ordem_producao,
+                    'order_id': order_id,
                     'order_id_bling': order_id,
                 }
 
@@ -3996,6 +4019,166 @@ class WebServer:
 </body>
 </html>"""
 
+        # ── Rota de reparo: repovoar pedido_numero em itens existentes ─────────
+        @self.app.route('/admin/repair-orders', methods=['GET', 'POST'])
+        def admin_repair_orders():
+            """Corrige itens existentes no MongoDB que têm order_id mas não têm pedido_numero."""
+            if request.method == 'POST':
+                repaired = 0
+                skipped  = 0
+                errors   = []
+                for key, item in list(pending_orders.data.items()):
+                    pnum = item.get('pedido_numero')
+                    if pnum and str(pnum) != '0':
+                        skipped += 1
+                        continue
+                    # Tenta preencher de order_id_bling ou order_id
+                    oid = str(item.get('order_id_bling') or item.get('order_id') or '')
+                    if not oid or oid == '0':
+                        errors.append(f"{key}: sem order_id")
+                        continue
+                    # Usa o order_id como pedido_numero (é o número interno Bling)
+                    pending_orders.data[key]['pedido_numero'] = oid
+                    if not item.get('order_id'):
+                        pending_orders.data[key]['order_id'] = oid
+                    pending_orders._save_one(key)
+                    repaired += 1
+
+                msg = (f"Reparados: {repaired} | Já tinham número: {skipped} | "
+                       f"Sem order_id: {len(errors)}")
+                logger.info(f"🔧 Repair orders: {msg}")
+                return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
+                    <h2>✅ Reparo concluído</h2>
+                    <p style="color:#86efac">{msg}</p>
+                    {'<p style="color:#f87171">Sem order_id: ' + ', '.join(errors[:10]) + '</p>' if errors else ''}
+                    <a href="/admin/repair-orders" style="color:#60a5fa">← Voltar</a> &nbsp;
+                    <a href="/" style="color:#60a5fa">Ir ao Dashboard →</a>
+                    </body></html>"""
+
+            # GET — preview
+            need_repair = []
+            ok = 0
+            no_id = 0
+            for key, item in pending_orders.data.items():
+                pnum = item.get('pedido_numero')
+                oid  = item.get('order_id_bling') or item.get('order_id')
+                if pnum and str(pnum) != '0':
+                    ok += 1
+                elif oid and str(oid) != '0':
+                    need_repair.append(f"{key} → usar order_id={oid}")
+                else:
+                    no_id += 1
+
+            return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><title>Repair Orders</title>
+<style>body{{font-family:'Segoe UI',sans-serif;padding:40px;background:#0f172a;color:#e2e8f0;max-width:700px;margin:0 auto}}
+h1{{color:#f1f5f9}}h2{{color:#94a3b8;font-size:1rem;margin-top:24px}}
+.tag-green{{color:#86efac}}.tag-yellow{{color:#fbbf24}}.tag-red{{color:#f87171}}
+ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
+.btn{{display:inline-block;padding:12px 28px;border-radius:8px;font-weight:700;text-decoration:none;border:none;cursor:pointer;font-size:1rem}}
+.btn-blue{{background:#3b82f6;color:#fff}}.btn-back{{background:#1e293b;color:#94a3b8;border:1px solid #334155;margin-right:12px}}</style>
+</head><body>
+<h1>🔧 Reparo de Pedidos</h1>
+<p style="color:#94a3b8">Preenche <code>pedido_numero</code> usando <code>order_id</code> em itens que estão com o campo vazio.</p>
+<h2 class="tag-green">✅ Já têm pedido_numero ({ok})</h2>
+<h2 class="tag-yellow">⚠️ Serão reparados — usarão order_id ({len(need_repair)})</h2>
+<ul>{''.join(f'<li>{r}</li>' for r in need_repair[:20]) or '<li>Nenhum</li>'}</ul>
+<h2 class="tag-red">❌ Sem nenhum identificador — serão ignorados ({no_id})</h2>
+<p style="color:#64748b;font-size:.8rem;">Itens sem identificador devem ser removidos pelo <a href="/admin/purge-ghost-orders" style="color:#60a5fa">Purge</a>.</p>
+<br>
+<a href="/" class="btn btn-back">← Voltar</a>
+<form method="POST" style="display:inline">
+  <button type="submit" class="btn btn-blue">🔧 Confirmar Reparo ({len(need_repair)} itens)</button>
+</form>
+</body></html>"""
+
+        # ── Rota de emergência: purge de pedidos fantasma/antigos ────────────────
+        @self.app.route('/admin/purge-ghost-orders', methods=['GET', 'POST'])
+        def admin_purge_ghost_orders():
+            if request.method == 'POST':
+                try:
+                    removed = pending_orders.reset_if_new_month()
+                    # Força também limpeza direto no MongoDB para itens que não estão em memória
+                    mongo_removed = 0
+                    if MONGO_AVAILABLE:
+                        agora = datetime.now()
+                        cutoff = (agora - timedelta(days=30)).isoformat()
+                        try:
+                            # Remove itens sem identificador válido
+                            r1 = _mongo_db['pending_orders'].delete_many({
+                                'pedido_numero': {'$in': [None, '', 0]},
+                                'order_id':      {'$in': [None, '', 0]},
+                                'ordem_producao':{'$in': [None, '', 0]},
+                            })
+                            # Remove itens waiting/in_production com mais de 30 dias
+                            r2 = _mongo_db['pending_orders'].delete_many({
+                                'status': {'$in': ['waiting', 'in_production']},
+                                'added_at': {'$lt': cutoff},
+                            })
+                            mongo_removed = r1.deleted_count + r2.deleted_count
+                        except Exception as _me:
+                            logger.error(f"Purge MongoDB direto: {_me}")
+                    # Recarrega memória do MongoDB após purge
+                    pending_orders.load()
+                    msg = f"Removidos: {removed} em memória + {mongo_removed} direto no MongoDB. Total em fila: {len(pending_orders.data)}"
+                    logger.info(f"🧹 Purge manual: {msg}")
+                    return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
+                        <h2>✅ Purge concluído</h2><p style="color:#86efac">{msg}</p>
+                        <a href="/admin/purge-ghost-orders" style="color:#60a5fa">← Voltar</a> &nbsp;
+                        <a href="/" style="color:#60a5fa">Ir ao Dashboard →</a>
+                        </body></html>"""
+                except Exception as e:
+                    return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
+                        <h2>❌ Erro</h2><pre style="color:#f87171">{e}</pre>
+                        <a href="/admin/purge-ghost-orders" style="color:#60a5fa">← Voltar</a></body></html>""", 500
+
+            # GET — mostra preview do que será removido
+            agora = datetime.now()
+            mes_atual = f"{agora.year}-{agora.month:02d}"
+            ghost, old_items, ok = [], [], []
+            for key, item in pending_orders.data.items():
+                has_id = (item.get('pedido_numero') or item.get('ordem_producao') or item.get('order_id'))
+                if not has_id:
+                    ghost.append(key)
+                    continue
+                status = item.get('status', 'waiting')
+                mes_ref = item.get('added_at', '')[:7] if status != 'done' else (item.get('mes_conclusao') or item.get('finished_at','')[:7])
+                try:
+                    added_dt = datetime.fromisoformat(item.get('added_at',''))
+                    if status != 'done' and (agora - added_dt).days >= 30:
+                        old_items.append(f"{key} ({(agora-added_dt).days}d, {status})")
+                        continue
+                except Exception:
+                    pass
+                if mes_ref and mes_ref != mes_atual and status != 'done':
+                    old_items.append(f"{key} (mês={mes_ref}, {status})")
+                else:
+                    ok.append(key)
+
+            return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Purge Pedidos Fantasma</title>
+<style>body{{font-family:'Segoe UI',sans-serif;padding:40px;background:#0f172a;color:#e2e8f0;max-width:700px;margin:0 auto}}
+h1{{color:#f1f5f9}}h2{{color:#94a3b8;font-size:1rem;margin-top:24px}}
+.tag-red{{color:#f87171}}.tag-yellow{{color:#fbbf24}}.tag-green{{color:#86efac}}
+ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
+.btn{{display:inline-block;padding:12px 28px;border-radius:8px;font-weight:700;text-decoration:none;border:none;cursor:pointer;font-size:1rem}}
+.btn-red{{background:#ef4444;color:#fff}}.btn-back{{background:#1e293b;color:#94a3b8;border:1px solid #334155;margin-right:12px}}</style>
+</head><body>
+<h1>🧹 Purge de Pedidos Fantasma</h1>
+<h2 class="tag-red">❌ SERÃO REMOVIDOS — sem identificador ({len(ghost)})</h2>
+<ul>{''.join(f'<li>{g}</li>' for g in ghost[:20]) or '<li>Nenhum</li>'}</ul>
+<h2 class="tag-yellow">⚠️ SERÃO REMOVIDOS — antigos/expirados ({len(old_items)})</h2>
+<ul>{''.join(f'<li>{o}</li>' for o in old_items[:20]) or '<li>Nenhum</li>'}</ul>
+<h2 class="tag-green">✅ SERÃO MANTIDOS ({len(ok)})</h2>
+<ul>{''.join(f'<li>{k}</li>' for k in ok[:20]) or '<li>Nenhum</li>'}</ul>
+<br>
+<a href="/" class="btn btn-back">← Voltar</a>
+<form method="POST" style="display:inline">
+  <button type="submit" class="btn btn-red">🗑️ Confirmar Purge ({len(ghost)+len(old_items)} itens)</button>
+</form>
+</body></html>"""
+
         # Rota de Callback OAuth (Recebe o code do Bling)
         @self.app.route('/callback')
         def callback():
@@ -5090,6 +5273,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <a href="/admin/reset-tokens" class="btn btn-sm"
                    style="background:#ef4444;color:#fff;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
                    title="Resetar tokens OAuth (use quando API retornar 403)">🔑 Reset OAuth</a>
+                <a href="/admin/repair-orders" class="btn btn-sm"
+                   style="background:#3b82f6;color:#fff;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
+                   title="Reparar pedidos sem número">🔧 Reparar</a>
+                <a href="/admin/purge-ghost-orders" class="btn btn-sm"
+                   style="background:#f59e0b;color:#000;font-weight:600;border:none;border-radius:50px;padding:4px 12px;font-size:.72rem;"
+                   title="Remover pedidos fantasma e antigos">🧹 Purge</a>
             </div>
         </div>
     </nav>
@@ -6302,7 +6491,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                 grupo.items.forEach(item => {
                     const ikey = item.item_key || '';
-                    const op = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                    // Fallback em cascata: ordem_producao → pedido_numero → order_id → item_key
+                    // Filtra valores inválidos: 0, '0', null, undefined, ''
+                    const _rawOp = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                    const op = (_rawOp && String(_rawOp) !== '0') ? String(_rawOp) : '';
                     const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
                     const urg = item.urgencia || 'normal';
                     const dias = item.dias_restantes;
@@ -6321,9 +6513,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                             <div class="bc-nome">${escapeHtml(item.nome||item.nome_original||'N/D')}</div>
                             ${item.base||item.cor ? `<div style="font-size:.68rem;color:#6b7280;margin-bottom:8px;">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))}</div>` : ''}
-                            <div class="bc-num">#${escapeHtml(String(op))}</div>
+                            <div class="bc-num">${op ? '#'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número — remova e sincronize</span>'}</div>
                             <div class="bc-svg-wrap my-2 text-center">
-                                <svg id="${svgId}"></svg>
+                                ${op ? `<svg id="${svgId}"></svg>` : `<div style="color:#ef4444;font-size:.7rem;padding:8px;">Código indisponível</div>`}
                             </div>
                             <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data ? '· '+new Date(item.pedido_data).toLocaleDateString('pt-BR') : ''}</div>
                             ${jaLido
@@ -6347,13 +6539,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             // Renderiza barcodes
             items.forEach(item => {
                 const ikey = item.item_key || '';
-                const op = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const _rawOp2 = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const op = (_rawOp2 && String(_rawOp2) !== '0') ? String(_rawOp2) : '';
                 const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
                 const svgEl = document.getElementById(svgId);
                 if (svgEl && op) {
                     try {
-                        JsBarcode(svgEl, String(op), { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
-                    } catch(e) { if (svgEl) svgEl.innerHTML = `<text font-size="10">${op}</text>`; }
+                        JsBarcode(svgEl, op, { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { svgEl.innerHTML = `<text font-size="10" fill="#ef4444">Erro: ${op}</text>`; }
                 }
             });
         }
@@ -6401,7 +6594,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             filtered.forEach(item => {
                 const ikey  = item.item_key || '';
                 const nome  = item.nome || item.nome_original || item.produto || 'N/D';
-                const op    = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const _rawOp3 = item.pedido_numero || item.ordem_producao || item.order_id || '';
+                const op    = (_rawOp3 && String(_rawOp3) !== '0') ? String(_rawOp3) : '';
+                const opInterna = item.ordem_producao ? String(item.ordem_producao) : '';
+                const cliente = item.cliente || '';
                 const tkey  = item.timer_key || nome;
                 const safeId = nome.replace(/[^a-zA-Z0-9]/g,'_');
                 const svgId  = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
@@ -6427,13 +6623,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
 
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
-                    <div class="bc-card inprod">
+                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(ikey)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
-                        <div class="bc-num">#${escapeHtml(String(op))}</div>
+                        <div class="bc-num">${op ? '#'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
                         ${dataEntFmt ? `<div style="font-size:.65rem;color:#6b7280;margin-bottom:4px;">📅 Previsto: ${dataEntFmt}</div>` : ''}
                         <div class="bc-svg-wrap my-2 text-center">
-                            <svg id="${svgId}"></svg>
+                            ${op ? `<svg id="${svgId}"></svg>` : `<div style="color:#ef4444;font-size:.7rem;">Código indisponível</div>`}
                         </div>
                         <!-- Timer ao vivo -->
                         <div class="text-center my-2">
@@ -6462,13 +6658,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             // Renderiza barcodes
             filtered.forEach(item => {
                 const ikey = item.item_key || '';
-                const op   = item.ordem_producao || item.pedido_numero || item.order_id || '';
+                const _rawOp4 = item.pedido_numero || item.ordem_producao || item.order_id || '';
+                const op = (_rawOp4 && String(_rawOp4) !== '0') ? String(_rawOp4) : '';
                 const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
                 const svgEl = document.getElementById(svgId);
                 if (svgEl && op) {
                     try {
-                        JsBarcode(svgEl, String(op), { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
-                    } catch(e) { if (svgEl) svgEl.innerHTML = `<text font-size="10">${op}</text>`; }
+                        JsBarcode(svgEl, op, { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { svgEl.innerHTML = `<text font-size="10" fill="#ef4444">Erro: ${op}</text>`; }
                 }
             });
         }
@@ -6565,7 +6762,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 
         /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
-        function openOPModal(numeroOP, nomeProduto, itemKey) {
+        function openOPModal(pedidoNum, nomeProduto, itemKey, ordemProducao, clienteNome) {
+            // pedidoNum = número do pedido Bling (usado como barcode)
+            // ordemProducao = OP interna (informativo)
+            const codigoBarras = String(pedidoNum || ordemProducao || '');
+
             const existing = document.getElementById('opModal');
             if (existing) { bootstrap.Modal.getInstance(existing)?.hide(); existing.remove(); }
 
@@ -6581,9 +6782,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                         <div class="modal-body text-center" style="background:#f9f9f7;padding:24px;">
                             <p class="text-muted small mb-1" style="font-size:0.78rem;">${escapeHtml(nomeProduto)}</p>
-                            <h4 class="fw-bold font-monospace mb-4" style="color:#01010d;letter-spacing:.06em;">
-                                OP # ${escapeHtml(numeroOP)}
+                            ${clienteNome ? `<p class="text-muted mb-1" style="font-size:0.72rem;">Cliente: ${escapeHtml(clienteNome)}</p>` : ''}
+                            <h4 class="fw-bold font-monospace mb-1" style="color:#01010d;letter-spacing:.06em;">
+                                Ped. #${escapeHtml(String(pedidoNum||''))}
                             </h4>
+                            ${ordemProducao ? `<div style="font-size:.72rem;color:#94a3b8;margin-bottom:12px;">OP Interna: ${escapeHtml(String(ordemProducao))}</div>` : ''}
 
                             <!-- Barcode real via JsBarcode -->
                             <div id="op-barcode-wrap" style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:20px 16px 12px;display:inline-block;margin-bottom:16px;min-width:280px;">
@@ -6595,12 +6798,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
                             <p class="text-muted mb-0" style="font-size:0.72rem;">
                                 Scanner: aponte para o código acima.<br>
-                                <strong>1ª leitura</strong> = Iniciar · <strong>2ª leitura</strong> = Concluir
+                                <strong>1ª leitura</strong> = Marcenaria · <strong>2ª</strong> = Tapeçaria · <strong>3ª</strong> = Concluído
                             </p>
                         </div>
                         <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
                             <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
-                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(numeroOP)}', '${escapeHtml(nomeProduto)}')">
+                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(ordemProducao||''))}', '${escapeHtml(clienteNome||'')}')">
                                 🖨️ Imprimir OP
                             </button>
                         </div>
@@ -6614,26 +6817,23 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             // Renderiza barcode real com JsBarcode (Code128 — lido por qualquer scanner)
             setTimeout(() => {
-                try {
-                    JsBarcode('#opBarcodeReal', String(numeroOP), {
-                        format: 'CODE128',
-                        width: 2.2,
-                        height: 70,
-                        displayValue: true,
-                        fontSize: 14,
-                        fontOptions: 'bold',
-                        margin: 6,
-                        background: '#ffffff',
-                        lineColor: '#000000',
-                        textMargin: 4,
-                    });
-                } catch(e) {
+                if (!codigoBarras) {
                     document.getElementById('op-barcode-wrap').innerHTML =
-                        `<div class="font-monospace fw-bold" style="font-size:1.4rem;letter-spacing:.15em;">${escapeHtml(numeroOP)}</div>`;
+                        `<div style="color:#ef4444;font-size:.85rem;">⚠️ Sem número identificador — remova este pedido e sincronize.</div>`;
+                } else {
+                    try {
+                        JsBarcode('#opBarcodeReal', codigoBarras, {
+                            format: 'CODE128', width: 2.2, height: 70,
+                            displayValue: true, fontSize: 14, fontOptions: 'bold',
+                            margin: 6, background: '#ffffff', lineColor: '#000000', textMargin: 4,
+                        });
+                    } catch(e) {
+                        document.getElementById('op-barcode-wrap').innerHTML =
+                            `<div class="font-monospace fw-bold" style="font-size:1.4rem;letter-spacing:.15em;">${escapeHtml(codigoBarras)}</div>`;
+                    }
                 }
-
                 // Mostra status atual do pedido
-                _updateOPStatusBox(numeroOP);
+                _updateOPStatusBox(codigoBarras);
             }, 60);
         }
 
@@ -6668,20 +6868,27 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         /** Impressão da OP em página limpa (sem travar) */
-        function printOP(numeroOP, nomeProduto) {
-            // Gera SVG do barcode num canvas auxiliar
+        function printOP(pedidoNum, nomeProduto, ordemProducao, clienteNome) {
+            // pedidoNum  = número do pedido Bling (usado como barcode)
+            // ordemProducao = número da OP interna (informativo)
+            const codigoBarras = String(pedidoNum || ordemProducao || '');
+            if (!codigoBarras) {
+                alert('Este pedido não tem número identificador. Use o botão ✕ para removê-lo e sincronize novamente.');
+                return;
+            }
+
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printBcSvg';
             tempSvg.style.display = 'none';
             document.body.appendChild(tempSvg);
 
             try {
-                JsBarcode('#_printBcSvg', String(numeroOP), {
+                JsBarcode('#_printBcSvg', codigoBarras, {
                     format: 'CODE128', width: 3, height: 90,
                     displayValue: true, fontSize: 16, fontOptions: 'bold',
                     margin: 8, background: '#ffffff', lineColor: '#000000'
                 });
-            } catch(e) {}
+            } catch(e) { console.warn('JsBarcode error:', e); }
 
             const svgHtml = tempSvg.outerHTML;
             tempSvg.remove();
@@ -6690,24 +6897,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 <div style="font-family:Arial,sans-serif;text-align:center;padding:30px;">
                     <h2 style="letter-spacing:.05em;margin-bottom:4px;">SW Móveis MDF</h2>
                     <p style="color:#666;font-size:13px;margin-bottom:20px;">Ordem de Produção</p>
-                    <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;min-width:300px;">
-                        <div style="font-size:13px;color:#555;margin-bottom:8px;">${nomeProduto}</div>
-                        <div style="font-size:28px;font-weight:900;font-family:monospace;margin-bottom:16px;letter-spacing:.06em;">
-                            OP # ${numeroOP}
+                    <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;min-width:320px;max-width:420px;">
+                        <div style="font-size:13px;color:#555;margin-bottom:6px;font-weight:bold;">${escapeHtml(nomeProduto||'')}</div>
+                        ${clienteNome ? `<div style="font-size:11px;color:#888;margin-bottom:6px;">Cliente: ${escapeHtml(clienteNome)}</div>` : ''}
+                        <div style="font-size:26px;font-weight:900;font-family:monospace;margin-bottom:4px;letter-spacing:.06em;">
+                            Ped. #${escapeHtml(String(pedidoNum||''))}
                         </div>
-                        ${svgHtml}
+                        ${ordemProducao ? `<div style="font-size:11px;color:#888;margin-bottom:12px;">OP Interna: ${escapeHtml(String(ordemProducao))}</div>` : ''}
+                        <div style="margin:16px 0;">${svgHtml}</div>
                     </div>
                     <p style="color:#888;font-size:11px;margin-top:16px;">
                         1ª leitura = Marcenaria &nbsp;|&nbsp; 2ª leitura = Tapeçaria &nbsp;|&nbsp; 3ª leitura = Concluído
                     </p>
-                    <script>window.onload=function(){window.print();window.onafterprint=function(){document.getElementById('print-area').style.display='none';}}</scr' + 'ipt>
                 </div>`;
 
             const printArea = document.getElementById('print-area');
             printArea.innerHTML = printContent;
             printArea.style.display = 'block';
             window.print();
-            // Limpa após impressão
             window.onafterprint = () => {
                 printArea.innerHTML = '';
                 printArea.style.display = 'none';
@@ -7712,6 +7919,15 @@ def create_app() -> Flask:
     def _try_auto_start():
         try:
             time.sleep(2)  # aguarda Flask terminar de subir
+
+            # ── Purge imediato de dados fantasma e itens antigos no boot ──
+            try:
+                removed = pending_orders.reset_if_new_month()
+                if removed:
+                    logger.info(f"🧹 Boot purge: {removed} itens fantasma/antigos removidos do MongoDB.")
+            except Exception as _pe:
+                logger.warning(f"Boot purge: {_pe}")
+
             if orchestrator.is_running():
                 return
             # Reseta timer de sync para garantir leitura fresca do MongoDB no boot
