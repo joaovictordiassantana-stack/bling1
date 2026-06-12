@@ -2512,12 +2512,15 @@ class Orchestrator:
 
             # ── Processamento ─────────────────────────────────────────────
             try:
+                # Pedidos/KPIs primeiro — popula o board de produção rapidamente.
+                # O cache de produtos (mais pesado, ~15-30 páginas) roda depois,
+                # evitando que o frontend fique vazio por minutos no cold start.
+                logger.info(f"🔄 Ciclo #{cycle_count}: atualizando pedidos/KPIs...")
+                self.process_sales_orders()
+
                 if cycle_count == 1 or cycle_count % 3 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: atualizando cache de produtos...")
                     self.process_products_cache()
-
-                logger.info(f"🔄 Ciclo #{cycle_count}: atualizando pedidos/KPIs...")
-                self.process_sales_orders()
 
                 if cycle_count % 2 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: calculando componentes...")
@@ -3889,6 +3892,39 @@ class WebServer:
                 return jsonify({'error': 'item_key obrigatório'}), 400
             pending_orders.dismiss(item_key)
             return jsonify({'success': True})
+
+        @self.app.route('/api/pending-orders/sync', methods=['POST'])
+        @token_required
+        def api_pending_orders_sync(token):
+            """
+            Força sincronização imediata com o Bling — busca pedidos do mês
+            e popula a fila de produção. Usado pelo botão '🔄 Sincronizar Bling'.
+            Roda de forma síncrona (bloqueante) para o front saber quantos itens
+            novos entraram, mas com timeout de segurança.
+            """
+            orch = self.orchestrator
+            if not orch.auth.is_authenticated():
+                return jsonify({'message': 'Autentique-se com o Bling primeiro (/auth).', 'added': 0}), 200
+
+            before = len(pending_orders.data)
+            try:
+                # force=True ignora o lock de "recálculo em andamento" de outro worker
+                orch.process_sales_orders(force=True)
+            except Exception as e:
+                logger.exception("Erro em sync manual de pedidos")
+                return jsonify({'message': f'Erro ao sincronizar: {e}', 'added': 0}), 500
+
+            after = len(pending_orders.data)
+            added = max(0, after - before)
+            total_pedidos = len(orch.sales._sales_history or [])
+
+            if added == 0:
+                msg = (f"Nenhum item novo. {total_pedidos} pedido(s) no histórico — "
+                       "todos já estão na fila ou fora do mês atual.")
+            else:
+                msg = f"{added} novo(s) item(ns) adicionados à fila."
+
+            return jsonify({'added': added, 'message': msg, 'total_pedidos': total_pedidos})
 
         @self.app.route('/api/debug/orders-sample')
         @token_required
