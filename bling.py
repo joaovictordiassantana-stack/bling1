@@ -2665,9 +2665,11 @@ class Orchestrator:
                     # Tenta sync direto (funciona se itens vierem na listagem)
                     added = pending_orders.sync_from_orders(valid_orders, cache_flat)
                     # Se nenhum item foi adicionado e há pedidos, busca detalhes individuais
+                    # em lote pequeno (síncrono — ~40 pedidos, ~34s, com checkpoint
+                    # persistente para não repetir entre ciclos/workers)
                     if added == 0 and valid_orders:
-                        self.logger.info("⚠️ Itens não vieram na listagem. Buscando pedidos individualmente...")
-                        Thread(target=self._fetch_orders_with_items, args=(valid_orders, cache_flat), daemon=True).start()
+                        self.logger.info("⚠️ Itens não vieram na listagem. Buscando lote individual...")
+                        self._fetch_orders_with_items(valid_orders, cache_flat)
                 except Exception as e:
                     self.logger.warning(f"Erro ao sincronizar pending_orders: {e}")
                 
@@ -2807,11 +2809,35 @@ class Orchestrator:
         Busca detalhes individuais de cada pedido para obter os itens.
         A API Bling V3 na listagem não retorna itens — só no endpoint individual.
         Chamado em thread separada para não bloquear o worker principal.
+
+        Estratégia incremental:
+        - Mantém um checkpoint persistente (MongoDB: collection 'sync_checkpoint',
+          doc '_id'='fetched_order_ids') com os IDs já buscados individualmente —
+          evita repetir 2500+ chamadas a cada ciclo e evita duplicação entre os
+          2 workers Gunicorn (que têm memória `pending_orders.data` separada).
+        - Processa em lotes pequenos por ciclo (BATCH_SIZE) para não travar
+          o worker por 30+ minutos.
         """
-        # Todos os order_ids já presentes (qualquer status) — evita re-buscar e duplicar
-        already_have = {v.get('order_id') for v in pending_orders.data.values()}
+        BATCH_SIZE = 40  # ~40 * 0.85s ≈ 34s por ciclo — seguro e visível no log
+
+        # 1) Carrega checkpoint persistente do MongoDB (IDs já processados)
+        fetched_ids: set = set()
+        if MONGO_AVAILABLE:
+            try:
+                doc = _mongo_db['sync_checkpoint'].find_one({'_id': 'fetched_order_ids'})
+                if doc and isinstance(doc.get('ids'), list):
+                    fetched_ids = set(str(i) for i in doc['ids'])
+            except Exception as e:
+                self.logger.warning(f"Checkpoint: erro ao carregar — {e}")
+
+        # 2) Também considera o que já está na memória local (qualquer status)
+        local_ids = {str(v.get('order_id')) for v in pending_orders.data.values() if v.get('order_id')}
+        already_have = fetched_ids | local_ids
+
+        # 3) Filtra apenas pedidos do mês atual
         agora_fetch = datetime.now()
         orders_mes = []
+        skipped_mes = 0
         for o in orders:
             data_str = o.get('data') or o.get('dataEmissao') or ''
             if data_str:
@@ -2819,18 +2845,38 @@ class Orchestrator:
                 if dt:
                     if dt.month == agora_fetch.month and dt.year == agora_fetch.year:
                         orders_mes.append(o)
+                    else:
+                        skipped_mes += 1
                 else:
                     orders_mes.append(o)  # data não parseável: inclui por segurança
             else:
                 orders_mes.append(o)
-        orders_to_fetch = [o for o in orders_mes if str(o.get('id', '')) not in already_have]
 
-        if not orders_to_fetch:
-            self.logger.info("✅ Todos os pedidos já estão na fila de pendentes.")
+        orders_to_fetch_all = [o for o in orders_mes if str(o.get('id', '')) not in already_have]
+
+        # ── LOG DE DIAGNÓSTICO CRÍTICO ─────────────────────────────────────
+        self.logger.info(
+            f"📋 Sync individual — total recebido: {len(orders)} | "
+            f"mês atual ({agora_fetch.month}/{agora_fetch.year}): {len(orders_mes)} "
+            f"(descartados de outros meses: {skipped_mes}) | "
+            f"já processados (checkpoint+memória): {len(already_have)} | "
+            f"pendentes de busca: {len(orders_to_fetch_all)}"
+        )
+
+        if not orders_to_fetch_all:
+            self.logger.info("✅ Todos os pedidos do mês já foram processados (checkpoint completo).")
             return
 
-        self.logger.info(f"🔍 Buscando itens de {len(orders_to_fetch)} pedidos individualmente...")
+        # 4) Limita ao tamanho do lote — restante fica para o próximo ciclo
+        orders_to_fetch = orders_to_fetch_all[:BATCH_SIZE]
+        remaining = len(orders_to_fetch_all) - len(orders_to_fetch)
+
+        self.logger.info(
+            f"🔍 Buscando itens de {len(orders_to_fetch)} pedidos individualmente "
+            f"(lote de {BATCH_SIZE}, restam {remaining} para próximos ciclos)..."
+        )
         enriched = []
+        newly_fetched_ids = []
 
         for pedido in orders_to_fetch:
             order_id = str(pedido.get('id', ''))
@@ -2839,10 +2885,9 @@ class Orchestrator:
             try:
                 resp = self.api.get(f'pedidos/vendas/{order_id}')
                 if not resp:
+                    self.logger.debug(f"  Pedido {order_id}: resposta vazia (None) — possível 403/404")
                     continue
                 detail = resp.get('data', resp)
-                # Mantém campos do pedido original e adiciona itens do detalhe
-                # Preserva campos de entrega e OP do detalhe individual
                 merged = {
                     **pedido,
                     'itens': detail.get('itens', []),
@@ -2852,17 +2897,44 @@ class Orchestrator:
                 }
                 if merged['itens']:
                     enriched.append(merged)
-                    self.logger.debug(f"  Pedido {order_id}: {len(merged['itens'])} itens encontrados")
-                time.sleep(0.4)  # respeita rate limit
+                # Marca como processado independente de ter itens — evita re-tentar
+                # pedidos vazios (ex: cancelados) infinitamente
+                newly_fetched_ids.append(order_id)
+                time.sleep(0.85)  # respeita rate limit (alinhado ao RateLimiter)
             except Exception as e:
                 self.logger.error(f"Erro ao buscar pedido {order_id}: {e}")
                 continue
 
+        self.logger.info(
+            f"📦 Lote concluído: {len(enriched)}/{len(orders_to_fetch)} pedidos com itens válidos."
+        )
+
         if enriched:
             added = pending_orders.sync_from_orders(enriched, cache_flat)
-            self.logger.info(f"✅ {added} itens adicionados à fila de espera após busca individual.")
+            self.logger.info(f"✅ {added} novo(s) item(ns) adicionados à fila de espera.")
         else:
-            self.logger.warning("⚠️ Nenhum item encontrado nos pedidos individuais.")
+            self.logger.warning("⚠️ Nenhum item encontrado neste lote (todos sem 'itens' no detalhe).")
+
+        # 5) Persiste checkpoint — soma os IDs deste lote ao histórico global
+        if newly_fetched_ids and MONGO_AVAILABLE:
+            try:
+                _mongo_db['sync_checkpoint'].update_one(
+                    {'_id': 'fetched_order_ids'},
+                    {'$addToSet': {'ids': {'$each': newly_fetched_ids}},
+                     '$set': {'updated_at': datetime.now().isoformat()}},
+                    upsert=True
+                )
+                self.logger.info(f"💾 Checkpoint atualizado: +{len(newly_fetched_ids)} IDs.")
+            except Exception as e:
+                self.logger.warning(f"Checkpoint: erro ao salvar — {e}")
+
+        # 6) Acorda o worker imediatamente se restam pedidos — processa próximo lote
+        if remaining > 0:
+            self.logger.info(f"⏭️  {remaining} pedidos restantes — agendando próximo lote.")
+            try:
+                self.wake_worker()
+            except Exception:
+                pass
 
     def calculate_component_usage(self) -> Dict[str, Any]:
         """Calcula insumos com alta performance e logs de diagnóstico."""
@@ -4131,6 +4203,58 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
 </form>
 </body></html>"""
 
+        # ── Rota de status: progresso do checkpoint de sync individual ─────────
+        @self.app.route('/admin/sync-status', methods=['GET', 'POST'])
+        def admin_sync_status():
+            if request.method == 'POST' and request.form.get('action') == 'reset':
+                if MONGO_AVAILABLE:
+                    try:
+                        _mongo_db['sync_checkpoint'].delete_one({'_id': 'fetched_order_ids'})
+                    except Exception:
+                        pass
+                return redirect('/admin/sync-status')
+
+            fetched_count = 0
+            updated_at = 'N/D'
+            if MONGO_AVAILABLE:
+                try:
+                    doc = _mongo_db['sync_checkpoint'].find_one({'_id': 'fetched_order_ids'})
+                    if doc:
+                        fetched_count = len(doc.get('ids', []))
+                        updated_at = doc.get('updated_at', 'N/D')
+                except Exception:
+                    pass
+
+            total_history = len(self.orchestrator.sales._sales_history or [])
+            board_total = len(pending_orders.data)
+            waiting = len(pending_orders.get_waiting())
+
+            return f"""<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8"><title>Sync Status</title>
+<style>body{{font-family:'Segoe UI',sans-serif;padding:40px;background:#0f172a;color:#e2e8f0;max-width:600px;margin:0 auto}}
+h1{{color:#f1f5f9}}.row{{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1e293b}}
+.label{{color:#94a3b8}}.value{{font-weight:700;color:#86efac;font-family:monospace}}
+.btn{{display:inline-block;padding:10px 24px;border-radius:8px;font-weight:700;text-decoration:none;border:none;cursor:pointer;font-size:.9rem;margin-top:20px}}
+.btn-back{{background:#1e293b;color:#94a3b8;border:1px solid #334155;margin-right:12px}}
+.btn-red{{background:#ef4444;color:#fff}}</style>
+</head><body>
+<h1>📊 Status de Sincronização</h1>
+<div class="row"><span class="label">Pedidos com itens já buscados (checkpoint)</span><span class="value">{fetched_count}</span></div>
+<div class="row"><span class="label">Última atualização do checkpoint</span><span class="value">{updated_at}</span></div>
+<div class="row"><span class="label">Total no histórico de vendas</span><span class="value">{total_history}</span></div>
+<div class="row"><span class="label">Itens no board (todos status)</span><span class="value">{board_total}</span></div>
+<div class="row"><span class="label">Itens "Em Espera"</span><span class="value">{waiting}</span></div>
+<p style="color:#64748b;font-size:.8rem;margin-top:16px;">
+O sistema processa ~40 pedidos por ciclo (~10 min entre ciclos, acelerado enquanto houver pendentes).
+Reiniciar o checkpoint força reprocessamento de todos os pedidos do mês.
+</p>
+<a href="/" class="btn btn-back">← Voltar</a>
+<form method="POST" style="display:inline">
+  <input type="hidden" name="action" value="reset">
+  <button type="submit" class="btn btn-red" onclick="return confirm('Resetar checkpoint? Isso fará o sistema rebuscar todos os pedidos do mês novamente.')">🔄 Resetar Checkpoint</button>
+</form>
+</body></html>"""
+
         # ── Rota de emergência: purge de pedidos fantasma/antigos ────────────────
         @self.app.route('/admin/purge-ghost-orders', methods=['GET', 'POST'])
         def admin_purge_ghost_orders():
@@ -5325,6 +5449,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         <li><a class="dropdown-item" href="/admin/repair-orders">
                             🔧 Reparar Pedidos
                             <div class="text-muted" style="font-size:.68rem;">Preenche número de pedido ausente</div>
+                        </a></li>
+                        <li><hr class="dropdown-divider"></li>
+                        <li><a class="dropdown-item" href="/admin/sync-status">
+                            📊 Status da Sincronização
+                            <div class="text-muted" style="font-size:.68rem;">Progresso da busca individual de pedidos</div>
                         </a></li>
                         <li><hr class="dropdown-divider"></li>
                         <li><a class="dropdown-item" href="/admin/purge-ghost-orders">
