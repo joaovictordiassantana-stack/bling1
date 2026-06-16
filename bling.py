@@ -316,7 +316,7 @@ class InMemoryLogHandler(logging.Handler):
                 self.ws_callbacks.remove(callback)
 
 # Configuração global de diretórios e logs
-LOGS_DIR = Path('logs')
+LOGS_DIR = DATA_DIR / 'logs'
 LOG_FILE = LOGS_DIR / 'automacao_bling.log'
 ERROR_LOG_FILE = LOGS_DIR / 'errors.log'
 
@@ -835,10 +835,11 @@ class BlingAPIClient:
             return None
             
         except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                # Silencioso para 404, deixa o chamador decidir
-                raise e
-            self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
+            status = e.response.status_code if e.response is not None else '?'
+            if status == 404:
+                self.logger.debug(f"404 em {endpoint} — recurso não encontrado.")
+            else:
+                self.logger.error(f"Erro HTTP em {endpoint}: {str(e)}")
             return None
         except Exception as e:
             self.logger.error(f"Erro genérico em {endpoint}: {str(e)}")
@@ -871,7 +872,7 @@ class BlingAPIClient:
 class AuthManager:
     """Gerencia o ciclo de vida do token OAuth 2.0 do Bling."""
     
-    OAUTH_STATE_FILE: Path = Path('oauth_state.json')
+    OAUTH_STATE_FILE: Path = DATA_DIR / 'oauth_state.json'
 
     def _save_oauth_state(self, state: str):
         """Salva o state do OAuth de forma persistente em arquivo."""
@@ -1095,11 +1096,10 @@ class AuthManager:
 
     def _perform_token_request(self, grant_type: str, **kwargs) -> bool:
         """Executa a requisição de troca/renovação de token."""
-        # ── LOG CRÍTICO DE DIAGNÓSTICO ────────────────────────────────────────
         client_id_preview = (self.config.CLIENT_ID or '')[:8] + '...' if self.config.CLIENT_ID else '❌ VAZIO'
         secret_ok         = '✅ presente' if self.config.CLIENT_ID and self.config.CLIENT_SECRET else '❌ VAZIO'
         redirect_uri      = self.config.REDIRECT_URI or '❌ VAZIO'
-        self.logger.critical(
+        self.logger.debug(
             f"🔐 TOKEN REQUEST | grant_type={grant_type} | "
             f"client_id={client_id_preview} | secret={secret_ok} | "
             f"redirect_uri={redirect_uri} | url={self.config.TOKEN_URL} | "
@@ -1130,8 +1130,7 @@ class AuthManager:
                 timeout=self.config.AUTH_TIMEOUT
             )
 
-            # ── LOG CRÍTICO: sempre loga status + corpo da resposta do Bling ──
-            self.logger.critical(
+            self.logger.debug(
                 f"🔐 BLING RESPONSE | status={response.status_code} | "
                 f"body={response.text[:600]!r}"
             )
@@ -1145,8 +1144,8 @@ class AuthManager:
             expires_in          = token_data.get('expires_in', 3600)
             self._expires_at    = time.time() + expires_in
 
-            self.logger.critical(
-                f"✅ TOKEN OK | access_token={str(self._access_token or '')[:12]}... | "
+            self.logger.info(
+                f"✅ TOKEN OK ({grant_type}) | access_token={str(self._access_token or '')[:12]}... | "
                 f"expires_in={expires_in}s | "
                 f"refresh={'presente' if self._refresh_token else 'ausente'}"
             )
@@ -1400,13 +1399,15 @@ class SalesManager:
             subset = counts[max(0, i-6):i+1]
             moving_avg.append(sum(subset) / len(subset) if subset else 0)
 
-        # Crescimento: últimos 7 dias vs média mensal ÷ 20 dias úteis
-        # (conforme proposta V5.0: comparar semana atual vs ritmo mensal esperado)
-        last_7   = sum(counts[-7:])
+        # Crescimento: últimos 7 dias vs média dos últimos 30 dias
+        # Usa janela de 30 dias do gráfico (sempre disponível, independente do mês)
+        # em vez de dividir por "20 dias úteis" — que distorce no início do mês
+        last_7    = sum(counts[-7:])
+        last_30   = sum(counts)
+        dias_30_com_ped = max(sum(1 for c in counts if c > 0), 1)
+        ritmo_7d_esperado = (last_30 / dias_30_com_ped) * 7  # média diária × 7
+        growth = round(((last_7 - ritmo_7d_esperado) / ritmo_7d_esperado * 100), 1) if ritmo_7d_esperado > 0.5 else 0
         monthly_total = len(monthly_orders)
-        # Ritmo esperado para 7 dias = (total_mês / 20 dias úteis) * 7
-        ritmo_mensal_7d = (monthly_total / 20) * 7 if monthly_total > 0 else 0
-        growth = round(((last_7 - ritmo_mensal_7d) / ritmo_mensal_7d * 100), 1) if ritmo_mensal_7d else 0
 
         # Média diária de produção (pedidos/dia nos últimos 30d com pedidos)
         dias_com_pedidos = sum(1 for c in counts if c > 0)
@@ -1435,7 +1436,7 @@ class SalesManager:
                 'growth':       growth,
                 'avg_daily':    avg_daily,
                 'last_7':       last_7,
-                'ritmo_7d':     round(ritmo_mensal_7d, 1),
+                'ritmo_7d':     round(ritmo_7d_esperado, 1),
                 'monthly_total': monthly_total,
                 'weekly_count': len(weekly_orders),
                 'daily_count':  len(daily_orders),
@@ -1506,6 +1507,10 @@ class ProductionTimer:
         Ao reiniciar: soma o tempo que estava rodando desde o último checkpoint
         e retoma automaticamente (start_ts = agora).
         Assim o timer continua contando sem interrupção visível para o usuário.
+
+        Nota: a validação contra pending_orders (remoção de timers órfãos)
+        roda separadamente em purge_orphan_timers(), chamado após a
+        instanciação global de pending_orders (ver final do arquivo).
         """
         changed = False
         now = time.time()
@@ -1522,6 +1527,24 @@ class ProductionTimer:
                 logger.info(f"▶️ Restart: timer '{k}' retomado automaticamente ({int(v['accumulated'])}s acumulados).")
         if changed:
             self._save()
+
+    def purge_orphan_timers(self, valid_timer_keys: set):
+        """
+        Remove timers cujo item correspondente não está mais 'in_production'
+        em pending_orders. Chamado após pending_orders ser instanciado/carregado.
+
+        valid_timer_keys: conjunto de timer_key de itens com status='in_production'.
+        """
+        orphans = [k for k in self.timers if k not in valid_timer_keys]
+        if not orphans:
+            return 0
+        for k in orphans:
+            elapsed = self.timers[k].get('accumulated', 0)
+            del self.timers[k]
+            logger.info(f"🗑️  Timer órfão removido: '{k}' ({int(elapsed)}s acumulados, item não está mais em produção).")
+        self._save()
+        logger.info(f"🧹 {len(orphans)} timer(s) órfão(s) removido(s).")
+        return len(orphans)
 
     def start(self, produto_nome):
         now = time.time()
@@ -1604,7 +1627,7 @@ class ProductionTimer:
 
         # Auto-registra componentes NÃO marcados no checklist (apenas se timer existiu)
         # Se timer não existiu, não auto-registra para evitar duplicação de componentes
-        if timer_existed and 'CADEIRA' in nome_real.upper():
+        if timer_existed and _is_cadeira(nome_real):
             auto_registrados = 0
             for comp in RECIPE_CADEIRA:
                 nome_comp = comp['nome']
@@ -1918,6 +1941,11 @@ class ComponentConsumptionManager:
             })
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
 
+def _is_cadeira(nome: str) -> bool:
+    """Detecta se um produto é cadeira/poltrona/estofado (requer receita de 3 leituras)."""
+    n = (nome or '').upper()
+    return any(k in n for k in ('CADEIRA', 'POLTRONA', 'ESTOFADO', 'SOFÁ', 'SOFA', 'PUFF'))
+
 # ── Extração de Base/Cor do nome do produto ──────────────────────────────────
 
 import re as _re_ecb
@@ -2017,17 +2045,29 @@ class PendingOrdersManager:
         self._op_cache_lock = __import__('threading').Lock()
 
     def _restore_in_production_to_waiting(self):
-        """Ao reiniciar: itens in_production voltam para waiting.
-        O timer foi pausado pelo _auto_pause_on_restart. O usuário
-        clica em Produzir novamente para retomar.
+        """
+        Ao reiniciar: itens 'in_production' voltam para 'waiting' para que
+        o usuário possa bipeá-los novamente para retomar a etapa.
+
+        Preserva 'fsm_step' e as flags de scan (scan_iniciado, scan_tapecaria)
+        para que a próxima leitura continue da etapa correta:
+        - fsm_step='marcenaria' → próxima leitura avança para tapecaria
+        - fsm_step='tapecaria'  → próxima leitura conclui o item
+        - fsm_step='mdf'        → próxima leitura conclui o item
         """
         changed = False
         for key, item in self.data.items():
             if item.get('status') == 'in_production':
                 item['status'] = 'waiting'
                 item.pop('started_at', None)
+                # NÃO remove fsm_step nem scan_iniciado/scan_tapecaria —
+                # a próxima bipagem usa esses campos para saber em qual etapa
+                # o item estava e avança corretamente
                 changed = True
-                logger.info(f"♻️ Restart: '{item.get('nome','?')}'  voltou para fila de espera.")
+                step = item.get('fsm_step', '')
+                step_label = {'marcenaria': 'em Marcenaria', 'tapecaria': 'em Tapeçaria',
+                              'mdf': 'em Produção MDF'}.get(step, '')
+                logger.info(f"♻️ Restart: '{item.get('nome','?')}' voltou para espera {step_label} — bipe para continuar.")
         if changed:
             self._save()
 
@@ -2388,6 +2428,22 @@ try:
 except Exception as _e:
     logger.warning(f"reset_if_new_month falhou: {_e}")
 
+# Remove timers órfãos — timers cujo item correspondente não está mais
+# em 'in_production' (purgado pelo reset mensal, finalizado, ou nunca
+# vinculado corretamente). Evita o problema de "37 produzindo do mês
+# passado ainda armazenados" persistindo indefinidamente entre deploys.
+try:
+    _valid_timer_keys = {
+        item['timer_key']
+        for item in pending_orders.data.values()
+        if item.get('status') == 'in_production' and item.get('timer_key')
+    }
+    _purged = production_timer.purge_orphan_timers(_valid_timer_keys)
+    if _purged:
+        logger.info(f"♻️ Início: {_purged} timer(s) órfão(s) removido(s).")
+except Exception as _e:
+    logger.warning(f"purge_orphan_timers falhou: {_e}")
+
 # ============================================================================ 
 # 7. ORCHESTRATOR (WORKER DE FUNDO)
 # ============================================================================
@@ -2651,9 +2707,15 @@ class Orchestrator:
                 # Reconstrói lista ordenada por data (mais recente por último)
                 merged = sorted(history_map.values(),
                                 key=lambda x: x.get('data', ''), reverse=False)
-                # Limita a 2000 mais recentes
-                self.sales._sales_history = merged[-2000:]
-                self.logger.info(f"📦 Histórico de pedidos: {len(valid_orders)} novos/atualizados, {len(self.sales._sales_history)} total em memória.")
+                # Janela de 60 dias corridos (cobre o mês atual completo + mês
+                # anterior para comparações) — em vez de cap fixo de 2000
+                # registros, que cortava pedidos do início do mês em meses
+                # de alto volume (2500+) e distorcia o cálculo de tendência.
+                # Hard ceiling de 5000 como rede de segurança contra picos extremos.
+                cutoff_date = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+                merged_window = [o for o in merged if o.get('data', '') >= cutoff_date]
+                self.sales._sales_history = merged_window[-5000:]
+                self.logger.info(f"📦 Histórico de pedidos: {len(valid_orders)} novos/atualizados, {len(self.sales._sales_history)} total em memória (janela 60d).")
                 
                 # 2. Recalcula as estatísticas
                 self.sales.recalculate_from_orders(self.sales._sales_history)
@@ -2885,7 +2947,8 @@ class Orchestrator:
             try:
                 resp = self.api.get(f'pedidos/vendas/{order_id}')
                 if not resp:
-                    self.logger.debug(f"  Pedido {order_id}: resposta vazia (None) — possível 403/404")
+                    self.logger.debug(f"  Pedido {order_id}: resposta vazia (404/403) — marcando como processado para não retentar")
+                    newly_fetched_ids.append(order_id)
                     continue
                 detail = resp.get('data', resp)
                 merged = {
@@ -3116,7 +3179,23 @@ class WebServer:
     code_lock = Lock()
     used_codes = set()
     webhook_lock = Lock()
-    
+
+    # Lock granular por item_key — evita que 2 bipagens simultâneas/duplicadas
+    # do MESMO produto avancem 2 etapas FSM de uma vez só (race condition).
+    # Não bloqueia bipagens de itens DIFERENTES entre si.
+    _barcode_locks_guard = Lock()       # protege a criação/limpeza do dict abaixo
+    _barcode_item_locks: Dict[str, Lock] = {}
+    _barcode_last_scan: Dict[str, float] = {}  # item_key -> timestamp do último scan aceito
+    BARCODE_DEBOUNCE_SECONDS = 2.0      # ignora a mesma leitura repetida em menos de 2s
+
+    @classmethod
+    def _get_item_lock(cls, item_key: str) -> Lock:
+        """Retorna (criando se necessário) o Lock dedicado a este item_key."""
+        with cls._barcode_locks_guard:
+            if item_key not in cls._barcode_item_locks:
+                cls._barcode_item_locks[item_key] = Lock()
+            return cls._barcode_item_locks[item_key]
+
     def __init__(self, config: "Config", orchestrator: "Orchestrator", flask_app: Flask):
         self.config = config
         self.orchestrator = orchestrator
@@ -3734,27 +3813,44 @@ class WebServer:
                 reader_id = _pfx.group(1).upper()   # "R1", "R2", "R3" ou "R4"
                 codigo    = _pfx.group(2).strip()
 
-            # ── Classifica produto como cadeira (3 leituras) ou MDF (2 leituras) ──
-            def _is_cadeira(nome: str) -> bool:
-                n = nome.upper()
-                return any(k in n for k in ('CADEIRA', 'POLTRONA', 'ESTOFADO', 'SOFÁ', 'SOFA'))
-
             # ── Busca pedido pelo número do pedido, ordem_producao, order_id ou OP ──
             found_key = None
             found_item = None
-            for key, item in pending_orders.data.items():
-                if item.get('status') == 'done':
-                    continue
-                pnum = str(item.get('pedido_numero', '') or item.get('order_id', '') or '')
-                op   = str(item.get('ordem_producao', '') or '')
-                oid  = str(item.get('order_id_bling') or item.get('order_id') or pnum or '')
-                op_cached = ''
-                with pending_orders._op_cache_lock:
-                    op_cached = pending_orders._op_cache.get(oid, {}).get('numero_op', '')
-                if codigo in (pnum, op, op_cached) or key == codigo:
-                    found_key  = key
-                    found_item = item
-                    break
+
+            # ── PRIORIDADE 1: match exato por item_key (único por produto individual) ──
+            # Isso é o caso normal quando a etiqueta impressa traz o item_key.
+            # Evita ambiguidade quando um pedido tem múltiplos produtos —
+            # cada produto tem seu próprio item_key e avança independentemente.
+            if codigo in pending_orders.data:
+                _item = pending_orders.data[codigo]
+                if _item.get('status') != 'done':
+                    found_key, found_item = codigo, _item
+                else:
+                    return jsonify({
+                        'acao': 'ja_concluido',
+                        'codigo': codigo,
+                        'reader_id': reader_id,
+                        'mensagem': f'Este item já foi concluído anteriormente.'
+                    })
+
+            # ── PRIORIDADE 2 (fallback): match por pedido_numero/ordem_producao ──
+            # Usado para códigos antigos/impressos por pedido inteiro (não por item).
+            # ATENÇÃO: se o pedido tiver múltiplos produtos, pega o PRIMEIRO item
+            # ainda não iniciado — pode não corresponder ao produto físico em mãos.
+            if not found_item:
+                for key, item in pending_orders.data.items():
+                    if item.get('status') == 'done':
+                        continue
+                    pnum = str(item.get('pedido_numero', '') or item.get('order_id', '') or '')
+                    op   = str(item.get('ordem_producao', '') or '')
+                    oid  = str(item.get('order_id_bling') or item.get('order_id') or pnum or '')
+                    op_cached = ''
+                    with pending_orders._op_cache_lock:
+                        op_cached = pending_orders._op_cache.get(oid, {}).get('numero_op', '')
+                    if codigo in (pnum, op, op_cached):
+                        found_key  = key
+                        found_item = item
+                        break
 
             if not found_item:
                 return jsonify({
@@ -3764,177 +3860,236 @@ class WebServer:
                     'mensagem': f'Nenhum pedido ativo encontrado para #{codigo}'
                 }), 404
 
-            status_atual  = found_item.get('status', 'waiting')
-            nome_produto  = found_item.get('nome') or found_item.get('nome_original', '')
-            timer_key     = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
-            eh_cadeira    = _is_cadeira(nome_produto)
-            fsm_step      = found_item.get('fsm_step', '')   # '' | 'marcenaria' | 'tapecaria'
-
-            def _broadcast_async():
-                def _do():
-                    try:
-                        usage = self.orchestrator.calculate_component_usage()
-                        self.orchestrator._component_usage_cache = usage
-                        self.orchestrator.broadcast_kpi_update(component_usage=usage)
-                    except Exception: pass
-                Thread(target=_do, daemon=True).start()
-
-            # ══════════════════════════════════════════════════════════════
-            # ETAPA 1 — waiting → in_production (Marcenaria / Início MDF)
-            # ══════════════════════════════════════════════════════════════
-            if status_atual == 'waiting':
-                if found_item.get('scan_iniciado'):
-                    return jsonify({
-                        'acao': 'ja_lido_etapa',
-                        'codigo': codigo,
-                        'reader_id': reader_id,
-                        'item_key': found_key,
-                        'nome': nome_produto,
-                        'mensagem': f'Pedido #{codigo} já foi iniciado. Veja a aba Produzindo.'
-                    })
-
-                pending_orders.start_production(found_key)
-                production_timer.start(timer_key)
-                pending_orders.data[found_key]['timer_key']   = timer_key
-                pending_orders.data[found_key]['scan_iniciado'] = True
-                pending_orders.data[found_key]['reader_inicio'] = reader_id
-                # Para cadeiras, a 1ª leitura coloca na etapa marcenaria
-                pending_orders.data[found_key]['fsm_step'] = 'marcenaria' if eh_cadeira else 'mdf'
-                pending_orders._save_one(found_key)
-
-                # Registra componentes automaticamente para cadeiras
-                try:
-                    _cc = globals().get('component_consumption')
-                    if _cc and eh_cadeira:
-                        consumo_key = f"scan_{found_key}"
-                        existing_logs = _cc.get_current_month().get('checklist_logs', [])
-                        already = any(l.get('produto') == consumo_key for l in existing_logs)
-                        if not already:
-                            for comp in RECIPE_CADEIRA:
-                                _cc.register_component(comp['nome'], comp['qtd'], comp['un'], consumo_key)
-                            logger.info(f"✅ Componentes registrados via scan para {nome_produto}")
-                except Exception as _ce:
-                    logger.warning(f"Scan: erro componentes: {_ce}")
-
-                _broadcast_async()
-                etapa_label = 'Marcenaria' if eh_cadeira else 'Produção'
+            # ── LOCK + DEBOUNCE POR ITEM — evita avanço duplo de etapa FSM ──
+            # Cenário real: scanner dispara 2 eventos Enter por bipagem (comum em
+            # modelos baratos/gatilho com bounce), ou o operador aproxima o produto
+            # 2x rapidamente. Sem isso, 2 requisições concorrentes podem ler o
+            # MESMO status_atual antes de qualquer uma escrever, e ambas avançam
+            # a etapa — fazendo a peça "pular" Marcenaria→Concluído numa única
+            # bipagem física, sem nunca passar pela Tapeçaria.
+            item_lock = WebServer._get_item_lock(found_key)
+            if not item_lock.acquire(timeout=0.05):
+                # Outra requisição para o MESMO item já está processando agora
                 return jsonify({
-                    'acao': 'iniciado',
+                    'acao': 'processando',
                     'codigo': codigo,
                     'reader_id': reader_id,
                     'item_key': found_key,
-                    'nome': nome_produto,
-                    'timer_key': timer_key,
-                    'fsm_step': pending_orders.data[found_key]['fsm_step'],
-                    'mensagem': f'✅ {etapa_label} INICIADA: {nome_produto}'
-                })
+                    'mensagem': 'Leitura já em processamento — aguarde.'
+                }), 200
 
-            # ══════════════════════════════════════════════════════════════
-            # ETAPA 2 — in_production, FSM marcenaria → tapecaria (cadeiras)
-            #           in_production, FSM mdf → done
-            # ══════════════════════════════════════════════════════════════
-            elif status_atual == 'in_production':
-                current_step = found_item.get('fsm_step', 'mdf')
+            try:
+                now_ts = time.time()
+                last_ts = WebServer._barcode_last_scan.get(found_key, 0)
+                if (now_ts - last_ts) < WebServer.BARCODE_DEBOUNCE_SECONDS:
+                    return jsonify({
+                        'acao': 'debounce',
+                        'codigo': codigo,
+                        'reader_id': reader_id,
+                        'item_key': found_key,
+                        'mensagem': 'Leitura duplicada ignorada (bipado há menos de 2s).'
+                    }), 200
+                WebServer._barcode_last_scan[found_key] = now_ts
 
-                # ── Cadeira: marcenaria → tapecaria ──────────────────────
-                if eh_cadeira and current_step == 'marcenaria':
-                    if found_item.get('scan_tapecaria'):
+                # Releitura do item DENTRO do lock — garante estado fresco,
+                # já que outra requisição pode ter alterado pending_orders.data
+                # entre o match inicial (fora do lock) e agora.
+                found_item = pending_orders.data.get(found_key)
+                if not found_item:
+                    return jsonify({
+                        'acao': 'nao_encontrado',
+                        'codigo': codigo,
+                        'reader_id': reader_id,
+                        'mensagem': f'Item removido durante o processamento — bipe novamente.'
+                    }), 404
+
+                status_atual  = found_item.get('status', 'waiting')
+                nome_produto  = found_item.get('nome') or found_item.get('nome_original', '')
+                timer_key     = found_item.get('timer_key') or f"{nome_produto}||{found_key}"
+                eh_cadeira    = _is_cadeira(nome_produto)
+                fsm_step      = found_item.get('fsm_step', '')   # '' | 'marcenaria' | 'tapecaria'
+
+                def _broadcast_async():
+                    def _do():
+                        try:
+                            usage = self.orchestrator.calculate_component_usage()
+                            self.orchestrator._component_usage_cache = usage
+                            self.orchestrator.broadcast_kpi_update(component_usage=usage)
+                        except Exception: pass
+                    Thread(target=_do, daemon=True).start()
+
+                # ══════════════════════════════════════════════════════════
+                # ETAPA 1 — waiting → in_production (Marcenaria / Início MDF)
+                # ══════════════════════════════════════════════════════════
+                if status_atual == 'waiting':
+                    # Caso pós-restart: item estava em produção, foi restaurado para
+                    # waiting com scan_iniciado=True e fsm_step já definido.
+                    # A bipagem deve retomar da etapa onde parou, não reiniciar do zero.
+                    if found_item.get('scan_iniciado') and found_item.get('fsm_step'):
+                        pending_orders.start_production(found_key)
+                        production_timer.start(timer_key)
+                        pending_orders.data[found_key]['timer_key'] = timer_key
+                        pending_orders._save_one(found_key)
+                        _broadcast_async()
+                        step_label = {'marcenaria': 'Marcenaria', 'tapecaria': 'Tapeçaria', 'mdf': 'Produção'}.get(fsm_step, 'Produção')
+                        return jsonify({
+                            'acao': 'retomado',
+                            'codigo': codigo,
+                            'reader_id': reader_id,
+                            'item_key': found_key,
+                            'nome': nome_produto,
+                            'fsm_step': fsm_step,
+                            'mensagem': f'▶️ {step_label} RETOMADA: {nome_produto}'
+                        })
+
+                    if found_item.get('scan_iniciado'):
                         return jsonify({
                             'acao': 'ja_lido_etapa',
                             'codigo': codigo,
                             'reader_id': reader_id,
                             'item_key': found_key,
                             'nome': nome_produto,
-                            'mensagem': f'#{codigo} já passou para Tapeçaria.'
+                            'mensagem': f'Pedido #{codigo} já foi iniciado. Veja a aba Produzindo.'
                         })
-                    pending_orders.data[found_key]['fsm_step']       = 'tapecaria'
-                    pending_orders.data[found_key]['scan_tapecaria']  = True
-                    pending_orders.data[found_key]['reader_tapecaria'] = reader_id
+
+                    pending_orders.start_production(found_key)
+                    production_timer.start(timer_key)
+                    pending_orders.data[found_key]['timer_key']   = timer_key
+                    pending_orders.data[found_key]['scan_iniciado'] = True
+                    pending_orders.data[found_key]['reader_inicio'] = reader_id
+                    pending_orders.data[found_key]['fsm_step'] = 'marcenaria' if eh_cadeira else 'mdf'
                     pending_orders._save_one(found_key)
+
+                    try:
+                        _cc = globals().get('component_consumption')
+                        if _cc and eh_cadeira:
+                            consumo_key = f"scan_{found_key}"
+                            existing_logs = _cc.get_current_month().get('checklist_logs', [])
+                            already = any(l.get('produto') == consumo_key for l in existing_logs)
+                            if not already:
+                                for comp in RECIPE_CADEIRA:
+                                    _cc.register_component(comp['nome'], comp['qtd'], comp['un'], consumo_key)
+                                logger.info(f"✅ Componentes registrados via scan para {nome_produto}")
+                    except Exception as _ce:
+                        logger.warning(f"Scan: erro componentes: {_ce}")
+
                     _broadcast_async()
+                    etapa_label = 'Marcenaria' if eh_cadeira else 'Produção'
                     return jsonify({
-                        'acao': 'tapecaria',
+                        'acao': 'iniciado',
                         'codigo': codigo,
                         'reader_id': reader_id,
                         'item_key': found_key,
                         'nome': nome_produto,
-                        'fsm_step': 'tapecaria',
-                        'mensagem': f'🧵 Tapeçaria INICIADA: {nome_produto}'
+                        'timer_key': timer_key,
+                        'fsm_step': pending_orders.data[found_key]['fsm_step'],
+                        'mensagem': f'✅ {etapa_label} INICIADA: {nome_produto}'
                     })
 
-                # ── Cadeira: tapecaria → done ─────────────────────────────
-                if eh_cadeira and current_step == 'tapecaria':
-                    if found_item.get('scan_concluido'):
+                # ══════════════════════════════════════════════════════════
+                # ETAPA 2 — in_production, FSM marcenaria → tapecaria (cadeiras)
+                #           in_production, FSM mdf → done
+                # ══════════════════════════════════════════════════════════
+                elif status_atual == 'in_production':
+                    current_step = found_item.get('fsm_step', 'mdf')
+
+                    if eh_cadeira and current_step == 'marcenaria':
+                        if found_item.get('scan_tapecaria'):
+                            return jsonify({
+                                'acao': 'ja_lido_etapa',
+                                'codigo': codigo,
+                                'reader_id': reader_id,
+                                'item_key': found_key,
+                                'nome': nome_produto,
+                                'mensagem': f'#{codigo} já passou para Tapeçaria.'
+                            })
+                        pending_orders.data[found_key]['fsm_step']        = 'tapecaria'
+                        pending_orders.data[found_key]['scan_tapecaria']   = True
+                        pending_orders.data[found_key]['reader_tapecaria'] = reader_id
+                        pending_orders._save_one(found_key)
+                        _broadcast_async()
                         return jsonify({
-                            'acao': 'ja_lido_etapa',
+                            'acao': 'tapecaria',
                             'codigo': codigo,
                             'reader_id': reader_id,
                             'item_key': found_key,
                             'nome': nome_produto,
-                            'mensagem': f'Pedido #{codigo} já foi concluído.'
+                            'fsm_step': 'tapecaria',
+                            'mensagem': f'🧵 Tapeçaria INICIADA: {nome_produto}'
                         })
-                    result = production_timer.stop_and_log(timer_key)
-                    tempo  = result.get('elapsed', 0)
-                    pending_orders.finish_production(found_key, tempo_segundos=tempo)
-                    pending_orders.data[found_key]['scan_concluido']  = True
-                    pending_orders.data[found_key]['reader_conclusao'] = reader_id
-                    pending_orders._save_one(found_key)
-                    _broadcast_async()
-                    h = int(tempo // 3600); m = int((tempo % 3600) // 60); s = int(tempo % 60)
-                    return jsonify({
-                        'acao': 'concluido',
-                        'codigo': codigo,
-                        'reader_id': reader_id,
-                        'item_key': found_key,
-                        'nome': nome_produto,
-                        'tempo_producao': tempo,
-                        'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
-                    })
 
-                # ── MDF / outros: in_production → done ───────────────────
-                if not eh_cadeira or current_step == 'mdf':
-                    if found_item.get('scan_concluido'):
+                    if eh_cadeira and current_step == 'tapecaria':
+                        if found_item.get('scan_concluido'):
+                            return jsonify({
+                                'acao': 'ja_lido_etapa',
+                                'codigo': codigo,
+                                'reader_id': reader_id,
+                                'item_key': found_key,
+                                'nome': nome_produto,
+                                'mensagem': f'Pedido #{codigo} já foi concluído.'
+                            })
+                        result = production_timer.stop_and_log(timer_key)
+                        tempo  = result.get('elapsed', 0)
+                        pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                        pending_orders.data[found_key]['scan_concluido']   = True
+                        pending_orders.data[found_key]['reader_conclusao'] = reader_id
+                        pending_orders._save_one(found_key)
+                        _broadcast_async()
+                        h = int(tempo // 3600); m = int((tempo % 3600) // 60); s = int(tempo % 60)
                         return jsonify({
-                            'acao': 'ja_lido_etapa',
+                            'acao': 'concluido',
                             'codigo': codigo,
                             'reader_id': reader_id,
                             'item_key': found_key,
                             'nome': nome_produto,
-                            'mensagem': f'Pedido #{codigo} já foi concluído. Veja a aba Concluídos.'
+                            'tempo_producao': tempo,
+                            'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
                         })
-                    result = production_timer.stop_and_log(timer_key)
-                    tempo  = result.get('elapsed', 0)
-                    pending_orders.finish_production(found_key, tempo_segundos=tempo)
-                    pending_orders.data[found_key]['scan_concluido']  = True
-                    pending_orders.data[found_key]['reader_conclusao'] = reader_id
-                    pending_orders._save_one(found_key)
-                    _broadcast_async()
-                    h = int(tempo // 3600); m = int((tempo % 3600) // 60); s = int(tempo % 60)
+
+                    if not eh_cadeira or current_step == 'mdf':
+                        if found_item.get('scan_concluido'):
+                            return jsonify({
+                                'acao': 'ja_lido_etapa',
+                                'codigo': codigo,
+                                'reader_id': reader_id,
+                                'item_key': found_key,
+                                'nome': nome_produto,
+                                'mensagem': f'Pedido #{codigo} já foi concluído. Veja a aba Concluídos.'
+                            })
+                        result = production_timer.stop_and_log(timer_key)
+                        tempo  = result.get('elapsed', 0)
+                        pending_orders.finish_production(found_key, tempo_segundos=tempo)
+                        pending_orders.data[found_key]['scan_concluido']   = True
+                        pending_orders.data[found_key]['reader_conclusao'] = reader_id
+                        pending_orders._save_one(found_key)
+                        _broadcast_async()
+                        h = int(tempo // 3600); m = int((tempo % 3600) // 60); s = int(tempo % 60)
+                        return jsonify({
+                            'acao': 'concluido',
+                            'codigo': codigo,
+                            'reader_id': reader_id,
+                            'item_key': found_key,
+                            'nome': nome_produto,
+                            'tempo_producao': tempo,
+                            'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
+                        })
+
+                    logger.warning(f"Scan: estado FSM inesperado para {found_key}: step={current_step} status={status_atual}")
                     return jsonify({
-                        'acao': 'concluido',
+                        'acao': 'erro_fsm',
+                        'codigo': codigo,
+                        'mensagem': f'Estado de produção inconsistente para #{codigo}. Contate o administrador.'
+                    }), 500
+
+                else:
+                    return jsonify({
+                        'acao': 'ja_concluido',
                         'codigo': codigo,
                         'reader_id': reader_id,
-                        'item_key': found_key,
-                        'nome': nome_produto,
-                        'tempo_producao': tempo,
-                        'mensagem': f'✅ Produção CONCLUÍDA: {nome_produto} ({h:02d}:{m:02d}:{s:02d})'
+                        'mensagem': f'Pedido #{codigo} já foi concluído anteriormente.'
                     })
-
-                # Caso residual: step desconhecido — protege contra estado corrompido
-                logger.warning(f"Scan: estado FSM inesperado para {found_key}: step={current_step} status={status_atual}")
-                return jsonify({
-                    'acao': 'erro_fsm',
-                    'codigo': codigo,
-                    'mensagem': f'Estado de produção inconsistente para #{codigo}. Contate o administrador.'
-                }), 500
-
-            else:
-                return jsonify({
-                    'acao': 'ja_concluido',
-                    'codigo': codigo,
-                    'reader_id': reader_id,
-                    'mensagem': f'Pedido #{codigo} já foi concluído anteriormente.'
-                })
+            finally:
+                item_lock.release()
 
         @self.app.route('/api/pending-orders/start', methods=['POST'])
         @token_required
@@ -6658,17 +6813,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                             <div class="bc-nome">${escapeHtml(item.nome||item.nome_original||'N/D')}</div>
                             ${item.base||item.cor ? `<div style="font-size:.68rem;color:#6b7280;margin-bottom:8px;">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))}</div>` : ''}
-                            <div class="bc-num">${op ? '#'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número — remova e sincronize</span>'}</div>
+                            <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número — remova e sincronize</span>'}</div>
                             <div class="bc-svg-wrap my-2 text-center">
-                                ${op ? `<svg id="${svgId}"></svg>` : `<div style="color:#ef4444;font-size:.7rem;padding:8px;">Código indisponível</div>`}
+                                <svg id="${svgId}"></svg>
                             </div>
                             <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data ? '· '+new Date(item.pedido_data).toLocaleDateString('pt-BR') : ''}</div>
                             ${jaLido
                                 ? `<div class="bc-lido-overlay">✅ CÓDIGO LIDO<br><small style="font-weight:400;font-size:.72rem;">Indo para Produzindo...</small></div>`
                                 : `<div class="mt-2 d-flex gap-2">
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
-                                        📷 Bipe o código de barras para iniciar
+                                        📷 Bipe a etiqueta para iniciar
                                     </div>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}')" title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -6681,17 +6837,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes
+            // Renderiza barcodes — usa item_key (único por produto individual)
             items.forEach(item => {
                 const ikey = item.item_key || '';
-                const _rawOp2 = item.ordem_producao || item.pedido_numero || item.order_id || '';
-                const op = (_rawOp2 && String(_rawOp2) !== '0') ? String(_rawOp2) : '';
                 const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
                 const svgEl = document.getElementById(svgId);
-                if (svgEl && op) {
+                if (svgEl && ikey) {
                     try {
-                        JsBarcode(svgEl, op, { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
-                    } catch(e) { svgEl.innerHTML = `<text font-size="10" fill="#ef4444">Erro: ${op}</text>`; }
+                        JsBarcode(svgEl, ikey, { format:'CODE128', width:1.4, height:50, displayValue:false, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { svgEl.innerHTML = `<text font-size="9" fill="#ef4444">Erro</text>`; }
                 }
             });
         }
@@ -6773,10 +6927,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(ikey)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
-                        <div class="bc-num">${op ? '#'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
+                        <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
                         ${dataEntFmt ? `<div style="font-size:.65rem;color:#6b7280;margin-bottom:4px;">📅 Previsto: ${dataEntFmt}</div>` : ''}
                         <div class="bc-svg-wrap my-2 text-center">
-                            ${op ? `<svg id="${svgId}"></svg>` : `<div style="color:#ef4444;font-size:.7rem;">Código indisponível</div>`}
+                            <svg id="${svgId}"></svg>
                         </div>
                         <!-- Timer ao vivo -->
                         <div class="text-center my-2">
@@ -6791,10 +6945,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         <div class="bc-meta">${escapeHtml(item.cliente||'')} ${item.pedido_data?'· '+new Date(item.pedido_data).toLocaleDateString('pt-BR'):''}</div>
                         ${jaLido
                             ? `<div class="bc-lido-overlay">✅ CONCLUÍDO!<br><small style="font-weight:400;font-size:.72rem;">Registrado com sucesso</small></div>`
-                            : `<div class="mt-2">
+                            : `<div class="mt-2 d-flex gap-2" onclick="event.stopPropagation()">
                                 <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
-                                    📷 Bipe o código de barras para concluir
+                                    📷 Bipe a etiqueta para avançar
                                 </div>
+                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(op)}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
                                </div>`
                         }
                     </div>
@@ -6803,17 +6958,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes
+            // Renderiza barcodes — usa item_key (único por produto individual)
             filtered.forEach(item => {
                 const ikey = item.item_key || '';
-                const _rawOp4 = item.pedido_numero || item.ordem_producao || item.order_id || '';
-                const op = (_rawOp4 && String(_rawOp4) !== '0') ? String(_rawOp4) : '';
                 const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
                 const svgEl = document.getElementById(svgId);
-                if (svgEl && op) {
+                if (svgEl && ikey) {
                     try {
-                        JsBarcode(svgEl, op, { format:'CODE128', width:1.8, height:50, displayValue:true, fontSize:12, margin:4, background:'#fff', lineColor:'#000' });
-                    } catch(e) { svgEl.innerHTML = `<text font-size="10" fill="#ef4444">Erro: ${op}</text>`; }
+                        JsBarcode(svgEl, ikey, { format:'CODE128', width:1.4, height:50, displayValue:false, margin:4, background:'#fff', lineColor:'#000' });
+                    } catch(e) { svgEl.innerHTML = `<text font-size="9" fill="#ef4444">Erro</text>`; }
                 }
             });
         }
@@ -6911,9 +7064,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
         function openOPModal(pedidoNum, nomeProduto, itemKey, ordemProducao, clienteNome) {
-            // pedidoNum = número do pedido Bling (usado como barcode)
-            // ordemProducao = OP interna (informativo)
-            const codigoBarras = String(pedidoNum || ordemProducao || '');
+            // itemKey = código real lido pelo scanner (único por produto individual)
+            // pedidoNum = número do pedido Bling (informativo, pode repetir entre produtos)
+            const codigoBarras = String(itemKey || pedidoNum || ordemProducao || '');
 
             const existing = document.getElementById('opModal');
             if (existing) { bootstrap.Modal.getInstance(existing)?.hide(); existing.remove(); }
@@ -6936,10 +7089,11 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             </h4>
                             ${ordemProducao ? `<div style="font-size:.72rem;color:#94a3b8;margin-bottom:12px;">OP Interna: ${escapeHtml(String(ordemProducao))}</div>` : ''}
 
-                            <!-- Barcode real via JsBarcode -->
-                            <div id="op-barcode-wrap" style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:20px 16px 12px;display:inline-block;margin-bottom:16px;min-width:280px;">
+                            <!-- Barcode real via JsBarcode (código do produto individual) -->
+                            <div id="op-barcode-wrap" style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:20px 16px 12px;display:inline-block;margin-bottom:8px;min-width:280px;">
                                 <svg id="opBarcodeReal"></svg>
                             </div>
+                            <div style="font-size:.65rem;color:#94a3b8;margin-bottom:12px;">Código deste produto — pedidos com vários itens têm um código por item</div>
 
                             <!-- Status do pedido -->
                             <div id="op-status-box" class="mt-2 mb-1"></div>
@@ -6951,9 +7105,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         </div>
                         <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
                             <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
-                            <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(ordemProducao||''))}', '${escapeHtml(clienteNome||'')}')">
-                                🖨️ Imprimir OP
-                            </button>
+                            <div class="d-flex gap-2">
+                                <button class="btn btn-outline-primary btn-sm fw-bold" onclick="printItemLabel('${escapeHtml(codigoBarras)}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(clienteNome||'')}')">
+                                    🏷️ Etiqueta
+                                </button>
+                                <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(ordemProducao||''))}', '${escapeHtml(clienteNome||'')}')">
+                                    🖨️ Folha A4
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -6967,32 +7126,32 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             setTimeout(() => {
                 if (!codigoBarras) {
                     document.getElementById('op-barcode-wrap').innerHTML =
-                        `<div style="color:#ef4444;font-size:.85rem;">⚠️ Sem número identificador — remova este pedido e sincronize.</div>`;
+                        `<div style="color:#ef4444;font-size:.85rem;">⚠️ Sem código identificador — remova este item e sincronize.</div>`;
                 } else {
                     try {
                         JsBarcode('#opBarcodeReal', codigoBarras, {
-                            format: 'CODE128', width: 2.2, height: 70,
-                            displayValue: true, fontSize: 14, fontOptions: 'bold',
-                            margin: 6, background: '#ffffff', lineColor: '#000000', textMargin: 4,
+                            format: 'CODE128', width: 1.8, height: 60,
+                            displayValue: false, margin: 6,
+                            background: '#ffffff', lineColor: '#000000',
                         });
                     } catch(e) {
                         document.getElementById('op-barcode-wrap').innerHTML =
-                            `<div class="font-monospace fw-bold" style="font-size:1.4rem;letter-spacing:.15em;">${escapeHtml(codigoBarras)}</div>`;
+                            `<div class="font-monospace fw-bold" style="font-size:1rem;letter-spacing:.1em;word-break:break-all;">${escapeHtml(codigoBarras)}</div>`;
                     }
                 }
-                // Mostra status atual do pedido
-                _updateOPStatusBox(codigoBarras);
+                // Mostra status atual do item (busca por item_key — sem ambiguidade)
+                _updateOPStatusBox(itemKey || codigoBarras);
             }, 60);
         }
 
-        async function _updateOPStatusBox(numeroOP) {
+        async function _updateOPStatusBox(itemKeyLookup) {
             const box = document.getElementById('op-status-box');
             if (!box) return;
             try {
                 const res = await fetch('/api/production/board');
                 const data = await res.json();
                 const all = [...(data.waiting||[]), ...(data.in_production||[]), ...(data.done||[])];
-                const item = all.find(i => String(i.pedido_numero||i.order_id||i.ordem_producao||'') === String(numeroOP));
+                const item = all.find(i => String(i.item_key||'') === String(itemKeyLookup));
                 if (!item) {
                     box.innerHTML = `<span class="badge bg-secondary">Status desconhecido</span>`;
                     return;
@@ -7013,6 +7172,79 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 };
                 box.innerHTML = labels[st] || `<span class="badge bg-secondary">${st}</span>`;
             } catch { box.innerHTML = ''; }
+        }
+
+        /** ════════════════════════════════════════════════════
+         *  ETIQUETA INDIVIDUAL POR PRODUTO (formato adesivo 62x40mm)
+         *  Barcode codifica o item_key — único por produto dentro
+         *  do pedido. Cole na peça física; cada produto é bipado
+         *  independentemente em sua própria etapa (Marcenaria,
+         *  Tapeçaria, Concluído), mesmo que outros itens do mesmo
+         *  pedido estejam em etapas diferentes.
+         *  ════════════════════════════════════════════════════ */
+        function printItemLabel(itemKey, nomeProduto, pedidoNum, clienteNome) {
+            if (!itemKey) {
+                alert('Item sem identificador — não é possível gerar etiqueta.');
+                return;
+            }
+
+            const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+            tempSvg.id = '_printLabelSvg';
+            tempSvg.style.display = 'none';
+            document.body.appendChild(tempSvg);
+
+            try {
+                JsBarcode('#_printLabelSvg', itemKey, {
+                    format: 'CODE128', width: 1.6, height: 45,
+                    displayValue: false, margin: 2,
+                    background: '#ffffff', lineColor: '#000000'
+                });
+            } catch(e) { console.warn('JsBarcode error:', e); }
+
+            const svgHtml = tempSvg.outerHTML;
+            tempSvg.remove();
+
+            // Nome truncado para caber na etiqueta pequena
+            const nomeShort = (nomeProduto || '').length > 38
+                ? nomeProduto.substring(0, 36) + '…'
+                : (nomeProduto || '');
+
+            const printContent = `
+                <style>
+                    @page { size: 62mm 40mm; margin: 0; }
+                    @media print {
+                        body { margin: 0; }
+                        .label-box { box-shadow: none !important; }
+                    }
+                </style>
+                <div class="label-box" style="
+                    width:62mm; height:40mm; box-sizing:border-box;
+                    padding:2.5mm 3mm; font-family:Arial,sans-serif;
+                    display:flex; flex-direction:column; justify-content:space-between;
+                    border:1px solid #ccc;">
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                        <div style="font-size:7.5pt; font-weight:900; letter-spacing:.04em;">SW MÓVEIS MDF</div>
+                        ${pedidoNum ? `<div style="font-size:7.5pt; font-weight:700; font-family:monospace;">Ped.${escapeHtml(String(pedidoNum))}</div>` : ''}
+                    </div>
+                    <div style="font-size:8pt; font-weight:700; line-height:1.15; max-height:7mm; overflow:hidden;">
+                        ${escapeHtml(nomeShort)}
+                    </div>
+                    ${clienteNome ? `<div style="font-size:6.5pt; color:#444; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeHtml(clienteNome)}</div>` : ''}
+                    <div style="text-align:center; margin:0.5mm 0;">${svgHtml}</div>
+                    <div style="font-size:6pt; color:#666; text-align:center; letter-spacing:.03em;">
+                        BIPE PARA AVANÇAR ETAPA
+                    </div>
+                </div>`;
+
+            const printArea = document.getElementById('print-area');
+            printArea.innerHTML = printContent;
+            printArea.style.display = 'block';
+            window.print();
+            window.onafterprint = () => {
+                printArea.innerHTML = '';
+                printArea.style.display = 'none';
+                window.onafterprint = null;
+            };
         }
 
         /** Impressão da OP em página limpa (sem travar) */
@@ -7073,14 +7305,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         /** ════════════════════════════════════════════════════
          *  LISTENER GLOBAL DE SCANNER DE CÓDIGO DE BARRAS
          *  Scanners USB emulam teclado: digitam o código + Enter
-         *  1ª leitura (Em Espera)   → inicia produção
-         *  2ª leitura (Produzindo)  → conclui produção
-         *  Anti-duplicação: _scannedThisSession por item+etapa
+         *  MUITO rápido (cada tecla em <30ms). Humanos digitam mais
+         *  lento. Usamos essa diferença de velocidade para distinguir
+         *  uma bipagem real de digitação manual em um campo de busca —
+         *  assim o scanner funciona mesmo que algum input esteja com
+         *  foco (cenário comum: operador clicou na busca por engano).
+         *
+         *  1ª leitura (Em Espera)   → inicia/retoma produção
+         *  2ª leitura (Produzindo)  → avança etapa ou conclui
+         *  Anti-duplicação: debounce de 2s no frontend (espelha o
+         *  backend) + _scannedThisSession por item+etapa.
          *  ════════════════════════════════════════════════════ */
         (function() {
             let _scanBuffer = '';
             let _scanTimer  = null;
+            let _lastKeyTs  = 0;
             const _MIN_LEN  = 3;
+            const _MAX_KEY_INTERVAL_MS = 35;  // scanners digitam bem mais rápido que isso
+            const _MAX_KEY_INTERVAL_MS_FALLBACK = 80; // tolerância para scanners mais lentos/bluetooth
+            let _fastKeyCount = 0; // quantas teclas consecutivas vieram "rápido"
+
+            // Debounce local por código — evita 2 disparos da MESMA leitura em <2s
+            // (espelha BARCODE_DEBOUNCE_SECONDS do backend, mas reage instantaneamente
+            // sem precisar de round-trip de rede)
+            const _localLastScan = {};
+            const _LOCAL_DEBOUNCE_MS = 1800;
 
             const _indicator = document.getElementById('scanner-indicator');
 
@@ -7095,20 +7344,48 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
 
             document.addEventListener('keydown', function(e) {
+                const now = performance.now();
+                const interval = now - _lastKeyTs;
+                _lastKeyTs = now;
+
                 const tag = document.activeElement?.tagName?.toLowerCase();
-                if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+                const isEditable = tag === 'input' || tag === 'textarea' || tag === 'select';
 
                 if (e.key === 'Enter') {
                     const code = _scanBuffer.trim();
+                    const wasFast = _fastKeyCount >= Math.max(2, code.length - 1);
                     _scanBuffer = '';
+                    _fastKeyCount = 0;
                     clearTimeout(_scanTimer);
-                    if (code.length >= _MIN_LEN) _processScan(code);
+
+                    if (code.length < _MIN_LEN) return;
+
+                    // Se o foco está num campo editável, só processa como bipagem
+                    // se a velocidade de digitação foi de scanner (rápida demais
+                    // para ser humano). Caso contrário, deixa o Enter seguir o
+                    // comportamento normal do input (ex: submeter busca).
+                    if (isEditable && !wasFast) return;
+
+                    // Se foi reconhecido como scanner mesmo em campo editável,
+                    // evita que o Enter exiba sugestões/submeta o formulário
+                    if (isEditable && wasFast) e.preventDefault();
+
+                    _processScan(code);
                     return;
                 }
+
                 if (e.key.length === 1) {
+                    // Conta como "tecla rápida" se o intervalo desde a tecla
+                    // anterior for característico de scanner
+                    if (interval > 0 && interval <= _MAX_KEY_INTERVAL_MS_FALLBACK) {
+                        _fastKeyCount++;
+                    } else {
+                        _fastKeyCount = isEditable ? 0 : 1; // fora de input, não exige velocidade
+                    }
+
                     _scanBuffer += e.key;
                     clearTimeout(_scanTimer);
-                    _scanTimer = setTimeout(() => { _scanBuffer = ''; }, 400);
+                    _scanTimer = setTimeout(() => { _scanBuffer = ''; _fastKeyCount = 0; }, 400);
                 }
             });
 
@@ -7117,6 +7394,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     _showIndicator('Não autenticado', '#ef4444');
                     return;
                 }
+
+                // Debounce local — evita round-trip duplicado para a mesma leitura
+                const nowMs = Date.now();
+                const lastMs = _localLastScan[codigo] || 0;
+                if ((nowMs - lastMs) < _LOCAL_DEBOUNCE_MS) {
+                    _showIndicator('Leitura repetida ignorada', '#6b7280');
+                    return;
+                }
+                _localLastScan[codigo] = nowMs;
+
                 // Extrai prefixo de leitor do código (ex: "R2:2781" → reader "R2", codigo "2781")
                 const _pfxMatch = codigo.match(/^(R[1-4]):(.+)$/i);
                 const readerLabel = _pfxMatch ? ` [${_pfxMatch[1].toUpperCase()}]` : '';
@@ -7146,10 +7433,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         return;
                     }
 
-                    if (acao === 'iniciado') {
+                    if (acao === 'processando' || acao === 'debounce') {
+                        // Lock/debounce do backend pegou uma leitura duplicada/concorrente —
+                        // não é erro, apenas confirma que a primeira leitura já está sendo tratada.
+                        _showIndicator('Leitura já em andamento', '#6b7280');
+                        return;
+                    }
+
+                    if (acao === 'iniciado' || acao === 'retomado') {
                         if (ikey) _scannedThisSession.add(ikey + ':waiting');
                         const fsm = result.fsm_step || '';
-                        const etiqLabel = fsm === 'marcenaria' ? '🪚 MARCENARIA INICIADA' : '🚀 PRODUÇÃO INICIADA';
+                        const isRetomado = acao === 'retomado';
+                        let etiqLabel;
+                        if (isRetomado) {
+                            const stepMap = {marcenaria:'🪚 MARCENARIA RETOMADA', tapecaria:'🧵 TAPEÇARIA RETOMADA', mdf:'🔄 PRODUÇÃO RETOMADA'};
+                            etiqLabel = stepMap[fsm] || '▶️ PRODUÇÃO RETOMADA';
+                        } else {
+                            etiqLabel = fsm === 'marcenaria' ? '🪚 MARCENARIA INICIADA' : '🚀 PRODUÇÃO INICIADA';
+                        }
                         _showIndicator(etiqLabel + rLabel + ' — ' + nome, '#10b981');
                         showToast(etiqLabel, nome + ' · #' + (result.codigo || codigo), 'success');
                         await loadProductionBoard();
