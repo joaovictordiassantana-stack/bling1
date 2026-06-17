@@ -8,9 +8,15 @@
 # ============================================================================
 try:
     from gevent import monkey as _gm
-    _gm.patch_all(thread=True, socket=True, dns=True, time=True,
-                  select=True, ssl=True, subprocess=True, signal=True,
-                  builtins=False, os=True)
+    # Gunicorn com worker_class='gevent' já executa monkey.patch_all() internamente
+    # ao subir o worker, ANTES de importar a aplicação. Chamar de novo aqui causa
+    # o "MonkeyPatchWarning: Patching more than once" e pode deixar o estado de
+    # threading inconsistente — contribuindo para os KeyError nas greenlets do
+    # pymongo (pymongo_server_rtt_thread / pymongo_server_monitor_thread).
+    if not _gm.is_module_patched('threading'):
+        _gm.patch_all(thread=True, socket=True, dns=True, time=True,
+                      select=True, ssl=True, subprocess=True, signal=True,
+                      builtins=False, os=True)
     import asyncio as _aio
     try:
         _aio.get_event_loop()
@@ -88,7 +94,14 @@ try:
     from pymongo.errors import PyMongoError
     _MONGO_URI = os.environ.get('MONGODB_URI', '') or os.environ.get('MONGO_URI', '')
     if _MONGO_URI:
-        _mongo_client = MongoClient(_MONGO_URI, serverSelectionTimeoutMS=5000)
+        _mongo_client = MongoClient(
+            _MONGO_URI,
+            serverSelectionTimeoutMS=5000,
+            connect=False,        # ← conexão lazy: evita threads nativas de monitor
+                                   #   sendo criadas antes do gevent.monkey.patch_all()
+                                   #   completar, que causava KeyError nas greenlets
+                                   #   pymongo_server_rtt_thread/pymongo_server_monitor_thread
+        )
         _mongo_db = _mongo_client.get_database('sw_moveis')
         _mongo_client.admin.command('ping')  # testa conexão na inicialização
         MONGO_AVAILABLE = True
@@ -114,7 +127,8 @@ class MongoStore:
             if doc:
                 doc.pop('_id', None)
             return doc or {}
-        except Exception:
+        except Exception as e:
+            logger.debug(f"MongoStore.get('{collection}','{doc_id}') falhou: {e}")
             return {}
 
     @staticmethod
@@ -480,14 +494,25 @@ def atomic_write_json(data: dict, path: Path):
             os.remove(temp_path)
 
 def load_tokens_safe(path: Path | str = "tokens.json"):
-    # MongoDB primeiro
+    # MongoDB primeiro — com retry curto, pois com connect=False (lazy) a
+    # primeira operação Mongo do processo pode coincidir com o estabelecimento
+    # da conexão TCP/DNS e falhar por timing, não por ausência real do dado.
+    # Sem o retry, isso fazia o sistema reportar "nenhum token encontrado"
+    # mesmo com um token válido salvo, forçando reautenticação manual
+    # desnecessária a cada novo boot.
     if MONGO_AVAILABLE:
-        try:
-            data = MongoStore.get('auth_tokens', 'tokens')
-            if data:
-                return data
-        except Exception:
-            pass
+        for attempt in range(3):
+            try:
+                data = MongoStore.get('auth_tokens', 'tokens')
+                if data:
+                    return data
+                break  # MongoDB respondeu, mas não há token salvo — não é erro
+            except Exception as e:
+                if attempt < 2:
+                    logger.debug(f"load_tokens_safe: tentativa {attempt+1}/3 falhou ({e}), retentando em 0.3s...")
+                    time.sleep(0.3)
+                else:
+                    logger.warning(f"load_tokens_safe: falha ao ler tokens do MongoDB após 3 tentativas: {e}")
     if isinstance(path, str): path = Path(path)
     if not path.exists():
         try:
@@ -2398,6 +2423,9 @@ class PendingOrdersManager:
                     'ordem_producao': ordem_producao,
                     'order_id': order_id,
                     'order_id_bling': order_id,
+                    'qtd_total': qtd,   # total de unidades deste produto no pedido —
+                                        # usado no frontend para exibir "Unidade X de Y"
+                                        # quando o mesmo pedido gera múltiplos cards
                 }
 
                 for unit in range(qtd):
@@ -5620,7 +5648,27 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         .bc-card .bc-nome { font-size: 0.78rem; font-weight: 700; color: #374151; margin-bottom: 10px; line-height: 1.3; }
         .bc-card .bc-meta { font-size: 0.68rem; color: #9ca3af; margin-top: 6px; }
         .bc-card .bc-prazo { position: absolute; top: 10px; right: 10px; }
-        .bc-card .bc-svg-wrap { background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px 10px 4px; display: inline-block; }
+        .bc-card .bc-svg-wrap {
+            background: #fff;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 8px 6px 4px;
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;          /* nunca deixa o SVG escapar do card */
+            box-sizing: border-box;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .bc-card .bc-svg-wrap svg {
+            display: block;
+            width: 100% !important;    /* JsBarcode define width/height em px fixos —
+                                           força responsivo dentro do container */
+            height: auto;
+            max-height: 52px;
+            max-width: 100%;
+        }
         .bc-card .bc-lido-overlay {
             position: absolute; inset: 0; background: rgba(16,185,129,.92); border-radius: var(--radius);
             display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -6898,6 +6946,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                             <div class="bc-nome">${escapeHtml(item.nome||item.nome_original||'N/D')}</div>
                             ${item.base||item.cor ? `<div style="font-size:.68rem;color:#6b7280;margin-bottom:8px;">${escapeHtml((item.base||'')+(item.base&&item.cor?' / ':'')+( item.cor||''))}</div>` : ''}
                             <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número — remova e sincronize</span>'}</div>
+                            ${item.qtd_total > 1 ? `<div style="font-size:.66rem;color:#6366f1;font-weight:700;margin-bottom:4px;">📦 Unidade ${(item.qtd_unit_idx||0)+1} de ${item.qtd_total}</div>` : ''}
                             <div class="bc-svg-wrap my-2 text-center">
                                 <svg id="${svgId}"></svg>
                             </div>
@@ -6908,7 +6957,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
                                         📷 Bipe a etiqueta para iniciar
                                     </div>
-                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}')" title="Imprimir etiqueta deste produto">🏷️</button>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -6925,13 +6974,40 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             items.forEach(item => {
                 const ikey = item.item_key || '';
                 const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                const svgEl = document.getElementById(svgId);
-                if (svgEl && ikey) {
-                    try {
-                        JsBarcode(svgEl, ikey, { format:'CODE128', width:1.4, height:50, displayValue:false, margin:4, background:'#fff', lineColor:'#000' });
-                    } catch(e) { svgEl.innerHTML = `<text font-size="9" fill="#ef4444">Erro</text>`; }
-                }
+                renderItemBarcode(document.getElementById(svgId), ikey);
             });
+        }
+
+        /** Renderiza um barcode CODE128 sempre contido no card, com largura de
+         *  barra adaptativa ao tamanho do código (mais caracteres = barras mais
+         *  finas), e força um viewBox no SVG resultante para que `width:100%`
+         *  no CSS escale proporcionalmente em vez de distorcer. */
+        function renderItemBarcode(svgEl, code) {
+            if (!svgEl || !code) return;
+            // Largura de barra adaptativa: códigos longos (item_key tipo
+            // "12345_SKU-ABC_0") usam barras mais finas para não estourar o card.
+            const len = code.length;
+            const barWidth = len > 28 ? 0.9 : len > 20 ? 1.1 : len > 14 ? 1.3 : 1.5;
+            try {
+                JsBarcode(svgEl, code, {
+                    format: 'CODE128', width: barWidth, height: 46,
+                    displayValue: false, margin: 2,
+                    background: '#fff', lineColor: '#000'
+                });
+                // JsBarcode seta width/height em atributos absolutos (px) — sem
+                // viewBox, o CSS `width:100%` distorceria a proporção. Copiamos
+                // os valores para um viewBox e então deixamos o CSS controlar
+                // o tamanho real de exibição.
+                const w = svgEl.getAttribute('width');
+                const h = svgEl.getAttribute('height');
+                if (w && h) {
+                    svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
+                    svgEl.removeAttribute('width');
+                    svgEl.removeAttribute('height');
+                }
+            } catch(e) {
+                svgEl.innerHTML = `<text font-size="9" fill="#ef4444">Código inválido</text>`;
+            }
         }
 
         /* Remove pedido da fila (botão ✕) */
@@ -7046,12 +7122,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             filtered.forEach(item => {
                 const ikey = item.item_key || '';
                 const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                const svgEl = document.getElementById(svgId);
-                if (svgEl && ikey) {
-                    try {
-                        JsBarcode(svgEl, ikey, { format:'CODE128', width:1.4, height:50, displayValue:false, margin:4, background:'#fff', lineColor:'#000' });
-                    } catch(e) { svgEl.innerHTML = `<text font-size="9" fill="#ef4444">Erro</text>`; }
-                }
+                renderItemBarcode(document.getElementById(svgId), ikey);
             });
         }
 
@@ -7266,7 +7337,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
          *  Tapeçaria, Concluído), mesmo que outros itens do mesmo
          *  pedido estejam em etapas diferentes.
          *  ════════════════════════════════════════════════════ */
-        function printItemLabel(itemKey, nomeProduto, pedidoNum, clienteNome) {
+        function printItemLabel(itemKey, nomeProduto, pedidoNum, clienteNome, unitLabel) {
             if (!itemKey) {
                 alert('Item sem identificador — não é possível gerar etiqueta.');
                 return;
@@ -7277,12 +7348,28 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             tempSvg.style.display = 'none';
             document.body.appendChild(tempSvg);
 
+            // Largura de barra adaptativa — mesma lógica de renderItemBarcode,
+            // já que a etiqueta impressa tem largura fixa de 62mm e o barcode
+            // não pode estourar essa margem física.
+            const len = itemKey.length;
+            const barWidth = len > 28 ? 0.85 : len > 20 ? 1.0 : len > 14 ? 1.2 : 1.4;
+
             try {
                 JsBarcode('#_printLabelSvg', itemKey, {
-                    format: 'CODE128', width: 1.6, height: 45,
+                    format: 'CODE128', width: barWidth, height: 42,
                     displayValue: false, margin: 2,
                     background: '#ffffff', lineColor: '#000000'
                 });
+                // Mesma correção de viewBox usada nos cards — garante que o SVG
+                // escale proporcionalmente dentro dos ~56mm úteis da etiqueta
+                // em vez de vazar para fora pela largura fixa em px do JsBarcode.
+                const w = tempSvg.getAttribute('width');
+                const h = tempSvg.getAttribute('height');
+                if (w && h) {
+                    tempSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+                    tempSvg.removeAttribute('width');
+                    tempSvg.setAttribute('style', 'width:100%;max-width:56mm;height:auto;display:block;margin:0 auto;');
+                }
             } catch(e) { console.warn('JsBarcode error:', e); }
 
             const svgHtml = tempSvg.outerHTML;
@@ -7305,6 +7392,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     width:62mm; height:40mm; box-sizing:border-box;
                     padding:2.5mm 3mm; font-family:Arial,sans-serif;
                     display:flex; flex-direction:column; justify-content:space-between;
+                    overflow:hidden;
                     border:1px solid #ccc;">
                     <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                         <div style="font-size:7.5pt; font-weight:900; letter-spacing:.04em;">SW MÓVEIS MDF</div>
@@ -7313,8 +7401,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     <div style="font-size:8pt; font-weight:700; line-height:1.15; max-height:7mm; overflow:hidden;">
                         ${escapeHtml(nomeShort)}
                     </div>
+                    ${unitLabel ? `<div style="font-size:6.5pt; color:#4f46e5; font-weight:700;">📦 ${escapeHtml(unitLabel)}</div>` : ''}
                     ${clienteNome ? `<div style="font-size:6.5pt; color:#444; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeHtml(clienteNome)}</div>` : ''}
-                    <div style="text-align:center; margin:0.5mm 0;">${svgHtml}</div>
+                    <div style="text-align:center; margin:0.5mm 0; width:100%; overflow:hidden;">${svgHtml}</div>
                     <div style="font-size:6pt; color:#666; text-align:center; letter-spacing:.03em;">
                         BIPE PARA AVANÇAR ETAPA
                     </div>
