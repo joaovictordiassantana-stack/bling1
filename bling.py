@@ -52,6 +52,7 @@ import base64
 import secrets
 import shutil
 import hmac
+import hashlib
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -2087,6 +2088,18 @@ def _extract_base_cor(nome: str):
 
     return base, cor
 
+def make_scan_code(item_key: str) -> str:
+    """
+    Gera um código curto e estável (8 hex chars) a partir do item_key completo.
+    Usado como valor real do barcode impresso/lido — muito mais curto que o
+    item_key bruto (que pode ter 30+ caracteres: order_id_sku_idx), o que
+    facilita a impressão em etiquetas pequenas e a leitura confiável pelo
+    scanner. Determinístico: o mesmo item_key sempre gera o mesmo scan_code,
+    então não precisa de armazenamento extra além do próprio item_data.
+    """
+    return hashlib.sha256(item_key.encode('utf-8')).hexdigest()[:8].upper()
+
+
 class PendingOrdersManager:
     """
     Gerencia pedidos do Bling que chegaram e estão aguardando produção.
@@ -2097,9 +2110,25 @@ class PendingOrdersManager:
     def __init__(self):
         self.data = self._load()
         self._restore_in_production_to_waiting()
+        self._backfill_scan_codes()
         self._op_cache     = {}   # oid -> {numero_op, situacao, previsao}
         self._op_cache_ts  = 0.0  # timestamp do último refresh
         self._op_cache_lock = __import__('threading').Lock()
+
+    def _backfill_scan_codes(self):
+        """
+        Itens carregados que foram criados antes do campo 'scan_code' existir
+        não o têm — gera retroativamente a partir do item_key, sem precisar
+        de migração manual ou reset de dados.
+        """
+        changed = False
+        for key, item in self.data.items():
+            if not item.get('scan_code'):
+                item['scan_code'] = make_scan_code(key)
+                changed = True
+        if changed:
+            self._save()
+            logger.info("🔧 scan_code retroativo gerado para itens legados.")
 
     def _restore_in_production_to_waiting(self):
         """
@@ -2440,6 +2469,7 @@ class PendingOrdersManager:
                             'qtd': 1,
                             'order_id': order_id,
                             'item_key': sub_key,
+                            'scan_code': make_scan_code(sub_key),  # código curto p/ barcode
                             'qtd_unit_idx': unit,
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
@@ -3904,11 +3934,21 @@ class WebServer:
             found_key = None
             found_item = None
 
-            # ── PRIORIDADE 1: match exato por item_key (único por produto individual) ──
-            # Isso é o caso normal quando a etiqueta impressa traz o item_key.
-            # Evita ambiguidade quando um pedido tem múltiplos produtos —
-            # cada produto tem seu próprio item_key e avança independentemente.
-            if codigo in pending_orders.data:
+            # ── PRIORIDADE 1: match por scan_code (código curto impresso/lido) ──
+            # É isso que está fisicamente impresso na etiqueta — único por
+            # produto individual e muito mais curto/legível que o item_key bruto.
+            if not found_item:
+                for key, item in pending_orders.data.items():
+                    if item.get('status') == 'done':
+                        continue
+                    if item.get('scan_code') == codigo:
+                        found_key, found_item = key, item
+                        break
+
+            # ── PRIORIDADE 2: match exato por item_key completo ──
+            # Compatibilidade com etiquetas antigas já impressas antes do
+            # scan_code existir, ou chamadas diretas via item_key.
+            if not found_item and codigo in pending_orders.data:
                 _item = pending_orders.data[codigo]
                 if _item.get('status') != 'done':
                     found_key, found_item = codigo, _item
@@ -3920,7 +3960,7 @@ class WebServer:
                         'mensagem': f'Este item já foi concluído anteriormente.'
                     })
 
-            # ── PRIORIDADE 2 (fallback): match por pedido_numero/ordem_producao ──
+            # ── PRIORIDADE 3 (fallback): match por pedido_numero/ordem_producao ──
             # Usado para códigos antigos/impressos por pedido inteiro (não por item).
             # ATENÇÃO: se o pedido tiver múltiplos produtos, pega o PRIMEIRO item
             # ainda não iniciado — pode não corresponder ao produto físico em mãos.
@@ -5666,7 +5706,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             width: 100% !important;    /* JsBarcode define width/height em px fixos —
                                            força responsivo dentro do container */
             height: auto;
-            max-height: 52px;
+            max-height: 62px;          /* barras + texto do código abaixo */
             max-width: 100%;
         }
         .bc-card .bc-lido-overlay {
@@ -6957,7 +6997,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
                                         📷 Bipe a etiqueta para iniciar
                                     </div>
-                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(item.scan_code||ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -6970,34 +7010,32 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes — usa item_key (único por produto individual)
+            // Renderiza barcodes — usa scan_code (curto, único por produto individual)
             items.forEach(item => {
                 const ikey = item.item_key || '';
+                const code = item.scan_code || ikey;
                 const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                renderItemBarcode(document.getElementById(svgId), ikey);
+                renderItemBarcode(document.getElementById(svgId), code);
             });
         }
 
-        /** Renderiza um barcode CODE128 sempre contido no card, com largura de
-         *  barra adaptativa ao tamanho do código (mais caracteres = barras mais
-         *  finas), e força um viewBox no SVG resultante para que `width:100%`
-         *  no CSS escale proporcionalmente em vez de distorcer. */
+        /** Renderiza um barcode CODE128 sempre contido no card. Como o
+         *  scan_code é sempre 8 caracteres fixos (hash curto), a largura de
+         *  barra pode ser constante — bem mais simples e previsível que a
+         *  lógica adaptativa anterior (necessária quando ainda usávamos o
+         *  item_key bruto, que variava de 15 a 40+ caracteres). Mostra o
+         *  texto do código abaixo das barras: ajuda na conferência visual e
+         *  serve de fallback para digitação manual se a leitura óptica falhar.
+         *  Força viewBox no SVG para que `width:100%` do CSS escale
+         *  proporcionalmente em vez de distorcer. */
         function renderItemBarcode(svgEl, code) {
             if (!svgEl || !code) return;
-            // Largura de barra adaptativa: códigos longos (item_key tipo
-            // "12345_SKU-ABC_0") usam barras mais finas para não estourar o card.
-            const len = code.length;
-            const barWidth = len > 28 ? 0.9 : len > 20 ? 1.1 : len > 14 ? 1.3 : 1.5;
             try {
                 JsBarcode(svgEl, code, {
-                    format: 'CODE128', width: barWidth, height: 46,
-                    displayValue: false, margin: 2,
-                    background: '#fff', lineColor: '#000'
+                    format: 'CODE128', width: 1.8, height: 42,
+                    displayValue: true, fontSize: 10, textMargin: 2,
+                    margin: 2, background: '#fff', lineColor: '#000'
                 });
-                // JsBarcode seta width/height em atributos absolutos (px) — sem
-                // viewBox, o CSS `width:100%` distorceria a proporção. Copiamos
-                // os valores para um viewBox e então deixamos o CSS controlar
-                // o tamanho real de exibição.
                 const w = svgEl.getAttribute('width');
                 const h = svgEl.getAttribute('height');
                 if (w && h) {
@@ -7052,6 +7090,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             let html = '<div class="p-3 row g-3">';
             filtered.forEach(item => {
                 const ikey  = item.item_key || '';
+                const scanCode = item.scan_code || ikey;
                 const nome  = item.nome || item.nome_original || item.produto || 'N/D';
                 const _rawOp3 = item.pedido_numero || item.ordem_producao || item.order_id || '';
                 const op    = (_rawOp3 && String(_rawOp3) !== '0') ? String(_rawOp3) : '';
@@ -7084,7 +7123,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
 
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
-                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(ikey)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
+                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(scanCode)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
                         <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
@@ -7109,7 +7148,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
                                     📷 Bipe a etiqueta para avançar
                                 </div>
-                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(op)}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
+                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(scanCode)}','${escapeHtml(nome)}','${escapeHtml(op)}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
                                </div>`
                         }
                     </div>
@@ -7118,11 +7157,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes — usa item_key (único por produto individual)
+            // Renderiza barcodes — usa scan_code (curto, único por produto individual)
             filtered.forEach(item => {
                 const ikey = item.item_key || '';
+                const code = item.scan_code || ikey;
                 const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                renderItemBarcode(document.getElementById(svgId), ikey);
+                renderItemBarcode(document.getElementById(svgId), code);
             });
         }
 
@@ -7218,10 +7258,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 
         /** Modal para ver e imprimir a Ordem de Produção do Bling — com barcode real */
-        function openOPModal(pedidoNum, nomeProduto, itemKey, ordemProducao, clienteNome) {
-            // itemKey = código real lido pelo scanner (único por produto individual)
+        function openOPModal(pedidoNum, nomeProduto, scanCode, ordemProducao, clienteNome) {
+            // scanCode = código real lido pelo scanner (curto, único por produto individual)
             // pedidoNum = número do pedido Bling (informativo, pode repetir entre produtos)
-            const codigoBarras = String(itemKey || pedidoNum || ordemProducao || '');
+            const codigoBarras = String(scanCode || pedidoNum || ordemProducao || '');
 
             const existing = document.getElementById('opModal');
             if (existing) { bootstrap.Modal.getInstance(existing)?.hide(); existing.remove(); }
@@ -7295,7 +7335,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     }
                 }
                 // Mostra status atual do item (busca por item_key — sem ambiguidade)
-                _updateOPStatusBox(itemKey || codigoBarras);
+                _updateOPStatusBox(scanCode || codigoBarras);
             }, 60);
         }
 
@@ -7306,7 +7346,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const res = await fetch('/api/production/board');
                 const data = await res.json();
                 const all = [...(data.waiting||[]), ...(data.in_production||[]), ...(data.done||[])];
-                const item = all.find(i => String(i.item_key||'') === String(itemKeyLookup));
+                const item = all.find(i => String(i.scan_code||i.item_key||'') === String(itemKeyLookup));
                 if (!item) {
                     box.innerHTML = `<span class="badge bg-secondary">Status desconhecido</span>`;
                     return;
@@ -7337,87 +7377,100 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
          *  Tapeçaria, Concluído), mesmo que outros itens do mesmo
          *  pedido estejam em etapas diferentes.
          *  ════════════════════════════════════════════════════ */
-        function printItemLabel(itemKey, nomeProduto, pedidoNum, clienteNome, unitLabel) {
-            if (!itemKey) {
-                alert('Item sem identificador — não é possível gerar etiqueta.');
+        function printItemLabel(scanCode, nomeProduto, pedidoNum, clienteNome, unitLabel) {
+            if (!scanCode) {
+                alert('Item sem código de leitura — não é possível gerar etiqueta. Sincronize novamente.');
                 return;
             }
 
-            const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            tempSvg.id = '_printLabelSvg';
-            tempSvg.style.display = 'none';
-            document.body.appendChild(tempSvg);
-
-            // Largura de barra adaptativa — mesma lógica de renderItemBarcode,
-            // já que a etiqueta impressa tem largura fixa de 62mm e o barcode
-            // não pode estourar essa margem física.
-            const len = itemKey.length;
-            const barWidth = len > 28 ? 0.85 : len > 20 ? 1.0 : len > 14 ? 1.2 : 1.4;
-
-            try {
-                JsBarcode('#_printLabelSvg', itemKey, {
-                    format: 'CODE128', width: barWidth, height: 42,
-                    displayValue: false, margin: 2,
-                    background: '#ffffff', lineColor: '#000000'
-                });
-                // Mesma correção de viewBox usada nos cards — garante que o SVG
-                // escale proporcionalmente dentro dos ~56mm úteis da etiqueta
-                // em vez de vazar para fora pela largura fixa em px do JsBarcode.
-                const w = tempSvg.getAttribute('width');
-                const h = tempSvg.getAttribute('height');
-                if (w && h) {
-                    tempSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-                    tempSvg.removeAttribute('width');
-                    tempSvg.setAttribute('style', 'width:100%;max-width:56mm;height:auto;display:block;margin:0 auto;');
-                }
-            } catch(e) { console.warn('JsBarcode error:', e); }
-
-            const svgHtml = tempSvg.outerHTML;
-            tempSvg.remove();
-
             // Nome truncado para caber na etiqueta pequena
-            const nomeShort = (nomeProduto || '').length > 38
-                ? nomeProduto.substring(0, 36) + '…'
+            const nomeShort = (nomeProduto || '').length > 42
+                ? nomeProduto.substring(0, 40) + '…'
                 : (nomeProduto || '');
 
-            const printContent = `
-                <style>
-                    @page { size: 62mm 40mm; margin: 0; }
-                    @media print {
-                        body { margin: 0; }
-                        .label-box { box-shadow: none !important; }
-                    }
-                </style>
-                <div class="label-box" style="
-                    width:62mm; height:40mm; box-sizing:border-box;
-                    padding:2.5mm 3mm; font-family:Arial,sans-serif;
-                    display:flex; flex-direction:column; justify-content:space-between;
-                    overflow:hidden;
-                    border:1px solid #ccc;">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                        <div style="font-size:7.5pt; font-weight:900; letter-spacing:.04em;">SW MÓVEIS MDF</div>
-                        ${pedidoNum ? `<div style="font-size:7.5pt; font-weight:700; font-family:monospace;">Ped.${escapeHtml(String(pedidoNum))}</div>` : ''}
-                    </div>
-                    <div style="font-size:8pt; font-weight:700; line-height:1.15; max-height:7mm; overflow:hidden;">
-                        ${escapeHtml(nomeShort)}
-                    </div>
-                    ${unitLabel ? `<div style="font-size:6.5pt; color:#4f46e5; font-weight:700;">📦 ${escapeHtml(unitLabel)}</div>` : ''}
-                    ${clienteNome ? `<div style="font-size:6.5pt; color:#444; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeHtml(clienteNome)}</div>` : ''}
-                    <div style="text-align:center; margin:0.5mm 0; width:100%; overflow:hidden;">${svgHtml}</div>
-                    <div style="font-size:6pt; color:#666; text-align:center; letter-spacing:.03em;">
-                        BIPE PARA AVANÇAR ETAPA
-                    </div>
-                </div>`;
+            // ── Janela de impressão dedicada ──────────────────────────────
+            // Abrir um documento HTML completo e isolado (em vez de injetar
+            // dentro da página principal via innerHTML) é o que garante que
+            // @page seja respeitado pelo navegador sem conflito com o CSS
+            // de impressão global da página (que usa padding:20px e tamanho
+            // de página padrão A4 para outros tipos de impressão, como a OP
+            // completa). Esse conflito era a causa raiz da etiqueta sair
+            // cortada e deslocada para o canto da folha.
+            const printWin = window.open('', '_blank', 'width=400,height=300');
+            if (!printWin) {
+                alert('O navegador bloqueou a janela de impressão. Permita pop-ups para este site e tente novamente.');
+                return;
+            }
 
-            const printArea = document.getElementById('print-area');
-            printArea.innerHTML = printContent;
-            printArea.style.display = 'block';
-            window.print();
-            window.onafterprint = () => {
-                printArea.innerHTML = '';
-                printArea.style.display = 'none';
-                window.onafterprint = null;
-            };
+            printWin.document.write(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Etiqueta</title>
+<style>
+    @page { size: 62mm 40mm; margin: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 62mm; height: 40mm; }
+    body {
+        font-family: Arial, Helvetica, sans-serif;
+        display: flex; align-items: center; justify-content: center;
+    }
+    .label {
+        width: 62mm; height: 40mm;
+        padding: 2.5mm 3mm;
+        display: flex; flex-direction: column; justify-content: space-between;
+        overflow: hidden;
+    }
+    .row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 2mm; }
+    .brand { font-size: 7.5pt; font-weight: 900; letter-spacing: .04em; white-space: nowrap; }
+    .ped   { font-size: 7.5pt; font-weight: 700; font-family: 'Courier New', monospace; white-space: nowrap; }
+    .nome  { font-size: 8pt; font-weight: 700; line-height: 1.15; max-height: 7mm; overflow: hidden; }
+    .unit  { font-size: 6.5pt; color: #4f46e5; font-weight: 700; }
+    .cliente { font-size: 6.5pt; color: #444; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .bc-wrap { width: 100%; text-align: center; overflow: hidden; margin: 0.5mm 0; }
+    .bc-wrap svg { width: 100%; max-width: 54mm; height: auto; display: block; margin: 0 auto; }
+    .footer { font-size: 6pt; color: #666; text-align: center; letter-spacing: .03em; }
+</style>
+</head><body>
+    <div class="label">
+        <div class="row-top">
+            <span class="brand">SW MÓVEIS MDF</span>
+            ${pedidoNum ? `<span class="ped">Ped.${escapeHtml(String(pedidoNum))}</span>` : ''}
+        </div>
+        <div class="nome">${escapeHtml(nomeShort)}</div>
+        ${unitLabel ? `<div class="unit">📦 ${escapeHtml(unitLabel)}</div>` : ''}
+        ${clienteNome ? `<div class="cliente">${escapeHtml(clienteNome)}</div>` : ''}
+        <div class="bc-wrap"><svg id="bcSvg"></svg></div>
+        <div class="footer">BIPE PARA AVANÇAR ETAPA</div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+    <script>
+        (function() {
+            var code = ${JSON.stringify(scanCode)};
+            try {
+                JsBarcode('#bcSvg', code, {
+                    format: 'CODE128', width: 2, height: 42,
+                    displayValue: true, fontSize: 9, textMargin: 1,
+                    margin: 2, background: '#ffffff', lineColor: '#000000'
+                });
+            } catch(e) {
+                document.getElementById('bcSvg').outerHTML =
+                    '<div style="font-family:monospace;font-weight:700;font-size:11pt;letter-spacing:.1em;">' + code + '</div>';
+            }
+            // Aguarda o SVG renderizar antes de imprimir
+            setTimeout(function() {
+                window.focus();
+                window.print();
+            }, 200);
+        })();
+    </script>
+</body></html>`);
+            printWin.document.close();
+
+            // Fecha a janela automaticamente após a impressão (ou cancelamento)
+            printWin.onafterprint = function() { printWin.close(); };
+            // Fallback: se o navegador não disparar onafterprint (alguns não
+            // disparam ao cancelar), fecha após um tempo razoável de qualquer forma
+            setTimeout(function() {
+                if (!printWin.closed) printWin.close();
+            }, 60000);
         }
 
         /** Impressão da OP em página limpa (sem travar) */
@@ -7430,49 +7483,61 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            tempSvg.id = '_printBcSvg';
-            tempSvg.style.display = 'none';
-            document.body.appendChild(tempSvg);
+            const printWin = window.open('', '_blank', 'width=500,height=600');
+            if (!printWin) {
+                alert('O navegador bloqueou a janela de impressão. Permita pop-ups para este site e tente novamente.');
+                return;
+            }
 
+            printWin.document.write(`<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Ordem de Produção</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; text-align: center; padding: 30px; }
+    h2 { letter-spacing: .05em; margin-bottom: 4px; }
+    .sub { color: #666; font-size: 13px; margin-bottom: 20px; }
+    .box {
+        border: 2px solid #000; border-radius: 8px; padding: 20px;
+        display: inline-block; min-width: 320px; max-width: 420px;
+    }
+    .nome { font-size: 13px; color: #555; margin-bottom: 6px; font-weight: bold; }
+    .cliente { font-size: 11px; color: #888; margin-bottom: 6px; }
+    .num { font-size: 26px; font-weight: 900; font-family: 'Courier New', monospace; margin-bottom: 4px; letter-spacing: .06em; }
+    .op-interna { font-size: 11px; color: #888; margin-bottom: 12px; }
+    .bc { margin: 16px 0; }
+    .footer { color: #888; font-size: 11px; margin-top: 16px; }
+</style>
+</head><body>
+    <h2>SW Móveis MDF</h2>
+    <p class="sub">Ordem de Produção</p>
+    <div class="box">
+        <div class="nome">${escapeHtml(nomeProduto||'')}</div>
+        ${clienteNome ? `<div class="cliente">Cliente: ${escapeHtml(clienteNome)}</div>` : ''}
+        <div class="num">Ped. #${escapeHtml(String(pedidoNum||''))}</div>
+        ${ordemProducao ? `<div class="op-interna">OP Interna: ${escapeHtml(String(ordemProducao))}</div>` : ''}
+        <div class="bc"><svg id="bcSvg"></svg></div>
+    </div>
+    <p class="footer">1ª leitura = Marcenaria &nbsp;|&nbsp; 2ª leitura = Tapeçaria &nbsp;|&nbsp; 3ª leitura = Concluído</p>
+    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+    <script>
+        (function() {
             try {
-                JsBarcode('#_printBcSvg', codigoBarras, {
+                JsBarcode('#bcSvg', ${JSON.stringify(codigoBarras)}, {
                     format: 'CODE128', width: 3, height: 90,
                     displayValue: true, fontSize: 16, fontOptions: 'bold',
                     margin: 8, background: '#ffffff', lineColor: '#000000'
                 });
-            } catch(e) { console.warn('JsBarcode error:', e); }
-
-            const svgHtml = tempSvg.outerHTML;
-            tempSvg.remove();
-
-            const printContent = `
-                <div style="font-family:Arial,sans-serif;text-align:center;padding:30px;">
-                    <h2 style="letter-spacing:.05em;margin-bottom:4px;">SW Móveis MDF</h2>
-                    <p style="color:#666;font-size:13px;margin-bottom:20px;">Ordem de Produção</p>
-                    <div style="border:2px solid #000;border-radius:8px;padding:20px;display:inline-block;min-width:320px;max-width:420px;">
-                        <div style="font-size:13px;color:#555;margin-bottom:6px;font-weight:bold;">${escapeHtml(nomeProduto||'')}</div>
-                        ${clienteNome ? `<div style="font-size:11px;color:#888;margin-bottom:6px;">Cliente: ${escapeHtml(clienteNome)}</div>` : ''}
-                        <div style="font-size:26px;font-weight:900;font-family:monospace;margin-bottom:4px;letter-spacing:.06em;">
-                            Ped. #${escapeHtml(String(pedidoNum||''))}
-                        </div>
-                        ${ordemProducao ? `<div style="font-size:11px;color:#888;margin-bottom:12px;">OP Interna: ${escapeHtml(String(ordemProducao))}</div>` : ''}
-                        <div style="margin:16px 0;">${svgHtml}</div>
-                    </div>
-                    <p style="color:#888;font-size:11px;margin-top:16px;">
-                        1ª leitura = Marcenaria &nbsp;|&nbsp; 2ª leitura = Tapeçaria &nbsp;|&nbsp; 3ª leitura = Concluído
-                    </p>
-                </div>`;
-
-            const printArea = document.getElementById('print-area');
-            printArea.innerHTML = printContent;
-            printArea.style.display = 'block';
-            window.print();
-            window.onafterprint = () => {
-                printArea.innerHTML = '';
-                printArea.style.display = 'none';
-                window.onafterprint = null;
-            };
+            } catch(e) {
+                document.getElementById('bcSvg').outerHTML =
+                    '<div style="font-family:monospace;font-weight:900;font-size:22pt;letter-spacing:.1em;">' + ${JSON.stringify(codigoBarras)} + '</div>';
+            }
+            setTimeout(function() { window.focus(); window.print(); }, 200);
+        })();
+    </script>
+</body></html>`);
+            printWin.document.close();
+            printWin.onafterprint = function() { printWin.close(); };
+            setTimeout(function() { if (!printWin.closed) printWin.close(); }, 60000);
         }
 
         /** ════════════════════════════════════════════════════
