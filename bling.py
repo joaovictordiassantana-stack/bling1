@@ -788,7 +788,15 @@ class BlingAPIClient:
                             self.logger.info(f"♻️  Retry '{endpoint}' → status {response.status_code}")
                             if response.status_code not in (403, 401):
                                 try:
-                                    return response.json()
+                                    retry_data = response.json()
+                                    if isinstance(retry_data, dict) and isinstance(retry_data.get('error'), dict):
+                                        err = retry_data['error']
+                                        self.logger.error(
+                                            f"⛔ Bling retornou erro estruturado no retry '{endpoint}': "
+                                            f"{err.get('type','?')} — {err.get('message','')}"
+                                        )
+                                        return None
+                                    return retry_data
                                 except Exception:
                                     return {}
                         except Exception as _re:
@@ -808,9 +816,33 @@ class BlingAPIClient:
             response.raise_for_status()
             
             try:
-                return response.json()
+                data = response.json()
             except json.JSONDecodeError:
                 return {}
+
+            # ── Detecta erro estruturado do Bling mesmo com HTTP 200 ──────────
+            # Alguns endpoints da API v3 retornam status 200 com corpo
+            # {"error":{"type":"FORBIDDEN","message":"Não permitido.",...}}
+            # em vez de um 403 real — isso passava direto por raise_for_status()
+            # e era retornado como se fosse dado válido, vazando o erro cru
+            # para qualquer código que chamasse self.api.get(...).
+            if isinstance(data, dict) and isinstance(data.get('error'), dict):
+                err = data['error']
+                err_type = err.get('type', 'UNKNOWN')
+                err_msg  = err.get('message') or err.get('description') or 'Erro não especificado'
+                self.logger.error(
+                    f"⛔ Bling retornou erro estruturado em '{endpoint}' (HTTP {response.status_code}): "
+                    f"{err_type} — {err_msg}"
+                )
+                if err_type == 'FORBIDDEN':
+                    self.logger.error(
+                        f"   → Causa provável: o token tem acesso geral à API, mas falta escopo "
+                        f"específico para '{endpoint}'. Verifique os escopos marcados no painel "
+                        f"Bling em Configurações > API > Aplicativos, e refaça o OAuth se ajustar."
+                    )
+                return None
+
+            return data
 
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             self.logger.error(f"Erro de Conexão (Reset/Queda) em {endpoint}: {str(e)}")
@@ -3593,12 +3625,19 @@ class WebServer:
                 done_enriched.append(enriched_done)
 
             # ── Busca OPs do Bling em cache (5min TTL, thread-safe) ───────────
+            # Circuit breaker: se 'ordens/producao' não está disponível (módulo
+            # não habilitado na conta Bling — retorna FORBIDDEN), desativa por
+            # 1h em vez de tentar até 25x a cada 5min. Evita lentidão e ruído
+            # de erro quando o recurso simplesmente não existe para esta conta.
             with pending_orders._op_cache_lock:
                 _op_cache    = pending_orders._op_cache
                 _op_cache_ts = pending_orders._op_cache_ts
                 needs_refresh = time.time() - _op_cache_ts > 300
 
-            if needs_refresh:
+            _ops_disabled_until = getattr(self.orchestrator, '_ops_endpoint_disabled_until', 0)
+            _ops_circuit_open = time.time() < _ops_disabled_until
+
+            if needs_refresh and not _ops_circuit_open:
                 new_op_cache = dict(_op_cache)  # cópia para não bloquear leituras
                 order_ids_to_fetch = set()
                 for it in list(pending_orders.data.values()):
@@ -3607,6 +3646,7 @@ class WebServer:
                     if oid:
                         order_ids_to_fetch.add(str(oid))
                 fetched = 0
+                consecutive_failures = 0
                 for oid in list(order_ids_to_fetch):
                     if fetched >= 25:   # máx 25 req por ciclo para não travar
                         break
@@ -3617,7 +3657,25 @@ class WebServer:
                             'ordens/producao',
                             params={'numeroPedidoVenda': oid}
                         )
-                        if resp and resp.get('data'):
+                        if resp is None:
+                            # api.get retorna None tanto para erro de rede quanto
+                            # para erro estruturado FORBIDDEN — trata como falha
+                            consecutive_failures += 1
+                            if consecutive_failures >= 3:
+                                # 3 falhas seguidas = endpoint indisponível para esta
+                                # conta (módulo não habilitado). Abre o circuito.
+                                self.orchestrator._ops_endpoint_disabled_until = time.time() + 3600
+                                self.logger.warning(
+                                    "⚠️ Endpoint 'ordens/producao' indisponível (FORBIDDEN/erro) — "
+                                    "provavelmente o módulo Ordens de Produção não está habilitado "
+                                    "nesta conta Bling. Desativado por 1h para evitar lentidão. "
+                                    "OPs internas não aparecerão nos cards (apenas o número do "
+                                    "pedido, que já é suficiente para o código de barras)."
+                                )
+                                break
+                            continue
+                        consecutive_failures = 0
+                        if resp.get('data'):
                             ops = resp['data'] if isinstance(resp['data'], list) else [resp['data']]
                             for op in ops:
                                 numero_op = str(op.get('numero') or op.get('id') or '')
@@ -3639,6 +3697,7 @@ class WebServer:
                                     fetched += 1
                                     break
                     except Exception:
+                        consecutive_failures += 1
                         pass
                 with pending_orders._op_cache_lock:
                     pending_orders._op_cache    = new_op_cache
@@ -4369,6 +4428,10 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
                         pass
                 return redirect('/admin/sync-status')
 
+            if request.method == 'POST' and request.form.get('action') == 'reenable_ops':
+                self.orchestrator._ops_endpoint_disabled_until = 0
+                return redirect('/admin/sync-status')
+
             fetched_count = 0
             updated_at = 'N/D'
             if MONGO_AVAILABLE:
@@ -4384,6 +4447,14 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
             board_total = len(pending_orders.data)
             waiting = len(pending_orders.get_waiting())
 
+            ops_disabled_until = getattr(self.orchestrator, '_ops_endpoint_disabled_until', 0)
+            ops_circuit_open = time.time() < ops_disabled_until
+            if ops_circuit_open:
+                mins_left = int((ops_disabled_until - time.time()) / 60)
+                ops_status_html = f'<span style="color:#fbbf24">⚠️ Desativado (FORBIDDEN) — reativa em {mins_left} min</span>'
+            else:
+                ops_status_html = '<span style="color:#86efac">✅ Ativo</span>'
+
             return f"""<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"><title>Sync Status</title>
 <style>body{{font-family:'Segoe UI',sans-serif;padding:40px;background:#0f172a;color:#e2e8f0;max-width:600px;margin:0 auto}}
@@ -4391,9 +4462,11 @@ h1{{color:#f1f5f9}}.row{{display:flex;justify-content:space-between;padding:10px
 .label{{color:#94a3b8}}.value{{font-weight:700;color:#86efac;font-family:monospace}}
 .btn{{display:inline-block;padding:10px 24px;border-radius:8px;font-weight:700;text-decoration:none;border:none;cursor:pointer;font-size:.9rem;margin-top:20px}}
 .btn-back{{background:#1e293b;color:#94a3b8;border:1px solid #334155;margin-right:12px}}
-.btn-red{{background:#ef4444;color:#fff}}</style>
+.btn-red{{background:#ef4444;color:#fff}}
+.btn-blue{{background:#3b82f6;color:#fff}}</style>
 </head><body>
 <h1>📊 Status de Sincronização</h1>
+<div class="row"><span class="label">Endpoint "Ordens de Produção"</span><span class="value">{ops_status_html}</span></div>
 <div class="row"><span class="label">Pedidos com itens já buscados (checkpoint)</span><span class="value">{fetched_count}</span></div>
 <div class="row"><span class="label">Última atualização do checkpoint</span><span class="value">{updated_at}</span></div>
 <div class="row"><span class="label">Total no histórico de vendas</span><span class="value">{total_history}</span></div>
@@ -4403,11 +4476,22 @@ h1{{color:#f1f5f9}}.row{{display:flex;justify-content:space-between;padding:10px
 O sistema processa ~40 pedidos por ciclo (~10 min entre ciclos, acelerado enquanto houver pendentes).
 Reiniciar o checkpoint força reprocessamento de todos os pedidos do mês.
 </p>
+{f'''<p style="color:#fbbf24;font-size:.8rem;background:#78350f20;border:1px solid #78350f60;border-radius:8px;padding:12px;">
+⚠️ O endpoint de Ordens de Produção retornou erro de permissão (FORBIDDEN). Isso geralmente
+significa que o módulo "Ordens de Produção" não está habilitado nesta conta Bling, ou o escopo
+correspondente não foi marcado ao criar o aplicativo. O sistema continua funcionando normalmente
+sem ele — apenas o número da OP interna não aparece nos cards (o código de barras do produto
+já é suficiente). Se você habilitar o módulo no Bling, use o botão abaixo para reativar agora.
+</p>''' if ops_circuit_open else ''}
 <a href="/" class="btn btn-back">← Voltar</a>
 <form method="POST" style="display:inline">
   <input type="hidden" name="action" value="reset">
   <button type="submit" class="btn btn-red" onclick="return confirm('Resetar checkpoint? Isso fará o sistema rebuscar todos os pedidos do mês novamente.')">🔄 Resetar Checkpoint</button>
 </form>
+{f'''<form method="POST" style="display:inline">
+  <input type="hidden" name="action" value="reenable_ops">
+  <button type="submit" class="btn btn-blue">🔓 Reativar Ordens de Produção</button>
+</form>''' if ops_circuit_open else ''}
 </body></html>"""
 
         # ── Rota de emergência: purge de pedidos fantasma/antigos ────────────────
