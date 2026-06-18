@@ -1261,10 +1261,6 @@ class SalesManager:
     lock: Lock = field(default_factory=Lock)
     recalculation_lock: Lock = field(default_factory=Lock)
     _recalculation_running: bool = False
-    # Lock real que serializa a EXECUÇÃO da busca (diferente do recalculation_lock,
-    # que só protege a leitura/escrita da flag _recalculation_running).
-    # Evita que duas buscas de pedidos no Bling rodem em paralelo, mesmo com force=True.
-    execution_lock: Lock = field(default_factory=Lock)
 
     def __post_init__(self):
         self._load_stats()
@@ -2691,34 +2687,14 @@ class Orchestrator:
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
         self.logger.debug(f"process_sales_orders chamado (force={force})")
-
-        # ── Evita recálculos encavalados/paralelos ──────────────────────────
-        # force=False (ciclo automático do worker): se já existe uma busca em
-        # andamento, desiste imediatamente (comportamento original).
-        # force=True (botão "Sincronizar Bling", endpoints manuais): NÃO pula
-        # a checagem mais — em vez disso ESPERA a busca atual terminar e só
-        # então roda, de forma exclusiva. Antes, force=True ignorava o lock
-        # por completo e podia rodar em paralelo com o ciclo automático,
-        # duplicando as páginas buscadas no Bling (mesmo intervalo de datas
-        # buscado duas vezes ao mesmo tempo — visível nos logs como números
-        # de página intercalados, ex: 12, 20, 21, 13, 22...).
-        if force:
-            acquired = self.sales.execution_lock.acquire(timeout=120)
-            if not acquired:
-                self.logger.warning(
-                    "⏱ Timeout (120s) esperando a busca anterior de pedidos terminar — "
-                    "sincronização manual abortada para evitar busca duplicada."
-                )
-                return
-        else:
-            acquired = self.sales.execution_lock.acquire(blocking=False)
-            if not acquired:
+        
+        # Evita recálculos encavalados
+        with self.sales.recalculation_lock:
+            if self.sales._recalculation_running and not force:
                 self.logger.debug("Recálculo já em execução, ignorando.")
                 return
-
-        with self.sales.recalculation_lock:
             self.sales._recalculation_running = True
-
+            
         try:
             if not self.auth.is_authenticated():
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
@@ -2818,16 +2794,23 @@ class Orchestrator:
                 for o in valid_orders:
                     if o.get('id'):
                         history_map[o['id']] = o  # insere ou atualiza
+
+                def _norm_date(d: str) -> str:
+                    """Converte DD/MM/YYYY → YYYY-MM-DD para comparação/sort seguro.
+                    Necessário porque a Bling API pode retornar ambos os formatos,
+                    e comparação lexicográfica de string falha para DD/MM/YYYY."""
+                    if not d:
+                        return ''
+                    if len(d) >= 10 and d[2] == '/' and d[5] == '/':
+                        return f"{d[6:10]}-{d[3:5]}-{d[0:2]}"
+                    return d[:10]
+
                 # Reconstrói lista ordenada por data (mais recente por último)
                 merged = sorted(history_map.values(),
-                                key=lambda x: x.get('data', ''), reverse=False)
-                # Janela de 60 dias corridos (cobre o mês atual completo + mês
-                # anterior para comparações) — em vez de cap fixo de 2000
-                # registros, que cortava pedidos do início do mês em meses
-                # de alto volume (2500+) e distorcia o cálculo de tendência.
-                # Hard ceiling de 5000 como rede de segurança contra picos extremos.
+                                key=lambda x: _norm_date(x.get('data', '')), reverse=False)
+                # Janela de 60 dias corridos
                 cutoff_date = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
-                merged_window = [o for o in merged if o.get('data', '') >= cutoff_date]
+                merged_window = [o for o in merged if _norm_date(o.get('data', '')) >= cutoff_date]
                 self.sales._sales_history = merged_window[-5000:]
                 self.logger.info(f"📦 Histórico de pedidos: {len(valid_orders)} novos/atualizados, {len(self.sales._sales_history)} total em memória (janela 60d).")
                 
@@ -2865,7 +2848,6 @@ class Orchestrator:
         finally:
             with self.sales.recalculation_lock:
                 self.sales._recalculation_running = False
-            self.sales.execution_lock.release()
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
@@ -7427,66 +7409,49 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            printWin.document.write(`<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Etiqueta</title>
-<style>
-    @page { size: 62mm 40mm; margin: 0; }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 62mm; height: 40mm; }
-    body {
-        font-family: Arial, Helvetica, sans-serif;
-        display: flex; align-items: center; justify-content: center;
-    }
-    .label {
-        width: 62mm; height: 40mm;
-        padding: 2.5mm 3mm;
-        display: flex; flex-direction: column; justify-content: space-between;
-        overflow: hidden;
-    }
-    .row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 2mm; }
-    .brand { font-size: 7.5pt; font-weight: 900; letter-spacing: .04em; white-space: nowrap; }
-    .ped   { font-size: 7.5pt; font-weight: 700; font-family: 'Courier New', monospace; white-space: nowrap; }
-    .nome  { font-size: 8pt; font-weight: 700; line-height: 1.15; max-height: 7mm; overflow: hidden; }
-    .unit  { font-size: 6.5pt; color: #4f46e5; font-weight: 700; }
-    .cliente { font-size: 6.5pt; color: #444; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-    .bc-wrap { width: 100%; text-align: center; overflow: hidden; margin: 0.5mm 0; }
-    .bc-wrap svg { width: 100%; max-width: 54mm; height: auto; display: block; margin: 0 auto; }
-    .footer { font-size: 6pt; color: #666; text-align: center; letter-spacing: .03em; }
-</style>
-</head><body>
-    <div class="label">
-        <div class="row-top">
-            <span class="brand">SW MÓVEIS MDF</span>
-            ${pedidoNum ? `<span class="ped">Ped.${escapeHtml(String(pedidoNum))}</span>` : ''}
-        </div>
-        <div class="nome">${escapeHtml(nomeShort)}</div>
-        ${unitLabel ? `<div class="unit">📦 ${escapeHtml(unitLabel)}</div>` : ''}
-        ${clienteNome ? `<div class="cliente">${escapeHtml(clienteNome)}</div>` : ''}
-        <div class="bc-wrap"><svg id="bcSvg"></svg></div>
-        <div class="footer">BIPE PARA AVANÇAR ETAPA</div>
-    </div>
-    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
-    <script>
-        (function() {
-            var code = ${JSON.stringify(scanCode)};
-            try {
-                JsBarcode('#bcSvg', code, {
-                    format: 'CODE128', width: 2, height: 42,
-                    displayValue: true, fontSize: 9, textMargin: 1,
-                    margin: 2, background: '#ffffff', lineColor: '#000000'
-                });
-            } catch(e) {
-                document.getElementById('bcSvg').outerHTML =
-                    '<div style="font-family:monospace;font-weight:700;font-size:11pt;letter-spacing:.1em;">' + code + '</div>';
-            }
-            // Aguarda o SVG renderizar antes de imprimir
-            setTimeout(function() {
-                window.focus();
-                window.print();
-            }, 200);
-        })();
-    </script>
-</body></html>`);
+            printWin.document.write('<!DOCTYPE html>\n'
++ '<html><head><meta charset="UTF-8"><title>Etiqueta</title>\n'
++ '<style>\n'
++ '    @page { size: 62mm 40mm; margin: 0; }\n'
++ '    * { margin: 0; padding: 0; box-sizing: border-box; }\n'
++ '    html, body { width: 62mm; height: 40mm; }\n'
++ '    body { font-family: Arial, Helvetica, sans-serif; display: flex; align-items: center; justify-content: center; }\n'
++ '    .label { width: 62mm; height: 40mm; padding: 2.5mm 3mm; display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; }\n'
++ '    .row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 2mm; }\n'
++ '    .brand { font-size: 7.5pt; font-weight: 900; letter-spacing: .04em; white-space: nowrap; }\n'
++ '    .ped   { font-size: 7.5pt; font-weight: 700; font-family: "Courier New", monospace; white-space: nowrap; }\n'
++ '    .nome  { font-size: 8pt; font-weight: 700; line-height: 1.15; max-height: 7mm; overflow: hidden; }\n'
++ '    .unit  { font-size: 6.5pt; color: #4f46e5; font-weight: 700; }\n'
++ '    .cliente { font-size: 6.5pt; color: #444; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }\n'
++ '    .bc-wrap { width: 100%; text-align: center; overflow: hidden; margin: 0.5mm 0; }\n'
++ '    .bc-wrap svg { width: 100%; max-width: 54mm; height: auto; display: block; margin: 0 auto; }\n'
++ '    .footer { font-size: 6pt; color: #666; text-align: center; letter-spacing: .03em; }\n'
++ '</style>\n'
++ '</head><body>\n'
++ '    <div class="label">\n'
++ '        <div class="row-top">\n'
++ '            <span class="brand">SW M\u00d3VEIS MDF</span>\n'
++ (pedidoNum ? '            <span class="ped">Ped.' + escapeHtml(String(pedidoNum)) + '</span>\n' : '')
++ '        </div>\n'
++ '        <div class="nome">' + escapeHtml(nomeShort) + '</div>\n'
++ (unitLabel   ? '        <div class="unit">\ud83d\udce6 ' + escapeHtml(unitLabel) + '</div>\n' : '')
++ (clienteNome ? '        <div class="cliente">' + escapeHtml(clienteNome) + '</div>\n' : '')
++ '        <div class="bc-wrap"><svg id="bcSvg"></svg></div>\n'
++ '        <div class="footer">BIPE PARA AVAN\u00c7AR ETAPA</div>\n'
++ '    </div>\n'
++ '    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"><\/script>\n'
++ '    <script>\n'
++ '        (function() {\n'
++ '            var code = ' + JSON.stringify(scanCode) + ';\n'
++ '            try {\n'
++ '                JsBarcode("#bcSvg", code, { format: "CODE128", width: 2, height: 42, displayValue: true, fontSize: 9, textMargin: 1, margin: 2, background: "#ffffff", lineColor: "#000000" });\n'
++ '            } catch(e) {\n'
++ '                document.getElementById("bcSvg").outerHTML = "<div style=\'font-family:monospace;font-weight:700;font-size:11pt;letter-spacing:.1em;\'>" + code + "<\/div>";\n'
++ '            }\n'
++ '            setTimeout(function() { window.focus(); window.print(); }, 200);\n'
++ '        })();\n'
++ '    <\/script>\n'
++ '</body></html>');
             printWin.document.close();
 
             // Fecha a janela automaticamente após a impressão (ou cancelamento)
@@ -7514,52 +7479,44 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
-            printWin.document.write(`<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Ordem de Produção</title>
-<style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { font-family: Arial, sans-serif; text-align: center; padding: 30px; }
-    h2 { letter-spacing: .05em; margin-bottom: 4px; }
-    .sub { color: #666; font-size: 13px; margin-bottom: 20px; }
-    .box {
-        border: 2px solid #000; border-radius: 8px; padding: 20px;
-        display: inline-block; min-width: 320px; max-width: 420px;
-    }
-    .nome { font-size: 13px; color: #555; margin-bottom: 6px; font-weight: bold; }
-    .cliente { font-size: 11px; color: #888; margin-bottom: 6px; }
-    .num { font-size: 26px; font-weight: 900; font-family: 'Courier New', monospace; margin-bottom: 4px; letter-spacing: .06em; }
-    .op-interna { font-size: 11px; color: #888; margin-bottom: 12px; }
-    .bc { margin: 16px 0; }
-    .footer { color: #888; font-size: 11px; margin-top: 16px; }
-</style>
-</head><body>
-    <h2>SW Móveis MDF</h2>
-    <p class="sub">Ordem de Produção</p>
-    <div class="box">
-        <div class="nome">${escapeHtml(nomeProduto||'')}</div>
-        ${clienteNome ? `<div class="cliente">Cliente: ${escapeHtml(clienteNome)}</div>` : ''}
-        <div class="num">Ped. #${escapeHtml(String(pedidoNum||''))}</div>
-        ${ordemProducao ? `<div class="op-interna">OP Interna: ${escapeHtml(String(ordemProducao))}</div>` : ''}
-        <div class="bc"><svg id="bcSvg"></svg></div>
-    </div>
-    <p class="footer">1ª leitura = Marcenaria &nbsp;|&nbsp; 2ª leitura = Tapeçaria &nbsp;|&nbsp; 3ª leitura = Concluído</p>
-    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
-    <script>
-        (function() {
-            try {
-                JsBarcode('#bcSvg', ${JSON.stringify(codigoBarras)}, {
-                    format: 'CODE128', width: 3, height: 90,
-                    displayValue: true, fontSize: 16, fontOptions: 'bold',
-                    margin: 8, background: '#ffffff', lineColor: '#000000'
-                });
-            } catch(e) {
-                document.getElementById('bcSvg').outerHTML =
-                    '<div style="font-family:monospace;font-weight:900;font-size:22pt;letter-spacing:.1em;">' + ${JSON.stringify(codigoBarras)} + '</div>';
-            }
-            setTimeout(function() { window.focus(); window.print(); }, 200);
-        })();
-    </script>
-</body></html>`);
+            printWin.document.write('<!DOCTYPE html>\n'
++ '<html><head><meta charset="UTF-8"><title>Ordem de Produ\u00e7\u00e3o</title>\n'
++ '<style>\n'
++ '    * { margin: 0; padding: 0; box-sizing: border-box; }\n'
++ '    body { font-family: Arial, sans-serif; text-align: center; padding: 30px; }\n'
++ '    h2 { letter-spacing: .05em; margin-bottom: 4px; }\n'
++ '    .sub { color: #666; font-size: 13px; margin-bottom: 20px; }\n'
++ '    .box { border: 2px solid #000; border-radius: 8px; padding: 20px; display: inline-block; min-width: 320px; max-width: 420px; }\n'
++ '    .nome { font-size: 13px; color: #555; margin-bottom: 6px; font-weight: bold; }\n'
++ '    .cliente { font-size: 11px; color: #888; margin-bottom: 6px; }\n'
++ '    .num { font-size: 26px; font-weight: 900; font-family: "Courier New", monospace; margin-bottom: 4px; letter-spacing: .06em; }\n'
++ '    .op-interna { font-size: 11px; color: #888; margin-bottom: 12px; }\n'
++ '    .bc { margin: 16px 0; }\n'
++ '    .footer { color: #888; font-size: 11px; margin-top: 16px; }\n'
++ '</style>\n'
++ '</head><body>\n'
++ '    <h2>SW M\u00f3veis MDF</h2>\n'
++ '    <p class="sub">Ordem de Produ\u00e7\u00e3o</p>\n'
++ '    <div class="box">\n'
++ '        <div class="nome">' + escapeHtml(nomeProduto||'') + '</div>\n'
++ (clienteNome  ? '        <div class="cliente">Cliente: ' + escapeHtml(clienteNome) + '</div>\n' : '')
++ '        <div class="num">Ped. #' + escapeHtml(String(pedidoNum||'')) + '</div>\n'
++ (ordemProducao ? '        <div class="op-interna">OP Interna: ' + escapeHtml(String(ordemProducao)) + '</div>\n' : '')
++ '        <div class="bc"><svg id="bcSvg"></svg></div>\n'
++ '    </div>\n'
++ '    <p class="footer">1\u00aa leitura = Marcenaria &nbsp;|&nbsp; 2\u00aa = Tapecaria &nbsp;|&nbsp; 3\u00aa = Conclu\u00eddo</p>\n'
++ '    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"><\/script>\n'
++ '    <script>\n'
++ '        (function() {\n'
++ '            try {\n'
++ '                JsBarcode("#bcSvg", ' + JSON.stringify(codigoBarras) + ', { format: "CODE128", width: 3, height: 90, displayValue: true, fontSize: 16, fontOptions: "bold", margin: 8, background: "#ffffff", lineColor: "#000000" });\n'
++ '            } catch(e) {\n'
++ '                document.getElementById("bcSvg").outerHTML = "<div style=\'font-family:monospace;font-weight:900;font-size:22pt;letter-spacing:.1em;\'>" + ' + JSON.stringify(codigoBarras) + ' + "<\/div>";\n'
++ '            }\n'
++ '            setTimeout(function() { window.focus(); window.print(); }, 200);\n'
++ '        })();\n'
++ '    <\/script>\n'
++ '</body></html>');
             printWin.document.close();
             printWin.onafterprint = function() { printWin.close(); };
             setTimeout(function() { if (!printWin.closed) printWin.close(); }, 60000);
