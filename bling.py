@@ -142,10 +142,7 @@ class MongoStore:
         if not MONGO_AVAILABLE:
             return False
         try:
-            # Sanitiza surrogates antes de salvar — evita que caracteres
-            # inválidos de nomes de clientes/produtos do Bling sejam
-            # reintroduzidos a cada boot ao recarregar do MongoDB.
-            payload = {k: v for k, v in remove_surrogates(data).items() if k != '_id'}
+            payload = {k: v for k, v in data.items() if k != '_id'}
             if replace:
                 _mongo_db[collection].replace_one(
                     {'_id': doc_id},
@@ -606,30 +603,6 @@ def safe_dict(data):
             return {}
     return {}
 
-def remove_surrogates(data):
-    """
-    Remove caracteres surrogate (quebrados/inválidos) de strings, dicts e listas.
-
-    Surrogates são "meio-caracteres" que aparecem quando:
-    - Um emoji foi cortado ao meio no banco de dados do cliente
-    - Houve conversão incorreta de encoding (Windows-1252 → UTF-8)
-    - Alguém colou texto com caracteres especiais invisíveis num campo do Bling
-
-    Sem essa limpeza, o Flask/Werkzeug lança UnicodeEncodeError ao tentar
-    serializar o HTML/JSON de resposta para bytes UTF-8, derrubando a página
-    com 500 — mesmo que o dado problemático esteja num único campo de 2537.
-
-    Aplica 'replace' no encode/decode: o caractere quebrado vira '?' (U+FFFD),
-    inofensivo para renderização e armazenamento.
-    """
-    if isinstance(data, str):
-        return data.encode('utf-8', 'replace').decode('utf-8')
-    elif isinstance(data, dict):
-        return {k: remove_surrogates(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [remove_surrogates(i) for i in data]
-    return data
-
 def load_products_cache(cache_file):
     """
     Carrega cache de produtos e kits — MongoDB primeiro, arquivo fallback.
@@ -895,10 +868,7 @@ class BlingAPIClient:
                     )
                 return None
 
-            # Remove surrogates na fonte — evita UnicodeEncodeError no Flask
-            # Nomes de clientes/produtos no Bling podem conter emojis
-            # partidos (surrogates) que derrubam GET / com 500.
-            return remove_surrogates(data)
+            return data
 
         except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
             self.logger.error(f"Erro de Conexão (Reset/Queda) em {endpoint}: {str(e)}")
@@ -1317,16 +1287,6 @@ class SalesManager:
                         hist_doc = MongoStore.get('sales_history', 'history')
                         loaded = hist_doc.get('orders', [])
                         if loaded:
-                            # Normaliza datas DD/MM/YYYY → YYYY-MM-DD nos dados carregados
-                            # (gravados antes do fix de normalização — sem isso, a janela
-                            # de 60 dias os descartaria novamente no próximo ciclo)
-                            for o in loaded:
-                                dp = str(o.get('data') or o.get('dataEmissao') or '')
-                                dp = dp.split('T')[0].split(' ')[0].strip()
-                                if len(dp) >= 10 and dp[2] == '/' and dp[5] == '/':
-                                    dp = f"{dp[6:10]}-{dp[3:5]}-{dp[0:2]}"
-                                if dp:
-                                    o['data'] = dp
                             self._sales_history = loaded
                             logger.info(f"✅ sales_history: {len(loaded)} pedidos carregados do MongoDB")
                     except Exception:
@@ -2816,19 +2776,8 @@ class Orchestrator:
                     
                     if not data_pedido:
                         continue # Pula pedido sem data
-
-                    # Normaliza para YYYY-MM-DD independente do formato retornado
-                    # pela API (que pode ser DD/MM/YYYY para pedidos mais antigos).
-                    # Sem normalização, a comparação lexicográfica da janela de 60
-                    # dias descarta todos os pedidos em DD/MM/YYYY silenciosamente,
-                    # deixando só ~196 de 2537 no histórico.
-                    dp = str(data_pedido).split('T')[0].split(' ')[0].strip()
-                    if len(dp) >= 10 and dp[2] == '/' and dp[5] == '/':
-                        # DD/MM/YYYY → YYYY-MM-DD
-                        dp = f"{dp[6:10]}-{dp[3:5]}-{dp[0:2]}"
-                    data_pedido = dp
                         
-                    o['data'] = data_pedido  # Padroniza para 'data' em YYYY-MM-DD
+                    o['data'] = data_pedido # Padroniza para 'data'
                     
                     if o.get('id'):
                         valid_orders.append(o)
@@ -3363,10 +3312,7 @@ class WebServer:
         @self.app.route('/')
         def index():
             auth_url = self.orchestrator.auth.get_authorization_url()
-            # Sanitiza auth_url — improvável ter surrogates, mas protege
-            # contra qualquer caractere inválido que passe pelas camadas anteriores
-            safe_auth_url = remove_surrogates(str(auth_url or ''))
-            return render_template_string(DASHBOARD_TEMPLATE, auth_url=safe_auth_url)
+            return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
 
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
         @self.app.route('/auth')
@@ -7484,27 +7430,27 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 + '</head><body>\n'
 + '    <div class="label">\n'
 + '        <div class="row-top">\n'
-+ '            <span class="brand">SW MÓVEIS MDF</span>\n'
++ '            <span class="brand">SW M\u00d3VEIS MDF</span>\n'
 + (pedidoNum ? '            <span class="ped">Ped.' + escapeHtml(String(pedidoNum)) + '</span>\n' : '')
 + '        </div>\n'
 + '        <div class="nome">' + escapeHtml(nomeShort) + '</div>\n'
-+ (unitLabel   ? '        <div class="unit">📦 ' + escapeHtml(unitLabel) + '</div>\n' : '')
++ (unitLabel   ? '        <div class="unit">\ud83d\udce6 ' + escapeHtml(unitLabel) + '</div>\n' : '')
 + (clienteNome ? '        <div class="cliente">' + escapeHtml(clienteNome) + '</div>\n' : '')
 + '        <div class="bc-wrap"><svg id="bcSvg"></svg></div>\n'
-+ '        <div class="footer">BIPE PARA AVANÇAR ETAPA</div>\n'
++ '        <div class="footer">BIPE PARA AVAN\u00c7AR ETAPA</div>\n'
 + '    </div>\n'
-+ '    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>\n'
++ '    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"><\/script>\n'
 + '    <script>\n'
 + '        (function() {\n'
 + '            var code = ' + JSON.stringify(scanCode) + ';\n'
 + '            try {\n'
 + '                JsBarcode("#bcSvg", code, { format: "CODE128", width: 2, height: 42, displayValue: true, fontSize: 9, textMargin: 1, margin: 2, background: "#ffffff", lineColor: "#000000" });\n'
 + '            } catch(e) {\n'
-+ '                document.getElementById("bcSvg").outerHTML = "<div style=\'font-family:monospace;font-weight:700;font-size:11pt;letter-spacing:.1em;\'>" + code + "</div>";\n'
++ '                document.getElementById("bcSvg").outerHTML = "<div style=\'font-family:monospace;font-weight:700;font-size:11pt;letter-spacing:.1em;\'>" + code + "<\/div>";\n'
 + '            }\n'
 + '            setTimeout(function() { window.focus(); window.print(); }, 200);\n'
 + '        })();\n'
-+ '    </script>\n'
++ '    <\/script>\n'
 + '</body></html>');
             printWin.document.close();
 
@@ -7534,7 +7480,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
 
             printWin.document.write('<!DOCTYPE html>\n'
-+ '<html><head><meta charset="UTF-8"><title>Ordem de Produção</title>\n'
++ '<html><head><meta charset="UTF-8"><title>Ordem de Produ\u00e7\u00e3o</title>\n'
 + '<style>\n'
 + '    * { margin: 0; padding: 0; box-sizing: border-box; }\n'
 + '    body { font-family: Arial, sans-serif; text-align: center; padding: 30px; }\n'
@@ -7549,8 +7495,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 + '    .footer { color: #888; font-size: 11px; margin-top: 16px; }\n'
 + '</style>\n'
 + '</head><body>\n'
-+ '    <h2>SW Móveis MDF</h2>\n'
-+ '    <p class="sub">Ordem de Produção</p>\n'
++ '    <h2>SW M\u00f3veis MDF</h2>\n'
++ '    <p class="sub">Ordem de Produ\u00e7\u00e3o</p>\n'
 + '    <div class="box">\n'
 + '        <div class="nome">' + escapeHtml(nomeProduto||'') + '</div>\n'
 + (clienteNome  ? '        <div class="cliente">Cliente: ' + escapeHtml(clienteNome) + '</div>\n' : '')
@@ -7558,18 +7504,18 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 + (ordemProducao ? '        <div class="op-interna">OP Interna: ' + escapeHtml(String(ordemProducao)) + '</div>\n' : '')
 + '        <div class="bc"><svg id="bcSvg"></svg></div>\n'
 + '    </div>\n'
-+ '    <p class="footer">1ª leitura = Marcenaria &nbsp;|&nbsp; 2ª = Tapeçaria &nbsp;|&nbsp; 3ª = Concluído</p>\n'
-+ '    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>\n'
++ '    <p class="footer">1\u00aa leitura = Marcenaria &nbsp;|&nbsp; 2\u00aa = Tapecaria &nbsp;|&nbsp; 3\u00aa = Conclu\u00eddo</p>\n'
++ '    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"><\/script>\n'
 + '    <script>\n'
 + '        (function() {\n'
 + '            try {\n'
 + '                JsBarcode("#bcSvg", ' + JSON.stringify(codigoBarras) + ', { format: "CODE128", width: 3, height: 90, displayValue: true, fontSize: 16, fontOptions: "bold", margin: 8, background: "#ffffff", lineColor: "#000000" });\n'
 + '            } catch(e) {\n'
-+ '                document.getElementById("bcSvg").outerHTML = "<div style=\'font-family:monospace;font-weight:900;font-size:22pt;letter-spacing:.1em;\'>" + ' + JSON.stringify(codigoBarras) + ' + "</div>";\n'
++ '                document.getElementById("bcSvg").outerHTML = "<div style=\'font-family:monospace;font-weight:900;font-size:22pt;letter-spacing:.1em;\'>" + ' + JSON.stringify(codigoBarras) + ' + "<\/div>";\n'
 + '            }\n'
 + '            setTimeout(function() { window.focus(); window.print(); }, 200);\n'
 + '        })();\n'
-+ '    </script>\n'
++ '    <\/script>\n'
 + '</body></html>');
             printWin.document.close();
             printWin.onafterprint = function() { printWin.close(); };
