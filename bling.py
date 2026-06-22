@@ -1261,10 +1261,6 @@ class SalesManager:
     lock: Lock = field(default_factory=Lock)
     recalculation_lock: Lock = field(default_factory=Lock)
     _recalculation_running: bool = False
-    # Lock real que serializa a EXECUÇÃO da busca (diferente do recalculation_lock,
-    # que só protege a leitura/escrita da flag _recalculation_running).
-    # Evita que duas buscas de pedidos no Bling rodem em paralelo, mesmo com force=True.
-    execution_lock: Lock = field(default_factory=Lock)
 
     def __post_init__(self):
         self._load_stats()
@@ -2691,34 +2687,14 @@ class Orchestrator:
     def process_sales_orders(self, force: bool = False):
         """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
         self.logger.debug(f"process_sales_orders chamado (force={force})")
-
-        # ── Evita recálculos encavalados/paralelos ──────────────────────────
-        # force=False (ciclo automático do worker): se já existe uma busca em
-        # andamento, desiste imediatamente (comportamento original).
-        # force=True (botão "Sincronizar Bling", endpoints manuais): NÃO pula
-        # a checagem mais — em vez disso ESPERA a busca atual terminar e só
-        # então roda, de forma exclusiva. Antes, force=True ignorava o lock
-        # por completo e podia rodar em paralelo com o ciclo automático,
-        # duplicando as páginas buscadas no Bling (mesmo intervalo de datas
-        # buscado duas vezes ao mesmo tempo — visível nos logs como números
-        # de página intercalados, ex: 12, 20, 21, 13, 22...).
-        if force:
-            acquired = self.sales.execution_lock.acquire(timeout=120)
-            if not acquired:
-                self.logger.warning(
-                    "⏱ Timeout (120s) esperando a busca anterior de pedidos terminar — "
-                    "sincronização manual abortada para evitar busca duplicada."
-                )
-                return
-        else:
-            acquired = self.sales.execution_lock.acquire(blocking=False)
-            if not acquired:
+        
+        # Evita recálculos encavalados
+        with self.sales.recalculation_lock:
+            if self.sales._recalculation_running and not force:
                 self.logger.debug("Recálculo já em execução, ignorando.")
                 return
-
-        with self.sales.recalculation_lock:
             self.sales._recalculation_running = True
-
+            
         try:
             if not self.auth.is_authenticated():
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
@@ -2865,7 +2841,6 @@ class Orchestrator:
         finally:
             with self.sales.recalculation_lock:
                 self.sales._recalculation_running = False
-            self.sales.execution_lock.release()
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
