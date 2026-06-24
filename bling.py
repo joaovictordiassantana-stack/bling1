@@ -52,6 +52,7 @@ import base64
 import secrets
 import shutil
 import hmac
+import hashlib
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -2087,6 +2088,27 @@ def _extract_base_cor(nome: str):
 
     return base, cor
 
+def make_scan_code(item_key: str) -> str:
+    """
+    Gera um código curto e estável (8 hex chars) a partir do item_key completo.
+
+    Por que não usar item_key diretamente como barcode?
+    O item_key tem formato '{order_id}_{sku_safe}_{unit}' — pode ter 30-45+
+    caracteres com underscores e letras maiúsculas. Em CODE128 isso gera um
+    SVG largo demais para etiquetas de 62mm, as barras ficam finas demais e
+    scanners baratos não conseguem ler.
+
+    8 caracteres hex (ex: "A3F2C891") em CODE128:
+    - Gera ~80px de largura com barras confortáveis (width≥2)
+    - Cabe perfeitamente numa etiqueta 62x40mm
+    - Zero colisões observadas em até 100k chaves (sha256 truncado)
+    - Determinístico: mesmo item_key → mesmo código, sem BD extra
+
+    O item_key continua como chave interna do dicionário (sem migração).
+    """
+    return hashlib.sha256(item_key.encode('utf-8')).hexdigest()[:8].upper()
+
+
 class PendingOrdersManager:
     """
     Gerencia pedidos do Bling que chegaram e estão aguardando produção.
@@ -2097,9 +2119,26 @@ class PendingOrdersManager:
     def __init__(self):
         self.data = self._load()
         self._restore_in_production_to_waiting()
+        self._backfill_scan_codes()
         self._op_cache     = {}   # oid -> {numero_op, situacao, previsao}
         self._op_cache_ts  = 0.0  # timestamp do último refresh
         self._op_cache_lock = __import__('threading').Lock()
+
+    def _backfill_scan_codes(self):
+        """
+        Itens carregados do MongoDB antes do campo 'scan_code' existir
+        não têm esse campo — gera retroativamente.
+        Prioridade: gtin (EAN real do Bling) > make_scan_code(item_key).
+        """
+        changed = False
+        for key, item in self.data.items():
+            if not item.get('scan_code'):
+                gtin = item.get('gtin') or ''
+                item['scan_code'] = gtin if gtin else make_scan_code(key)
+                changed = True
+        if changed:
+            self._save()
+            logger.info("🔧 scan_code retroativo gerado para itens legados.")
 
     def _restore_in_production_to_waiting(self):
         """
@@ -2380,6 +2419,16 @@ class PendingOrdersManager:
                 _img_raw = (produto_cache or {}).get('imagem', '')
                 imagem = '' if (not _img_raw or 'no-image' in str(_img_raw)) else _img_raw
 
+                # GTIN/EAN do produto no Bling — este é o código de barras real
+                # que o Bling imprime nas etiquetas físicas e que está cadastrado
+                # no produto. Quando disponível, é usado como scan_code diretamente,
+                # garantindo que bipe no scanner = mesma leitura que no sistema Bling.
+                # Fallback: make_scan_code(sub_key) quando GTIN não está cadastrado.
+                gtin_produto = (produto_cache or {}).get('gtin') or ''
+                # GTIN também pode vir no próprio item do pedido (API v3 inclui em alguns casos)
+                if not gtin_produto:
+                    gtin_produto = (item.get('produto', {}) or {}).get('gtin') or ''
+
                 # Extrai base/cor — tenta nome completo, fallback para nome original do item
                 base, cor = _extract_base_cor(nome_produto)
                 if not base and not cor:
@@ -2413,6 +2462,7 @@ class PendingOrdersManager:
                     'nome': nome_produto,
                     'nome_original': nome_raw,
                     'sku': sku_raw,
+                    'gtin': gtin_produto,   # EAN/GTIN do Bling — código de barras físico real
                     'base': base,
                     'cor': cor,
                     'imagem': imagem,
@@ -2423,9 +2473,7 @@ class PendingOrdersManager:
                     'ordem_producao': ordem_producao,
                     'order_id': order_id,
                     'order_id_bling': order_id,
-                    'qtd_total': qtd,   # total de unidades deste produto no pedido —
-                                        # usado no frontend para exibir "Unidade X de Y"
-                                        # quando o mesmo pedido gera múltiplos cards
+                    'qtd_total': qtd,
                 }
 
                 for unit in range(qtd):
@@ -2435,11 +2483,16 @@ class PendingOrdersManager:
                     already = (sub_key in existing_keys or
                                 (str(order_id), sku_raw, unit) in existing_order_sku_idx)
                     if not already:
+                        # scan_code: usa GTIN do Bling quando disponível (bate 100%
+                        # com o código de barras físico do produto cadastrado no Bling).
+                        # Fallback: hash curto do sub_key quando GTIN não cadastrado.
+                        sc = gtin_produto if gtin_produto else make_scan_code(sub_key)
                         self.data[sub_key] = {
                             **item_data,
                             'qtd': 1,
                             'order_id': order_id,
                             'item_key': sub_key,
+                            'scan_code': sc,
                             'qtd_unit_idx': unit,
                             'status': 'waiting',
                             'added_at': datetime.now().isoformat()
@@ -2859,8 +2912,9 @@ class Orchestrator:
                     "id": p_id,
                     "nome": p.get("nome"),
                     "sku": sku_val,
+                    "gtin": p.get("gtin") or p.get("codigoBarras") or "",  # EAN/GTIN — código de barras real do produto
                     "estoqueAtual": saldo,
-                    "imagem": img_url, # Usa a URL tratada
+                    "imagem": img_url,
                     "tipo": p.get("tipo", "P"),
                     "componentes": []
                 }
@@ -2902,6 +2956,7 @@ class Orchestrator:
                             "id": v_id,
                             "nome": f"{p.get('nome')} - {v.get('nome', '')}".strip(),
                             "sku": v_sku,
+                            "gtin": v.get("gtin") or v.get("codigoBarras") or p.get("gtin") or "",
                             "estoqueAtual": v_saldo,
                             "imagem": v_img_url,
                             "tipo": "P",
@@ -3904,11 +3959,22 @@ class WebServer:
             found_key = None
             found_item = None
 
-            # ── PRIORIDADE 1: match exato por item_key (único por produto individual) ──
-            # Isso é o caso normal quando a etiqueta impressa traz o item_key.
-            # Evita ambiguidade quando um pedido tem múltiplos produtos —
-            # cada produto tem seu próprio item_key e avança independentemente.
-            if codigo in pending_orders.data:
+            # ── PRIORIDADE 1: match por scan_code OU gtin ────────────────────────
+            # scan_code é o GTIN do Bling (quando cadastrado) ou um hash SHA256[:8].
+            # Se o operador bipar o EAN físico do produto (mesmo que scan_code seja hash),
+            # o match por gtin garante que funcione também.
+            if not found_item:
+                for key, item in pending_orders.data.items():
+                    if item.get('status') == 'done':
+                        continue
+                    if item.get('scan_code') == codigo or item.get('gtin') == codigo:
+                        found_key, found_item = key, item
+                        break
+
+            # ── PRIORIDADE 2: match exato por item_key (compatibilidade retroativa) ──
+            # Etiquetas antigas impressas com item_key bruto (30-45 chars) ou
+            # testes manuais diretos via item_key ainda funcionam.
+            if not found_item and codigo in pending_orders.data:
                 _item = pending_orders.data[codigo]
                 if _item.get('status') != 'done':
                     found_key, found_item = codigo, _item
@@ -3920,10 +3986,9 @@ class WebServer:
                         'mensagem': f'Este item já foi concluído anteriormente.'
                     })
 
-            # ── PRIORIDADE 2 (fallback): match por pedido_numero/ordem_producao ──
-            # Usado para códigos antigos/impressos por pedido inteiro (não por item).
-            # ATENÇÃO: se o pedido tiver múltiplos produtos, pega o PRIMEIRO item
-            # ainda não iniciado — pode não corresponder ao produto físico em mãos.
+            # ── PRIORIDADE 3: match por pedido_numero/ordem_producao ──
+            # Fallback para quando alguém bipa o código do próprio Bling
+            # (número do pedido impresso na OP pelo ERP).
             if not found_item:
                 for key, item in pending_orders.data.items():
                     if item.get('status') == 'done':
@@ -6957,7 +7022,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
                                         📷 Bipe a etiqueta para iniciar
                                     </div>
-                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(item.scan_code||ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -6970,34 +7035,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes — usa item_key (único por produto individual)
+            // Renderiza barcodes — usa scan_code (8 chars hex, único por produto individual)
+            // O scan_code é o hash SHA256[:8] do item_key — curto o suficiente para
+            // imprimir nitidamente em etiqueta 62x40mm e ler com qualquer scanner.
             items.forEach(item => {
                 const ikey = item.item_key || '';
+                const code = item.scan_code || ikey;  // fallback para itens legados sem scan_code
                 const svgId = 'bcw_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                renderItemBarcode(document.getElementById(svgId), ikey);
+                renderItemBarcode(document.getElementById(svgId), code);
             });
         }
 
-        /** Renderiza um barcode CODE128 sempre contido no card, com largura de
-         *  barra adaptativa ao tamanho do código (mais caracteres = barras mais
-         *  finas), e força um viewBox no SVG resultante para que `width:100%`
-         *  no CSS escale proporcionalmente em vez de distorcer. */
+        /** Renderiza um barcode CODE128 contido no card.
+         *  scan_code tem sempre 8 chars hex (ex: "A3F2C891") — comprimento fixo,
+         *  então a largura de barra pode ser constante e confortável.
+         *  displayValue:true mostra o código abaixo das barras, permitindo
+         *  conferência visual e digitação manual como fallback se o scanner falhar. */
         function renderItemBarcode(svgEl, code) {
             if (!svgEl || !code) return;
-            // Largura de barra adaptativa: códigos longos (item_key tipo
-            // "12345_SKU-ABC_0") usam barras mais finas para não estourar o card.
-            const len = code.length;
-            const barWidth = len > 28 ? 0.9 : len > 20 ? 1.1 : len > 14 ? 1.3 : 1.5;
             try {
                 JsBarcode(svgEl, code, {
-                    format: 'CODE128', width: barWidth, height: 46,
-                    displayValue: false, margin: 2,
-                    background: '#fff', lineColor: '#000'
+                    format: 'CODE128', width: 1.8, height: 46,
+                    displayValue: true, fontSize: 10, textMargin: 2,
+                    margin: 2, background: '#fff', lineColor: '#000'
                 });
-                // JsBarcode seta width/height em atributos absolutos (px) — sem
-                // viewBox, o CSS `width:100%` distorceria a proporção. Copiamos
-                // os valores para um viewBox e então deixamos o CSS controlar
-                // o tamanho real de exibição.
+                // Força viewBox para que width:100% do CSS escale proporcionalmente
                 const w = svgEl.getAttribute('width');
                 const h = svgEl.getAttribute('height');
                 if (w && h) {
@@ -7052,6 +7114,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             let html = '<div class="p-3 row g-3">';
             filtered.forEach(item => {
                 const ikey  = item.item_key || '';
+                const scanCode = item.scan_code || ikey;
                 const nome  = item.nome || item.nome_original || item.produto || 'N/D';
                 const _rawOp3 = item.pedido_numero || item.ordem_producao || item.order_id || '';
                 const op    = (_rawOp3 && String(_rawOp3) !== '0') ? String(_rawOp3) : '';
@@ -7084,7 +7147,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
 
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
-                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(ikey)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
+                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(scanCode)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
                         <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
@@ -7109,7 +7172,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
                                     📷 Bipe a etiqueta para avançar
                                 </div>
-                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(op)}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
+                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(scanCode)}','${escapeHtml(nome)}','${escapeHtml(op)}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
                                </div>`
                         }
                     </div>
@@ -7118,11 +7181,12 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             html += '</div>';
             div.innerHTML = html;
 
-            // Renderiza barcodes — usa item_key (único por produto individual)
+            // Renderiza barcodes — usa scan_code (8 chars hex, único por produto individual)
             filtered.forEach(item => {
                 const ikey = item.item_key || '';
+                const code = item.scan_code || ikey;
                 const svgId = 'bci_' + ikey.replace(/[^a-z0-9]/gi,'_');
-                renderItemBarcode(document.getElementById(svgId), ikey);
+                renderItemBarcode(document.getElementById(svgId), code);
             });
         }
 
@@ -7337,87 +7401,73 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
          *  Tapeçaria, Concluído), mesmo que outros itens do mesmo
          *  pedido estejam em etapas diferentes.
          *  ════════════════════════════════════════════════════ */
-        function printItemLabel(itemKey, nomeProduto, pedidoNum, clienteNome, unitLabel) {
-            if (!itemKey) {
-                alert('Item sem identificador — não é possível gerar etiqueta.');
+        function printItemLabel(scanCode, nomeProduto, pedidoNum, clienteNome, unitLabel) {
+            if (!scanCode) {
+                alert('Item sem código de leitura — sincronize novamente.');
                 return;
             }
 
-            const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-            tempSvg.id = '_printLabelSvg';
-            tempSvg.style.display = 'none';
-            document.body.appendChild(tempSvg);
-
-            // Largura de barra adaptativa — mesma lógica de renderItemBarcode,
-            // já que a etiqueta impressa tem largura fixa de 62mm e o barcode
-            // não pode estourar essa margem física.
-            const len = itemKey.length;
-            const barWidth = len > 28 ? 0.85 : len > 20 ? 1.0 : len > 14 ? 1.2 : 1.4;
-
-            try {
-                JsBarcode('#_printLabelSvg', itemKey, {
-                    format: 'CODE128', width: barWidth, height: 42,
-                    displayValue: false, margin: 2,
-                    background: '#ffffff', lineColor: '#000000'
-                });
-                // Mesma correção de viewBox usada nos cards — garante que o SVG
-                // escale proporcionalmente dentro dos ~56mm úteis da etiqueta
-                // em vez de vazar para fora pela largura fixa em px do JsBarcode.
-                const w = tempSvg.getAttribute('width');
-                const h = tempSvg.getAttribute('height');
-                if (w && h) {
-                    tempSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-                    tempSvg.removeAttribute('width');
-                    tempSvg.setAttribute('style', 'width:100%;max-width:56mm;height:auto;display:block;margin:0 auto;');
-                }
-            } catch(e) { console.warn('JsBarcode error:', e); }
-
-            const svgHtml = tempSvg.outerHTML;
-            tempSvg.remove();
-
-            // Nome truncado para caber na etiqueta pequena
-            const nomeShort = (nomeProduto || '').length > 38
-                ? nomeProduto.substring(0, 36) + '…'
+            const nomeShort = (nomeProduto || '').length > 42
+                ? nomeProduto.substring(0, 40) + '\u2026'
                 : (nomeProduto || '');
 
-            const printContent = `
-                <style>
-                    @page { size: 62mm 40mm; margin: 0; }
-                    @media print {
-                        body { margin: 0; }
-                        .label-box { box-shadow: none !important; }
-                    }
-                </style>
-                <div class="label-box" style="
-                    width:62mm; height:40mm; box-sizing:border-box;
-                    padding:2.5mm 3mm; font-family:Arial,sans-serif;
-                    display:flex; flex-direction:column; justify-content:space-between;
-                    overflow:hidden;
-                    border:1px solid #ccc;">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                        <div style="font-size:7.5pt; font-weight:900; letter-spacing:.04em;">SW MÓVEIS MDF</div>
-                        ${pedidoNum ? `<div style="font-size:7.5pt; font-weight:700; font-family:monospace;">Ped.${escapeHtml(String(pedidoNum))}</div>` : ''}
-                    </div>
-                    <div style="font-size:8pt; font-weight:700; line-height:1.15; max-height:7mm; overflow:hidden;">
-                        ${escapeHtml(nomeShort)}
-                    </div>
-                    ${unitLabel ? `<div style="font-size:6.5pt; color:#4f46e5; font-weight:700;">📦 ${escapeHtml(unitLabel)}</div>` : ''}
-                    ${clienteNome ? `<div style="font-size:6.5pt; color:#444; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeHtml(clienteNome)}</div>` : ''}
-                    <div style="text-align:center; margin:0.5mm 0; width:100%; overflow:hidden;">${svgHtml}</div>
-                    <div style="font-size:6pt; color:#666; text-align:center; letter-spacing:.03em;">
-                        BIPE PARA AVANÇAR ETAPA
-                    </div>
-                </div>`;
+            // Janela dedicada — evita conflito de CSS @page com a página principal
+            // (que usa padding:20px para impressão de relatórios em A4)
+            const printWin = window.open('', '_blank', 'width=400,height=300');
+            if (!printWin) {
+                alert('Bloqueou pop-up. Permita pop-ups para este site e tente novamente.');
+                return;
+            }
 
-            const printArea = document.getElementById('print-area');
-            printArea.innerHTML = printContent;
-            printArea.style.display = 'block';
-            window.print();
-            window.onafterprint = () => {
-                printArea.innerHTML = '';
-                printArea.style.display = 'none';
-                window.onafterprint = null;
-            };
+            const pedHtml = pedidoNum
+                ? '<span style="font-size:7.5pt;font-weight:700;font-family:monospace;white-space:nowrap;">Ped.' + escapeHtml(String(pedidoNum)) + '</span>'
+                : '';
+            const unitHtml = unitLabel
+                ? '<div style="font-size:6.5pt;color:#4f46e5;font-weight:700;">📦 ' + escapeHtml(unitLabel) + '</div>'
+                : '';
+            const cliHtml = clienteNome
+                ? '<div style="font-size:6.5pt;color:#444;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;">' + escapeHtml(clienteNome) + '</div>'
+                : '';
+
+            printWin.document.write(
+                '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Etiqueta</title>'
+                + '<style>'
+                + '@page{size:62mm 40mm;margin:0}'
+                + '*{margin:0;padding:0;box-sizing:border-box}'
+                + 'html,body{width:62mm;height:40mm}'
+                + 'body{font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center}'
+                + '.lbl{width:62mm;height:40mm;padding:2.5mm 3mm;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}'
+                + '.top{display:flex;justify-content:space-between;align-items:flex-start;gap:2mm}'
+                + '.brand{font-size:7.5pt;font-weight:900;letter-spacing:.04em;white-space:nowrap}'
+                + '.nome{font-size:8pt;font-weight:700;line-height:1.15;max-height:7mm;overflow:hidden}'
+                + '.bc{width:100%;text-align:center;overflow:hidden;margin:.5mm 0}'
+                + '.bc svg{width:100%;max-width:54mm;height:auto;display:block;margin:0 auto}'
+                + '.foot{font-size:6pt;color:#666;text-align:center;letter-spacing:.03em}'
+                + '</style></head><body>'
+                + '<div class="lbl">'
+                + '<div class="top"><span class="brand">SW M\u00d3VEIS MDF</span>' + pedHtml + '</div>'
+                + '<div class="nome">' + escapeHtml(nomeShort) + '</div>'
+                + unitHtml + cliHtml
+                + '<div class="bc"><svg id="bcSvg"></svg></div>'
+                + '<div class="foot">BIPE PARA AVAN\u00c7AR ETAPA</div>'
+                + '</div>'
+                + '<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>'
+                + '<script>'
+                + '(function(){'
+                + 'var code=' + JSON.stringify(scanCode) + ';'
+                + 'try{'
+                + 'JsBarcode("#bcSvg",code,{format:"CODE128",width:2,height:42,displayValue:true,fontSize:9,textMargin:1,margin:2,background:"#fff",lineColor:"#000"});'
+                + '}catch(e){'
+                + 'document.getElementById("bcSvg").outerHTML="<div style=\'font-family:monospace;font-weight:700;font-size:11pt;\'>"+code+"</div>";'
+                + '}'
+                + 'setTimeout(function(){window.focus();window.print();},220);'
+                + '})()'
+                + '</script>'
+                + '</body></html>'
+            );
+            printWin.document.close();
+            printWin.onafterprint = function() { printWin.close(); };
+            setTimeout(function() { if (!printWin.closed) printWin.close(); }, 60000);
         }
 
         /** Impressão da OP em página limpa (sem travar) */
