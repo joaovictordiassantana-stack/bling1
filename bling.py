@@ -2409,10 +2409,21 @@ class PendingOrdersManager:
                 # Número do pedido Bling — usado como barcode principal
                 numero_pedido = str(pedido.get('numero') or order_id)
 
+                # GTIN do produto — campo canônico para etiqueta/scanner
+                # Vem em item.gtin ou no cache de produto (campo gtin/ean)
+                gtin_raw = (
+                    item.get('gtin') or item.get('ean') or
+                    (produto_cache or {}).get('gtin') or
+                    (produto_cache or {}).get('ean') or
+                    ''
+                )
+                gtin = ''.join(c for c in str(gtin_raw) if c.isdigit())  # apenas dígitos
+
                 item_data = {
                     'nome': nome_produto,
                     'nome_original': nome_raw,
                     'sku': sku_raw,
+                    'gtin': gtin,
                     'base': base,
                     'cor': cor,
                     'imagem': imagem,
@@ -2429,7 +2440,18 @@ class PendingOrdersManager:
                 }
 
                 for unit in range(qtd):
-                    sku_safe = (sku_raw or nome_raw[:20]).replace(' ', '_').replace('/', '_')
+                    # ── item_key: apenas ASCII imprimível, sem acentos ──────────
+                    # CODE128 só aceita ASCII 0x20-0x7E. Acentos (ã,ç,é…) no
+                    # nome/SKU corrompem o barcode — scanner lê lixo ou nada.
+                    import unicodedata as _ud
+                    def _to_ascii(s):
+                        return ''.join(
+                            c for c in _ud.normalize('NFD', s)
+                            if _ud.category(c) != 'Mn' and ord(c) < 128
+                        )
+                    sku_safe = _to_ascii(sku_raw or nome_raw[:20])
+                    sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
+                    sku_safe = sku_safe.strip('_')[:28]  # limita comprimento total do key
                     sub_key = f"{order_id}_{sku_safe}_{unit}"
                     # Lookup O(1) usando sets pré-computados
                     already = (sub_key in existing_keys or
@@ -3904,6 +3926,8 @@ class WebServer:
             found_key = None
             found_item = None
 
+            logger.info(f"🔍 Scan recebido: codigo='{codigo}' reader_id={reader_id}")
+
             # ── PRIORIDADE 1: match exato por item_key (único por produto individual) ──
             # Isso é o caso normal quando a etiqueta impressa traz o item_key.
             # Evita ambiguidade quando um pedido tem múltiplos produtos —
@@ -3920,7 +3944,20 @@ class WebServer:
                         'mensagem': f'Este item já foi concluído anteriormente.'
                     })
 
-            # ── PRIORIDADE 2 (fallback): match por pedido_numero/ordem_producao ──
+            # ── PRIORIDADE 2: match por GTIN (campo canônico da etiqueta física) ──
+            # Quando a impressora imprime o GTIN do produto (EAN-13/EAN-8),
+            # o scanner envia só os dígitos — busca pelo campo gtin no item.
+            if not found_item and codigo.isdigit() and len(codigo) in (8, 13, 14):
+                for key, item in pending_orders.data.items():
+                    if item.get('status') == 'done':
+                        continue
+                    if str(item.get('gtin', '') or '') == codigo:
+                        found_key  = key
+                        found_item = item
+                        logger.info(f"✅ Match por GTIN '{codigo}' → item_key='{key}'")
+                        break
+
+            # ── PRIORIDADE 3 (fallback): match por pedido_numero/ordem_producao ──
             # Usado para códigos antigos/impressos por pedido inteiro (não por item).
             # ATENÇÃO: se o pedido tiver múltiplos produtos, pega o PRIMEIRO item
             # ainda não iniciado — pode não corresponder ao produto físico em mãos.
@@ -3940,6 +3977,7 @@ class WebServer:
                         break
 
             if not found_item:
+                logger.warning(f"❌ Scan nao_encontrado: codigo='{codigo}' reader={reader_id}")
                 return jsonify({
                     'acao': 'nao_encontrado',
                     'codigo': codigo,
@@ -7343,36 +7381,38 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
+            // Gera o SVG do barcode no DOM atual onde JsBarcode está disponível
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printLabelSvg';
-            tempSvg.style.display = 'none';
+            tempSvg.style.cssText = 'position:absolute;left:-9999px;top:-9999px;';
             document.body.appendChild(tempSvg);
 
-            // Largura de barra adaptativa — mesma lógica de renderItemBarcode,
-            // já que a etiqueta impressa tem largura fixa de 62mm e o barcode
-            // não pode estourar essa margem física.
             const len = itemKey.length;
-            const barWidth = len > 28 ? 0.85 : len > 20 ? 1.0 : len > 14 ? 1.2 : 1.4;
+            // Barras mais finas para keys longos — garante que cabe nos 56mm úteis
+            const barWidth = len > 32 ? 0.7 : len > 24 ? 0.85 : len > 16 ? 1.0 : 1.2;
 
+            let svgHtml = '';
             try {
                 JsBarcode('#_printLabelSvg', itemKey, {
-                    format: 'CODE128', width: barWidth, height: 42,
-                    displayValue: false, margin: 2,
-                    background: '#ffffff', lineColor: '#000000'
+                    format: 'CODE128', width: barWidth, height: 40,
+                    displayValue: true, fontSize: 7, textMargin: 1,
+                    margin: 3, background: '#ffffff', lineColor: '#000000'
                 });
-                // Mesma correção de viewBox usada nos cards — garante que o SVG
-                // escale proporcionalmente dentro dos ~56mm úteis da etiqueta
-                // em vez de vazar para fora pela largura fixa em px do JsBarcode.
+                // Adiciona viewBox para escalar proporcionalmente no CSS
                 const w = tempSvg.getAttribute('width');
                 const h = tempSvg.getAttribute('height');
                 if (w && h) {
                     tempSvg.setAttribute('viewBox', `0 0 ${w} ${h}`);
                     tempSvg.removeAttribute('width');
-                    tempSvg.setAttribute('style', 'width:100%;max-width:56mm;height:auto;display:block;margin:0 auto;');
+                    tempSvg.removeAttribute('height');
+                    tempSvg.setAttribute('style',
+                        'display:block;width:56mm;height:auto;max-width:100%;margin:0 auto;');
                 }
-            } catch(e) { console.warn('JsBarcode error:', e); }
-
-            const svgHtml = tempSvg.outerHTML;
+                svgHtml = tempSvg.outerHTML;
+            } catch(e) {
+                console.warn('JsBarcode error:', e);
+                svgHtml = `<div style="color:red;font-size:7pt;text-align:center;">Erro no barcode:<br>${itemKey}</div>`;
+            }
             tempSvg.remove();
 
             // Nome truncado para caber na etiqueta pequena
@@ -7380,44 +7420,63 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 ? nomeProduto.substring(0, 36) + '…'
                 : (nomeProduto || '');
 
-            const printContent = `
-                <style>
-                    @page { size: 62mm 40mm; margin: 0; }
-                    @media print {
-                        body { margin: 0; }
-                        .label-box { box-shadow: none !important; }
-                    }
-                </style>
-                <div class="label-box" style="
-                    width:62mm; height:40mm; box-sizing:border-box;
-                    padding:2.5mm 3mm; font-family:Arial,sans-serif;
-                    display:flex; flex-direction:column; justify-content:space-between;
-                    overflow:hidden;
-                    border:1px solid #ccc;">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                        <div style="font-size:7.5pt; font-weight:900; letter-spacing:.04em;">SW MÓVEIS MDF</div>
-                        ${pedidoNum ? `<div style="font-size:7.5pt; font-weight:700; font-family:monospace;">Ped.${escapeHtml(String(pedidoNum))}</div>` : ''}
-                    </div>
-                    <div style="font-size:8pt; font-weight:700; line-height:1.15; max-height:7mm; overflow:hidden;">
-                        ${escapeHtml(nomeShort)}
-                    </div>
-                    ${unitLabel ? `<div style="font-size:6.5pt; color:#4f46e5; font-weight:700;">📦 ${escapeHtml(unitLabel)}</div>` : ''}
-                    ${clienteNome ? `<div style="font-size:6.5pt; color:#444; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">${escapeHtml(clienteNome)}</div>` : ''}
-                    <div style="text-align:center; margin:0.5mm 0; width:100%; overflow:hidden;">${svgHtml}</div>
-                    <div style="font-size:6pt; color:#666; text-align:center; letter-spacing:.03em;">
-                        BIPE PARA AVANÇAR ETAPA
-                    </div>
-                </div>`;
+            // ── Abre janela isolada para impressão ──────────────────────────
+            // Usar window.print() na página principal colide com o CSS do app
+            // (Bootstrap + display:none em elementos ocultos) e corrompe o layout.
+            // Uma popup isolada tem seu próprio documento e não herda nada.
+            const pw = window.open('', '_blank', 'width=300,height=250');
+            if (!pw) {
+                alert('Popup bloqueado! Permita popups para este site e tente novamente.');
+                return;
+            }
 
-            const printArea = document.getElementById('print-area');
-            printArea.innerHTML = printContent;
-            printArea.style.display = 'block';
-            window.print();
-            window.onafterprint = () => {
-                printArea.innerHTML = '';
-                printArea.style.display = 'none';
-                window.onafterprint = null;
-            };
+            pw.document.write(`<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Etiqueta SW</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  @page { size: 62mm 40mm; margin: 0; }
+  html, body { width: 62mm; height: 40mm; background: #fff; }
+  .label {
+    width: 62mm; height: 40mm;
+    padding: 2mm 2.5mm 1.5mm 2.5mm;
+    font-family: Arial, Helvetica, sans-serif;
+    display: flex; flex-direction: column;
+    justify-content: space-between;
+    overflow: hidden;
+  }
+  .row-top { display: flex; justify-content: space-between; align-items: flex-start; }
+  .sw    { font-size: 7.5pt; font-weight: 900; letter-spacing: .04em; }
+  .ped   { font-size: 7pt; font-weight: 700; font-family: monospace; }
+  .nome  { font-size: 8pt; font-weight: 700; line-height: 1.2;
+           max-height: 8.5mm; overflow: hidden; }
+  .unit  { font-size: 6pt; color: #4f46e5; font-weight: 700; }
+  .cli   { font-size: 6pt; color: #444; white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; }
+  .bc    { text-align: center; line-height: 0; }
+  .tip   { font-size: 5.5pt; color: #666; text-align: center;
+           letter-spacing: .03em; margin-top: 0.5mm; }
+</style>
+</head><body>
+<div class="label">
+  <div class="row-top">
+    <span class="sw">SW MÓVEIS MDF</span>
+    ${pedidoNum ? `<span class="ped">Ped.${String(pedidoNum).replace(/[<>&"]/g,'?')}</span>` : ''}
+  </div>
+  <div class="nome">${(nomeShort||'').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]))}</div>
+  ${unitLabel ? `<div class="unit">📦 ${unitLabel.replace(/[<>&"]/g,'?')}</div>` : ''}
+  ${clienteNome ? `<div class="cli">${(clienteNome||'').replace(/[<>&"]/g,'?')}</div>` : ''}
+  <div class="bc">${svgHtml}</div>
+  <div class="tip">BIPE PARA AVANÇAR ETAPA</div>
+</div>
+<script>
+  window.onload = function() {
+    window.print();
+    setTimeout(function(){ window.close(); }, 800);
+  };
+<\/script>
+</body></html>`);
+            pw.document.close();
         }
 
         /** Impressão da OP em página limpa (sem travar) */
