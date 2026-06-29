@@ -7037,7 +7037,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
                                         📷 Bipe a etiqueta para iniciar
                                     </div>
-                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(op||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(item.pedido_numero||item.order_id||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -7189,7 +7189,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
                                     📷 Bipe a etiqueta para avançar
                                 </div>
-                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(op)}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
+                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(String(item.pedido_numero||item.order_id||''))}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
                                </div>`
                         }
                     </div>
@@ -7477,8 +7477,26 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <title>Etiqueta SW</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  @page { size: 62mm 40mm; margin: 0; }
-  html, body { width: 62mm; height: 40mm; background: #fff; }
+  /*
+   * @page: 62x40mm é o tamanho físico da etiqueta.
+   * Impressoras térmicas (Zebra/Elgin/Brother) que usam driver genérico
+   * ou "raw/ZPL" ignoram @page — configure o tamanho diretamente no
+   * driver/fila de impressão para 62x40mm.
+   * Para impressoras laser/jato de tinta com folha A4 de adesivos,
+   * o @page size é ignorado; o Chrome imprimirá na folha configurada.
+   */
+  @page {
+    size: 62mm 40mm;
+    margin: 0;
+  }
+  html, body {
+    width: 62mm;
+    height: 40mm;
+    background: #fff;
+    /* Evita que o browser redimensione o conteúdo ao imprimir */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
   .label {
     width: 62mm; height: 40mm;
     padding: 2mm 2.5mm 1.5mm 2.5mm;
