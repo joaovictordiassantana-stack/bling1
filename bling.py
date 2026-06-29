@@ -2881,6 +2881,7 @@ class Orchestrator:
                     "id": p_id,
                     "nome": p.get("nome"),
                     "sku": sku_val,
+                    "gtin": ''.join(c for c in str(p.get("gtin") or p.get("ean") or '') if c.isdigit()),
                     "estoqueAtual": saldo,
                     "imagem": img_url, # Usa a URL tratada
                     "tipo": p.get("tipo", "P"),
@@ -2924,6 +2925,7 @@ class Orchestrator:
                             "id": v_id,
                             "nome": f"{p.get('nome')} - {v.get('nome', '')}".strip(),
                             "sku": v_sku,
+                            "gtin": ''.join(c for c in str(v.get("gtin") or v.get("ean") or '') if c.isdigit()),
                             "estoqueAtual": v_saldo,
                             "imagem": v_img_url,
                             "tipo": "P",
@@ -3491,6 +3493,46 @@ class WebServer:
 
             Thread(target=self.orchestrator.process_sales_orders, kwargs={'force': True}, daemon=True).start()
             return jsonify({"status": "started", "message": "Recálculo iniciado em segundo plano."}), 202
+
+        @self.app.route('/api/debug/barcode-test', methods=['GET'])
+        @token_required
+        def api_debug_barcode_test(token):
+            """
+            Endpoint de diagnóstico — lista todos os item_keys e gtins ativos.
+            Use para verificar se o barcode impresso bate com o que está no sistema.
+            GET /api/debug/barcode-test?q=<codigo_lido>  → testa match por código específico
+            GET /api/debug/barcode-test                  → lista todos os itens ativos (máx 50)
+            """
+            q = request.args.get('q', '').strip()
+            items_out = []
+            for key, item in list(pending_orders.data.items()):
+                if item.get('status') == 'done':
+                    continue
+                entry = {
+                    'item_key':      key,
+                    'nome':          item.get('nome') or item.get('nome_original', ''),
+                    'pedido_numero': item.get('pedido_numero', ''),
+                    'gtin':          item.get('gtin', ''),
+                    'status':        item.get('status', ''),
+                    'key_is_ascii':  all(ord(c) < 128 for c in key),
+                    'key_len':       len(key),
+                }
+                if q:
+                    match = (q == key or
+                             q == str(item.get('gtin', '') or '') or
+                             q == str(item.get('pedido_numero', '') or ''))
+                    entry['match'] = match
+                    if match:
+                        items_out.insert(0, entry)
+                    else:
+                        items_out.append(entry)
+                else:
+                    items_out.append(entry)
+            return jsonify({
+                'total_ativos': len(items_out),
+                'query': q or None,
+                'items': items_out[:50]
+            })
 
         @self.app.route('/api/timer/action', methods=['POST'])
         @token_required
