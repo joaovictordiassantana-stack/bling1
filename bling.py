@@ -7423,6 +7423,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
+            // ── Checagem prévia: a lib JsBarcode vem de um CDN externo ──────
+            // (cdn.jsdelivr.net). Se a rede da fábrica bloquear esse domínio
+            // (firewall corporativo, proxy, sem internet no momento), a lib
+            // nunca carrega e JsBarcode fica undefined. Sem essa checagem,
+            // o erro só aparecia silencioso dentro da etiqueta já aberta —
+            // parecia "bug de impressão" quando na real era falta de conexão.
+            if (typeof JsBarcode === 'undefined') {
+                alert(
+                    '⚠️ Biblioteca de código de barras não carregou.\n\n' +
+                    'Isso normalmente acontece quando:\n' +
+                    '• A internet caiu ou está instável\n' +
+                    '• O firewall da rede está bloqueando cdn.jsdelivr.net\n\n' +
+                    'Recarregue a página (F5) com internet ativa e tente novamente.\n' +
+                    'Se persistir, peça para o TI liberar o domínio cdn.jsdelivr.net.'
+                );
+                return;
+            }
+
             // Gera o SVG do barcode no DOM atual onde JsBarcode está disponível
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printLabelSvg';
@@ -7434,6 +7452,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const barWidth = len > 32 ? 0.7 : len > 24 ? 0.85 : len > 16 ? 1.0 : 1.2;
 
             let svgHtml = '';
+            let barcodeOk = false;
             try {
                 JsBarcode('#_printLabelSvg', itemKey, {
                     format: 'CODE128', width: barWidth, height: 40,
@@ -7449,6 +7468,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     tempSvg.removeAttribute('height');
                     tempSvg.setAttribute('style',
                         'display:block;width:56mm;height:auto;max-width:100%;margin:0 auto;');
+                    barcodeOk = true;
                 }
                 svgHtml = tempSvg.outerHTML;
             } catch(e) {
@@ -7457,6 +7477,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
             tempSvg.remove();
 
+            if (!barcodeOk) {
+                alert(
+                    '⚠️ O código de barras não pôde ser gerado para o código:\n"' + itemKey + '"\n\n' +
+                    'Provável causa: caractere inválido no código do item.\n' +
+                    'Use o botão ✕ para remover este item e sincronize novamente — ' +
+                    'a nova sincronização gera um código limpo automaticamente.'
+                );
+                return;
+            }
+
             // Nome truncado para caber na etiqueta pequena
             const nomeShort = (nomeProduto || '').length > 38
                 ? nomeProduto.substring(0, 36) + '…'
@@ -7464,39 +7494,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             // ── Abre janela isolada para impressão ──────────────────────────
             // Usar window.print() na página principal colide com o CSS do app
-            // (Bootstrap + display:none em elementos ocultos) e corrompe o layout.
-            // Uma popup isolada tem seu próprio documento e não herda nada.
-            const pw = window.open('', '_blank', 'width=300,height=250');
+            // e corrompe o layout. Uma popup isolada tem seu próprio documento.
+            //
+            // IMPORTANTE: window.print() é BLOQUEANTE em vários navegadores —
+            // a thread do popup fica parada até o usuário fechar o diálogo
+            // nativo de impressão. Por isso NUNCA fechamos a janela via
+            // setTimeout (corrida contra o print) — fechamos só depois do
+            // evento 'afterprint', e deixamos um botão manual como fallback
+            // caso o navegador não dispare esse evento (alguns não disparam
+            // quando o diálogo é cancelado).
+            const pw = window.open('', '_blank', 'width=320,height=280');
             if (!pw) {
-                alert('Popup bloqueado! Permita popups para este site e tente novamente.');
+                alert('Popup bloqueado! Libere popups para este site (ícone na barra de endereço) e tente novamente.');
                 return;
             }
 
-            pw.document.write(`<!DOCTYPE html>
+            const labelHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Etiqueta SW</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  /*
-   * @page: 62x40mm é o tamanho físico da etiqueta.
-   * Impressoras térmicas (Zebra/Elgin/Brother) que usam driver genérico
-   * ou "raw/ZPL" ignoram @page — configure o tamanho diretamente no
-   * driver/fila de impressão para 62x40mm.
-   * Para impressoras laser/jato de tinta com folha A4 de adesivos,
-   * o @page size é ignorado; o Chrome imprimirá na folha configurada.
-   */
-  @page {
-    size: 62mm 40mm;
-    margin: 0;
-  }
-  html, body {
-    width: 62mm;
-    height: 40mm;
-    background: #fff;
-    /* Evita que o browser redimensione o conteúdo ao imprimir */
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
+  @page { size: 62mm 40mm; margin: 0; }
+  html, body { width: 62mm; height: 40mm; background: #fff; }
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
     width: 62mm; height: 40mm;
     padding: 2mm 2.5mm 1.5mm 2.5mm;
@@ -7516,6 +7536,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .bc    { text-align: center; line-height: 0; }
   .tip   { font-size: 5.5pt; color: #666; text-align: center;
            letter-spacing: .03em; margin-top: 0.5mm; }
+  @media screen {
+    body { padding: 12px; width: auto; height: auto; background:#f1f5f9; }
+    .label { border:1px solid #ccc; box-shadow:0 2px 8px rgba(0,0,0,.1); }
+    .toolbar { margin-top:10px; text-align:center; }
+    .toolbar button {
+      font-family: Arial, sans-serif; font-size: 13px; padding: 8px 16px;
+      border-radius: 6px; border: none; cursor: pointer; background:#2563eb; color:#fff;
+    }
+  }
+  @media print { .toolbar { display: none !important; } }
 </style>
 </head><body>
 <div class="label">
@@ -7529,14 +7559,32 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <div class="bc">${svgHtml}</div>
   <div class="tip">BIPE PARA AVANÇAR ETAPA</div>
 </div>
-<script>
-  window.onload = function() {
-    window.print();
-    setTimeout(function(){ window.close(); }, 800);
-  };
-<\/script>
-</body></html>`);
+<div class="toolbar">
+  <button onclick="window.print()">🖨️ Imprimir</button>
+</div>
+</body></html>`;
+
+            // document.write em vez de srcdoc/Blob por compatibilidade ampla,
+            // mas SEM disparo automático de print — usuário clica no botão.
+            // Isso elimina o travamento: nada bloqueia a thread principal,
+            // e a janela permanece aberta e responsiva até o usuário agir.
+            pw.document.open();
+            pw.document.write(labelHtml);
             pw.document.close();
+
+            // Fecha a janela automaticamente só depois que o print terminar
+            // (evento confiável, sem corrida de tempo).
+            // Em alguns navegadores com política restrita de cross-window,
+            // anexar listener na popup pode lançar — isso NÃO deve impedir
+            // a impressão, só o fechamento automático deixa de funcionar
+            // (usuário fecha manualmente, sem prejuízo).
+            try {
+                pw.addEventListener('afterprint', () => {
+                    try { pw.close(); } catch(e) {}
+                });
+            } catch(e) {
+                console.warn('Não foi possível registrar fechamento automático:', e);
+            }
         }
 
         /** Impressão da OP em página limpa (sem travar) */
