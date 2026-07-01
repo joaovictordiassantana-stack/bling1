@@ -7466,8 +7466,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             // Usar window.print() na página principal colide com o CSS do app
             // (Bootstrap + display:none em elementos ocultos) e corrompe o layout.
             // Uma popup isolada tem seu próprio documento e não herda nada.
-            const pw = window.open('', '_blank', 'width=300,height=250');
+            const pw = window.open('', '_blank', 'width=400,height=320');
             if (!pw) {
+                showToast('Popup Bloqueada', 'Permita popups para este site e clique novamente no botão 🏷️.', 'warning');
                 alert('Popup bloqueado! Permita popups para este site e tente novamente.');
                 return;
             }
@@ -7531,8 +7532,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 </div>
 <script>
   window.onload = function() {
+    // FIX: usar onafterprint para fechar a janela DEPOIS que o usuário
+    // confirmar (ou cancelar) o diálogo de impressão.
+    // O setTimeout de 800ms original fechava ANTES do diálogo aparecer
+    // em sistemas lentos / impressoras de rede, cancelando o job.
+    var _closed = false;
+    function _closeOnce() { if (!_closed) { _closed = true; window.close(); } }
+    window.onafterprint = _closeOnce;
+    // Fallback: fecha após 5s caso onafterprint não dispare (Firefox mobile, etc.)
+    setTimeout(_closeOnce, 5000);
     window.print();
-    setTimeout(function(){ window.close(); }, 800);
   };
 <\/script>
 </body></html>`);
@@ -7551,7 +7560,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printBcSvg';
-            tempSvg.style.display = 'none';
+            // FIX: usar off-screen em vez de display:none — JsBarcode pode não
+            // calcular dimensões corretamente com display:none, gerando barcode
+            // sem viewBox ou em branco. Mesma estratégia do printItemLabel.
+            tempSvg.style.cssText = 'position:absolute;left:-9999px;top:-9999px;';
             document.body.appendChild(tempSvg);
 
             try {
@@ -7586,12 +7598,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const printArea = document.getElementById('print-area');
             printArea.innerHTML = printContent;
             printArea.style.display = 'block';
-            window.print();
-            window.onafterprint = () => {
-                printArea.innerHTML = '';
-                printArea.style.display = 'none';
-                window.onafterprint = null;
-            };
+            // Usar _printAreaPrint para aproveitar o lock anti-race-condition e
+            // o requestAnimationFrame duplo que garante render do SVG antes de imprimir.
+            _printAreaPrint(printContent);
         }
 
         /** ════════════════════════════════════════════════════
@@ -7942,6 +7951,44 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         _connectKpiWs();
 
         /* ══════════════════════════════════════════════════════════
+           LOCK DE IMPRESSÃO — evita race condition em onafterprint
+           Todas as funções que usam print-area + window.print() devem
+           chamar _printAreaPrint(content) em vez de window.print() direto.
+           Dois cliques rápidos sobrescreviam window.onafterprint, deixando
+           o print-area visível e travando o layout.
+        ══════════════════════════════════════════════════════════ */
+        let _printing = false;
+
+        function _printAreaPrint(htmlContent) {
+            if (_printing) return; // ignora segundo clique enquanto imprimindo
+            _printing = true;
+            const printArea = document.getElementById('print-area');
+            if (!printArea) { _printing = false; return; }
+            printArea.innerHTML = htmlContent;
+            printArea.style.display = 'block';
+            // Aguardar dois frames para garantir que SVGs e tabelas renderizaram
+            requestAnimationFrame(function() {
+                requestAnimationFrame(function() {
+                    window.print();
+                    window.onafterprint = function() {
+                        printArea.innerHTML = '';
+                        printArea.style.display = 'none';
+                        window.onafterprint = null;
+                        _printing = false;
+                    };
+                    // Fallback: libera lock após 8s (caso onafterprint não dispare)
+                    setTimeout(function() {
+                        if (_printing) {
+                            printArea.innerHTML = '';
+                            printArea.style.display = 'none';
+                            _printing = false;
+                        }
+                    }, 8000);
+                });
+            });
+        }
+
+        /* ══════════════════════════════════════════════════════════
            DASHBOARD — Gráficos unificados
         ══════════════════════════════════════════════════════════ */
 
@@ -7961,14 +8008,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             loadKPIChart();
         }
         function printDashboard() {
-            const area = document.getElementById('print-area');
             const dash = document.getElementById('tab-dashboard');
-            if (area && dash) {
-                area.innerHTML = '<div style="padding:20px;">' + dash.innerHTML + '</div>';
-                area.style.display = 'block';
-                window.print();
-                window.onafterprint = () => { area.innerHTML = ''; area.style.display = 'none'; window.onafterprint = null; };
-            }
+            if (!dash) return;
+            _printAreaPrint('<div style="padding:20px;">' + dash.innerHTML + '</div>');
         }
 
         async function loadKPIChart() {
@@ -8183,19 +8225,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printSetor() {
-            const area = document.getElementById('print-area');
             const boardEl = document.getElementById('board-inprod');
-            if (!area || !boardEl) return;
+            if (!boardEl) return;
             const titulo = _currentSetor === 'todos' ? 'Todos os Setores' :
                            _currentSetor === 'marcenaria' ? '🪚 Marcenaria' : '🧵 Tapeçaria';
-            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Produção: ${titulo}</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${boardEl.innerHTML}
-            </div>`;
-            area.style.display = 'block';
-            window.print();
-            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+            </div>`);
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8269,17 +8307,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printExpedicao() {
-            const area = document.getElementById('print-area');
             const sec  = document.getElementById('expedicao-section');
-            if (!area || !sec) return;
-            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!sec) return;
+            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Lista de Expedição</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`;
-            area.style.display = 'block';
-            window.print();
-            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+            </div>`);
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8385,17 +8419,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printRelatorio() {
-            const area = document.getElementById('print-area');
             const sec  = document.getElementById('relatorio-section');
-            if (!area || !sec) return;
-            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!sec) return;
+            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Relatório de Produção</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`;
-            area.style.display = 'block';
-            window.print();
-            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+            </div>`);
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8470,17 +8500,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printFicha() {
-            const area = document.getElementById('print-area');
             const sec  = document.getElementById('ficha-section');
-            if (!area || !sec) return;
-            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!sec) return;
+            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2>SW Móveis MDF — Ficha Técnica: Cadeira SW</h2>
                 <p style="color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`;
-            area.style.display = 'block';
-            window.print();
-            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
+            </div>`);
         }
 
         /* ══════════════════════════════════════════════════════════
