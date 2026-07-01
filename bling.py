@@ -65,7 +65,7 @@ import requests
 from requests.exceptions import RequestException
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for
+from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session
 from flask_sock import Sock
 try:
     from simple_websocket import ConnectionClosed
@@ -2439,19 +2439,19 @@ class PendingOrdersManager:
                                         # quando o mesmo pedido gera múltiplos cards
                 }
 
+                # ── Converte nome/SKU para ASCII puro (CODE128 só aceita 0x20-0x7E) ──
+                # Definido fora do loop por unidade — não precisa ser recriado para cada unidade
+                import unicodedata as _ud
+                def _to_ascii(s):
+                    return ''.join(
+                        c for c in _ud.normalize('NFD', s)
+                        if _ud.category(c) != 'Mn' and ord(c) < 128
+                    )
+                sku_safe = _to_ascii(sku_raw or nome_raw[:20])
+                sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
+                sku_safe = sku_safe.strip('_')[:28]
+
                 for unit in range(qtd):
-                    # ── item_key: apenas ASCII imprimível, sem acentos ──────────
-                    # CODE128 só aceita ASCII 0x20-0x7E. Acentos (ã,ç,é…) no
-                    # nome/SKU corrompem o barcode — scanner lê lixo ou nada.
-                    import unicodedata as _ud
-                    def _to_ascii(s):
-                        return ''.join(
-                            c for c in _ud.normalize('NFD', s)
-                            if _ud.category(c) != 'Mn' and ord(c) < 128
-                        )
-                    sku_safe = _to_ascii(sku_raw or nome_raw[:20])
-                    sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
-                    sku_safe = sku_safe.strip('_')[:28]  # limita comprimento total do key
                     sub_key = f"{order_id}_{sku_safe}_{unit}"
                     # Lookup O(1) usando sets pré-computados
                     already = (sub_key in existing_keys or
@@ -3894,7 +3894,8 @@ class WebServer:
             })
 
         @self.app.route('/api/consumption/history')
-        def api_consumption_history():
+        @token_required
+        def api_consumption_history(token):
             """Retorna histórico de todos os meses."""
             all_data = component_consumption.get_all_months()
             result = {}
@@ -3958,8 +3959,8 @@ class WebServer:
             # ── Extrai reader_id do prefixo R1:/R2:/R3:/R4: ──────────────────
             reader_id = None
             codigo    = raw_codigo
-            import re as _re_scan
-            _pfx = _re_scan.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_scan.IGNORECASE)
+            # usa _re_ecb já importado no nível de módulo (evita reimport a cada scan)
+            _pfx = _re_ecb.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_ecb.IGNORECASE)
             if _pfx:
                 reader_id = _pfx.group(1).upper()   # "R1", "R2", "R3" ou "R4"
                 codigo    = _pfx.group(2).strip()
@@ -4629,7 +4630,7 @@ já é suficiente). Se você habilitar o módulo no Bling, use o botão abaixo p
                         except Exception as _me:
                             logger.error(f"Purge MongoDB direto: {_me}")
                     # Recarrega memória do MongoDB após purge
-                    pending_orders.load()
+                    pending_orders.data = pending_orders._load()
                     msg = f"Removidos: {removed} em memória + {mongo_removed} direto no MongoDB. Total em fila: {len(pending_orders.data)}"
                     logger.info(f"🧹 Purge manual: {msg}")
                     return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
@@ -4921,7 +4922,6 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
             try:
                 # Retorna cache se disponível E não vazio
                 cache = None  # Sempre recalcula para garantir history atualizado
-                _old_cache = getattr(self.orchestrator, '_component_usage_cache', None)
                 
                 if cache and (cache.get('components') or cache.get('daily_breakdown')):
                     self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
@@ -7532,18 +7532,30 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 </div>
 <script>
   window.onload = function() {
-    // FIX: usar onafterprint para fechar a janela DEPOIS que o usuário
-    // confirmar (ou cancelar) o diálogo de impressão.
-    // O setTimeout de 800ms original fechava ANTES do diálogo aparecer
-    // em sistemas lentos / impressoras de rede, cancelando o job.
+    // DIAGNÓSTICO DO BUG "impressora em pausa":
+    // O Chrome dispara onafterprint quando o DIÁLOGO fecha, mas ainda
+    // está gerando o PDF internamente (spool). Fechar a janela nesse
+    // instante manda um job incompleto ao spooler do Windows, que o
+    // marca como "Pausado". Outros programas imprimem normal porque
+    // eles não fecham a janela enquanto o spool ainda roda.
+    //
+    // SOLUÇÃO: aguardar 2s após onafterprint antes de fechar — tempo
+    // suficiente para o Chrome terminar o spool e entregar o job
+    // completo ao driver da impressora.
     var _closed = false;
-    function _closeOnce() { if (!_closed) { _closed = true; window.close(); } }
-    window.onafterprint = _closeOnce;
-    // Fallback: fecha após 5s caso onafterprint não dispare (Firefox mobile, etc.)
-    setTimeout(_closeOnce, 5000);
+    function _closeOnce() {
+      if (!_closed) { _closed = true; window.close(); }
+    }
+    window.onafterprint = function() {
+      // Aguarda 2s para o Chrome finalizar o spool antes de fechar
+      setTimeout(_closeOnce, 2000);
+    };
+    // Fallback: fecha após 30s (cobre sistemas muito lentos ou
+    // impressoras de rede) — o onafterprint deve disparar bem antes
+    setTimeout(_closeOnce, 30000);
     window.print();
   };
-<\/script>
+<\\/script>
 </body></html>`);
             pw.document.close();
         }
@@ -7595,9 +7607,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     </p>
                 </div>`;
 
-            const printArea = document.getElementById('print-area');
-            printArea.innerHTML = printContent;
-            printArea.style.display = 'block';
             // Usar _printAreaPrint para aproveitar o lock anti-race-condition e
             // o requestAnimationFrame duplo que garante render do SVG antes de imprimir.
             _printAreaPrint(printContent);
