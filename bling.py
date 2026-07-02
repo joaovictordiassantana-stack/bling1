@@ -65,7 +65,7 @@ import requests
 from requests.exceptions import RequestException
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session
+from flask import Flask, request, render_template_string, jsonify, redirect, url_for
 from flask_sock import Sock
 try:
     from simple_websocket import ConnectionClosed
@@ -2439,19 +2439,19 @@ class PendingOrdersManager:
                                         # quando o mesmo pedido gera múltiplos cards
                 }
 
-                # ── Converte nome/SKU para ASCII puro (CODE128 só aceita 0x20-0x7E) ──
-                # Definido fora do loop por unidade — não precisa ser recriado para cada unidade
-                import unicodedata as _ud
-                def _to_ascii(s):
-                    return ''.join(
-                        c for c in _ud.normalize('NFD', s)
-                        if _ud.category(c) != 'Mn' and ord(c) < 128
-                    )
-                sku_safe = _to_ascii(sku_raw or nome_raw[:20])
-                sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
-                sku_safe = sku_safe.strip('_')[:28]
-
                 for unit in range(qtd):
+                    # ── item_key: apenas ASCII imprimível, sem acentos ──────────
+                    # CODE128 só aceita ASCII 0x20-0x7E. Acentos (ã,ç,é…) no
+                    # nome/SKU corrompem o barcode — scanner lê lixo ou nada.
+                    import unicodedata as _ud
+                    def _to_ascii(s):
+                        return ''.join(
+                            c for c in _ud.normalize('NFD', s)
+                            if _ud.category(c) != 'Mn' and ord(c) < 128
+                        )
+                    sku_safe = _to_ascii(sku_raw or nome_raw[:20])
+                    sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
+                    sku_safe = sku_safe.strip('_')[:28]  # limita comprimento total do key
                     sub_key = f"{order_id}_{sku_safe}_{unit}"
                     # Lookup O(1) usando sets pré-computados
                     already = (sub_key in existing_keys or
@@ -3894,8 +3894,7 @@ class WebServer:
             })
 
         @self.app.route('/api/consumption/history')
-        @token_required
-        def api_consumption_history(token):
+        def api_consumption_history():
             """Retorna histórico de todos os meses."""
             all_data = component_consumption.get_all_months()
             result = {}
@@ -3959,8 +3958,8 @@ class WebServer:
             # ── Extrai reader_id do prefixo R1:/R2:/R3:/R4: ──────────────────
             reader_id = None
             codigo    = raw_codigo
-            # usa _re_ecb já importado no nível de módulo (evita reimport a cada scan)
-            _pfx = _re_ecb.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_ecb.IGNORECASE)
+            import re as _re_scan
+            _pfx = _re_scan.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_scan.IGNORECASE)
             if _pfx:
                 reader_id = _pfx.group(1).upper()   # "R1", "R2", "R3" ou "R4"
                 codigo    = _pfx.group(2).strip()
@@ -4630,7 +4629,7 @@ já é suficiente). Se você habilitar o módulo no Bling, use o botão abaixo p
                         except Exception as _me:
                             logger.error(f"Purge MongoDB direto: {_me}")
                     # Recarrega memória do MongoDB após purge
-                    pending_orders.data = pending_orders._load()
+                    pending_orders.load()
                     msg = f"Removidos: {removed} em memória + {mongo_removed} direto no MongoDB. Total em fila: {len(pending_orders.data)}"
                     logger.info(f"🧹 Purge manual: {msg}")
                     return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
@@ -4922,6 +4921,7 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
             try:
                 # Retorna cache se disponível E não vazio
                 cache = None  # Sempre recalcula para garantir history atualizado
+                _old_cache = getattr(self.orchestrator, '_component_usage_cache', None)
                 
                 if cache and (cache.get('components') or cache.get('daily_breakdown')):
                     self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
@@ -7037,7 +7037,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
                                         📷 Bipe a etiqueta para iniciar
                                     </div>
-                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(item.pedido_numero||item.order_id||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0"
+                                        data-p-ikey="${escapeHtml(ikey)}"
+                                        data-p-nome="${escapeHtml(item.nome||item.nome_original||'')}"
+                                        data-p-pedido="${escapeHtml(String(item.pedido_numero||item.order_id||''))}"
+                                        data-p-cliente="${escapeHtml(item.cliente||'')}"
+                                        data-p-unit="${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}"
+                                        onclick="printItemLabel(this.dataset.pIkey,this.dataset.pNome,this.dataset.pPedido,this.dataset.pCliente,this.dataset.pUnit)"
+                                        title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -7164,7 +7171,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
 
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
-                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(ikey)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
+                    <div class="bc-card inprod"
+                        data-c-op="${escapeHtml(op)}"
+                        data-c-nome="${escapeHtml(nome)}"
+                        data-c-ikey="${escapeHtml(ikey)}"
+                        data-c-opinterna="${escapeHtml(opInterna)}"
+                        data-c-cliente="${escapeHtml(cliente)}"
+                        onclick="openOPModal(this.dataset.cOp,this.dataset.cNome,this.dataset.cIkey,this.dataset.cOpinterna,this.dataset.cCliente)"
+                        style="cursor:pointer;">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
                         <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
@@ -7189,7 +7203,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
                                     📷 Bipe a etiqueta para avançar
                                 </div>
-                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(String(item.pedido_numero||item.order_id||''))}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
+                                <button class="btn btn-outline-primary btn-sm flex-shrink-0"
+                                    data-p-ikey="${escapeHtml(ikey)}"
+                                    data-p-nome="${escapeHtml(nome)}"
+                                    data-p-pedido="${escapeHtml(String(item.pedido_numero||item.order_id||''))}"
+                                    data-p-cliente="${escapeHtml(cliente)}"
+                                    onclick="event.stopPropagation();printItemLabel(this.dataset.pIkey,this.dataset.pNome,this.dataset.pPedido,this.dataset.pCliente,'')"
+                                    title="Reimprimir etiqueta deste produto">🏷️</button>
                                </div>`
                         }
                     </div>
@@ -7341,10 +7361,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
                             <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
                             <div class="d-flex gap-2">
-                                <button class="btn btn-outline-primary btn-sm fw-bold" onclick="printItemLabel('${escapeHtml(codigoBarras)}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(clienteNome||'')}')">
+                                <button id="opModalBtnEtiqueta" class="btn btn-outline-primary btn-sm fw-bold">
                                     🏷️ Etiqueta
                                 </button>
-                                <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(ordemProducao||''))}', '${escapeHtml(clienteNome||'')}')">
+                                <button id="opModalBtnFolhaA4" class="btn btn-primary btn-sm fw-bold">
                                     🖨️ Folha A4
                                 </button>
                             </div>
@@ -7356,6 +7376,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             document.body.insertAdjacentHTML('beforeend', modalHtml);
             const modal = new bootstrap.Modal(document.getElementById('opModal'));
             modal.show();
+
+            // Handlers anexados via addEventListener (não via onclick com string
+            // interpolada) — nomeProduto/clienteNome vêm diretamente das variáveis
+            // JS do escopo da função, sem passar por re-parse de atributo HTML.
+            // Isso evita quebra de sintaxe quando o nome do produto ou do cliente
+            // contém aspas simples/duplas (ex: apóstrofo em "D'Ávila", medidas
+            // com aspas como 55", nomes de tecido entre aspas).
+            document.getElementById('opModalBtnEtiqueta')?.addEventListener('click', () => {
+                printItemLabel(codigoBarras, nomeProduto, String(pedidoNum || ''), clienteNome || '');
+            });
+            document.getElementById('opModalBtnFolhaA4')?.addEventListener('click', () => {
+                printOP(String(pedidoNum || ''), nomeProduto, String(ordemProducao || ''), clienteNome || '');
+            });
 
             // Renderiza barcode real com JsBarcode (Code128 — lido por qualquer scanner)
             setTimeout(() => {
@@ -7423,6 +7456,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
+            // ── Checagem prévia: a lib JsBarcode vem de um CDN externo ──────
+            // (cdn.jsdelivr.net). Se a rede da fábrica bloquear esse domínio
+            // (firewall corporativo, proxy, sem internet no momento), a lib
+            // nunca carrega e JsBarcode fica undefined. Sem essa checagem,
+            // o erro só aparecia silencioso dentro da etiqueta já aberta —
+            // parecia "bug de impressão" quando na real era falta de conexão.
+            if (typeof JsBarcode === 'undefined') {
+                alert(
+                    '⚠️ Biblioteca de código de barras não carregou.\n\n' +
+                    'Isso normalmente acontece quando:\n' +
+                    '• A internet caiu ou está instável\n' +
+                    '• O firewall da rede está bloqueando cdn.jsdelivr.net\n\n' +
+                    'Recarregue a página (F5) com internet ativa e tente novamente.\n' +
+                    'Se persistir, peça para o TI liberar o domínio cdn.jsdelivr.net.'
+                );
+                return;
+            }
+
             // Gera o SVG do barcode no DOM atual onde JsBarcode está disponível
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printLabelSvg';
@@ -7434,6 +7485,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const barWidth = len > 32 ? 0.7 : len > 24 ? 0.85 : len > 16 ? 1.0 : 1.2;
 
             let svgHtml = '';
+            let barcodeOk = false;
             try {
                 JsBarcode('#_printLabelSvg', itemKey, {
                     format: 'CODE128', width: barWidth, height: 40,
@@ -7449,6 +7501,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     tempSvg.removeAttribute('height');
                     tempSvg.setAttribute('style',
                         'display:block;width:56mm;height:auto;max-width:100%;margin:0 auto;');
+                    barcodeOk = true;
                 }
                 svgHtml = tempSvg.outerHTML;
             } catch(e) {
@@ -7457,6 +7510,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
             tempSvg.remove();
 
+            if (!barcodeOk) {
+                alert(
+                    '⚠️ O código de barras não pôde ser gerado para o código:\n"' + itemKey + '"\n\n' +
+                    'Provável causa: caractere inválido no código do item.\n' +
+                    'Use o botão ✕ para remover este item e sincronize novamente — ' +
+                    'a nova sincronização gera um código limpo automaticamente.'
+                );
+                return;
+            }
+
             // Nome truncado para caber na etiqueta pequena
             const nomeShort = (nomeProduto || '').length > 38
                 ? nomeProduto.substring(0, 36) + '…'
@@ -7464,40 +7527,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             // ── Abre janela isolada para impressão ──────────────────────────
             // Usar window.print() na página principal colide com o CSS do app
-            // (Bootstrap + display:none em elementos ocultos) e corrompe o layout.
-            // Uma popup isolada tem seu próprio documento e não herda nada.
-            const pw = window.open('', '_blank', 'width=400,height=320');
+            // e corrompe o layout. Uma popup isolada tem seu próprio documento.
+            //
+            // IMPORTANTE: window.print() é BLOQUEANTE em vários navegadores —
+            // a thread do popup fica parada até o usuário fechar o diálogo
+            // nativo de impressão. Por isso NUNCA fechamos a janela via
+            // setTimeout (corrida contra o print) — fechamos só depois do
+            // evento 'afterprint', e deixamos um botão manual como fallback
+            // caso o navegador não dispare esse evento (alguns não disparam
+            // quando o diálogo é cancelado).
+            const pw = window.open('', '_blank', 'width=320,height=280');
             if (!pw) {
-                showToast('Popup Bloqueada', 'Permita popups para este site e clique novamente no botão 🏷️.', 'warning');
-                alert('Popup bloqueado! Permita popups para este site e tente novamente.');
+                alert('Popup bloqueado! Libere popups para este site (ícone na barra de endereço) e tente novamente.');
                 return;
             }
 
-            pw.document.write(`<!DOCTYPE html>
+            const labelHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Etiqueta SW</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  /*
-   * @page: 62x40mm é o tamanho físico da etiqueta.
-   * Impressoras térmicas (Zebra/Elgin/Brother) que usam driver genérico
-   * ou "raw/ZPL" ignoram @page — configure o tamanho diretamente no
-   * driver/fila de impressão para 62x40mm.
-   * Para impressoras laser/jato de tinta com folha A4 de adesivos,
-   * o @page size é ignorado; o Chrome imprimirá na folha configurada.
-   */
-  @page {
-    size: 62mm 40mm;
-    margin: 0;
-  }
-  html, body {
-    width: 62mm;
-    height: 40mm;
-    background: #fff;
-    /* Evita que o browser redimensione o conteúdo ao imprimir */
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
+  @page { size: 62mm 40mm; margin: 0; }
+  html, body { width: 62mm; height: 40mm; background: #fff; }
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
     width: 62mm; height: 40mm;
     padding: 2mm 2.5mm 1.5mm 2.5mm;
@@ -7517,6 +7569,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .bc    { text-align: center; line-height: 0; }
   .tip   { font-size: 5.5pt; color: #666; text-align: center;
            letter-spacing: .03em; margin-top: 0.5mm; }
+  @media screen {
+    body { padding: 12px; width: auto; height: auto; background:#f1f5f9; }
+    .label { border:1px solid #ccc; box-shadow:0 2px 8px rgba(0,0,0,.1); }
+    .toolbar { margin-top:10px; text-align:center; }
+    .toolbar button {
+      font-family: Arial, sans-serif; font-size: 13px; padding: 8px 16px;
+      border-radius: 6px; border: none; cursor: pointer; background:#2563eb; color:#fff;
+    }
+  }
+  @media print { .toolbar { display: none !important; } }
 </style>
 </head><body>
 <div class="label">
@@ -7530,34 +7592,32 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <div class="bc">${svgHtml}</div>
   <div class="tip">BIPE PARA AVANÇAR ETAPA</div>
 </div>
-<script>
-  window.onload = function() {
-    // DIAGNÓSTICO DO BUG "impressora em pausa":
-    // O Chrome dispara onafterprint quando o DIÁLOGO fecha, mas ainda
-    // está gerando o PDF internamente (spool). Fechar a janela nesse
-    // instante manda um job incompleto ao spooler do Windows, que o
-    // marca como "Pausado". Outros programas imprimem normal porque
-    // eles não fecham a janela enquanto o spool ainda roda.
-    //
-    // SOLUÇÃO: aguardar 2s após onafterprint antes de fechar — tempo
-    // suficiente para o Chrome terminar o spool e entregar o job
-    // completo ao driver da impressora.
-    var _closed = false;
-    function _closeOnce() {
-      if (!_closed) { _closed = true; window.close(); }
-    }
-    window.onafterprint = function() {
-      // Aguarda 2s para o Chrome finalizar o spool antes de fechar
-      setTimeout(_closeOnce, 2000);
-    };
-    // Fallback: fecha após 30s (cobre sistemas muito lentos ou
-    // impressoras de rede) — o onafterprint deve disparar bem antes
-    setTimeout(_closeOnce, 30000);
-    window.print();
-  };
-<\\/script>
-</body></html>`);
+<div class="toolbar">
+  <button onclick="window.print()">🖨️ Imprimir</button>
+</div>
+</body></html>`;
+
+            // document.write em vez de srcdoc/Blob por compatibilidade ampla,
+            // mas SEM disparo automático de print — usuário clica no botão.
+            // Isso elimina o travamento: nada bloqueia a thread principal,
+            // e a janela permanece aberta e responsiva até o usuário agir.
+            pw.document.open();
+            pw.document.write(labelHtml);
             pw.document.close();
+
+            // Fecha a janela automaticamente só depois que o print terminar
+            // (evento confiável, sem corrida de tempo).
+            // Em alguns navegadores com política restrita de cross-window,
+            // anexar listener na popup pode lançar — isso NÃO deve impedir
+            // a impressão, só o fechamento automático deixa de funcionar
+            // (usuário fecha manualmente, sem prejuízo).
+            try {
+                pw.addEventListener('afterprint', () => {
+                    try { pw.close(); } catch(e) {}
+                });
+            } catch(e) {
+                console.warn('Não foi possível registrar fechamento automático:', e);
+            }
         }
 
         /** Impressão da OP em página limpa (sem travar) */
@@ -7572,10 +7632,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printBcSvg';
-            // FIX: usar off-screen em vez de display:none — JsBarcode pode não
-            // calcular dimensões corretamente com display:none, gerando barcode
-            // sem viewBox ou em branco. Mesma estratégia do printItemLabel.
-            tempSvg.style.cssText = 'position:absolute;left:-9999px;top:-9999px;';
+            tempSvg.style.display = 'none';
             document.body.appendChild(tempSvg);
 
             try {
@@ -7607,9 +7664,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     </p>
                 </div>`;
 
-            // Usar _printAreaPrint para aproveitar o lock anti-race-condition e
-            // o requestAnimationFrame duplo que garante render do SVG antes de imprimir.
-            _printAreaPrint(printContent);
+            const printArea = document.getElementById('print-area');
+            printArea.innerHTML = printContent;
+            printArea.style.display = 'block';
+            window.print();
+            window.onafterprint = () => {
+                printArea.innerHTML = '';
+                printArea.style.display = 'none';
+                window.onafterprint = null;
+            };
         }
 
         /** ════════════════════════════════════════════════════
@@ -7960,44 +8023,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         _connectKpiWs();
 
         /* ══════════════════════════════════════════════════════════
-           LOCK DE IMPRESSÃO — evita race condition em onafterprint
-           Todas as funções que usam print-area + window.print() devem
-           chamar _printAreaPrint(content) em vez de window.print() direto.
-           Dois cliques rápidos sobrescreviam window.onafterprint, deixando
-           o print-area visível e travando o layout.
-        ══════════════════════════════════════════════════════════ */
-        let _printing = false;
-
-        function _printAreaPrint(htmlContent) {
-            if (_printing) return; // ignora segundo clique enquanto imprimindo
-            _printing = true;
-            const printArea = document.getElementById('print-area');
-            if (!printArea) { _printing = false; return; }
-            printArea.innerHTML = htmlContent;
-            printArea.style.display = 'block';
-            // Aguardar dois frames para garantir que SVGs e tabelas renderizaram
-            requestAnimationFrame(function() {
-                requestAnimationFrame(function() {
-                    window.print();
-                    window.onafterprint = function() {
-                        printArea.innerHTML = '';
-                        printArea.style.display = 'none';
-                        window.onafterprint = null;
-                        _printing = false;
-                    };
-                    // Fallback: libera lock após 8s (caso onafterprint não dispare)
-                    setTimeout(function() {
-                        if (_printing) {
-                            printArea.innerHTML = '';
-                            printArea.style.display = 'none';
-                            _printing = false;
-                        }
-                    }, 8000);
-                });
-            });
-        }
-
-        /* ══════════════════════════════════════════════════════════
            DASHBOARD — Gráficos unificados
         ══════════════════════════════════════════════════════════ */
 
@@ -8017,9 +8042,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             loadKPIChart();
         }
         function printDashboard() {
+            const area = document.getElementById('print-area');
             const dash = document.getElementById('tab-dashboard');
-            if (!dash) return;
-            _printAreaPrint('<div style="padding:20px;">' + dash.innerHTML + '</div>');
+            if (area && dash) {
+                area.innerHTML = '<div style="padding:20px;">' + dash.innerHTML + '</div>';
+                area.style.display = 'block';
+                window.print();
+                window.onafterprint = () => { area.innerHTML = ''; area.style.display = 'none'; window.onafterprint = null; };
+            }
         }
 
         async function loadKPIChart() {
@@ -8234,15 +8264,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printSetor() {
+            const area = document.getElementById('print-area');
             const boardEl = document.getElementById('board-inprod');
-            if (!boardEl) return;
+            if (!area || !boardEl) return;
             const titulo = _currentSetor === 'todos' ? 'Todos os Setores' :
                            _currentSetor === 'marcenaria' ? '🪚 Marcenaria' : '🧵 Tapeçaria';
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Produção: ${titulo}</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${boardEl.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8316,13 +8350,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printExpedicao() {
+            const area = document.getElementById('print-area');
             const sec  = document.getElementById('expedicao-section');
-            if (!sec) return;
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Lista de Expedição</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8428,13 +8466,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printRelatorio() {
+            const area = document.getElementById('print-area');
             const sec  = document.getElementById('relatorio-section');
-            if (!sec) return;
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Relatório de Produção</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8509,13 +8551,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printFicha() {
+            const area = document.getElementById('print-area');
             const sec  = document.getElementById('ficha-section');
-            if (!sec) return;
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2>SW Móveis MDF — Ficha Técnica: Cadeira SW</h2>
                 <p style="color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
