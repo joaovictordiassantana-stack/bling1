@@ -2782,30 +2782,61 @@ class Orchestrator:
         """
         Inicia o worker de fundo para atualização de dados.
 
-        Antes de iniciar, verifica o lock distribuído entre processos
-        (self.worker_lock, anexado por create_app). Isso evita que múltiplos
-        processos do Gunicorn rodem cada um seu próprio ciclo completo de
-        sync com o Bling ao mesmo tempo — o guard 'if not self._running'
-        abaixo só protege contra chamada duplicada DENTRO deste mesmo
-        processo/objeto, não entre processos diferentes.
+        FAIL-CLOSED por design: exige que self.worker_lock exista e tenha
+        sido adquirido com sucesso antes de iniciar a thread do worker.
+        Se o lock distribuído não puder ser verificado por QUALQUER motivo
+        (não anexado, MongoDB fora do ar, exceção inesperada), o worker
+        NÃO inicia — mesmo que isso signifique nenhum processo rodando o
+        sync temporariamente. É preferível a um estado visível e óbvio
+        (nenhum worker rodando, dados não atualizam, fácil de perceber)
+        do que ao estado anterior: dois processos rodando sync completo
+        em paralelo, silenciosamente, sobrecarregando o app até ele parar
+        de responder requisições HTTP — o que pareceu, pro usuário final,
+        "o sistema travou e não carrega mais".
         """
         if self._running:
             return
+
         _lock = getattr(self, 'worker_lock', None)
-        if _lock is not None:
-            if not _lock.try_acquire():
-                self.logger.info(
-                    "⏸️ Worker de fundo NÃO iniciado neste processo — outro "
-                    "processo já detém o lock distribuído (evita sync duplicado)."
-                )
-                return
-            _lock.start_heartbeat()
+        if _lock is None:
+            self.logger.critical(
+                "🚨 start_worker() ABORTADO: self.worker_lock não existe. "
+                "O worker NÃO será iniciado neste processo — isso é "
+                "intencional (fail-closed) para nunca arriscar dois "
+                "processos rodando sync em paralelo sem coordenação. "
+                "Isso indica um bug de inicialização: verifique se "
+                "create_app() está anexando orchestrator.worker_lock "
+                "corretamente antes de qualquer chamada a start_worker()."
+            )
+            return
+
+        try:
+            acquired = _lock.try_acquire()
+        except Exception as _lock_err:
+            self.logger.critical(
+                f"🚨 start_worker() ABORTADO: erro ao verificar o lock "
+                f"distribuído ({_lock_err}). O worker NÃO será iniciado "
+                f"neste processo — fail-closed intencional. Verifique a "
+                f"conexão com o MongoDB."
+            )
+            return
+
+        if not acquired:
+            self.logger.info(
+                "⏸️ Worker de fundo NÃO iniciado neste processo — outro "
+                "processo já detém o lock distribuído (evita sync duplicado)."
+            )
+            return
+
+        _lock.start_heartbeat()
         self._running = True
         self._stop_event = Event()   # sinaliza parada definitiva
         self._wake_event = Event()   # sinaliza "acorda agora" sem parar
         self._worker_thread = Thread(target=self._worker_loop, daemon=True)
         self._worker_thread.start()
-        self.logger.info("Worker de fundo iniciado.")
+        self.logger.info(
+            f"✅ Worker de fundo iniciado (holder_id={_lock.holder_id})."
+        )
 
     def stop_worker(self):
         """Para o worker de fundo."""
@@ -2906,23 +2937,99 @@ class Orchestrator:
         """
         self.logger.debug(f"process_sales_orders chamado (force={force})")
         
-        # Evita recálculos encavalados.
-        # 'force' NUNCA permite duas execuções em paralelo — isso corromperia
-        # self.sales._sales_history, mutada sem lock próprio mais abaixo.
-        # Antes, force=True chamado enquanto outro recálculo já rodava (ex:
-        # worker periódico + botão "Sincronizar Bling" ao mesmo tempo) burlava
-        # a checagem e deixava os dois mutarem a mesma lista simultaneamente.
-        # Agora força apenas garante que o chamador recebe False (em vez de
-        # ser descartado sem explicação como no caminho não-force) — mas o
-        # segundo recálculo continua sendo recusado, nunca executado em
-        # paralelo. Essa garantia vive dentro da função — não depende de cada
-        # endpoint replicar a checagem externamente (o que
-        # /api/pending-orders/sync não fazia antes desta correção).
+        # Evita recálculos encavalados — DUAS camadas independentes:
+        #
+        # 1) threading.Lock em memória (rápido, sem I/O, cobre o caso comum
+        #    dentro do mesmo processo).
+        #
+        # 2) Verificação atômica via MongoDB (mesma técnica comprovadamente
+        #    atômica usada em DistributedWorkerLock — atomicidade garantida
+        #    pelo PRÓPRIO SERVIDOR MongoDB, não pelo cliente Python). Esta
+        #    camada existe porque o gatilho real confirmado (fetch automático
+        #    de sync disparado no reconnect do WebSocket + ciclo periódico do
+        #    worker, ambos chamando esta função ao mesmo tempo) fazia as DUAS
+        #    chamadas passarem pela camada 1 sem se verem — sob gevent,
+        #    threading.Lock quando monkey-patched vira cooperativo, e não
+        #    consigo verificar sob quais condições exatas ele falhou aqui
+        #    (sem gevent disponível para testar diretamente). Em vez de
+        #    insistir num mecanismo que já falhou uma vez sem eu conseguir
+        #    provar por quê, adiciono um que já testei sob concorrência real
+        #    (30 rodadas x 50 threads simultâneas, ver DistributedWorkerLock)
+        #    e cuja garantia não depende de nenhum detalhe do gevent.
+        #
+        #    TRADE-OFF CONHECIDO: se o processo morrer abruptamente (SIGTERM
+        #    sem graceful shutdown, ex: deploy no Render matando o processo
+        #    antigo) enquanto segura este guard, ele fica "preso" no Mongo
+        #    pelos 300s completos do TTL, mesmo que o processo já não exista
+        #    mais — o próximo processo não conseguirá sincronizar até o TTL
+        #    expirar. Isso é aceito de propósito: é preferível esperar até
+        #    5min a mais depois de um restart do que arriscar duas execuções
+        #    verdadeiramente paralelas de novo. Se isso incomodar na prática,
+        #    considere reduzir o TTL (troca: mais risco de janela de corrida
+        #    em operações lentas) ou implementar release no SIGTERM handler.
         with self.sales.recalculation_lock:
             if self.sales._recalculation_running:
-                self.logger.debug("Recálculo já em execução, ignorando (force=%s).", force)
+                self.logger.debug("Recálculo já em execução (lock local), ignorando (force=%s).", force)
                 return False
             self.sales._recalculation_running = True
+
+        _mongo_guard_acquired = False
+        if MONGO_AVAILABLE:
+            try:
+                now = time.time()
+                # Token único por tentativa — usado para saber com certeza se
+                # FOI ESTA chamada que venceu a corrida, por identidade, não
+                # por comparação de valor numérico recalculado. Testado sob
+                # 50 chamadas simultâneas reais: comparar contra um
+                # 'now + 60' recomputado após a escrita causava falsos
+                # negativos (nenhuma chamada se reconhecia como vencedora),
+                # porque threads diferentes calculam 'now' em instantes
+                # ligeiramente diferentes. Com token, ambiguidade zero.
+                _guard_token = secrets.token_hex(8)
+                # TTL de 300s (5min) — mesma margem usada pelo watchdog para
+                # considerar um estágio "travado". Ajustado para cima depois
+                # de medir: o caso rápido real (log do usuário) levou 16.8s,
+                # mas o código já documenta até ~34s só para
+                # _fetch_orders_with_items em casos menos favoráveis, que se
+                # soma ao tempo de paginação (cresce com o volume de
+                # pedidos). 60s era margem apertada demais — se a execução
+                # legítima demorasse mais que isso, o guard expiraria no
+                # meio dela, permitindo uma segunda chamada concorrente
+                # exatamente durante a primeira ainda rodando.
+                result = _mongo_db['sync_guard'].find_one_and_update(
+                    {
+                        '_id': 'process_sales_orders',
+                        '$or': [
+                            {'locked_until': {'$exists': False}},
+                            {'locked_until': {'$lt': now}},
+                        ]
+                    },
+                    {'$set': {
+                        'locked_until': now + 300,
+                        'token': _guard_token,
+                        'locked_at_iso': datetime.now().isoformat(),
+                    }},
+                    upsert=True,
+                    return_document=True,
+                )
+                _mongo_guard_acquired = bool(result and result.get('token') == _guard_token)
+                if not _mongo_guard_acquired:
+                    self.logger.warning(
+                        "⛔ Recálculo BLOQUEADO pelo guard do MongoDB — outra "
+                        "execução já está em andamento (mesmo com o lock local "
+                        "em memória liberado). Isso confirma uma corrida "
+                        "real entre chamadas concorrentes (ex: sync automático "
+                        "de reconexão de WebSocket + ciclo periódico do worker)."
+                    )
+                    with self.sales.recalculation_lock:
+                        self.sales._recalculation_running = False
+                    return False
+            except Exception as _guard_err:
+                # Mongo indisponível para o guard: não bloqueia a execução
+                # (o lock local em memória já rodou e permitiu chegar aqui),
+                # mas registra — essa é justamente a situação em que só a
+                # camada 1 está protegendo, então vale saber se isso ocorreu.
+                self.logger.warning(f"Guard do MongoDB indisponível para process_sales_orders: {_guard_err}")
             
         try:
             if not self.auth.is_authenticated():
@@ -3094,6 +3201,11 @@ class Orchestrator:
         finally:
             with self.sales.recalculation_lock:
                 self.sales._recalculation_running = False
+            if _mongo_guard_acquired and MONGO_AVAILABLE:
+                try:
+                    _mongo_db['sync_guard'].delete_one({'_id': 'process_sales_orders'})
+                except Exception:
+                    pass  # guard expira sozinho via TTL de 300s mesmo se isso falhar
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
@@ -3832,6 +3944,27 @@ class WebServer:
                     except Exception as e:
                         lock_state['error'] = str(e)
 
+            # ── Guard de process_sales_orders (segunda camada anti-corrida) ──
+            # Se isto aparecer 'held' logo após um deploy, é o trade-off
+            # conhecido e documentado em process_sales_orders: um processo
+            # morto abruptamente (SIGTERM sem cleanup) deixa o guard preso
+            # até o TTL de 300s expirar sozinho — não é um bug novo.
+            sync_guard_state = {}
+            if MONGO_AVAILABLE:
+                try:
+                    doc = _mongo_db['sync_guard'].find_one({'_id': 'process_sales_orders'})
+                    if doc:
+                        remaining = round(doc.get('locked_until', now) - now, 1)
+                        sync_guard_state = {
+                            'held': remaining > 0,
+                            'seconds_remaining': max(remaining, 0),
+                            'locked_at': doc.get('locked_at_iso'),
+                        }
+                    else:
+                        sync_guard_state = {'held': False}
+                except Exception as e:
+                    sync_guard_state = {'error': str(e)}
+
             # ── Fila de produção (indicador indireto de sync funcionando) ──
             queue_state = {
                 'total_items': len(pending_orders.data),
@@ -3866,10 +3999,13 @@ class WebServer:
 
             return jsonify({
                 'timestamp': datetime.now().isoformat(),
+                'build_id': '2026-07-02-sync-guard-v3-token-based',
+                'process_id': os.getpid(),
                 'overall_status': overall_status,
                 'warnings': warnings,
                 'worker': worker_state,
                 'distributed_lock': lock_state,
+                'sync_guard': sync_guard_state,
                 'production_queue': queue_state,
                 'bling_auth': auth_state,
             })
@@ -8349,6 +8485,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* WebSocket KPI com reconexão e backoff */
         let wsKpi = null;
+        // Dispara sync automático apenas na PRIMEIRA autenticação da vida da
+        // página (carregamento inicial) — não a cada reconexão de WebSocket.
+        // Reconexões são um evento NORMAL e frequente (Wi-Fi instável na
+        // fábrica, timeout ocioso, servidor reiniciando por deploy) — antes,
+        // _wsFirstAuthDone era resetado em TODA reconexão (dentro de
+        // wsKpi.onclose), disparando um novo POST /api/pending-orders/sync
+        // toda vez que o socket caía e voltava. Se isso acontecesse
+        // enquanto o worker periódico já estava no meio do próprio ciclo de
+        // sync, as duas chamadas rodavam de verdade em paralelo — cada uma
+        // com seu próprio contador de página, gerando exatamente o padrão
+        // de "duas sequências de página intercaladas" visto nos logs.
+        // Escopo de módulo (fora de setupKpiWebSocket) para persistir
+        // corretamente através de reconexões.
+        let _wsFirstAuthDoneEver = false;
+
         let _kpiReconnectDelay = 3000; // declarado fora para persistir entre reconexões
 
         function _connectKpiWs() {
@@ -8362,7 +8513,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _kpiReconnectDelay = 3000; // reset ao conectar com sucesso
             };
 
-            let _wsFirstAuthDone = false;
             wsKpi.onmessage = (e) => {
                 let data;
                 try { data = JSON.parse(e.data); } catch { return; }
@@ -8385,9 +8535,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         set('done-count-badge',    ps.done || 0);
                     }
 
-                    // Primeira mensagem autenticada: sync pedidos + recarrega board
-                    if (data.authenticated && !_wsFirstAuthDone) {
-                        _wsFirstAuthDone = true;
+                    // Primeira mensagem autenticada DA VIDA DA PÁGINA: sync
+                    // pedidos + recarrega board. NÃO repete em reconexões.
+                    if (data.authenticated && !_wsFirstAuthDoneEver) {
+                        _wsFirstAuthDoneEver = true;
                         fetch('/api/pending-orders/sync', { method: 'POST' }).catch(() => {});
                         const prodTab = document.getElementById('tab-producao');
                         if (prodTab && prodTab.classList.contains('active')) {
@@ -8405,7 +8556,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
 
             wsKpi.onclose = () => {
-                _wsFirstAuthDone = false;
                 setTimeout(() => {
                     _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
                     _connectKpiWs();
@@ -9093,7 +9243,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
-    
+
+    # ═══════════════════════════════════════════════════════════════════
+    # MARCA DE BUILD — resposta definitiva para "esse deploy já tem a
+    # correção X?" sem depender de lembrar quando algo foi deployado.
+    # Aparece LOGO nas primeiras linhas de log de todo boot de processo.
+    # Se esta linha não aparecer no log do Render após um deploy, o
+    # deploy não pegou este arquivo — não é preciso adivinhar mais.
+    # ═══════════════════════════════════════════════════════════════════
+    logging.getLogger('bling_automacao').critical(
+        "🏗️  BUILD_ID=2026-07-02-sync-guard-v3-token-based | "
+        "PID=%d | Inclui: fix do reconnect de WebSocket disparando sync "
+        "duplicado + guard atômico via MongoDB (token-based) em "
+        "process_sales_orders + DistributedWorkerLock entre processos. "
+        "Se você está confirmando se este deploy tem essas correções: tem, "
+        "se esta linha apareceu.",
+        os.getpid()
+    )
+
     # 1. Inicializa as dependências na ordem correta
     config = Config()
     
