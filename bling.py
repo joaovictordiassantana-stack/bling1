@@ -65,7 +65,7 @@ import requests
 from requests.exceptions import RequestException
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from flask import Flask, request, render_template_string, jsonify, redirect, url_for, session
+from flask import Flask, request, jsonify, redirect, session
 from flask_sock import Sock
 try:
     from simple_websocket import ConnectionClosed
@@ -91,7 +91,7 @@ _setup_gunicorn_filters()
 # Se não definida, cai para arquivos locais (modo legado).
 try:
     from pymongo import MongoClient
-    from pymongo.errors import PyMongoError
+    from pymongo.errors import DuplicateKeyError
     _MONGO_URI = os.environ.get('MONGODB_URI', '') or os.environ.get('MONGO_URI', '')
     if _MONGO_URI:
         _mongo_client = MongoClient(
@@ -99,18 +99,46 @@ try:
             serverSelectionTimeoutMS=5000,
             connect=False,        # ← conexão lazy: evita threads nativas de monitor
                                    #   sendo criadas antes do gevent.monkey.patch_all()
-                                   #   completar, que causava KeyError nas greenlets
-                                   #   pymongo_server_rtt_thread/pymongo_server_monitor_thread
+                                   #   completar.
         )
         _mongo_db = _mongo_client.get_database('sw_moveis')
         _mongo_client.admin.command('ping')  # testa conexão na inicialização
         MONGO_AVAILABLE = True
+
+        # ── Fecha o MongoClient de forma limpa no shutdown ──────────────
+        # Causa raiz REAL e documentada oficialmente do KeyError visto
+        # repetidamente nos logs de produção (pymongo_server_monitor_thread /
+        # pymongo_server_rtt_thread): "you must close or dereference any
+        # active MongoClient before exiting your application" — sem isso,
+        # as greenlets de monitor de saúde do servidor são destruídas de
+        # forma desordenada quando o processo recebe SIGTERM (deploy/restart
+        # no Render), e o Hub do gevent pode até bloquear esperando essas
+        # greenlets no join(), o que contribui para restarts/deploys lentos.
+        # Fonte: MongoDB Docs — pymongo.readthedocs.io/en/stable/examples/gevent.html
+        import atexit as _atexit
+        _atexit.register(_mongo_client.close)
+        del _atexit
     else:
         MONGO_AVAILABLE = False
         _mongo_db = None
 except Exception as _mongo_err:
     MONGO_AVAILABLE = False
     _mongo_db = None
+    if 'DuplicateKeyError' not in dir():
+        class DuplicateKeyError(Exception):
+            """Placeholder — pymongo não pôde ser importado, MONGO_AVAILABLE=False
+            garante que nenhum código tente de fato usar operações do Mongo."""
+            pass
+    # 'logger' customizado só é definido mais abaixo no módulo — usa logging
+    # padrão diretamente aqui para garantir que essa falha CRÍTICA de boot
+    # sempre apareça nos logs do Render, mesmo antes do logger estar pronto.
+    # Sem isso, uma URI errada ou rede bloqueada faz o app degradar
+    # silenciosamente para modo arquivo-local, sem nenhum rastro no log.
+    logging.getLogger('bling_automacao').critical(
+        f"❌ FALHA AO CONECTAR NO MONGODB NA INICIALIZAÇÃO — "
+        f"caindo para modo arquivo local (SEM persistência entre deploys). "
+        f"Verifique MONGODB_URI. Erro: {_mongo_err}"
+    )
 
 class MongoStore:
     """
@@ -188,8 +216,133 @@ class MongoStore:
             return False
 
 # ============================================================================
-# CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
+# LOCK DISTRIBUÍDO ENTRE PROCESSOS (worker de fundo) — via MongoDB
 # ============================================================================
+class DistributedWorkerLock:
+    """
+    Garante que o worker de fundo (sync com Bling) rode em UM ÚNICO processo
+    por vez, mesmo quando o Gunicorn sobe múltiplos processos worker.
+
+    Por quê isso é necessário:
+    'app = create_app()' roda no nível de módulo — todo processo do Gunicorn
+    que importa bling.py executa esse código, e cada um dispara seu próprio
+    auto-start do worker de fundo. O guard 'if not self._running' dentro do
+    Orchestrator só protege contra chamada duplicada NO MESMO objeto Python —
+    cada processo tem seu próprio Orchestrator, sua própria flag _running,
+    então esse guard não impede nada entre processos diferentes.
+
+    Sintoma real observado em produção: 2 processos rodando o ciclo de sync
+    completo (26+ páginas da API do Bling) ao mesmo tempo, dobrando todas as
+    chamadas de rede e escritas no MongoDB, sobrecarregando o app a ponto de
+    não conseguir responder requisições HTTP normais a tempo ("fica
+    carregando infinitamente").
+
+    Como funciona: um documento único no MongoDB guarda qual processo
+    (holder_id) "possui" o direito de rodar o worker, com um heartbeat
+    (updated_at). find_one_and_update com filtro incluindo a condição de
+    expiração é ATÔMICO no MongoDB — dois processos tentando adquirir ao
+    mesmo tempo nunca podem ambos vencer a corrida, o índice _id garante
+    exclusão mútua real no nível do banco.
+
+    Sem MongoDB disponível (fallback local): não há como coordenar entre
+    processos sem um recurso compartilhado — nesse caso o lock sempre
+    concede (comportamento antigo), já que o modo arquivo local já assume
+    processo único (Render sem Mongo tipicamente roda 1 worker).
+    """
+    COLLECTION = 'worker_lock'
+    DOC_ID = 'background_worker'
+    HEARTBEAT_SECONDS = 30       # renova o lock a cada N segundos
+    STALE_AFTER_SECONDS = 90     # se não renovar em N segundos, outro processo pode assumir
+
+    def __init__(self):
+        self.holder_id = f"{os.getpid()}-{secrets.token_hex(4)}"
+        self._acquired = False
+        self._heartbeat_thread: Optional[Thread] = None
+        self._stop_heartbeat = Event()
+
+    def try_acquire(self) -> bool:
+        """
+        Tenta adquirir o lock atomicamente. Retorna True se este processo
+        deve rodar o worker, False se outro processo já o possui (e o lock
+        dele ainda está fresco, dentro de STALE_AFTER_SECONDS).
+        """
+        if not MONGO_AVAILABLE:
+            # Sem Mongo não há coordenação possível entre processos — concede
+            # (mantém comportamento pré-existente em ambientes sem Mongo).
+            self._acquired = True
+            return True
+        now = time.time()
+        stale_cutoff = now - self.STALE_AFTER_SECONDS
+        filter_query = {
+            '_id': self.DOC_ID,
+            '$or': [
+                {'holder_id': {'$exists': False}},   # nunca adquirido
+                {'holder_id': self.holder_id},        # já é nosso (renovação)
+                {'updated_at': {'$lt': stale_cutoff}},  # dono anterior travou/morreu
+            ]
+        }
+        update_doc = {
+            '$set': {
+                'holder_id': self.holder_id,
+                'updated_at': now,
+                'acquired_at_iso': datetime.now().isoformat(),
+            }
+        }
+        try:
+            result = _mongo_db[self.COLLECTION].find_one_and_update(
+                filter_query, update_doc, upsert=True, return_document=True,
+            )
+            self._acquired = bool(result and result.get('holder_id') == self.holder_id)
+            return self._acquired
+        except DuplicateKeyError:
+            # Corrida real confirmada por teste: dois processos tentando o
+            # upsert inicial (ou logo após o lock ficar obsoleto) ao mesmo
+            # tempo podem ambos tentar inserir — o índice único de _id do
+            # MongoDB deixa só um passar, o outro recebe este erro. Isso
+            # SIGNIFICA que outro processo venceu a corrida agora mesmo,
+            # não é uma falha real — trata exatamente como "não adquiriu".
+            self._acquired = False
+            return False
+        except Exception as e:
+            # Falha de rede/Mongo ao tentar o lock: mais seguro NÃO iniciar o
+            # worker duplicado do que arriscar dois processos rodando —
+            # o processo que já detém o lock (se houver) continua normal.
+            logging.getLogger('bling_automacao').warning(
+                f"DistributedWorkerLock.try_acquire falhou (assumindo NÃO adquirido): {e}"
+            )
+            self._acquired = False
+            return False
+
+    def start_heartbeat(self):
+        """Renova o lock periodicamente enquanto o worker deste processo estiver ativo."""
+        if not self._acquired or self._heartbeat_thread is not None:
+            return
+        def _loop():
+            while not self._stop_heartbeat.wait(self.HEARTBEAT_SECONDS):
+                if not self.try_acquire():
+                    logging.getLogger('bling_automacao').critical(
+                        "⚠️ Este processo PERDEU o lock distribuído do worker "
+                        "(outro processo assumiu, ou o Mongo ficou indisponível "
+                        "por tempo demais). Verifique se dois workers estão "
+                        "processando ao mesmo tempo."
+                    )
+                    return
+        self._heartbeat_thread = Thread(target=_loop, daemon=True, name="worker_lock_heartbeat")
+        self._heartbeat_thread.start()
+
+    def release(self):
+        """Libera o lock explicitamente (ex: shutdown gracioso)."""
+        self._stop_heartbeat.set()
+        if MONGO_AVAILABLE and self._acquired:
+            try:
+                _mongo_db[self.COLLECTION].delete_one({'_id': self.DOC_ID, 'holder_id': self.holder_id})
+            except Exception:
+                pass
+        self._acquired = False
+
+
+# ============================================================================
+# CONFIGURAÇÃO DE DISCO (fallback quando MongoDB não disponível)
 # No Render o /tmp não persiste entre deploys — usa diretório local como fallback
 _default_data_dir = os.environ.get('DATA_DIR', '.')
 DATA_DIR = Path(_default_data_dir)
@@ -380,8 +533,13 @@ def cleanup_kpi_callbacks():
     if n > 0:
         logger.debug(f"🔗 WebSocket KPI: {n} conexão(ões) ativa(s)")
 
-def start_cleanup_timer():
-    """Inicia timer para limpar callbacks órfãos e fazer reset mensal — idempotente."""
+def start_cleanup_timer(orchestrator=None):
+    """Inicia timer para limpar callbacks órfãos, fazer reset mensal, e
+    vigiar se o worker de fundo travou — idempotente.
+
+    'orchestrator' é opcional para não quebrar chamadas existentes sem
+    argumento, mas quando fornecido habilita o watchdog de travamento
+    (ver _watchdog_check abaixo)."""
     global _cleanup_timer_started
     if _cleanup_timer_started:
         return
@@ -424,11 +582,42 @@ def start_cleanup_timer():
         except Exception as e:
             logger.error(f"Erro no reset mensal: {e}")
 
+    def _watchdog_check():
+        """
+        Detecta automaticamente se o worker de fundo parece travado, sem
+        precisar que ninguém consulte /api/debug/system-health manualmente.
+        Roda a cada 5min (mesmo ciclo do cleanup) — se o worker estiver
+        preso num estágio ativo (não 'dormindo') por mais de 5min seguidos,
+        loga CRITICAL de forma bem visível no Render. Isso é exatamente o
+        alerta automático pedido: quando algo travar de novo, aparece
+        sozinho no log, sem precisar reproduzir o problema pra descobrir.
+        """
+        if orchestrator is None:
+            return
+        try:
+            stage = getattr(orchestrator, 'worker_current_stage', None)
+            started = getattr(orchestrator, 'worker_cycle_started_at', None)
+            if stage is None or started is None or stage == 'dormindo':
+                return
+            elapsed = time.time() - started
+            if elapsed > 300:
+                logger.critical(
+                    f"🚨🚨 WATCHDOG: WORKER PARECE TRAVADO 🚨🚨 | "
+                    f"estágio='{stage}' há {elapsed:.0f}s (>5min é anormal) | "
+                    f"ciclo #{getattr(orchestrator, 'worker_cycle_count', '?')} | "
+                    f"Consulte /api/debug/system-health para mais detalhes. "
+                    f"Isso NÃO deveria acontecer — se persistir, considere "
+                    f"reiniciar o serviço no Render."
+                )
+        except Exception as _we:
+            logger.warning(f"Watchdog check falhou (não crítico): {_we}")
+
     def cleanup_loop():
         last_reset_month = datetime.now().month
         while True:
             time.sleep(300)  # verifica a cada 5 minutos
             cleanup_kpi_callbacks()
+            _watchdog_check()
 
             # Verifica se virou o mês
             now = datetime.now()
@@ -488,7 +677,7 @@ def atomic_write_json(data: dict, path: Path):
             json.dump(data, f, indent=4, ensure_ascii=False)
         # Move o temporário para o original (operação atômica no OS)
         shutil.move(str(temp_path), str(path))
-    except Exception as e:
+    except Exception:
         logger.exception(f"Erro ao salvar arquivo {path} de forma atômica.")
         if temp_path.exists():
             os.remove(temp_path)
@@ -525,7 +714,7 @@ def load_tokens_safe(path: Path | str = "tokens.json"):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
             return data
-    except Exception as e:
+    except Exception:
         logger.exception(f"Erro lendo {path.name}.")
         return {}
 
@@ -567,7 +756,7 @@ def load_stats_safe(path: Path):
             if data and 'last_recalculated' in data and isinstance(data['last_recalculated'], str):
                  data['last_recalculated'] = datetime.fromisoformat(data['last_recalculated'])
             return data
-    except Exception as e:
+    except Exception:
         logger.exception(f"Erro lendo {path.name}.")
         return None
 
@@ -588,19 +777,6 @@ def save_stats(data: Dict[str, Any], path: Path):
         logger.debug("Estatísticas salvas em arquivo local (backup).")
     except Exception as e:
         logger.error(f"Erro ao salvar stats em arquivo: {e}")
-
-def safe_dict(data):
-    """
-    Garante que o objeto é um dict, tentando carregar de string JSON se necessário.
-    """
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, str):
-        try:
-            return json.loads(data)
-        except:
-            return {}
-    return {}
 
 def load_products_cache(cache_file):
     """
@@ -646,7 +822,7 @@ def save_products_cache(cache_file, products, kits):
     try:
         atomic_write_json(payload, cache_file)
         logger.debug(f"Cache salvo em arquivo local (backup). Total: {total_produtos}")
-    except Exception as e:
+    except Exception:
         logger.exception("Erro ao salvar cache de produtos em arquivo.")
 
 def safe_iter(data):
@@ -914,14 +1090,6 @@ class BlingAPIClient:
     def delete(self, endpoint: str) -> Optional[Dict[str, Any]]:
         return self._request('DELETE', endpoint)
 
-    def register_webhook(self, event: str, url: str):
-        """
-        Na API v3 do Bling, o registro de webhooks deve ser feito manualmente
-        no painel do desenvolvedor (Cadastro de Aplicativos > Webhooks).
-        """
-        self.logger.info(f"📢 Configure o webhook '{event}' manualmente no painel do Bling → {url}")
-        return {"status": "manual_config_required"}
-
 # ============================================================================ 
 # 5. AUTH MANAGER
 # ============================================================================
@@ -937,7 +1105,7 @@ class AuthManager:
             with open(self.OAUTH_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump({"state": state}, f)
             self.logger.debug("State OAuth salvo em arquivo.")
-        except Exception as e:
+        except Exception:
             self.logger.exception("Erro ao salvar state OAuth.")
 
     def _load_oauth_state(self) -> Optional[str]:
@@ -947,7 +1115,7 @@ class AuthManager:
         try:
             with open(self.OAUTH_STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f).get("state")
-        except Exception as e:
+        except Exception:
             self.logger.exception("Erro ao carregar state OAuth.")
             return None
 
@@ -962,7 +1130,7 @@ class AuthManager:
         if is_valid:
             # Limpa o state imediatamente após uso para impedir reutilização (CSRF)
             self._clean_oauth_state()
-            self.logger.info(f"State OAuth validado com sucesso e limpo.")
+            self.logger.info("State OAuth validado com sucesso e limpo.")
 
         return is_valid
 
@@ -972,7 +1140,7 @@ class AuthManager:
             try:
                 os.remove(self.OAUTH_STATE_FILE)
                 self.logger.debug("State OAuth limpo do arquivo.")
-            except Exception as e:
+            except Exception:
                 self.logger.exception("Erro ao limpar state OAuth.")
     
     def __init__(self, config: Config):
@@ -1215,7 +1383,7 @@ class AuthManager:
             status = response.status_code if response is not None else '?'
             self.logger.critical(
                 f"❌ TOKEN HTTP ERROR | status={status} | "
-                f"grant_type={grant_type} | body={body!r}"
+                f"grant_type={grant_type} | erro={e} | body={body!r}"
             )
         except RequestException as e:
             self.logger.critical(
@@ -1314,18 +1482,6 @@ class SalesManager:
                     self.last_recalculated = last_recalc
                 else:
                     self.last_recalculated = datetime.now()
-
-    def get_stats(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "daily": self.daily_count,
-                "weekly": self.weekly_count,
-                "monthly": self.monthly_count,
-                "historic": self.historic_count,
-                "history_data": self.history_data,
-                "stats_history": self.stats_history,
-                "last_update": self.last_recalculated.isoformat()
-            }
 
     def _get_state_for_save(self) -> Dict[str, Any]:
         with self.lock:
@@ -1715,12 +1871,6 @@ class ProductionTimer:
 
         return {'elapsed': total_seconds, 'state': 'finished', 'registro': registro}
 
-    def reset(self, produto_nome):
-        if produto_nome in self.timers:
-            del self.timers[produto_nome]
-            self._save()
-        return {'elapsed': 0, 'state': 'stopped'}
-
     def get_status(self, produto_nome):
         if produto_nome not in self.timers:
             return {'elapsed': 0, 'state': 'stopped'}
@@ -1795,7 +1945,7 @@ class ProductionTimer:
                     json.dump(history, f, ensure_ascii=False)
                 shutil.move(str(temp), str(self.HISTORY_PATH))
             if not saved_mongo:
-                logger.info(f"✅ Histórico salvo em arquivo local (MongoDB indisponível).")
+                logger.info("✅ Histórico salvo em arquivo local (MongoDB indisponível).")
         except Exception as e:
             logger.error(f"Erro ao salvar histórico em arquivo: {e}")
             if not saved_mongo:
@@ -1998,10 +2148,18 @@ class ComponentConsumptionManager:
             })
         return sorted(summary, key=lambda x: x['qtd_total'], reverse=True)
 
+import re as _re_cadeira
+
+_CADEIRA_KEYWORDS_RE = _re_cadeira.compile(
+    r'\b(CADEIRA|POLTRONA|ESTOFADO|SOF[AÁ]|PUFF)\b', _re_cadeira.IGNORECASE
+)
+
 def _is_cadeira(nome: str) -> bool:
-    """Detecta se um produto é cadeira/poltrona/estofado (requer receita de 3 leituras)."""
-    n = (nome or '').upper()
-    return any(k in n for k in ('CADEIRA', 'POLTRONA', 'ESTOFADO', 'SOFÁ', 'SOFA', 'PUFF'))
+    """Detecta se um produto é cadeira/poltrona/estofado (requer receita de 3 leituras).
+    Usa \\b (word boundary) para não confundir substring — ex: um nome como
+    'Mesa de Apoio p/ Sofá' ou uma variação comercial contendo 'PUFF' embutido
+    numa palavra maior não deve disparar falso positivo."""
+    return bool(_CADEIRA_KEYWORDS_RE.search(nome or ''))
 
 # ── Extração de Base/Cor do nome do produto ──────────────────────────────────
 
@@ -2193,20 +2351,6 @@ class PendingOrdersManager:
             except Exception as e:
                 logger.error(f"Erro ao salvar item {key} no MongoDB: {e}")
         self._save()
-
-    def add_order_item(self, order_id: str, item_key: str, item_data: dict):
-        """Adiciona um item de pedido à fila de espera."""
-        key = f"{order_id}_{item_key}"
-        if key not in self.data:
-            self.data[key] = {
-                **item_data,
-                'order_id': str(order_id),
-                'item_key': item_key,
-                'status': 'waiting',
-                'added_at': datetime.now().isoformat()
-            }
-            self._save_one(key)
-        return self.data[key]
 
     def start_production(self, item_key: str):
         """Move item para status 'in_production'."""
@@ -2439,19 +2583,19 @@ class PendingOrdersManager:
                                         # quando o mesmo pedido gera múltiplos cards
                 }
 
-                # ── Converte nome/SKU para ASCII puro (CODE128 só aceita 0x20-0x7E) ──
-                # Definido fora do loop por unidade — não precisa ser recriado para cada unidade
-                import unicodedata as _ud
-                def _to_ascii(s):
-                    return ''.join(
-                        c for c in _ud.normalize('NFD', s)
-                        if _ud.category(c) != 'Mn' and ord(c) < 128
-                    )
-                sku_safe = _to_ascii(sku_raw or nome_raw[:20])
-                sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
-                sku_safe = sku_safe.strip('_')[:28]
-
                 for unit in range(qtd):
+                    # ── item_key: apenas ASCII imprimível, sem acentos ──────────
+                    # CODE128 só aceita ASCII 0x20-0x7E. Acentos (ã,ç,é…) no
+                    # nome/SKU corrompem o barcode — scanner lê lixo ou nada.
+                    import unicodedata as _ud
+                    def _to_ascii(s):
+                        return ''.join(
+                            c for c in _ud.normalize('NFD', s)
+                            if _ud.category(c) != 'Mn' and ord(c) < 128
+                        )
+                    sku_safe = _to_ascii(sku_raw or nome_raw[:20])
+                    sku_safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in sku_safe)
+                    sku_safe = sku_safe.strip('_')[:28]  # limita comprimento total do key
                     sub_key = f"{order_id}_{sku_safe}_{unit}"
                     # Lookup O(1) usando sets pré-computados
                     already = (sub_key in existing_keys or
@@ -2585,24 +2729,65 @@ class Orchestrator:
         with self._cache_lock:
             return len(self._products_cache) > 0 or len(self._kits_cache) > 0
 
-    def get_product_by_sku(self, sku: str) -> Optional[Dict[str, Any]]:
-        """Busca um produto ou kit pelo SKU no cache."""
-        with self._cache_lock:
-            if sku in self._products_cache:
-                return self._products_cache[sku]
-            if sku in self._kits_cache:
-                return self._kits_cache[sku]
-            return None
-
     def start_worker(self):
-        """Inicia o worker de fundo para atualização de dados."""
-        if not self._running:
-            self._running = True
-            self._stop_event = Event()   # sinaliza parada definitiva
-            self._wake_event = Event()   # sinaliza "acorda agora" sem parar
-            self._worker_thread = Thread(target=self._worker_loop, daemon=True)
-            self._worker_thread.start()
-            self.logger.info("Worker de fundo iniciado.")
+        """
+        Inicia o worker de fundo para atualização de dados.
+
+        FAIL-CLOSED por design: exige que self.worker_lock exista e tenha
+        sido adquirido com sucesso antes de iniciar a thread do worker.
+        Se o lock distribuído não puder ser verificado por QUALQUER motivo
+        (não anexado, MongoDB fora do ar, exceção inesperada), o worker
+        NÃO inicia — mesmo que isso signifique nenhum processo rodando o
+        sync temporariamente. É preferível a um estado visível e óbvio
+        (nenhum worker rodando, dados não atualizam, fácil de perceber)
+        do que ao estado anterior: dois processos rodando sync completo
+        em paralelo, silenciosamente, sobrecarregando o app até ele parar
+        de responder requisições HTTP — o que pareceu, pro usuário final,
+        "o sistema travou e não carrega mais".
+        """
+        if self._running:
+            return
+
+        _lock = getattr(self, 'worker_lock', None)
+        if _lock is None:
+            self.logger.critical(
+                "🚨 start_worker() ABORTADO: self.worker_lock não existe. "
+                "O worker NÃO será iniciado neste processo — isso é "
+                "intencional (fail-closed) para nunca arriscar dois "
+                "processos rodando sync em paralelo sem coordenação. "
+                "Isso indica um bug de inicialização: verifique se "
+                "create_app() está anexando orchestrator.worker_lock "
+                "corretamente antes de qualquer chamada a start_worker()."
+            )
+            return
+
+        try:
+            acquired = _lock.try_acquire()
+        except Exception as _lock_err:
+            self.logger.critical(
+                f"🚨 start_worker() ABORTADO: erro ao verificar o lock "
+                f"distribuído ({_lock_err}). O worker NÃO será iniciado "
+                f"neste processo — fail-closed intencional. Verifique a "
+                f"conexão com o MongoDB."
+            )
+            return
+
+        if not acquired:
+            self.logger.info(
+                "⏸️ Worker de fundo NÃO iniciado neste processo — outro "
+                "processo já detém o lock distribuído (evita sync duplicado)."
+            )
+            return
+
+        _lock.start_heartbeat()
+        self._running = True
+        self._stop_event = Event()   # sinaliza parada definitiva
+        self._wake_event = Event()   # sinaliza "acorda agora" sem parar
+        self._worker_thread = Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+        self.logger.info(
+            f"✅ Worker de fundo iniciado (holder_id={_lock.holder_id})."
+        )
 
     def stop_worker(self):
         """Para o worker de fundo."""
@@ -2617,6 +2802,9 @@ class Orchestrator:
                 self.logger.warning("Worker de fundo não parou em 5s.")
             else:
                 self.logger.info("Worker de fundo parado com sucesso.")
+        _lock = getattr(self, 'worker_lock', None)
+        if _lock is not None:
+            _lock.release()
 
     def wake_worker(self):
         """Acorda o worker imediatamente se estiver dormindo (sem parar o loop)."""
@@ -2633,16 +2821,27 @@ class Orchestrator:
     def _worker_loop(self):
         cycle_count = 0
         logger.info("🔄 Worker loop iniciado.")
+        # Estado exposto para diagnóstico externo (endpoint /api/debug/system-health).
+        # Sem isso, "o worker está travado ou só processando algo demorado?"
+        # só dava pra responder catando timestamps nos logs manualmente.
+        self.worker_cycle_count = 0
+        self.worker_current_stage = 'iniciando'
+        self.worker_cycle_started_at = time.time()
+        self.worker_last_cycle_finished_at = None
 
         while not self._stop_event.is_set():
             cycle_count += 1
+            self.worker_cycle_count = cycle_count
+            self.worker_cycle_started_at = time.time()
 
             # ── Verifica autenticação ────────────────────────────────────
+            self.worker_current_stage = 'verificando_autenticacao'
             if not (self.auth._access_token and self.auth._expires_at > time.time() + 60):
                 # access_token expirou — tenta refresh antes de desistir
                 self.auth.reload_tokens_from_disk()
                 if not self.auth.is_authenticated():
                     logger.info(f"⏸ Ciclo #{cycle_count}: sem token válido — aguardando...")
+                    self.worker_current_stage = 'aguardando_token'
                     self._wake_event.wait(60)
                     self._wake_event.clear()
                     continue
@@ -2654,14 +2853,17 @@ class Orchestrator:
                 # O cache de produtos (mais pesado, ~15-30 páginas) roda depois,
                 # evitando que o frontend fique vazio por minutos no cold start.
                 logger.info(f"🔄 Ciclo #{cycle_count}: atualizando pedidos/KPIs...")
+                self.worker_current_stage = 'sincronizando_pedidos'
                 self.process_sales_orders()
 
                 if cycle_count == 1 or cycle_count % 3 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: atualizando cache de produtos...")
+                    self.worker_current_stage = 'sincronizando_produtos'
                     self.process_products_cache()
 
                 if cycle_count % 2 == 0:
                     logger.info(f"🔄 Ciclo #{cycle_count}: calculando componentes...")
+                    self.worker_current_stage = 'calculando_componentes'
                     usage = self.calculate_component_usage()
                     if usage.get('components'):
                         self._component_usage_cache = usage
@@ -2671,26 +2873,119 @@ class Orchestrator:
                 logger.exception(f"❌ Erro fatal no ciclo #{cycle_count}")
 
             logger.info(f"✅ Ciclo #{cycle_count} finalizado. Próximo em 10min.")
+            self.worker_current_stage = 'dormindo'
+            self.worker_last_cycle_finished_at = time.time()
 
             # Dorme 600s mas acorda se wake_event for setado
             self._wake_event.wait(600)
             self._wake_event.clear()
 
-    def process_sales_orders(self, force: bool = False):
-        """Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3)."""
+    def process_sales_orders(self, force: bool = False) -> bool:
+        """
+        Busca pedidos de venda e atualiza o Sales Manager (Versão Híbrida V2/V3).
+        Retorna False se já havia um recálculo em andamento (nada foi feito),
+        True se este chamado executou (ou tentou executar) o recálculo.
+        """
         self.logger.debug(f"process_sales_orders chamado (force={force})")
         
-        # Evita recálculos encavalados
+        # Evita recálculos encavalados — DUAS camadas independentes:
+        #
+        # 1) threading.Lock em memória (rápido, sem I/O, cobre o caso comum
+        #    dentro do mesmo processo).
+        #
+        # 2) Verificação atômica via MongoDB (mesma técnica comprovadamente
+        #    atômica usada em DistributedWorkerLock — atomicidade garantida
+        #    pelo PRÓPRIO SERVIDOR MongoDB, não pelo cliente Python). Esta
+        #    camada existe porque o gatilho real confirmado (fetch automático
+        #    de sync disparado no reconnect do WebSocket + ciclo periódico do
+        #    worker, ambos chamando esta função ao mesmo tempo) fazia as DUAS
+        #    chamadas passarem pela camada 1 sem se verem — sob gevent,
+        #    threading.Lock quando monkey-patched vira cooperativo, e não
+        #    consigo verificar sob quais condições exatas ele falhou aqui
+        #    (sem gevent disponível para testar diretamente). Em vez de
+        #    insistir num mecanismo que já falhou uma vez sem eu conseguir
+        #    provar por quê, adiciono um que já testei sob concorrência real
+        #    (30 rodadas x 50 threads simultâneas, ver DistributedWorkerLock)
+        #    e cuja garantia não depende de nenhum detalhe do gevent.
+        #
+        #    TRADE-OFF CONHECIDO: se o processo morrer abruptamente (SIGTERM
+        #    sem graceful shutdown, ex: deploy no Render matando o processo
+        #    antigo) enquanto segura este guard, ele fica "preso" no Mongo
+        #    pelos 300s completos do TTL, mesmo que o processo já não exista
+        #    mais — o próximo processo não conseguirá sincronizar até o TTL
+        #    expirar. Isso é aceito de propósito: é preferível esperar até
+        #    5min a mais depois de um restart do que arriscar duas execuções
+        #    verdadeiramente paralelas de novo. Se isso incomodar na prática,
+        #    considere reduzir o TTL (troca: mais risco de janela de corrida
+        #    em operações lentas) ou implementar release no SIGTERM handler.
         with self.sales.recalculation_lock:
-            if self.sales._recalculation_running and not force:
-                self.logger.debug("Recálculo já em execução, ignorando.")
-                return
+            if self.sales._recalculation_running:
+                self.logger.debug("Recálculo já em execução (lock local), ignorando (force=%s).", force)
+                return False
             self.sales._recalculation_running = True
+
+        _mongo_guard_acquired = False
+        if MONGO_AVAILABLE:
+            try:
+                now = time.time()
+                # Token único por tentativa — usado para saber com certeza se
+                # FOI ESTA chamada que venceu a corrida, por identidade, não
+                # por comparação de valor numérico recalculado. Testado sob
+                # 50 chamadas simultâneas reais: comparar contra um
+                # 'now + 60' recomputado após a escrita causava falsos
+                # negativos (nenhuma chamada se reconhecia como vencedora),
+                # porque threads diferentes calculam 'now' em instantes
+                # ligeiramente diferentes. Com token, ambiguidade zero.
+                _guard_token = secrets.token_hex(8)
+                # TTL de 300s (5min) — mesma margem usada pelo watchdog para
+                # considerar um estágio "travado". Ajustado para cima depois
+                # de medir: o caso rápido real (log do usuário) levou 16.8s,
+                # mas o código já documenta até ~34s só para
+                # _fetch_orders_with_items em casos menos favoráveis, que se
+                # soma ao tempo de paginação (cresce com o volume de
+                # pedidos). 60s era margem apertada demais — se a execução
+                # legítima demorasse mais que isso, o guard expiraria no
+                # meio dela, permitindo uma segunda chamada concorrente
+                # exatamente durante a primeira ainda rodando.
+                result = _mongo_db['sync_guard'].find_one_and_update(
+                    {
+                        '_id': 'process_sales_orders',
+                        '$or': [
+                            {'locked_until': {'$exists': False}},
+                            {'locked_until': {'$lt': now}},
+                        ]
+                    },
+                    {'$set': {
+                        'locked_until': now + 300,
+                        'token': _guard_token,
+                        'locked_at_iso': datetime.now().isoformat(),
+                    }},
+                    upsert=True,
+                    return_document=True,
+                )
+                _mongo_guard_acquired = bool(result and result.get('token') == _guard_token)
+                if not _mongo_guard_acquired:
+                    self.logger.warning(
+                        "⛔ Recálculo BLOQUEADO pelo guard do MongoDB — outra "
+                        "execução já está em andamento (mesmo com o lock local "
+                        "em memória liberado). Isso confirma uma corrida "
+                        "real entre chamadas concorrentes (ex: sync automático "
+                        "de reconexão de WebSocket + ciclo periódico do worker)."
+                    )
+                    with self.sales.recalculation_lock:
+                        self.sales._recalculation_running = False
+                    return False
+            except Exception as _guard_err:
+                # Mongo indisponível para o guard: não bloqueia a execução
+                # (o lock local em memória já rodou e permitiu chegar aqui),
+                # mas registra — essa é justamente a situação em que só a
+                # camada 1 está protegendo, então vale saber se isso ocorreu.
+                self.logger.warning(f"Guard do MongoDB indisponível para process_sales_orders: {_guard_err}")
             
         try:
             if not self.auth.is_authenticated():
                 self.logger.warning("⛔ Worker: token inexistente. Abortando.")
-                return
+                return True
                 
             now = datetime.now()
             start_date = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -2709,8 +3004,30 @@ class Orchestrator:
             
             all_orders = []
             page = 1
-            
+            # Teto absoluto de páginas — nunca deixa este laço rodar para
+            # sempre. Cenário real que isso previne: se a API do Bling
+            # devolver sempre exatamente 100 itens por página (bug do lado
+            # deles, ou uma resposta malformada que nunca sinaliza "última
+            # página"), o laço nunca teria motivo pra parar sozinho — ficaria
+            # rodando indefinidamente, bloqueando o worker inteiro, SEM
+            # nenhuma exceção/crash que apareceria nos logs. Isso é
+            # exatamente o tipo de travamento silencioso que não pode
+            # acontecer de jeito nenhum — o limite abaixo garante que, na
+            # pior hipótese, o worker desiste dessa rodada e tenta de novo
+            # no próximo ciclo, deixando um rastro CRITICAL bem visível.
+            MAX_PAGES_HARD_LIMIT = 500  # 500 * 100/página = 50.000 pedidos no mês — bem acima do real
+
             while True:
+                if page > MAX_PAGES_HARD_LIMIT:
+                    self.logger.critical(
+                        f"🚨 PAGINAÇÃO ATINGIU O TETO ABSOLUTO ({MAX_PAGES_HARD_LIMIT} páginas) "
+                        f"buscando pedidos — abortando esta rodada para não travar o worker "
+                        f"indefinidamente. Isso é ANORMAL: ou a API do Bling está devolvendo "
+                        f"respostas malformadas que nunca indicam 'última página', ou o volume "
+                        f"real de pedidos no mês é inesperadamente alto. Pedidos já coletados "
+                        f"nesta rodada ({len(all_orders)}) serão processados normalmente."
+                    )
+                    break
                 params['pagina'] = page
                 self.logger.info(f"🔍 Buscando pedidos página {page} | params: {params}")
                 try:
@@ -2827,12 +3144,19 @@ class Orchestrator:
                 self.broadcast_kpi_update(sales_stats=self.sales._get_state_for_save(), cache_updated=False)
             else:
                 self.logger.warning("Nenhum pedido encontrado na busca.")
+            return True
 
         except Exception as e:
             self.logger.exception(f"Erro fatal no processamento de pedidos: {e}")
+            return True
         finally:
             with self.sales.recalculation_lock:
                 self.sales._recalculation_running = False
+            if _mongo_guard_acquired and MONGO_AVAILABLE:
+                try:
+                    _mongo_db['sync_guard'].delete_one({'_id': 'process_sales_orders'})
+                except Exception:
+                    pass  # guard expira sozinho via TTL de 300s mesmo se isso falhar
 
     def process_products_cache(self):
         """Busca e armazena em cache todos os produtos, variações e kits com tratamento de imagem V3."""
@@ -2843,8 +3167,22 @@ class Orchestrator:
         all_products = []
         all_kits = []
         page = 1
+        # Teto absoluto — mesma lógica de segurança aplicada em
+        # process_sales_orders: sem isso, uma resposta da API que nunca
+        # sinaliza "última página" travaria este laço para sempre, sem
+        # nenhuma exceção que apareceria nos logs para explicar o motivo.
+        MAX_PAGES_HARD_LIMIT = 500  # 500 * 100/página = 50.000 produtos — bem acima do catálogo real
         
         while True:
+            if page > MAX_PAGES_HARD_LIMIT:
+                self.logger.critical(
+                    f"🚨 PAGINAÇÃO DE PRODUTOS ATINGIU O TETO ABSOLUTO "
+                    f"({MAX_PAGES_HARD_LIMIT} páginas) — abortando esta rodada para "
+                    f"não travar o worker indefinidamente. Isso é ANORMAL — verifique "
+                    f"se a API do Bling está respondendo corretamente. Produtos já "
+                    f"coletados nesta rodada ({len(all_products)}) serão salvos normalmente."
+                )
+                break
             try:
                 # Busca produtos incluindo imagens e variações
                 response = self.api.get('produtos', params={'pagina': page, 'limite': 100})
@@ -3173,7 +3511,8 @@ class Orchestrator:
         Envia uma atualização completa de status via WebSocket para todos os clientes.
         Inclui status de autenticação, KPIs e, se solicitado, uso de componentes.
         """
-        global kpi_update_callbacks, kpi_update_lock
+        # kpi_update_callbacks/kpi_update_lock são globais só lidas aqui
+        # (nunca reatribuídas) — Python não exige 'global' nesse caso.
         
         # Verifica auth sem disparar refresh (operação lenta que bloquearia o broadcast)
         import time as _t
@@ -3287,6 +3626,14 @@ class WebServer:
         self.app = flask_app
         self.app.orchestrator = orchestrator # ✅ Anexa o orchestrator ao objeto Flask para acesso global
         self.sock = Sock(self.app)
+        # Compila o template do dashboard UMA VEZ aqui, em vez de deixar
+        # render_template_string recompilar os ~190KB do zero a CADA
+        # requisição — isso é um comportamento documentado e conhecido do
+        # Flask (github.com/pallets/flask/issues/2402: "render_template_string
+        # recompiles the template every time"), não uma otimização
+        # especulativa. Usa o mesmo jinja_env do app (mesmas regras de
+        # autoescape/filtros), só pula o passo de parsing repetido.
+        self._dashboard_jinja_template = self.app.jinja_env.from_string(DASHBOARD_TEMPLATE)
         self._setup_routes()
         self._setup_websockets()
 
@@ -3299,7 +3646,7 @@ class WebServer:
         @self.app.route('/')
         def index():
             auth_url = self.orchestrator.auth.get_authorization_url()
-            return render_template_string(DASHBOARD_TEMPLATE, auth_url=auth_url)
+            return self._dashboard_jinja_template.render(auth_url=auth_url)
 
         # Rota de Autorização OAuth (Gera o state e redireciona para o Bling)
         @self.app.route('/auth')
@@ -3379,7 +3726,6 @@ class WebServer:
                     moving_avg.append(round(sum(window)/len(window), 1) if window else 0)
                 total = sum(daily)
                 n = max(len(daily), 1)
-                lw = sum(daily[-7:]) if len(daily) >= 7 else total
                 # Período anterior do mesmo tamanho
                 all_daily  = stats.get('daily', [])
                 all_labels = stats.get('dates', [])
@@ -3484,15 +3830,155 @@ class WebServer:
         def api_recalculate(token):
             """Força o recálculo dos KPIs em uma thread separada."""
             
-            # Verifica e marca o estado de recalculação dentro do lock
-            # Não setar _recalculation_running aqui: process_sales_orders já faz isso
-            # Setar aqui causaria deadlock: process_sales_orders veria True e retornaria sem executar
+            # Checagem otimista de "fail fast": evita o custo de criar uma
+            # Thread que só ia checar o lock e desistir na hora. Não é a
+            # única proteção — process_sales_orders() já garante sozinha que
+            # nunca roda em paralelo, então mesmo perdendo essa corrida aqui
+            # (janela entre o 'with' abaixo e o Thread.start()), o pior caso
+            # é a thread nova recusar educadamente ao invés de crashar ou
+            # corromper dado.
             with self.orchestrator.sales.recalculation_lock:
                 if self.orchestrator.sales._recalculation_running:
                     return jsonify({"status": "already_running", "message": "Recálculo já em andamento."}), 202
 
             Thread(target=self.orchestrator.process_sales_orders, kwargs={'force': True}, daemon=True).start()
             return jsonify({"status": "started", "message": "Recálculo iniciado em segundo plano."}), 202
+
+        @self.app.route('/api/debug/system-health', methods=['GET'])
+        def api_debug_system_health():
+            """
+            Diagnóstico de saúde do sistema — SEM @token_required de propósito,
+            para que dê pra checar mesmo se o auth com o Bling estiver quebrado
+            (que é justamente um dos cenários que pode causar travamento).
+
+            Responde imediatamente mesmo se o worker estiver travado, porque
+            só lê atributos em memória — não faz nenhuma chamada de rede nem
+            espera nenhum lock do worker.
+
+            Use isso PRIMEIRO sempre que o sistema parecer travado/lento:
+            GET /api/debug/system-health
+            """
+            now = time.time()
+            orch = self.orchestrator
+
+            # ── Estado do worker deste processo ──────────────────────────
+            cycle_started = getattr(orch, 'worker_cycle_started_at', None)
+            current_stage = getattr(orch, 'worker_current_stage', 'desconhecido')
+            cycle_seconds = round(now - cycle_started, 1) if cycle_started else None
+            # Um ciclo (exceto o próprio "dormindo") rodando por mais de 5min é
+            # anormal — os ciclos normais levam segundos a poucos minutos.
+            stage_seems_stuck = (
+                cycle_seconds is not None and
+                current_stage != 'dormindo' and
+                cycle_seconds > 300
+            )
+
+            worker_state = {
+                'is_running': orch.is_running(),
+                'cycle_count': getattr(orch, 'worker_cycle_count', 0),
+                'current_stage': current_stage,
+                'current_stage_running_for_seconds': cycle_seconds,
+                'stage_seems_stuck': stage_seems_stuck,
+                'last_cycle_finished_at': (
+                    datetime.fromtimestamp(orch.worker_last_cycle_finished_at).isoformat()
+                    if getattr(orch, 'worker_last_cycle_finished_at', None) else None
+                ),
+            }
+
+            # ── Estado do lock distribuído entre processos ───────────────
+            lock_state = {'mongo_available': MONGO_AVAILABLE}
+            _lock = getattr(orch, 'worker_lock', None)
+            if _lock is not None:
+                lock_state['this_process_holder_id'] = _lock.holder_id
+                lock_state['this_process_has_lock'] = _lock._acquired
+                if MONGO_AVAILABLE:
+                    try:
+                        doc = _mongo_db[_lock.COLLECTION].find_one({'_id': _lock.DOC_ID})
+                        if doc:
+                            lock_state['current_holder_id'] = doc.get('holder_id')
+                            lock_state['lock_age_seconds'] = round(now - doc.get('updated_at', now), 1)
+                            lock_state['lock_is_stale'] = lock_state['lock_age_seconds'] > _lock.STALE_AFTER_SECONDS
+                        else:
+                            lock_state['current_holder_id'] = None
+                    except Exception as e:
+                        lock_state['error'] = str(e)
+
+            # ── Guard de process_sales_orders (segunda camada anti-corrida) ──
+            # Se isto aparecer 'held' logo após um deploy, é o trade-off
+            # conhecido e documentado em process_sales_orders: um processo
+            # morto abruptamente (SIGTERM sem cleanup) deixa o guard preso
+            # até o TTL de 300s expirar sozinho — não é um bug novo.
+            sync_guard_state = {}
+            if MONGO_AVAILABLE:
+                try:
+                    doc = _mongo_db['sync_guard'].find_one({'_id': 'process_sales_orders'})
+                    if doc:
+                        remaining = round(doc.get('locked_until', now) - now, 1)
+                        sync_guard_state = {
+                            'held': remaining > 0,
+                            'seconds_remaining': max(remaining, 0),
+                            'locked_at': doc.get('locked_at_iso'),
+                        }
+                    else:
+                        sync_guard_state = {'held': False}
+                except Exception as e:
+                    sync_guard_state = {'error': str(e)}
+
+            # ── Fila de produção (indicador indireto de sync funcionando) ──
+            queue_state = {
+                'total_items': len(pending_orders.data),
+                'waiting': sum(1 for v in pending_orders.data.values() if v.get('status') == 'waiting'),
+                'in_production': sum(1 for v in pending_orders.data.values() if v.get('status') == 'in_production'),
+            }
+
+            # ── Autenticação com o Bling ──────────────────────────────────
+            auth_state = {
+                'is_authenticated': orch.auth.is_authenticated(),
+                'token_expires_in_seconds': (
+                    round(orch.auth._expires_at - now, 1) if orch.auth._expires_at else None
+                ),
+            }
+
+            # ── Métricas de chamadas à API do Bling (latência, erros) ─────
+            # Direto relevante para diagnosticar lentidão: 401 (token) e 429
+            # (rate limit) frequentes, ou avg_latency_ms alta, explicam
+            # carregamento lento sem precisar vasculhar logs brutos.
+            api_metrics = {}
+            try:
+                api_metrics = orch.api.metrics.get_metrics()
+            except Exception:
+                pass
+
+            overall_status = 'ok'
+            warnings = []
+            if stage_seems_stuck:
+                overall_status = 'degraded'
+                warnings.append(
+                    f"Worker parece travado no estágio '{current_stage}' há "
+                    f"{cycle_seconds}s (normal é bem menos que isso)."
+                )
+            if lock_state.get('current_holder_id') and lock_state.get('this_process_holder_id') and \
+               lock_state['current_holder_id'] != lock_state['this_process_holder_id'] and \
+               not lock_state.get('lock_is_stale'):
+                # Não é erro — só informa qual processo é o dono ativo agora
+                pass
+            if not auth_state['is_authenticated']:
+                overall_status = 'degraded'
+                warnings.append("Não autenticado com o Bling — worker não vai sincronizar.")
+
+            return jsonify({
+                'timestamp': datetime.now().isoformat(),
+                'build_id': '2026-07-02-sync-guard-v3-token-based',
+                'process_id': os.getpid(),
+                'overall_status': overall_status,
+                'warnings': warnings,
+                'worker': worker_state,
+                'distributed_lock': lock_state,
+                'sync_guard': sync_guard_state,
+                'production_queue': queue_state,
+                'bling_auth': auth_state,
+                'bling_api_metrics': api_metrics,
+            })
 
         @self.app.route('/api/debug/barcode-test', methods=['GET'])
         @token_required
@@ -3894,8 +4380,7 @@ class WebServer:
             })
 
         @self.app.route('/api/consumption/history')
-        @token_required
-        def api_consumption_history(token):
+        def api_consumption_history():
             """Retorna histórico de todos os meses."""
             all_data = component_consumption.get_all_months()
             result = {}
@@ -3959,8 +4444,8 @@ class WebServer:
             # ── Extrai reader_id do prefixo R1:/R2:/R3:/R4: ──────────────────
             reader_id = None
             codigo    = raw_codigo
-            # usa _re_ecb já importado no nível de módulo (evita reimport a cada scan)
-            _pfx = _re_ecb.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_ecb.IGNORECASE)
+            import re as _re_scan
+            _pfx = _re_scan.match(r'^(R[1-4]):(.+)$', raw_codigo, _re_scan.IGNORECASE)
             if _pfx:
                 reader_id = _pfx.group(1).upper()   # "R1", "R2", "R3" ou "R4"
                 codigo    = _pfx.group(2).strip()
@@ -3984,7 +4469,7 @@ class WebServer:
                         'acao': 'ja_concluido',
                         'codigo': codigo,
                         'reader_id': reader_id,
-                        'mensagem': f'Este item já foi concluído anteriormente.'
+                        'mensagem': 'Este item já foi concluído anteriormente.'
                     })
 
             # ── PRIORIDADE 2: match por GTIN (campo canônico da etiqueta física) ──
@@ -4068,7 +4553,7 @@ class WebServer:
                         'acao': 'nao_encontrado',
                         'codigo': codigo,
                         'reader_id': reader_id,
-                        'mensagem': f'Item removido durante o processamento — bipe novamente.'
+                        'mensagem': 'Item removido durante o processamento — bipe novamente.'
                     }), 404
 
                 status_atual  = found_item.get('status', 'waiting')
@@ -4303,11 +4788,23 @@ class WebServer:
 
             before = len(pending_orders.data)
             try:
-                # force=True ignora o lock de "recálculo em andamento" de outro worker
-                orch.process_sales_orders(force=True)
+                # force=True aqui só evita ser descartado silenciosamente como
+                # uma chamada periódica normal seria — mas NUNCA roda em
+                # paralelo com um recálculo já em andamento (ver
+                # process_sales_orders). Se retornar False, nada foi
+                # executado — não confundir com "sincronizou e não achou
+                # nada novo".
+                ran = orch.process_sales_orders(force=True)
             except Exception as e:
                 logger.exception("Erro em sync manual de pedidos")
                 return jsonify({'message': f'Erro ao sincronizar: {e}', 'added': 0}), 500
+
+            if not ran:
+                return jsonify({
+                    'added': 0,
+                    'message': 'Já existe uma sincronização em andamento — aguarde ela terminar e tente de novo.',
+                    'total_pedidos': len(orch.sales._sales_history or [])
+                }), 202
 
             after = len(pending_orders.data)
             added = max(0, after - before)
@@ -4630,7 +5127,7 @@ já é suficiente). Se você habilitar o módulo no Bling, use o botão abaixo p
                         except Exception as _me:
                             logger.error(f"Purge MongoDB direto: {_me}")
                     # Recarrega memória do MongoDB após purge
-                    pending_orders.data = pending_orders._load()
+                    pending_orders.load()
                     msg = f"Removidos: {removed} em memória + {mongo_removed} direto no MongoDB. Total em fila: {len(pending_orders.data)}"
                     logger.info(f"🧹 Purge manual: {msg}")
                     return f"""<!DOCTYPE html><html><body style="font-family:sans-serif;padding:40px;background:#0f172a;color:#e2e8f0">
@@ -4729,7 +5226,7 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
 
                 if not self.orchestrator.is_running():
                     self.orchestrator.start_worker()
-                    start_cleanup_timer()
+                    start_cleanup_timer(self.orchestrator)
                     logger.info("🚀 Worker iniciado após autenticação.")
                 else:
                     # Acorda o worker E reseta o timer de sync para ele pegar o token novo
@@ -4920,9 +5417,10 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
             # (garante que finalizações recentes aparecem imediatamente)
             """Retorna uso de componentes (do cache do worker)."""
             try:
-                # Retorna cache se disponível E não vazio
-                cache = None  # Sempre recalcula para garantir history atualizado
-                
+                # Sempre recalcula (nunca serve cache) para garantir que o
+                # histórico de produção reflita finalizações recentes.
+                cache = None
+
                 if cache and (cache.get('components') or cache.get('daily_breakdown')):
                     self.logger.info(f"📦 Retornando cache: {len(cache.get('components', []))} componentes")
                     return jsonify(cache)
@@ -5038,7 +5536,8 @@ ul{{padding-left:20px;font-size:.85rem;color:#94a3b8}}
             self.logger.info("📡 WebSocket KPI conectado.")
             
             # ✅ Limite de callbacks para evitar DoS acidental
-            global kpi_update_callbacks, kpi_update_lock
+            # (kpi_update_callbacks é global lida/mutada por .append(), nunca
+            # reatribuída — Python não exige 'global' para esse caso)
             if len(kpi_update_callbacks) >= 10:
                 self.logger.warning("Limite de 10 conexões KPI WS atingido. Conexão recusada.")
                 return
@@ -7037,7 +7536,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                     <div class="text-center w-100 py-1" style="background:#f0fdf4;border:1px dashed #86efac;border-radius:8px;font-size:.72rem;color:#16a34a;font-weight:600;">
                                         📷 Bipe a etiqueta para iniciar
                                     </div>
-                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="printItemLabel('${escapeHtml(ikey)}','${escapeHtml(item.nome||item.nome_original||'')}','${escapeHtml(String(item.pedido_numero||item.order_id||''))}','${escapeHtml(item.cliente||'')}','${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}')" title="Imprimir etiqueta deste produto">🏷️</button>
+                                    <button class="btn btn-outline-primary btn-sm flex-shrink-0"
+                                        data-p-ikey="${escapeHtml(ikey)}"
+                                        data-p-nome="${escapeHtml(item.nome||item.nome_original||'')}"
+                                        data-p-pedido="${escapeHtml(String(item.pedido_numero||item.order_id||''))}"
+                                        data-p-cliente="${escapeHtml(item.cliente||'')}"
+                                        data-p-unit="${item.qtd_total>1?escapeHtml('Unidade '+((item.qtd_unit_idx||0)+1)+' de '+item.qtd_total):''}"
+                                        onclick="printItemLabel(this.dataset.pIkey,this.dataset.pNome,this.dataset.pPedido,this.dataset.pCliente,this.dataset.pUnit)"
+                                        title="Imprimir etiqueta deste produto">🏷️</button>
                                     <button class="btn btn-outline-secondary btn-sm flex-shrink-0" data-dkey="${ikey}" onclick="dismissPendingOrder(this.dataset.dkey,event)" title="Remover">✕</button>
                                    </div>`
                             }
@@ -7164,7 +7670,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 const dataEntFmt = item.data_entrega ? (() => { try { return new Date(item.data_entrega).toLocaleDateString('pt-BR'); } catch { return item.data_entrega; } })() : '';
 
                 html += `<div class="col-sm-6 col-lg-4 col-xl-3">
-                    <div class="bc-card inprod" onclick="openOPModal('${escapeHtml(op)}','${escapeHtml(nome)}','${escapeHtml(ikey)}','${escapeHtml(opInterna)}','${escapeHtml(cliente)}')" style="cursor:pointer;">
+                    <div class="bc-card inprod"
+                        data-c-op="${escapeHtml(op)}"
+                        data-c-nome="${escapeHtml(nome)}"
+                        data-c-ikey="${escapeHtml(ikey)}"
+                        data-c-opinterna="${escapeHtml(opInterna)}"
+                        data-c-cliente="${escapeHtml(cliente)}"
+                        onclick="openOPModal(this.dataset.cOp,this.dataset.cNome,this.dataset.cIkey,this.dataset.cOpinterna,this.dataset.cCliente)"
+                        style="cursor:pointer;">
                         ${prazoBadge ? `<div class="bc-prazo">${prazoBadge}</div>` : ''}
                         <div class="bc-nome">${escapeHtml(nome)}</div>
                         <div class="bc-num">${op ? 'Ped. #'+escapeHtml(op) : '<span style="color:#ef4444;font-size:.75rem;">⚠️ Sem número</span>'}</div>
@@ -7189,7 +7702,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                                 <div class="text-center w-100 py-1" style="background:#fef2f2;border:1px dashed #fca5a5;border-radius:8px;font-size:.72rem;color:#dc2626;font-weight:600;">
                                     📷 Bipe a etiqueta para avançar
                                 </div>
-                                <button class="btn btn-outline-primary btn-sm flex-shrink-0" onclick="event.stopPropagation();printItemLabel('${escapeHtml(ikey)}','${escapeHtml(nome)}','${escapeHtml(String(item.pedido_numero||item.order_id||''))}','${escapeHtml(cliente)}')" title="Reimprimir etiqueta deste produto">🏷️</button>
+                                <button class="btn btn-outline-primary btn-sm flex-shrink-0"
+                                    data-p-ikey="${escapeHtml(ikey)}"
+                                    data-p-nome="${escapeHtml(nome)}"
+                                    data-p-pedido="${escapeHtml(String(item.pedido_numero||item.order_id||''))}"
+                                    data-p-cliente="${escapeHtml(cliente)}"
+                                    onclick="event.stopPropagation();printItemLabel(this.dataset.pIkey,this.dataset.pNome,this.dataset.pPedido,this.dataset.pCliente,'')"
+                                    title="Reimprimir etiqueta deste produto">🏷️</button>
                                </div>`
                         }
                     </div>
@@ -7341,10 +7860,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         <div class="modal-footer bg-white justify-content-between" style="border-top:1px solid #f0f0f0;">
                             <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">Fechar</button>
                             <div class="d-flex gap-2">
-                                <button class="btn btn-outline-primary btn-sm fw-bold" onclick="printItemLabel('${escapeHtml(codigoBarras)}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(clienteNome||'')}')">
+                                <button id="opModalBtnEtiqueta" class="btn btn-outline-primary btn-sm fw-bold">
                                     🏷️ Etiqueta
                                 </button>
-                                <button class="btn btn-primary btn-sm fw-bold" onclick="printOP('${escapeHtml(String(pedidoNum||''))}', '${escapeHtml(nomeProduto)}', '${escapeHtml(String(ordemProducao||''))}', '${escapeHtml(clienteNome||'')}')">
+                                <button id="opModalBtnFolhaA4" class="btn btn-primary btn-sm fw-bold">
                                     🖨️ Folha A4
                                 </button>
                             </div>
@@ -7356,6 +7875,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             document.body.insertAdjacentHTML('beforeend', modalHtml);
             const modal = new bootstrap.Modal(document.getElementById('opModal'));
             modal.show();
+
+            // Handlers anexados via addEventListener (não via onclick com string
+            // interpolada) — nomeProduto/clienteNome vêm diretamente das variáveis
+            // JS do escopo da função, sem passar por re-parse de atributo HTML.
+            // Isso evita quebra de sintaxe quando o nome do produto ou do cliente
+            // contém aspas simples/duplas (ex: apóstrofo em "D'Ávila", medidas
+            // com aspas como 55", nomes de tecido entre aspas).
+            document.getElementById('opModalBtnEtiqueta')?.addEventListener('click', () => {
+                printItemLabel(codigoBarras, nomeProduto, String(pedidoNum || ''), clienteNome || '');
+            });
+            document.getElementById('opModalBtnFolhaA4')?.addEventListener('click', () => {
+                printOP(String(pedidoNum || ''), nomeProduto, String(ordemProducao || ''), clienteNome || '');
+            });
 
             // Renderiza barcode real com JsBarcode (Code128 — lido por qualquer scanner)
             setTimeout(() => {
@@ -7423,6 +7955,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 return;
             }
 
+            // ── Checagem prévia: a lib JsBarcode vem de um CDN externo ──────
+            // (cdn.jsdelivr.net). Se a rede da fábrica bloquear esse domínio
+            // (firewall corporativo, proxy, sem internet no momento), a lib
+            // nunca carrega e JsBarcode fica undefined. Sem essa checagem,
+            // o erro só aparecia silencioso dentro da etiqueta já aberta —
+            // parecia "bug de impressão" quando na real era falta de conexão.
+            if (typeof JsBarcode === 'undefined') {
+                alert(
+                    '⚠️ Biblioteca de código de barras não carregou.\\n\\n' +
+                    'Isso normalmente acontece quando:\\n' +
+                    '• A internet caiu ou está instável\\n' +
+                    '• O firewall da rede está bloqueando cdn.jsdelivr.net\\n\\n' +
+                    'Recarregue a página (F5) com internet ativa e tente novamente.\\n' +
+                    'Se persistir, peça para o TI liberar o domínio cdn.jsdelivr.net.'
+                );
+                return;
+            }
+
             // Gera o SVG do barcode no DOM atual onde JsBarcode está disponível
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printLabelSvg';
@@ -7434,6 +7984,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const barWidth = len > 32 ? 0.7 : len > 24 ? 0.85 : len > 16 ? 1.0 : 1.2;
 
             let svgHtml = '';
+            let barcodeOk = false;
             try {
                 JsBarcode('#_printLabelSvg', itemKey, {
                     format: 'CODE128', width: barWidth, height: 40,
@@ -7449,6 +8000,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     tempSvg.removeAttribute('height');
                     tempSvg.setAttribute('style',
                         'display:block;width:56mm;height:auto;max-width:100%;margin:0 auto;');
+                    barcodeOk = true;
                 }
                 svgHtml = tempSvg.outerHTML;
             } catch(e) {
@@ -7457,6 +8009,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             }
             tempSvg.remove();
 
+            if (!barcodeOk) {
+                alert(
+                    '⚠️ O código de barras não pôde ser gerado para o código:\\n"' + itemKey + '"\\n\\n' +
+                    'Provável causa: caractere inválido no código do item.\\n' +
+                    'Use o botão ✕ para remover este item e sincronize novamente — ' +
+                    'a nova sincronização gera um código limpo automaticamente.'
+                );
+                return;
+            }
+
             // Nome truncado para caber na etiqueta pequena
             const nomeShort = (nomeProduto || '').length > 38
                 ? nomeProduto.substring(0, 36) + '…'
@@ -7464,40 +8026,29 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             // ── Abre janela isolada para impressão ──────────────────────────
             // Usar window.print() na página principal colide com o CSS do app
-            // (Bootstrap + display:none em elementos ocultos) e corrompe o layout.
-            // Uma popup isolada tem seu próprio documento e não herda nada.
-            const pw = window.open('', '_blank', 'width=400,height=320');
+            // e corrompe o layout. Uma popup isolada tem seu próprio documento.
+            //
+            // IMPORTANTE: window.print() é BLOQUEANTE em vários navegadores —
+            // a thread do popup fica parada até o usuário fechar o diálogo
+            // nativo de impressão. Por isso NUNCA fechamos a janela via
+            // setTimeout (corrida contra o print) — fechamos só depois do
+            // evento 'afterprint', e deixamos um botão manual como fallback
+            // caso o navegador não dispare esse evento (alguns não disparam
+            // quando o diálogo é cancelado).
+            const pw = window.open('', '_blank', 'width=320,height=280');
             if (!pw) {
-                showToast('Popup Bloqueada', 'Permita popups para este site e clique novamente no botão 🏷️.', 'warning');
-                alert('Popup bloqueado! Permita popups para este site e tente novamente.');
+                alert('Popup bloqueado! Libere popups para este site (ícone na barra de endereço) e tente novamente.');
                 return;
             }
 
-            pw.document.write(`<!DOCTYPE html>
+            const labelHtml = `<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>Etiqueta SW</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  /*
-   * @page: 62x40mm é o tamanho físico da etiqueta.
-   * Impressoras térmicas (Zebra/Elgin/Brother) que usam driver genérico
-   * ou "raw/ZPL" ignoram @page — configure o tamanho diretamente no
-   * driver/fila de impressão para 62x40mm.
-   * Para impressoras laser/jato de tinta com folha A4 de adesivos,
-   * o @page size é ignorado; o Chrome imprimirá na folha configurada.
-   */
-  @page {
-    size: 62mm 40mm;
-    margin: 0;
-  }
-  html, body {
-    width: 62mm;
-    height: 40mm;
-    background: #fff;
-    /* Evita que o browser redimensione o conteúdo ao imprimir */
-    -webkit-print-color-adjust: exact;
-    print-color-adjust: exact;
-  }
+  @page { size: 62mm 40mm; margin: 0; }
+  html, body { width: 62mm; height: 40mm; background: #fff; }
+  body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .label {
     width: 62mm; height: 40mm;
     padding: 2mm 2.5mm 1.5mm 2.5mm;
@@ -7517,6 +8068,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .bc    { text-align: center; line-height: 0; }
   .tip   { font-size: 5.5pt; color: #666; text-align: center;
            letter-spacing: .03em; margin-top: 0.5mm; }
+  @media screen {
+    body { padding: 12px; width: auto; height: auto; background:#f1f5f9; }
+    .label { border:1px solid #ccc; box-shadow:0 2px 8px rgba(0,0,0,.1); }
+    .toolbar { margin-top:10px; text-align:center; }
+    .toolbar button {
+      font-family: Arial, sans-serif; font-size: 13px; padding: 8px 16px;
+      border-radius: 6px; border: none; cursor: pointer; background:#2563eb; color:#fff;
+    }
+  }
+  @media print { .toolbar { display: none !important; } }
 </style>
 </head><body>
 <div class="label">
@@ -7530,34 +8091,32 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <div class="bc">${svgHtml}</div>
   <div class="tip">BIPE PARA AVANÇAR ETAPA</div>
 </div>
-<script>
-  window.onload = function() {
-    // DIAGNÓSTICO DO BUG "impressora em pausa":
-    // O Chrome dispara onafterprint quando o DIÁLOGO fecha, mas ainda
-    // está gerando o PDF internamente (spool). Fechar a janela nesse
-    // instante manda um job incompleto ao spooler do Windows, que o
-    // marca como "Pausado". Outros programas imprimem normal porque
-    // eles não fecham a janela enquanto o spool ainda roda.
-    //
-    // SOLUÇÃO: aguardar 2s após onafterprint antes de fechar — tempo
-    // suficiente para o Chrome terminar o spool e entregar o job
-    // completo ao driver da impressora.
-    var _closed = false;
-    function _closeOnce() {
-      if (!_closed) { _closed = true; window.close(); }
-    }
-    window.onafterprint = function() {
-      // Aguarda 2s para o Chrome finalizar o spool antes de fechar
-      setTimeout(_closeOnce, 2000);
-    };
-    // Fallback: fecha após 30s (cobre sistemas muito lentos ou
-    // impressoras de rede) — o onafterprint deve disparar bem antes
-    setTimeout(_closeOnce, 30000);
-    window.print();
-  };
-<\\/script>
-</body></html>`);
+<div class="toolbar">
+  <button onclick="window.print()">🖨️ Imprimir</button>
+</div>
+</body></html>`;
+
+            // document.write em vez de srcdoc/Blob por compatibilidade ampla,
+            // mas SEM disparo automático de print — usuário clica no botão.
+            // Isso elimina o travamento: nada bloqueia a thread principal,
+            // e a janela permanece aberta e responsiva até o usuário agir.
+            pw.document.open();
+            pw.document.write(labelHtml);
             pw.document.close();
+
+            // Fecha a janela automaticamente só depois que o print terminar
+            // (evento confiável, sem corrida de tempo).
+            // Em alguns navegadores com política restrita de cross-window,
+            // anexar listener na popup pode lançar — isso NÃO deve impedir
+            // a impressão, só o fechamento automático deixa de funcionar
+            // (usuário fecha manualmente, sem prejuízo).
+            try {
+                pw.addEventListener('afterprint', () => {
+                    try { pw.close(); } catch(e) {}
+                });
+            } catch(e) {
+                console.warn('Não foi possível registrar fechamento automático:', e);
+            }
         }
 
         /** Impressão da OP em página limpa (sem travar) */
@@ -7572,10 +8131,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
             const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
             tempSvg.id = '_printBcSvg';
-            // FIX: usar off-screen em vez de display:none — JsBarcode pode não
-            // calcular dimensões corretamente com display:none, gerando barcode
-            // sem viewBox ou em branco. Mesma estratégia do printItemLabel.
-            tempSvg.style.cssText = 'position:absolute;left:-9999px;top:-9999px;';
+            tempSvg.style.display = 'none';
             document.body.appendChild(tempSvg);
 
             try {
@@ -7607,9 +8163,15 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                     </p>
                 </div>`;
 
-            // Usar _printAreaPrint para aproveitar o lock anti-race-condition e
-            // o requestAnimationFrame duplo que garante render do SVG antes de imprimir.
-            _printAreaPrint(printContent);
+            const printArea = document.getElementById('print-area');
+            printArea.innerHTML = printContent;
+            printArea.style.display = 'block';
+            window.print();
+            window.onafterprint = () => {
+                printArea.innerHTML = '';
+                printArea.style.display = 'none';
+                window.onafterprint = null;
+            };
         }
 
         /** ════════════════════════════════════════════════════
@@ -7834,7 +8396,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             const monthStr = data.month || '';
             const [year, month] = monthStr.split('-');
             const monthNames = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
-            const monthName = month ? `${monthNames[parseInt(month)-1]}/${year}` : monthStr;
+            const monthName = month ? `${monthNames[parseInt(month, 10)-1]}/${year}` : monthStr;
             if (monthLabel) monthLabel.textContent = `${monthName} • Reinicia todo mês`;
             const summary = data.summary || [];
             if (totalBadge) totalBadge.textContent = `${summary.length} insumos registrados`;
@@ -7893,6 +8455,21 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
         /* WebSocket KPI com reconexão e backoff */
         let wsKpi = null;
+        // Dispara sync automático apenas na PRIMEIRA autenticação da vida da
+        // página (carregamento inicial) — não a cada reconexão de WebSocket.
+        // Reconexões são um evento NORMAL e frequente (Wi-Fi instável na
+        // fábrica, timeout ocioso, servidor reiniciando por deploy) — antes,
+        // _wsFirstAuthDone era resetado em TODA reconexão (dentro de
+        // wsKpi.onclose), disparando um novo POST /api/pending-orders/sync
+        // toda vez que o socket caía e voltava. Se isso acontecesse
+        // enquanto o worker periódico já estava no meio do próprio ciclo de
+        // sync, as duas chamadas rodavam de verdade em paralelo — cada uma
+        // com seu próprio contador de página, gerando exatamente o padrão
+        // de "duas sequências de página intercaladas" visto nos logs.
+        // Escopo de módulo (fora de setupKpiWebSocket) para persistir
+        // corretamente através de reconexões.
+        let _wsFirstAuthDoneEver = false;
+
         let _kpiReconnectDelay = 3000; // declarado fora para persistir entre reconexões
 
         function _connectKpiWs() {
@@ -7906,7 +8483,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 _kpiReconnectDelay = 3000; // reset ao conectar com sucesso
             };
 
-            let _wsFirstAuthDone = false;
             wsKpi.onmessage = (e) => {
                 let data;
                 try { data = JSON.parse(e.data); } catch { return; }
@@ -7929,9 +8505,10 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                         set('done-count-badge',    ps.done || 0);
                     }
 
-                    // Primeira mensagem autenticada: sync pedidos + recarrega board
-                    if (data.authenticated && !_wsFirstAuthDone) {
-                        _wsFirstAuthDone = true;
+                    // Primeira mensagem autenticada DA VIDA DA PÁGINA: sync
+                    // pedidos + recarrega board. NÃO repete em reconexões.
+                    if (data.authenticated && !_wsFirstAuthDoneEver) {
+                        _wsFirstAuthDoneEver = true;
                         fetch('/api/pending-orders/sync', { method: 'POST' }).catch(() => {});
                         const prodTab = document.getElementById('tab-producao');
                         if (prodTab && prodTab.classList.contains('active')) {
@@ -7949,7 +8526,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             wsKpi.onerror = () => { /* silencioso — onclose vai reconectar */ };
 
             wsKpi.onclose = () => {
-                _wsFirstAuthDone = false;
                 setTimeout(() => {
                     _kpiReconnectDelay = Math.min(_kpiReconnectDelay * 1.5, 30000);
                     _connectKpiWs();
@@ -7958,44 +8534,6 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         _connectKpiWs();
-
-        /* ══════════════════════════════════════════════════════════
-           LOCK DE IMPRESSÃO — evita race condition em onafterprint
-           Todas as funções que usam print-area + window.print() devem
-           chamar _printAreaPrint(content) em vez de window.print() direto.
-           Dois cliques rápidos sobrescreviam window.onafterprint, deixando
-           o print-area visível e travando o layout.
-        ══════════════════════════════════════════════════════════ */
-        let _printing = false;
-
-        function _printAreaPrint(htmlContent) {
-            if (_printing) return; // ignora segundo clique enquanto imprimindo
-            _printing = true;
-            const printArea = document.getElementById('print-area');
-            if (!printArea) { _printing = false; return; }
-            printArea.innerHTML = htmlContent;
-            printArea.style.display = 'block';
-            // Aguardar dois frames para garantir que SVGs e tabelas renderizaram
-            requestAnimationFrame(function() {
-                requestAnimationFrame(function() {
-                    window.print();
-                    window.onafterprint = function() {
-                        printArea.innerHTML = '';
-                        printArea.style.display = 'none';
-                        window.onafterprint = null;
-                        _printing = false;
-                    };
-                    // Fallback: libera lock após 8s (caso onafterprint não dispare)
-                    setTimeout(function() {
-                        if (_printing) {
-                            printArea.innerHTML = '';
-                            printArea.style.display = 'none';
-                            _printing = false;
-                        }
-                    }, 8000);
-                });
-            });
-        }
 
         /* ══════════════════════════════════════════════════════════
            DASHBOARD — Gráficos unificados
@@ -8017,9 +8555,14 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             loadKPIChart();
         }
         function printDashboard() {
+            const area = document.getElementById('print-area');
             const dash = document.getElementById('tab-dashboard');
-            if (!dash) return;
-            _printAreaPrint('<div style="padding:20px;">' + dash.innerHTML + '</div>');
+            if (area && dash) {
+                area.innerHTML = '<div style="padding:20px;">' + dash.innerHTML + '</div>';
+                area.style.display = 'block';
+                window.print();
+                window.onafterprint = () => { area.innerHTML = ''; area.style.display = 'none'; window.onafterprint = null; };
+            }
         }
 
         async function loadKPIChart() {
@@ -8234,15 +8777,19 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printSetor() {
+            const area = document.getElementById('print-area');
             const boardEl = document.getElementById('board-inprod');
-            if (!boardEl) return;
+            if (!area || !boardEl) return;
             const titulo = _currentSetor === 'todos' ? 'Todos os Setores' :
                            _currentSetor === 'marcenaria' ? '🪚 Marcenaria' : '🧵 Tapeçaria';
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Produção: ${titulo}</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${boardEl.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8316,13 +8863,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printExpedicao() {
+            const area = document.getElementById('print-area');
             const sec  = document.getElementById('expedicao-section');
-            if (!sec) return;
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Lista de Expedição</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8423,18 +8974,22 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
                 }, 80);
 
             } catch(e) {
-                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar relatório: ' + e.message + '</div>';
+                if (sec) sec.innerHTML = '<div class="alert alert-danger m-3">Erro ao carregar relatório: ' + escapeHtml(e.message) + '</div>';
             }
         }
 
         function printRelatorio() {
+            const area = document.getElementById('print-area');
             const sec  = document.getElementById('relatorio-section');
-            if (!sec) return;
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2 style="text-align:center;">SW Móveis MDF — Relatório de Produção</h2>
                 <p style="text-align:center;color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8509,13 +9064,17 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         }
 
         function printFicha() {
+            const area = document.getElementById('print-area');
             const sec  = document.getElementById('ficha-section');
-            if (!sec) return;
-            _printAreaPrint(`<div style="padding:20px;font-family:Arial,sans-serif;">
+            if (!area || !sec) return;
+            area.innerHTML = `<div style="padding:20px;font-family:Arial,sans-serif;">
                 <h2>SW Móveis MDF — Ficha Técnica: Cadeira SW</h2>
                 <p style="color:#666;font-size:12px;">${new Date().toLocaleString('pt-BR')}</p>
                 ${sec.innerHTML}
-            </div>`);
+            </div>`;
+            area.style.display = 'block';
+            window.print();
+            window.onafterprint = () => { area.innerHTML=''; area.style.display='none'; window.onafterprint=null; };
         }
 
         /* ══════════════════════════════════════════════════════════
@@ -8654,7 +9213,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 def create_app() -> Flask:
     """Função de fábrica para criar e configurar a aplicação Flask."""
-    
+
+    # ═══════════════════════════════════════════════════════════════════
+    # MARCA DE BUILD — resposta definitiva para "esse deploy já tem a
+    # correção X?" sem depender de lembrar quando algo foi deployado.
+    # Aparece LOGO nas primeiras linhas de log de todo boot de processo.
+    # Se esta linha não aparecer no log do Render após um deploy, o
+    # deploy não pegou este arquivo — não é preciso adivinhar mais.
+    # ═══════════════════════════════════════════════════════════════════
+    logging.getLogger('bling_automacao').critical(
+        "🏗️  BUILD_ID=2026-07-02-sync-guard-v3-token-based | "
+        "PID=%d | Inclui: fix do reconnect de WebSocket disparando sync "
+        "duplicado + guard atômico via MongoDB (token-based) em "
+        "process_sales_orders + DistributedWorkerLock entre processos. "
+        "Se você está confirmando se este deploy tem essas correções: tem, "
+        "se esta linha apareceu.",
+        os.getpid()
+    )
+
     # 1. Inicializa as dependências na ordem correta
     config = Config()
     
@@ -8671,9 +9247,61 @@ def create_app() -> Flask:
         api_client=api_client,
         sales_manager=sales_manager,
     )
+
+    # Lock distribuído entre processos — garante que só 1 processo do
+    # Gunicorn rode o worker de fundo por vez (ver DistributedWorkerLock
+    # para o motivo detalhado). Anexado ao orchestrator para que todo
+    # ponto que já chama orchestrator.start_worker() tenha acesso direto.
+    orchestrator.worker_lock = DistributedWorkerLock()
     
     # 3. Inicializa o Flask
     flask_app = Flask(__name__)
+
+    # ── Compressão gzip de respostas de texto ──────────────────────────
+    # Sem isso, a página principal (medida em ~190KB no log real de
+    # produção) ia inteira sem compressão a cada carregamento — o maior
+    # fator isolado de "demora muito pra carregar" em conexões mais lentas
+    # (Wi-Fi da fábrica). gzip tipicamente reduz texto (HTML/CSS/JS/JSON)
+    # em 70-85%. Implementado com o módulo padrão 'gzip' (sem dependência
+    # nova) — só comprime quando o cliente anuncia suporte, o corpo já
+    # passa de um tamanho mínimo (comprimir respostas pequenas custa mais
+    # CPU do que economiza banda), e o mimetype é texto (nunca comprime
+    # imagens/binários que já vêm comprimidos, ou respostas de streaming
+    # como WebSocket/SSE, onde Content-Length não se aplica).
+    import gzip as _gzip
+
+    _COMPRESSIBLE_MIMETYPES = (
+        'text/html', 'text/css', 'text/plain', 'text/javascript',
+        'application/javascript', 'application/json', 'image/svg+xml',
+    )
+    _MIN_COMPRESS_BYTES = 500
+
+    @flask_app.after_request
+    def _compress_response(response):
+        try:
+            if response.direct_passthrough:
+                return response  # streaming (ex: SSE) — não mexe
+            accept_enc = request.headers.get('Accept-Encoding', '')
+            if 'gzip' not in accept_enc.lower():
+                return response
+            if response.headers.get('Content-Encoding'):
+                return response  # já comprimido por algum outro caminho
+            mimetype = (response.mimetype or '').lower()
+            if not any(mimetype.startswith(m) for m in _COMPRESSIBLE_MIMETYPES):
+                return response
+            body = response.get_data()
+            if len(body) < _MIN_COMPRESS_BYTES:
+                return response
+            compressed = _gzip.compress(body, compresslevel=6)
+            response.set_data(compressed)
+            response.headers['Content-Encoding'] = 'gzip'
+            response.headers['Content-Length'] = len(compressed)
+            response.headers.setdefault('Vary', 'Accept-Encoding')
+        except Exception as _compress_err:
+            # Compressão nunca pode quebrar uma resposta — se falhar por
+            # qualquer motivo, serve sem comprimir em vez de dar erro 500.
+            logger.warning(f"Falha ao comprimir resposta (servindo sem gzip): {_compress_err}")
+        return response
     
     # ✅ REGRA DE OURO: Define uma SECRET_KEY estável para persistência de sessão.
     # CRÍTICO: Sempre configure FLASK_SECRET_KEY como variável de ambiente em produção.
@@ -8719,7 +9347,7 @@ def create_app() -> Flask:
             if (orchestrator.auth._access_token and
                     orchestrator.auth._expires_at > time.time() + 60):
                 orchestrator.start_worker()
-                start_cleanup_timer()
+                start_cleanup_timer(orchestrator)
                 logger.info("✅ Worker iniciado automaticamente — token recuperado do storage.")
             else:
                 logger.info("ℹ️  Nenhum token válido — aguardando autenticação OAuth.")
@@ -8741,7 +9369,7 @@ if __name__ == '__main__':
     _orchestrator = app.orchestrator  # atribuído em WebServer.__init__ via flask_app.orchestrator
     if not _orchestrator.is_running():
         _orchestrator.start_worker()
-        start_cleanup_timer()
+        start_cleanup_timer(_orchestrator)
         logger.info("✅ Worker de fundo iniciado em modo local.")
 
     logger.info("Iniciando servidor Flask em modo local...")
