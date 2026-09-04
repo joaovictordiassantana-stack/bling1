@@ -636,10 +636,10 @@ class Config:
     """Configurações globais da aplicação."""
     
     # Bling OAuth
-    CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', '')
-    CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', '')
+    CLIENT_ID: str = os.environ.get('BLING_CLIENT_ID', '98db1ec6b8e5ddaef6c23337473959b9d037961c')
+    CLIENT_SECRET: str = os.environ.get('BLING_CLIENT_SECRET', 'ca7e11bb78b9475adc0606eaf850c9478c44e783f2b4fe16bc2fcb225e4d')
     WEBHOOK_SECRET: str = os.environ.get('BLING_WEBHOOK_SECRET', '')
-    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', '')
+    REDIRECT_URI: str = os.environ.get('BLING_REDIRECT_URI', 'https://bling1.onrender.com/webhook/bling')
     
     # API
     BLING_API_URL: str = 'https://api.bling.com.br/Api/v3'
